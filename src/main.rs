@@ -17,6 +17,7 @@
  *
  */
 
+mod db;
 mod github;
 mod openai;
 
@@ -919,6 +920,315 @@ fn tool_github_pull_request_patch(
     Ok(pr)
 }
 
+fn tool_agent_create(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        name: String,
+        #[serde(default)]
+        description: Option<String>,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let conn = ctx.db_conn()?;
+    db::create_agent(
+        &conn,
+        &params.name,
+        params.description.as_deref().unwrap_or(""),
+    )?;
+    ctx.println(&format!("Agent '{}' created successfully", params.name));
+    let result = serde_json::json!({"status": "created", "name": params.name});
+    Ok(result.to_string())
+}
+
+fn tool_agent_delete(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        name: String,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let conn = ctx.db_conn()?;
+    let deleted = db::delete_agent(&conn, &params.name)?;
+    if deleted {
+        ctx.println(&format!("Agent '{}' deleted", params.name));
+        let result = serde_json::json!({"status": "deleted", "name": params.name});
+        Ok(result.to_string())
+    } else {
+        let result = serde_json::json!({"status": "not_found", "name": params.name});
+        Ok(result.to_string())
+    }
+}
+
+fn tool_agent_list(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    let _ = params_str;
+    let conn = ctx.db_conn()?;
+    let agents = db::list_agents(&conn)?;
+    ctx.println(&format!("Found {} agent(s)", agents.len()));
+    for a in &agents {
+        ctx.println(&format!("  - {} ({})", a.name, a.description));
+    }
+    Ok(serde_json::to_string(&agents)?)
+}
+
+fn tool_agent_get(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        name: String,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let conn = ctx.db_conn()?;
+    match db::get_agent(&conn, &params.name)? {
+        Some(agent) => {
+            ctx.println(&format!("Agent '{}': {}", agent.name, agent.description));
+            Ok(serde_json::to_string(&agent)?)
+        }
+        None => {
+            let result = serde_json::json!({"error": format!("Agent '{}' not found", params.name)});
+            Ok(result.to_string())
+        }
+    }
+}
+
+fn tool_agent_data_set(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        agent: String,
+        key: String,
+        value: String,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let conn = ctx.db_conn()?;
+    db::set_agent_data(&conn, &params.agent, &params.key, &params.value)?;
+    ctx.println(&format!(
+        "Set data for agent '{}': {} = {}",
+        params.agent, params.key, params.value
+    ));
+    let result = serde_json::json!({"status": "ok", "agent": params.agent, "key": params.key});
+    Ok(result.to_string())
+}
+
+fn tool_agent_data_get(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        agent: String,
+        key: String,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let conn = ctx.db_conn()?;
+    match db::get_agent_data(&conn, &params.agent, &params.key)? {
+        Some(value) => {
+            ctx.println(&format!(
+                "Agent '{}' data: {} = {}",
+                params.agent, params.key, value
+            ));
+            let result =
+                serde_json::json!({"agent": params.agent, "key": params.key, "value": value});
+            Ok(result.to_string())
+        }
+        None => {
+            let result =
+                serde_json::json!({"agent": params.agent, "key": params.key, "value": null});
+            Ok(result.to_string())
+        }
+    }
+}
+
+fn tool_agent_data_delete(
+    params_str: &String,
+    ctx: &ToolContext,
+) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        agent: String,
+        key: String,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let conn = ctx.db_conn()?;
+    let deleted = db::delete_agent_data(&conn, &params.agent, &params.key)?;
+    if deleted {
+        ctx.println(&format!(
+            "Deleted key '{}' for agent '{}'",
+            params.key, params.agent
+        ));
+    }
+    let result = serde_json::json!({"deleted": deleted, "agent": params.agent, "key": params.key});
+    Ok(result.to_string())
+}
+
+fn tool_agent_data_list(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        agent: String,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let conn = ctx.db_conn()?;
+    let data = db::list_agent_data(&conn, &params.agent)?;
+    ctx.println(&format!(
+        "Agent '{}' has {} data entries",
+        params.agent,
+        data.len()
+    ));
+    for (k, v) in &data {
+        ctx.println(&format!("  {} = {}", k, v));
+    }
+    let entries: Vec<serde_json::Value> = data
+        .into_iter()
+        .map(|(k, v)| serde_json::json!({"key": k, "value": v}))
+        .collect();
+    Ok(serde_json::to_string(&entries)?)
+}
+
+fn tool_task_create_cron(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        name: String,
+        cron_expression: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        agent_name: Option<String>,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let conn = ctx.db_conn()?;
+    let id = db::create_cron_task(
+        &conn,
+        &params.name,
+        params.description.as_deref().unwrap_or(""),
+        &params.cron_expression,
+        params.agent_name.as_deref(),
+    )?;
+    ctx.println(&format!(
+        "Created cron task '{}' (id={}) with schedule '{}'",
+        params.name, id, params.cron_expression
+    ));
+    let result = serde_json::json!({"status": "created", "id": id, "name": params.name});
+    Ok(result.to_string())
+}
+
+fn tool_task_create_oneshot(
+    params_str: &String,
+    ctx: &ToolContext,
+) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        name: String,
+        run_at: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        agent_name: Option<String>,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let conn = ctx.db_conn()?;
+    let id = db::create_oneshot_task(
+        &conn,
+        &params.name,
+        params.description.as_deref().unwrap_or(""),
+        &params.run_at,
+        params.agent_name.as_deref(),
+    )?;
+    ctx.println(&format!(
+        "Created one-shot task '{}' (id={}) scheduled at '{}'",
+        params.name, id, params.run_at
+    ));
+    let result = serde_json::json!({"status": "created", "id": id, "name": params.name});
+    Ok(result.to_string())
+}
+
+fn tool_task_delete(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        id: i64,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let conn = ctx.db_conn()?;
+    let deleted = db::delete_task(&conn, params.id)?;
+    if deleted {
+        ctx.println(&format!("Deleted task id={}", params.id));
+    }
+    let result = serde_json::json!({"deleted": deleted, "id": params.id});
+    Ok(result.to_string())
+}
+
+fn tool_task_list(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        #[serde(default)]
+        agent_name: Option<String>,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let conn = ctx.db_conn()?;
+    let tasks = db::list_tasks(&conn, params.agent_name.as_deref())?;
+    ctx.println(&format!("Found {} task(s)", tasks.len()));
+    for t in &tasks {
+        let status = if t.enabled { "enabled" } else { "disabled" };
+        ctx.println(&format!(
+            "  [{}] {} - {} ({})",
+            t.id, t.name, t.task_type, status
+        ));
+    }
+    Ok(serde_json::to_string(&tasks)?)
+}
+
+fn tool_task_get(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        id: i64,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let conn = ctx.db_conn()?;
+    match db::get_task(&conn, params.id)? {
+        Some(task) => {
+            ctx.println(&format!(
+                "Task [{}]: {} ({})",
+                task.id, task.name, task.task_type
+            ));
+            Ok(serde_json::to_string(&task)?)
+        }
+        None => {
+            let result = serde_json::json!({"error": format!("Task id={} not found", params.id)});
+            Ok(result.to_string())
+        }
+    }
+}
+
+fn tool_task_set_enabled(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        id: i64,
+        enabled: bool,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let conn = ctx.db_conn()?;
+    let updated = db::set_task_enabled(&conn, params.id, params.enabled)?;
+    let status = if params.enabled {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    if updated {
+        ctx.println(&format!("Task id={} {}", params.id, status));
+    }
+    let result =
+        serde_json::json!({"updated": updated, "id": params.id, "enabled": params.enabled});
+    Ok(result.to_string())
+}
+
+fn tool_task_pending(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    let _ = params_str;
+    let conn = ctx.db_conn()?;
+    let tasks = db::get_pending_tasks(&conn)?;
+    ctx.println(&format!("Found {} pending task(s)", tasks.len()));
+    for t in &tasks {
+        ctx.println(&format!(
+            "  [{}] {} - {} (next: {})",
+            t.id,
+            t.name,
+            t.task_type,
+            t.next_run_at.as_deref().unwrap_or("N/A")
+        ));
+    }
+    Ok(serde_json::to_string(&tasks)?)
+}
+
 fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
     let mut tools: ToolsCollection = ToolsCollection::new();
 
@@ -1281,6 +1591,480 @@ fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
         .to_string(),
     );
 
+    append_tool(
+        &mut tools,
+        "agent_create".to_string(),
+        tool_agent_create,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "agent_create",
+                "description": "Create a new named agent in the database for organizing tasks and storing data.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Unique name for the agent"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Optional description of the agent's purpose"
+                        }
+                    },
+                    "required": [
+                        "name"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "agent_delete".to_string(),
+        tool_agent_delete,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "agent_delete",
+                "description": "Delete an agent and all its associated data from the database.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Name of the agent to delete"
+                        }
+                    },
+                    "required": [
+                        "name"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "agent_list".to_string(),
+        tool_agent_list,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "agent_list",
+                "description": "List all agents in the database.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "agent_get".to_string(),
+        tool_agent_get,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "agent_get",
+                "description": "Get details of a specific agent by name.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Name of the agent to retrieve"
+                        }
+                    },
+                    "required": [
+                        "name"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "agent_data_set".to_string(),
+        tool_agent_data_set,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "agent_data_set",
+                "description": "Store a key-value pair for an agent. Overwrites existing value if key exists.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent": {
+                            "type": "string",
+                            "description": "Name of the agent"
+                        },
+                        "key": {
+                            "type": "string",
+                            "description": "The key to store"
+                        },
+                        "value": {
+                            "type": "string",
+                            "description": "The value to associate with the key"
+                        }
+                    },
+                    "required": [
+                        "agent",
+                        "key",
+                        "value"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "agent_data_get".to_string(),
+        tool_agent_data_get,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "agent_data_get",
+                "description": "Retrieve the value for a key stored for an agent.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent": {
+                            "type": "string",
+                            "description": "Name of the agent"
+                        },
+                        "key": {
+                            "type": "string",
+                            "description": "The key to retrieve"
+                        }
+                    },
+                    "required": [
+                        "agent",
+                        "key"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "agent_data_delete".to_string(),
+        tool_agent_data_delete,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "agent_data_delete",
+                "description": "Delete a key-value pair for an agent.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent": {
+                            "type": "string",
+                            "description": "Name of the agent"
+                        },
+                        "key": {
+                            "type": "string",
+                            "description": "The key to delete"
+                        }
+                    },
+                    "required": [
+                        "agent",
+                        "key"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "agent_data_list".to_string(),
+        tool_agent_data_list,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "agent_data_list",
+                "description": "List all key-value pairs stored for an agent.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent": {
+                            "type": "string",
+                            "description": "Name of the agent"
+                        }
+                    },
+                    "required": [
+                        "agent"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "task_create_cron".to_string(),
+        tool_task_create_cron,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "task_create_cron",
+                "description": "Create a recurring scheduled task using a cron expression. Uses 7-field cron format: 'sec min hour day_of_month month day_of_week year'. Example: '0 30 9 * * Mon-Fri *' means 9:30 AM every weekday.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Name for the task"
+                        },
+                        "cron_expression": {
+                            "type": "string",
+                            "description": "7-field cron expression: sec min hour day_of_month month day_of_week year"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Optional description of what the task does"
+                        },
+                        "agent_name": {
+                            "type": "string",
+                            "description": "Optional agent to associate the task with"
+                        }
+                    },
+                    "required": [
+                        "name",
+                        "cron_expression"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "task_create_oneshot".to_string(),
+        tool_task_create_oneshot,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "task_create_oneshot",
+                "description": "Create a one-shot scheduled task that runs once at a specific datetime.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Name for the task"
+                        },
+                        "run_at": {
+                            "type": "string",
+                            "description": "When to run, in RFC 3339 format (e.g. '2025-12-31T23:59:59Z')"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Optional description of what the task does"
+                        },
+                        "agent_name": {
+                            "type": "string",
+                            "description": "Optional agent to associate the task with"
+                        }
+                    },
+                    "required": [
+                        "name",
+                        "run_at"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "task_delete".to_string(),
+        tool_task_delete,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "task_delete",
+                "description": "Delete a scheduled task by its ID.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "number",
+                            "description": "ID of the task to delete"
+                        }
+                    },
+                    "required": [
+                        "id"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "task_list".to_string(),
+        tool_task_list,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "task_list",
+                "description": "List all scheduled tasks, optionally filtered by agent name.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent_name": {
+                            "type": "string",
+                            "description": "Optional agent name to filter tasks by"
+                        }
+                    },
+                    "required": [],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "task_get".to_string(),
+        tool_task_get,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "task_get",
+                "description": "Get details of a specific scheduled task by its ID.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "number",
+                            "description": "ID of the task to retrieve"
+                        }
+                    },
+                    "required": [
+                        "id"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "task_set_enabled".to_string(),
+        tool_task_set_enabled,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "task_set_enabled",
+                "description": "Enable or disable a scheduled task.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "number",
+                            "description": "ID of the task"
+                        },
+                        "enabled": {
+                            "type": "boolean",
+                            "description": "true to enable, false to disable"
+                        }
+                    },
+                    "required": [
+                        "id",
+                        "enabled"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "task_pending".to_string(),
+        tool_task_pending,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "task_pending",
+                "description": "List all enabled scheduled tasks whose next_run_at is in the past (i.e. tasks that are due to run).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
     if !unsafe_tools {
         return tools;
     }
@@ -1419,6 +2203,7 @@ fn post_request_and_print_output(
     prompt: &String,
     system_prompts: Option<Vec<String>>,
     opts: &Opts,
+    db: Option<Arc<Mutex<rusqlite::Connection>>>,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Prompt: {}", prompt);
 
@@ -1465,10 +2250,10 @@ fn post_request_and_print_output(
     }
     messages.push(make_message("user", prompt.clone()));
 
-    // Create a simple ToolContext that prints to stdout
-    let tool_context = ToolContext::new(|msg: &str| {
+    let mut tool_context = ToolContext::new(|msg: &str| {
         println!("{}", msg);
     });
+    tool_context.db = db;
 
     let response: OpenAIResponse = post_request(messages, &tools, &openai_opts, &tool_context)?;
 
@@ -1486,7 +2271,12 @@ fn post_request_and_print_output(
 }
 
 /// Fetches a GitHub pull request and its patch, then sends them to the AI for review.
-fn review_pull_request(repo: &String, pr_id: u64, opts: &Opts) -> Result<(), Box<dyn Error>> {
+fn review_pull_request(
+    repo: &String,
+    pr_id: u64,
+    opts: &Opts,
+    db: Option<Arc<Mutex<rusqlite::Connection>>>,
+) -> Result<(), Box<dyn Error>> {
     debug!("Reviewing pull request {}/{}", repo, pr_id);
 
     let pr = get_github_pull_request(repo, pr_id)?;
@@ -1497,11 +2287,16 @@ fn review_pull_request(repo: &String, pr_id: u64, opts: &Opts) -> Result<(), Box
     let system_prompts: Vec<String> = vec![patch, pr_json];
     let prompt = "Review the following pull request and report any issue with it, pay attention to the code.  Report only what is wrong, don't highlight what is done correctly.".to_string();
 
-    post_request_and_print_output(&prompt, Some(system_prompts), opts)
+    post_request_and_print_output(&prompt, Some(system_prompts), opts, db)
 }
 
 /// Fetches a GitHub issue and its comments, then sends them to the AI for triaging.
-fn triage_issue(repo: &String, issue_id: u64, opts: &Opts) -> Result<(), Box<dyn Error>> {
+fn triage_issue(
+    repo: &String,
+    issue_id: u64,
+    opts: &Opts,
+    db: Option<Arc<Mutex<rusqlite::Connection>>>,
+) -> Result<(), Box<dyn Error>> {
     debug!("Triaging issue {}/{}", repo, issue_id);
 
     let issue = get_github_issue(repo, issue_id)?;
@@ -1514,7 +2309,7 @@ fn triage_issue(repo: &String, issue_id: u64, opts: &Opts) -> Result<(), Box<dyn
 
     let system_prompts: Vec<String> = vec![issue_json, comments_json];
 
-    post_request_and_print_output(&prompt, Some(system_prompts), opts)
+    post_request_and_print_output(&prompt, Some(system_prompts), opts, db)
 }
 
 /// Fetches recent issues and pull requests from specified repositories and sends them to the AI with a given command prompt.
@@ -1523,6 +2318,7 @@ fn prompt_issues_and_pull_requests(
     repos: &Vec<String>,
     days: Option<u64>,
     opts: &Opts,
+    db: Option<Arc<Mutex<rusqlite::Connection>>>,
 ) -> Result<(), Box<dyn Error>> {
     let days = days.unwrap_or_else(|| DEFAULT_DAYS);
     debug!(
@@ -1555,7 +2351,7 @@ fn prompt_issues_and_pull_requests(
     let system_prompts: Vec<String> = vec![issues_json, prs_json];
     let prompt_string = prompt.to_string();
 
-    post_request_and_print_output(&prompt_string, Some(system_prompts), opts)
+    post_request_and_print_output(&prompt_string, Some(system_prompts), opts, db)
 }
 
 /// Analyzes recent issues and pull requests for the specified repositories.
@@ -1563,6 +2359,7 @@ fn analyze_repos(
     repos: &Vec<String>,
     days: Option<u64>,
     opts: &Opts,
+    db: Option<Arc<Mutex<rusqlite::Connection>>>,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Analyzing repos: {:?} for past {:?} days", repos, days);
     prompt_issues_and_pull_requests(
@@ -1570,6 +2367,7 @@ fn analyze_repos(
         repos,
         days,
         opts,
+        db,
     )
 }
 
@@ -1578,6 +2376,7 @@ fn prioritize_repos(
     repos: &Vec<String>,
     days: Option<u64>,
     opts: &Opts,
+    db: Option<Arc<Mutex<rusqlite::Connection>>>,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Prioritizing repos: {:?} for past {:?} days", repos, days);
     prompt_issues_and_pull_requests(
@@ -1585,11 +2384,17 @@ fn prioritize_repos(
         repos,
         days,
         opts,
+        db,
     )
 }
 
 /// Sends the concatenated content of specified files as a prompt to the AI.
-fn prompt_command(prompt: &String, files: &Vec<String>, opts: &Opts) -> Result<(), Box<dyn Error>> {
+fn prompt_command(
+    prompt: &String,
+    files: &Vec<String>,
+    opts: &Opts,
+    db: Option<Arc<Mutex<rusqlite::Connection>>>,
+) -> Result<(), Box<dyn Error>> {
     debug!("Executing prompt command with {} files", files.len());
     let mut system_prompts: Vec<String> = vec![];
 
@@ -1598,7 +2403,7 @@ fn prompt_command(prompt: &String, files: &Vec<String>, opts: &Opts) -> Result<(
         let contents = fs::read_to_string(file)?;
         system_prompts.push(contents);
     }
-    post_request_and_print_output(prompt, Some(system_prompts), opts)
+    post_request_and_print_output(prompt, Some(system_prompts), opts, db)
 }
 
 enum ChatCommand {
@@ -2125,6 +2930,7 @@ fn execute_ai_request(
 fn chat_command(
     opts: &Opts,
     global_multi_progress: Arc<MultiProgress>,
+    db: Option<Arc<Mutex<rusqlite::Connection>>>,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Executing chat command");
 
@@ -2234,9 +3040,10 @@ fn chat_command(
                     status_pb.enable_steady_tick(Duration::from_millis(500));
 
                     let streaming_pb_for_context = streaming_pb.clone();
-                    let tool_context = ToolContext::new(move |msg: &str| {
+                    let mut tool_context = ToolContext::new(move |msg: &str| {
                         streaming_pb_for_context.println(msg);
                     });
+                    tool_context.db = db.clone();
 
                     match execute_ai_request(
                         messages.clone(),
@@ -2597,14 +3404,36 @@ fn main() -> Result<(), Box<dyn Error>> {
         opts.model = Some("".to_string());
     }
 
+    let db_connection = if let Some(ref db_path) = opts.db_path {
+        debug!("Opening SQLite database at: {}", db_path);
+        let conn = rusqlite::Connection::open(db_path)?;
+        db::initialize_db(&conn)?;
+        Some(Arc::new(Mutex::new(conn)))
+    } else {
+        debug!("No db_path configured, database tools will be unavailable");
+        None
+    };
+
     // Execute the chosen command
     let result = match &opts.command {
-        CliCommand::Analyze { days, repo } => analyze_repos(&repo, *days, &opts),
-        CliCommand::Prioritize { days, repo } => prioritize_repos(&repo, *days, &opts),
-        CliCommand::Triage { repo, issue } => triage_issue(&repo, *issue, &opts),
-        CliCommand::Review { repo, pr } => review_pull_request(&repo, *pr, &opts),
-        CliCommand::Prompt { prompt, files } => prompt_command(&prompt, &files, &opts),
-        CliCommand::Chat {} => chat_command(&opts, global_multi_progress.clone()),
+        CliCommand::Analyze { days, repo } => {
+            analyze_repos(&repo, *days, &opts, db_connection.clone())
+        }
+        CliCommand::Prioritize { days, repo } => {
+            prioritize_repos(&repo, *days, &opts, db_connection.clone())
+        }
+        CliCommand::Triage { repo, issue } => {
+            triage_issue(&repo, *issue, &opts, db_connection.clone())
+        }
+        CliCommand::Review { repo, pr } => {
+            review_pull_request(&repo, *pr, &opts, db_connection.clone())
+        }
+        CliCommand::Prompt { prompt, files } => {
+            prompt_command(&prompt, &files, &opts, db_connection.clone())
+        }
+        CliCommand::Chat {} => {
+            chat_command(&opts, global_multi_progress.clone(), db_connection.clone())
+        }
         CliCommand::Models {} => list_models_command(&opts),
     };
 
