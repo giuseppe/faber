@@ -19,7 +19,7 @@
 
 use cron::Schedule;
 use rusqlite::{Connection, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::str::FromStr;
 
@@ -83,10 +83,20 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
             FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE SET NULL
         );
 
+        CREATE TABLE IF NOT EXISTS agent_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_name TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            message_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
+        );
+
         CREATE INDEX IF NOT EXISTS idx_agent_data_agent ON agent_data(agent_name);
         CREATE INDEX IF NOT EXISTS idx_tasks_next_run ON scheduled_tasks(next_run_at)
             WHERE enabled = 1;
         CREATE INDEX IF NOT EXISTS idx_tasks_agent ON scheduled_tasks(agent_name);
+        CREATE INDEX IF NOT EXISTS idx_agent_messages_agent_seq ON agent_messages(agent_name, seq);
         ",
     )?;
 
@@ -403,4 +413,96 @@ pub fn mark_task_executed(
     }
 
     Ok(())
+}
+
+// --- Agent Config ---
+
+pub struct AgentConfig {
+    pub model: Option<String>,
+    pub endpoint: Option<String>,
+    pub system_prompt: Option<String>,
+}
+
+pub fn get_agent_config(
+    conn: &Connection,
+    agent_name: &str,
+) -> Result<AgentConfig, Box<dyn Error>> {
+    Ok(AgentConfig {
+        model: get_agent_data(conn, agent_name, "config:model")?,
+        endpoint: get_agent_data(conn, agent_name, "config:endpoint")?,
+        system_prompt: get_agent_data(conn, agent_name, "config:system_prompt")?,
+    })
+}
+
+// --- Agent Messages ---
+
+pub fn ensure_default_agent(conn: &Connection) -> Result<(), Box<dyn Error>> {
+    conn.execute(
+        "INSERT OR IGNORE INTO agents (name, description) VALUES ('default', 'Default agent')",
+        [],
+    )?;
+    Ok(())
+}
+
+pub fn save_agent_messages<T: Serialize>(
+    conn: &Connection,
+    agent_name: &str,
+    messages: &[T],
+) -> Result<(), Box<dyn Error>> {
+    conn.execute(
+        "DELETE FROM agent_messages WHERE agent_name = ?1",
+        params![agent_name],
+    )?;
+    let mut stmt = conn.prepare(
+        "INSERT INTO agent_messages (agent_name, seq, message_json) VALUES (?1, ?2, ?3)",
+    )?;
+    for (i, msg) in messages.iter().enumerate() {
+        let json = serde_json::to_string(msg)?;
+        stmt.execute(params![agent_name, i as i64, json])?;
+    }
+    Ok(())
+}
+
+pub fn load_agent_messages<T: for<'de> Deserialize<'de>>(
+    conn: &Connection,
+    agent_name: &str,
+) -> Result<Vec<T>, Box<dyn Error>> {
+    let mut stmt =
+        conn.prepare("SELECT message_json FROM agent_messages WHERE agent_name = ?1 ORDER BY seq")?;
+    let rows = stmt.query_map(params![agent_name], |row| row.get::<_, String>(0))?;
+    let mut messages = Vec::new();
+    for row in rows {
+        let json = row?;
+        let msg: T = serde_json::from_str(&json)?;
+        messages.push(msg);
+    }
+    Ok(messages)
+}
+
+pub fn append_agent_message<T: Serialize>(
+    conn: &Connection,
+    agent_name: &str,
+    message: &T,
+) -> Result<(), Box<dyn Error>> {
+    let json = serde_json::to_string(message)?;
+    conn.execute(
+        "INSERT INTO agent_messages (agent_name, seq, message_json)
+         VALUES (?1, COALESCE((SELECT MAX(seq) FROM agent_messages WHERE agent_name = ?1), -1) + 1, ?2)",
+        params![agent_name, json],
+    )?;
+    Ok(())
+}
+
+pub fn clear_agent_messages(conn: &Connection, agent_name: &str) -> Result<(), Box<dyn Error>> {
+    conn.execute(
+        "DELETE FROM agent_messages WHERE agent_name = ?1",
+        params![agent_name],
+    )?;
+    Ok(())
+}
+
+pub fn agent_message_count(conn: &Connection, agent_name: &str) -> Result<i64, Box<dyn Error>> {
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM agent_messages WHERE agent_name = ?1")?;
+    let count: i64 = stmt.query_row(params![agent_name], |row| row.get(0))?;
+    Ok(count)
 }

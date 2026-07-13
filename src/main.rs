@@ -29,7 +29,11 @@ use indicatif_log_bridge::LogWrapper;
 use log::{debug, trace, warn};
 use pathrs::{Root, flags::OpenFlags};
 use prettytable::{Cell, Row, Table, format};
-use rustyline::DefaultEditor;
+use rustyline::Editor;
+use rustyline::completion::{Completer, Pair};
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs;
@@ -54,6 +58,79 @@ use openai::{
     make_message, post_request, post_request_with_mode, tool_call,
 };
 use std::collections::HashMap;
+
+struct AgentState {
+    name: String,
+    messages: Vec<Message>,
+}
+
+const CHAT_COMMANDS: &[&str] = &[
+    "/quit",
+    "/clear",
+    "/show",
+    "/limit",
+    "/backtrace",
+    "/system",
+    "/agents",
+    "/select-agent",
+    "/delete-agent",
+];
+
+struct ChatHelper {
+    agent_names: Arc<Mutex<Vec<String>>>,
+}
+
+impl Completer for ChatHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        if !line.starts_with('/') {
+            return Ok((0, vec![]));
+        }
+
+        let input = &line[..pos];
+
+        if input.starts_with("/select-agent ") || input.starts_with("/delete-agent ") {
+            let prefix_end = input.find(' ').unwrap() + 1;
+            let name_prefix = &input[prefix_end..];
+            let mut candidates = Vec::new();
+            if let Ok(names) = self.agent_names.lock() {
+                for name in names.iter() {
+                    if name.starts_with(name_prefix) {
+                        candidates.push(Pair {
+                            display: name.clone(),
+                            replacement: name.clone(),
+                        });
+                    }
+                }
+            }
+            return Ok((prefix_end, candidates));
+        }
+
+        let mut candidates = Vec::new();
+        for cmd in CHAT_COMMANDS {
+            if cmd.starts_with(input) {
+                candidates.push(Pair {
+                    display: cmd.to_string(),
+                    replacement: cmd.to_string(),
+                });
+            }
+        }
+        Ok((0, candidates))
+    }
+}
+
+impl Hinter for ChatHelper {
+    type Hint = String;
+}
+impl Highlighter for ChatHelper {}
+impl Validator for ChatHelper {}
+impl rustyline::Helper for ChatHelper {}
 
 const DEFAULT_ENDPOINT: &str = "http://localhost:8080";
 const DEFAULT_MODEL: &str = "google/gemini-2.5-pro";
@@ -1091,6 +1168,7 @@ fn tool_task_create_cron(params_str: &String, ctx: &ToolContext) -> Result<Strin
         max_runs: Option<i64>,
     }
     let params: Params = serde_json::from_str(params_str)?;
+    let agent = params.agent_name.as_deref().or(ctx.agent_name.as_deref());
     let conn = ctx.db_conn()?;
     let id = db::create_cron_task(
         &conn,
@@ -1098,7 +1176,7 @@ fn tool_task_create_cron(params_str: &String, ctx: &ToolContext) -> Result<Strin
         params.description.as_deref().unwrap_or(""),
         &params.cron_expression,
         params.command.as_deref().unwrap_or(""),
-        params.agent_name.as_deref(),
+        agent,
         params.max_runs,
     )?;
     ctx.println(&format!(
@@ -1140,6 +1218,7 @@ fn tool_task_create_oneshot(
         }
     };
 
+    let agent = params.agent_name.as_deref().or(ctx.agent_name.as_deref());
     let conn = ctx.db_conn()?;
     let id = db::create_oneshot_task(
         &conn,
@@ -1147,7 +1226,7 @@ fn tool_task_create_oneshot(
         params.description.as_deref().unwrap_or(""),
         &run_at,
         params.command.as_deref().unwrap_or(""),
-        params.agent_name.as_deref(),
+        agent,
     )?;
     ctx.println(&format!(
         "Created one-shot task '{}' (id={}) scheduled at '{}'",
@@ -2455,6 +2534,9 @@ enum ChatCommand {
     Limit(usize),
     Backtrace(usize),
     System(String),
+    Agents,
+    SelectAgent(String),
+    DeleteAgent(String),
     Message(String),
     Empty,
     Invalid(String),
@@ -2465,55 +2547,141 @@ fn parse_chat_command(line: &str) -> ChatCommand {
         return ChatCommand::Empty;
     }
 
-    if line == "\\quit" {
+    let normalized = if line.starts_with('\\') {
+        format!("/{}", &line[1..])
+    } else {
+        line.to_string()
+    };
+
+    if normalized == "/quit" {
         return ChatCommand::Quit;
     }
-    if line == "\\clear" {
+    if normalized == "/clear" {
         return ChatCommand::Clear;
     }
-    if line == "\\show" {
+    if normalized == "/show" {
         return ChatCommand::Show;
     }
-    if line.starts_with("\\limit ") {
-        let parts: Vec<&str> = line.split_whitespace().collect();
+    if normalized.starts_with("/limit ") {
+        let parts: Vec<&str> = normalized.split_whitespace().collect();
         if parts.len() == 2 {
             if let Ok(n) = parts[1].parse::<usize>() {
                 return ChatCommand::Limit(n);
             }
         }
-        return ChatCommand::Invalid("Usage: \\limit <number_of_messages>".to_string());
+        return ChatCommand::Invalid("Usage: /limit <number_of_messages>".to_string());
     }
-    if line.starts_with("\\backtrace ") {
-        let parts: Vec<&str> = line.split_whitespace().collect();
+    if normalized.starts_with("/backtrace ") {
+        let parts: Vec<&str> = normalized.split_whitespace().collect();
         if parts.len() == 2 {
             if let Ok(n) = parts[1].parse::<usize>() {
                 return ChatCommand::Backtrace(n);
             }
         }
-        return ChatCommand::Invalid("Usage: \\backtrace <number_of_messages>".to_string());
+        return ChatCommand::Invalid("Usage: /backtrace <number_of_messages>".to_string());
     }
-    if line.starts_with("\\system ") {
-        let system_message = line.strip_prefix("\\system ").unwrap_or("").to_string();
+    if normalized.starts_with("/system ") {
+        let system_message = normalized
+            .strip_prefix("/system ")
+            .unwrap_or("")
+            .to_string();
         if !system_message.is_empty() {
             return ChatCommand::System(system_message);
         }
-        return ChatCommand::Invalid("Usage: \\system <message>".to_string());
+        return ChatCommand::Invalid("Usage: /system <message>".to_string());
+    }
+
+    if normalized == "/agents" {
+        return ChatCommand::Agents;
+    }
+    if normalized.starts_with("/select-agent ") {
+        let name = normalized
+            .strip_prefix("/select-agent ")
+            .unwrap()
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            return ChatCommand::Invalid("Usage: /select-agent <name>".to_string());
+        }
+        return ChatCommand::SelectAgent(name);
+    }
+    if normalized.starts_with("/delete-agent ") {
+        let name = normalized
+            .strip_prefix("/delete-agent ")
+            .unwrap()
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            return ChatCommand::Invalid("Usage: /delete-agent <name>".to_string());
+        }
+        return ChatCommand::DeleteAgent(name);
+    }
+
+    if normalized.starts_with('/') {
+        return ChatCommand::Invalid(format!("Unknown command: {}", normalized));
     }
 
     ChatCommand::Message(line.to_string())
 }
 
+fn build_openai_opts(opts: &Opts, agent_config: &db::AgentConfig) -> openai::Opts {
+    let model = agent_config
+        .model
+        .clone()
+        .or_else(|| opts.model.clone())
+        .unwrap_or(DEFAULT_MODEL.to_string());
+    let endpoint = agent_config
+        .endpoint
+        .clone()
+        .or_else(|| opts.endpoint.clone())
+        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+    let normalized_endpoint = openai::normalize_endpoint(&endpoint);
+    let parameters = parse_parameters(&opts.parameter).unwrap_or_default();
+
+    openai::Opts {
+        max_tokens: opts.max_tokens,
+        model,
+        endpoint: normalized_endpoint,
+        tool_choice: opts.tool_choice.clone(),
+        api_key: opts.api_key.clone(),
+        max_retries: None,
+        retry_base_delay_secs: None,
+        parameters,
+    }
+}
+
+fn initialize_agent_messages(
+    tools: &ToolsCollection,
+    opts: &Opts,
+    agent_config: &db::AgentConfig,
+) -> Vec<Message> {
+    let mut messages = initialize_chat_messages(tools, opts);
+    if let Some(ref prompt) = agent_config.system_prompt {
+        messages.push(make_message("system", prompt.clone()));
+    }
+    messages
+}
+
 fn handle_chat_command(
     command: ChatCommand,
-    messages: &mut Vec<Message>,
+    active_agent: &mut AgentState,
     tools: &ToolsCollection,
     opts: &Opts,
     chat_pb: &ProgressBar,
+    db: &Option<Arc<Mutex<rusqlite::Connection>>>,
+    openai_opts: &mut openai::Opts,
+    prompt_text: &Arc<Mutex<String>>,
+    agent_names: &Arc<Mutex<Vec<String>>>,
 ) -> Result<bool, Box<dyn Error>> {
+    let messages = &mut active_agent.messages;
     match command {
         ChatCommand::Quit => Ok(false),
         ChatCommand::Clear => {
             *messages = initialize_chat_messages(tools, opts);
+            if let Some(db) = db {
+                let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
+                db::clear_agent_messages(&conn, &active_agent.name)?;
+            }
             chat_pb.println("Chat history cleared and system prompts restored.");
             Ok(true)
         }
@@ -2585,6 +2753,103 @@ fn handle_chat_command(
         ChatCommand::System(system_message) => {
             messages.push(make_message("system", system_message));
             chat_pb.println("System message added to conversation.");
+            Ok(true)
+        }
+        ChatCommand::Agents => {
+            if let Some(db) = db {
+                let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
+                let agents = db::list_agents(&conn)?;
+                if agents.is_empty() {
+                    chat_pb.println("No agents.");
+                } else {
+                    let mut table = Table::new();
+                    table.set_format(*format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
+                    table.set_titles(Row::new(vec![
+                        Cell::new("Name"),
+                        Cell::new("Description"),
+                        Cell::new("Messages"),
+                        Cell::new("Active"),
+                    ]));
+                    for agent in &agents {
+                        let count = db::agent_message_count(&conn, &agent.name)?;
+                        let active = if agent.name == active_agent.name {
+                            "*"
+                        } else {
+                            ""
+                        };
+                        table.add_row(Row::new(vec![
+                            Cell::new(&agent.name),
+                            Cell::new(&agent.description),
+                            Cell::new(&count.to_string()),
+                            Cell::new(active),
+                        ]));
+                    }
+                    chat_pb.println(&table.to_string());
+                }
+            } else {
+                chat_pb.println("Database not configured.");
+            }
+            Ok(true)
+        }
+        ChatCommand::SelectAgent(name) => {
+            if name == active_agent.name {
+                chat_pb.println(&format!("Already on agent '{}'.", name));
+                return Ok(true);
+            }
+            if let Some(db) = db {
+                let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
+
+                db::save_agent_messages(&conn, &active_agent.name, &active_agent.messages)?;
+
+                let _ = db::create_agent(&conn, &name, "");
+
+                let agent_config = db::get_agent_config(&conn, &name)?;
+                *openai_opts = build_openai_opts(opts, &agent_config);
+
+                let loaded: Vec<Message> = db::load_agent_messages(&conn, &name)?;
+                active_agent.name = name.clone();
+                if loaded.is_empty() {
+                    active_agent.messages = initialize_agent_messages(tools, opts, &agent_config);
+                } else {
+                    active_agent.messages = loaded;
+                }
+
+                *prompt_text.lock().map_err(|e| format!("lock: {}", e))? = format!("{}> ", name);
+
+                if let Ok(mut names) = agent_names.lock() {
+                    if !names.contains(&name) {
+                        names.push(name.clone());
+                    }
+                }
+
+                chat_pb.println(&format!("Switched to agent '{}'.", name));
+            } else {
+                chat_pb.println("Database not configured.");
+            }
+            Ok(true)
+        }
+        ChatCommand::DeleteAgent(name) => {
+            if name == "default" {
+                chat_pb.println("Cannot delete the default agent.");
+                return Ok(true);
+            }
+            if name == active_agent.name {
+                chat_pb.println("Cannot delete the active agent. Switch first with /select-agent.");
+                return Ok(true);
+            }
+            if let Some(db) = db {
+                let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
+                if db::delete_agent(&conn, &name)? {
+                    if let Ok(mut names) = agent_names.lock() {
+                        names.retain(|n| n != &name);
+                    }
+                    chat_pb.println(&format!("Agent '{}' deleted.", name));
+                } else {
+                    chat_pb.println(&format!("Agent '{}' not found.", name));
+                }
+            } else {
+                chat_pb.println("Database not configured.");
+            }
             Ok(true)
         }
         ChatCommand::Message(_) => Ok(false),
@@ -3035,7 +3300,7 @@ fn execute_scheduled_command(
 fn scheduler_loop(
     db: Arc<Mutex<rusqlite::Connection>>,
     tools: Arc<ToolsCollection>,
-    tx: mpsc::Sender<(String, Message, Message)>,
+    tx: mpsc::Sender<(Option<String>, String, Message, Message)>,
 ) {
     let db_opt = Some(db.clone());
     loop {
@@ -3060,7 +3325,7 @@ fn scheduler_loop(
             if let Some((assistant_msg, tool_msg)) =
                 execute_scheduled_command(&command, &tools, &db_opt)
             {
-                let _ = tx.send((command, assistant_msg, tool_msg));
+                let _ = tx.send((task.agent_name.clone(), command, assistant_msg, tool_msg));
             }
 
             if let Ok(conn) = db.lock() {
@@ -3089,7 +3354,21 @@ fn chat_command(
     chat_pb.set_style(ProgressStyle::with_template("{msg}")?);
 
     // Create rustyline editor with history
-    let mut rl = DefaultEditor::new()?;
+    let initial_agent_names = if let Some(ref db) = db {
+        let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
+        db::list_agents(&conn)?
+            .iter()
+            .map(|a| a.name.clone())
+            .collect()
+    } else {
+        vec!["default".to_string()]
+    };
+    let agent_names = Arc::new(Mutex::new(initial_agent_names));
+    let helper = ChatHelper {
+        agent_names: agent_names.clone(),
+    };
+    let mut rl = Editor::new()?;
+    rl.set_helper(Some(helper));
 
     let tools = match opts.no_tools {
         true => {
@@ -3102,29 +3381,39 @@ fn chat_command(
         }
     };
 
-    let mut messages = initialize_chat_messages(&tools, opts);
-
-    let model = opts.model.clone().unwrap_or(DEFAULT_MODEL.to_string());
-    debug!("Using model: {}", model);
-
-    let parameters = parse_parameters(&opts.parameter)?;
-
-    let endpoint = opts
-        .endpoint
-        .clone()
-        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
-    let normalized_endpoint = openai::normalize_endpoint(&endpoint);
-
-    let openai_opts = openai::Opts {
-        max_tokens: opts.max_tokens,
-        model: model,
-        endpoint: normalized_endpoint,
-        tool_choice: opts.tool_choice.clone(),
-        api_key: opts.api_key.clone(),
-        max_retries: None,
-        retry_base_delay_secs: None,
-        parameters,
+    let default_agent_config = if let Some(ref db) = db {
+        let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
+        db::ensure_default_agent(&conn)?;
+        db::get_agent_config(&conn, "default")?
+    } else {
+        db::AgentConfig {
+            model: None,
+            endpoint: None,
+            system_prompt: None,
+        }
     };
+
+    let initial_messages = if let Some(ref db) = db {
+        let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
+        let loaded: Vec<Message> = db::load_agent_messages(&conn, "default")?;
+        if loaded.is_empty() {
+            initialize_agent_messages(&tools, opts, &default_agent_config)
+        } else {
+            loaded
+        }
+    } else {
+        initialize_agent_messages(&tools, opts, &default_agent_config)
+    };
+
+    let mut active_agent = AgentState {
+        name: "default".to_string(),
+        messages: initial_messages,
+    };
+
+    let mut openai_opts = build_openai_opts(opts, &default_agent_config);
+    debug!("Using model: {}", openai_opts.model);
+
+    let prompt_text = Arc::new(Mutex::new("default> ".to_string()));
 
     let (ctrl_c_tx, ctrl_c_rx) = mpsc::channel();
     let ctrl_c_rx = Arc::new(Mutex::new(ctrl_c_rx));
@@ -3141,7 +3430,7 @@ fn chat_command(
     })
     .expect("Error setting up Ctrl-C handler");
 
-    let (task_tx, task_rx) = mpsc::channel::<(String, Message, Message)>();
+    let (task_tx, task_rx) = mpsc::channel::<(Option<String>, String, Message, Message)>();
     if let Some(ref scheduler_db) = db {
         let scheduler_db = scheduler_db.clone();
         let scheduler_tools = Arc::new(tools.clone());
@@ -3152,9 +3441,14 @@ fn chat_command(
 
     let (input_tx, input_rx) = mpsc::channel::<Result<String, rustyline::error::ReadlineError>>();
 
+    let prompt_text_clone = prompt_text.clone();
     std::thread::spawn(move || {
         loop {
-            let result = rl.readline("> ");
+            let prompt = prompt_text_clone
+                .lock()
+                .map(|p| p.clone())
+                .unwrap_or_else(|_| "> ".to_string());
+            let result = rl.readline(&prompt);
             let is_eof = matches!(result, Err(rustyline::error::ReadlineError::Eof));
             if let Ok(ref line) = result {
                 let trimmed = line.trim();
@@ -3172,35 +3466,51 @@ fn chat_command(
     loop {
         global_multi_progress.clear()?;
 
-        while let Ok((command, assistant_msg, tool_msg)) = task_rx.try_recv() {
-            chat_pb.println(&format!("Scheduled task fired: {}", command));
-            if let Some(ref output) = tool_msg.content {
-                let display = if let Ok(obj) = serde_json::from_str::<serde_json::Value>(output) {
-                    let mut parts = Vec::new();
-                    if let Some(stdout) = obj.get("stdout").and_then(|v| v.as_str()) {
-                        let s = stdout.trim();
-                        if !s.is_empty() {
-                            parts.push(s.to_string());
+        while let Ok((task_agent, command, assistant_msg, tool_msg)) = task_rx.try_recv() {
+            let target = task_agent.as_deref().unwrap_or("default");
+
+            if target == active_agent.name {
+                chat_pb.println(&format!("Scheduled task fired: {}", command));
+                if let Some(ref output) = tool_msg.content {
+                    let display = if let Ok(obj) = serde_json::from_str::<serde_json::Value>(output)
+                    {
+                        let mut parts = Vec::new();
+                        if let Some(stdout) = obj.get("stdout").and_then(|v| v.as_str()) {
+                            let s = stdout.trim();
+                            if !s.is_empty() {
+                                parts.push(s.to_string());
+                            }
                         }
-                    }
-                    if let Some(stderr) = obj.get("stderr").and_then(|v| v.as_str()) {
-                        let s = stderr.trim();
-                        if !s.is_empty() {
-                            parts.push(format!("stderr: {}", s));
+                        if let Some(stderr) = obj.get("stderr").and_then(|v| v.as_str()) {
+                            let s = stderr.trim();
+                            if !s.is_empty() {
+                                parts.push(format!("stderr: {}", s));
+                            }
                         }
-                    }
-                    if parts.is_empty() {
-                        output.trim().to_string()
+                        if parts.is_empty() {
+                            output.trim().to_string()
+                        } else {
+                            parts.join("\n")
+                        }
                     } else {
-                        parts.join("\n")
+                        output.trim().to_string()
+                    };
+                    chat_pb.println(&display);
+                }
+                active_agent.messages.push(assistant_msg);
+                active_agent.messages.push(tool_msg);
+            } else {
+                if let Some(ref db) = db {
+                    if let Ok(conn) = db.lock() {
+                        let _ = db::append_agent_message(&conn, target, &assistant_msg);
+                        let _ = db::append_agent_message(&conn, target, &tool_msg);
                     }
-                } else {
-                    output.trim().to_string()
-                };
-                chat_pb.println(&display);
+                }
+                chat_pb.println(&format!(
+                    "Scheduled task fired for agent '{}': {}",
+                    target, command
+                ));
             }
-            messages.push(assistant_msg);
-            messages.push(tool_msg);
         }
 
         let line = match input_rx.recv_timeout(Duration::from_millis(200)) {
@@ -3225,20 +3535,39 @@ fn chat_command(
         debug!("User input: '{}' (length: {})", line, line.len());
 
         let command = parse_chat_command(&line);
-        match handle_chat_command(command, &mut messages, &tools, opts, &chat_pb)? {
-            true => continue, // Continue the loop for special commands
+        match handle_chat_command(
+            command,
+            &mut active_agent,
+            &tools,
+            opts,
+            &chat_pb,
+            &db,
+            &mut openai_opts,
+            &prompt_text,
+            &agent_names,
+        )? {
+            true => continue,
             false => {
-                // Handle quit command or process user message
                 if let ChatCommand::Quit = parse_chat_command(&line) {
+                    if let Some(ref db) = db {
+                        let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
+                        let _ = db::save_agent_messages(
+                            &conn,
+                            &active_agent.name,
+                            &active_agent.messages,
+                        );
+                    }
                     return Ok(());
                 }
                 if let ChatCommand::Message(user_message) = parse_chat_command(&line) {
-                    let message_count_before = messages.len();
-                    messages.push(make_message("user", user_message));
+                    let message_count_before = active_agent.messages.len();
+                    active_agent
+                        .messages
+                        .push(make_message("user", user_message));
                     debug!(
                         "Added user message. Message count: {} -> {}",
                         message_count_before,
-                        messages.len()
+                        active_agent.messages.len()
                     );
 
                     let multi_progress = global_multi_progress.clone();
@@ -3253,9 +3582,10 @@ fn chat_command(
                         streaming_pb_for_context.println(msg);
                     });
                     tool_context.db = db.clone();
+                    tool_context.agent_name = Some(active_agent.name.clone());
 
                     match execute_ai_request(
-                        messages.clone(),
+                        active_agent.messages.clone(),
                         &tools,
                         &openai_opts,
                         mode,
@@ -3272,8 +3602,20 @@ fn chat_command(
                                 "Response history contains: {} messages",
                                 response.history.len()
                             );
-                            messages = response.history;
-                            debug!("After updating history: {} messages", messages.len());
+                            active_agent.messages = response.history;
+                            debug!(
+                                "After updating history: {} messages",
+                                active_agent.messages.len()
+                            );
+
+                            if let Some(ref db) = db {
+                                let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
+                                let _ = db::save_agent_messages(
+                                    &conn,
+                                    &active_agent.name,
+                                    &active_agent.messages,
+                                );
+                            }
                         }
                         Err(e) => {
                             if e.downcast_ref::<InterruptedError>().is_some() {

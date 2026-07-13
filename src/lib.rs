@@ -26,6 +26,7 @@ pub mod openai;
 pub struct ToolContext {
     pub println: Box<dyn Fn(&str) + Send + Sync>,
     pub db: Option<Arc<Mutex<rusqlite::Connection>>>,
+    pub agent_name: Option<String>,
 }
 
 impl ToolContext {
@@ -36,6 +37,7 @@ impl ToolContext {
         Self {
             println: Box::new(println_fn),
             db: None,
+            agent_name: None,
         }
     }
 
