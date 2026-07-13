@@ -79,6 +79,7 @@ fn check_ctrl_c_signal(
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct Opts {
     pub max_tokens: Option<u32>,
     pub model: String,

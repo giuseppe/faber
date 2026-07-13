@@ -64,6 +64,12 @@ struct AgentState {
     messages: Vec<Message>,
 }
 
+struct SubAgentContext {
+    tools: Arc<ToolsCollection>,
+    opts: openai::Opts,
+    session_id: String,
+}
+
 const CHAT_COMMANDS: &[&str] = &[
     "/help",
     "/quit",
@@ -182,7 +188,6 @@ const DEFAULT_ENDPOINT: &str = "http://localhost:8080";
 const DEFAULT_MODEL: &str = "google/gemini-2.5-pro";
 const DEFAULT_DAYS: u64 = 7;
 
-// Import ToolContext from the library crate
 use codehawk::ToolContext;
 
 /// Parse parameter strings in NAME=VALUE format into a HashMap
@@ -1397,6 +1402,98 @@ fn tool_send_message(params_str: &String, ctx: &ToolContext) -> Result<String, B
     Ok(result.to_string())
 }
 
+fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        name: String,
+        prompt: String,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+
+    let sa_ctx = ctx
+        .extra
+        .as_ref()
+        .and_then(|e| e.downcast_ref::<SubAgentContext>())
+        .ok_or("Sub-agent context not configured")?;
+
+    let tools = sa_ctx.tools.clone();
+    let mut agent_opts = sa_ctx.opts.clone();
+    let db = ctx.db.clone().ok_or("Database required for sub-agents")?;
+    let parent_agent = ctx.agent_name.clone().unwrap_or("default".to_string());
+
+    let agent_name = params.name.clone();
+    let prompt = params.prompt.clone();
+
+    let agent_config = {
+        let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
+        let _ = db::claim_agent(&conn, &agent_name, &sa_ctx.session_id);
+        db::get_agent_config(&conn, &agent_name)?
+    };
+
+    if let Some(ref model) = agent_config.model {
+        agent_opts.model = model.clone();
+    }
+    if let Some(ref endpoint) = agent_config.endpoint {
+        agent_opts.endpoint = openai::normalize_endpoint(endpoint);
+    }
+
+    let mut messages: Vec<Message> = vec![make_message(
+        "system",
+        format!(
+            "You are a sub-agent named '{}'. Complete the task and return a concise result.",
+            agent_name
+        ),
+    )];
+    if let Some(ref sp) = agent_config.system_prompt {
+        messages.push(make_message("system", sp.clone()));
+    }
+    messages.push(make_message("user", prompt.clone()));
+
+    ctx.println(&format!("Spawning sub-agent '{}'...", agent_name));
+
+    std::thread::spawn(move || {
+        let mut sub_ctx = ToolContext::new(|_: &str| {});
+        sub_ctx.db = Some(db.clone());
+        let result = post_request_with_mode(
+            messages,
+            &tools,
+            &agent_opts,
+            ResponseMode::Complete,
+            &sub_ctx,
+            None,
+        );
+        let response_text = match result {
+            Ok(resp) => {
+                if let Some(ref choices) = resp.choices {
+                    choices
+                        .first()
+                        .and_then(|c| c.message.content.clone())
+                        .unwrap_or_else(|| "(no response)".to_string())
+                } else if let Some(ref err) = resp.error {
+                    format!("Error: {}", err.message)
+                } else {
+                    "(empty response)".to_string()
+                }
+            }
+            Err(e) => format!("Error: {}", e),
+        };
+        if let Ok(conn) = db.lock() {
+            let notification = serde_json::json!({
+                "type": "subagent_result",
+                "agent": agent_name,
+                "prompt": prompt,
+                "response": response_text,
+            });
+            let _ =
+                db::send_notification(&conn, &agent_name, &parent_agent, &notification.to_string());
+        }
+    });
+
+    let result =
+        serde_json::json!({"status": "spawned", "agent": params.name, "prompt": params.prompt});
+    Ok(result.to_string())
+}
+
 fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
     let mut tools: ToolsCollection = ToolsCollection::new();
 
@@ -2284,6 +2381,40 @@ fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
         .to_string(),
     );
 
+    append_tool(
+        &mut tools,
+        "spawn_agent".to_string(),
+        tool_spawn_agent,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "spawn_agent",
+                "description": "Spawn a sub-agent to work on a task in parallel. The sub-agent runs in the background and its result will be delivered asynchronously. You can spawn multiple sub-agents at once for parallel work.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Name for the sub-agent (used for display and identification)"
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "The task or question for the sub-agent to work on"
+                        }
+                    },
+                    "required": [
+                        "name",
+                        "prompt"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
     if !unsafe_tools {
         return tools;
     }
@@ -2786,6 +2917,7 @@ fn handle_chat_command(
     openai_opts: &mut openai::Opts,
     prompt_text: &Arc<Mutex<String>>,
     agent_names: &Arc<Mutex<Vec<String>>>,
+    session_id: &str,
 ) -> Result<bool, Box<dyn Error>> {
     let messages = &mut active_agent.messages;
     match command {
@@ -2961,7 +3093,16 @@ fn handle_chat_command(
                     return Ok(true);
                 }
 
+                if !db::claim_agent(&conn, &name, session_id)? {
+                    chat_pb.println(&format!(
+                        "Agent '{}' is already claimed by another session.",
+                        name
+                    ));
+                    return Ok(true);
+                }
+
                 db::save_agent_messages(&conn, &active_agent.name, &active_agent.messages)?;
+                db::release_agent(&conn, &active_agent.name, session_id)?;
 
                 let agent_config = db::get_agent_config(&conn, &name)?;
                 *openai_opts = build_openai_opts(opts, &agent_config);
@@ -2977,7 +3118,7 @@ fn handle_chat_command(
                 *prompt_text.lock().map_err(|e| format!("lock: {}", e))? =
                     format!("{}", agent_style(&name).apply_to(format!("{}> ", name)));
 
-                chat_pb.println(&format!("Switched to agent '{}'.", name));
+                chat_pb.println(&format!("Switched to agent '{}'.\n", name));
             } else {
                 chat_pb.println("Database not configured.");
             }
@@ -3022,7 +3163,11 @@ fn format_tool_arguments(args_json: &str) -> String {
         .replace('\r', " ")
         .replace('\t', " ");
     if clean_args.len() > 50 {
-        format!("{}... ({})", &clean_args[..47], clean_args.len())
+        let mut end = 47;
+        while end > 0 && !clean_args.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}... ({})", &clean_args[..end], clean_args.len())
     } else {
         clean_args
     }
@@ -3559,10 +3704,33 @@ fn chat_command(
         }
     };
 
-    let default_agent_config = if let Some(ref db) = db {
+    let session_id = format!(
+        "{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_millis()
+    );
+    let initial_agent_name = opts.agent.clone().unwrap_or_else(|| "default".to_string());
+
+    let agent_config = if let Some(ref db) = db {
         let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
         db::ensure_default_agent(&conn)?;
-        db::get_agent_config(&conn, "default")?
+        if initial_agent_name != "default" {
+            if db::get_agent(&conn, &initial_agent_name)?.is_none() {
+                return Err(format!(
+                    "Agent '{}' does not exist. Create it first.",
+                    initial_agent_name
+                )
+                .into());
+            }
+        }
+        if !db::claim_agent(&conn, &initial_agent_name, &session_id)? {
+            return Err(format!(
+                "Agent '{}' is already claimed by another session.",
+                initial_agent_name
+            )
+            .into());
+        }
+        db::get_agent_config(&conn, &initial_agent_name)?
     } else {
         db::AgentConfig {
             model: None,
@@ -3573,28 +3741,29 @@ fn chat_command(
 
     let initial_messages = if let Some(ref db) = db {
         let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
-        let loaded: Vec<Message> = db::load_agent_messages(&conn, "default")?;
+        let loaded: Vec<Message> = db::load_agent_messages(&conn, &initial_agent_name)?;
         if loaded.is_empty() {
-            initialize_agent_messages(&tools, opts, &default_agent_config)
+            initialize_agent_messages(&tools, opts, &agent_config)
         } else {
             loaded
         }
     } else {
-        initialize_agent_messages(&tools, opts, &default_agent_config)
+        initialize_agent_messages(&tools, opts, &agent_config)
     };
 
     let mut active_agent = AgentState {
-        name: "default".to_string(),
+        name: initial_agent_name.clone(),
         messages: initial_messages,
     };
 
-    let mut openai_opts = build_openai_opts(opts, &default_agent_config);
+    let mut openai_opts = build_openai_opts(opts, &agent_config);
     debug!("Using model: {}", openai_opts.model);
 
     let prompt_text = Arc::new(Mutex::new(format!(
         "{}",
-        agent_style("default").apply_to("default> ")
+        agent_style(&initial_agent_name).apply_to(format!("{}> ", initial_agent_name))
     )));
+    let session_id = Arc::new(session_id);
 
     let (ctrl_c_tx, ctrl_c_rx) = mpsc::channel();
     let ctrl_c_rx = Arc::new(Mutex::new(ctrl_c_rx));
@@ -3613,12 +3782,25 @@ fn chat_command(
 
     let (task_tx, task_rx) = mpsc::channel::<(Option<String>, String, Message, Message)>();
     if let Some(ref scheduler_db) = db {
+        let heartbeat_db = scheduler_db.clone();
+        let heartbeat_session = session_id.clone();
+
         let scheduler_db = scheduler_db.clone();
         let scheduler_tools = Arc::new(tools.clone());
         std::thread::spawn(move || {
             scheduler_loop(scheduler_db, scheduler_tools, task_tx);
         });
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(5));
+                if let Ok(conn) = heartbeat_db.lock() {
+                    let _ = db::heartbeat_all(&conn, &heartbeat_session);
+                }
+            }
+        });
     }
+
+    let tools_arc = Arc::new(tools.clone());
 
     let (input_tx, input_rx) = mpsc::channel::<Result<String, rustyline::error::ReadlineError>>();
 
@@ -3670,13 +3852,27 @@ fn chat_command(
             }
         }
 
-        let mut pending_notification: Option<String> = None;
+        let mut pending_injection: Option<String> = None;
         if let Some(ref db) = db {
             if let Ok(conn) = db.lock() {
-                if let Ok(notifications) = db::poll_notifications(&conn, &active_agent.name) {
+                if let Ok(notifications) = db::poll_notifications_for_session(&conn, &session_id) {
                     for notif in notifications {
-                        chat_pb.println_agent(&notif.from_agent, &notif.message);
-                        pending_notification = Some(format!(
+                        let display_msg = if let Ok(obj) =
+                            serde_json::from_str::<serde_json::Value>(&notif.message)
+                        {
+                            if obj.get("type").and_then(|v| v.as_str()) == Some("subagent_result") {
+                                obj.get("response")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(&notif.message)
+                                    .to_string()
+                            } else {
+                                notif.message.clone()
+                            }
+                        } else {
+                            notif.message.clone()
+                        };
+                        chat_pb.println_agent(&notif.from_agent, &display_msg);
+                        pending_injection = Some(format!(
                             "[Message from agent '{}']: {}",
                             notif.from_agent, notif.message
                         ));
@@ -3685,7 +3881,8 @@ fn chat_command(
             }
         }
 
-        let line = if let Some(injected) = pending_notification {
+        let is_injected = pending_injection.is_some();
+        let line = if let Some(injected) = pending_injection {
             injected
         } else {
             match input_rx.recv_timeout(Duration::from_millis(200)) {
@@ -3694,6 +3891,11 @@ fn chat_command(
                     continue;
                 }
                 Ok(Err(rustyline::error::ReadlineError::Eof)) => {
+                    if let Some(ref db) = db {
+                        if let Ok(conn) = db.lock() {
+                            let _ = db::release_all_agents(&conn, &session_id);
+                        }
+                    }
                     return Ok(());
                 }
                 Ok(Err(err)) => {
@@ -3703,6 +3905,11 @@ fn chat_command(
                     continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if let Some(ref db) = db {
+                        if let Ok(conn) = db.lock() {
+                            let _ = db::release_all_agents(&conn, &session_id);
+                        }
+                    }
                     return Ok(());
                 }
             }
@@ -3721,6 +3928,7 @@ fn chat_command(
             &mut openai_opts,
             &prompt_text,
             &agent_names,
+            &session_id,
         )? {
             true => continue,
             false => {
@@ -3732,72 +3940,102 @@ fn chat_command(
                             &active_agent.name,
                             &active_agent.messages,
                         );
+                        let _ = db::release_all_agents(&conn, &session_id);
                     }
                     return Ok(());
                 }
                 if let ChatCommand::Message(user_message) = parse_chat_command(&line) {
-                    let message_count_before = active_agent.messages.len();
                     active_agent
                         .messages
                         .push(make_message("user", user_message));
-                    debug!(
-                        "Added user message. Message count: {} -> {}",
-                        message_count_before,
-                        active_agent.messages.len()
-                    );
 
-                    let multi_progress = global_multi_progress.clone();
-                    let (streaming_pb, status_pb) = setup_progress_bars(&multi_progress)?;
-                    let mode = create_response_mode(streaming_pb.clone(), status_pb.clone());
-
-                    status_pb.set_message("Connecting");
-                    status_pb.enable_steady_tick(Duration::from_millis(500));
-
-                    let streaming_pb_for_context = streaming_pb.clone();
-                    let mut tool_context = ToolContext::new(move |msg: &str| {
-                        streaming_pb_for_context.println(msg);
-                    });
+                    let mut tool_context = ToolContext::new(|_: &str| {});
                     tool_context.db = db.clone();
                     tool_context.agent_name = Some(active_agent.name.clone());
+                    tool_context.extra = Some(Arc::new(SubAgentContext {
+                        tools: tools_arc.clone(),
+                        opts: openai_opts.clone(),
+                        session_id: session_id.to_string(),
+                    }));
 
-                    match execute_ai_request(
-                        active_agent.messages.clone(),
-                        &tools,
-                        &openai_opts,
-                        mode,
-                        &tool_context,
-                        Some(ctrl_c_rx.clone()),
-                        &signal_handler_active,
-                        &status_pb,
-                        &streaming_pb,
-                        &multi_progress,
-                        &mut chat_pb,
-                    ) {
-                        Ok(response) => {
-                            debug!(
-                                "Response history contains: {} messages",
-                                response.history.len()
-                            );
-                            active_agent.messages = response.history;
-                            debug!(
-                                "After updating history: {} messages",
-                                active_agent.messages.len()
-                            );
-
-                            if let Some(ref db) = db {
-                                let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
-                                let _ = db::save_agent_messages(
-                                    &conn,
-                                    &active_agent.name,
-                                    &active_agent.messages,
-                                );
+                    if is_injected {
+                        match post_request_with_mode(
+                            active_agent.messages.clone(),
+                            &tools,
+                            &openai_opts,
+                            ResponseMode::Complete,
+                            &tool_context,
+                            None,
+                        ) {
+                            Ok(response) => {
+                                active_agent.messages = response.history;
+                                if let Some(ref choices) = response.choices {
+                                    if let Some(content) =
+                                        choices.first().and_then(|c| c.message.content.as_ref())
+                                    {
+                                        chat_pb.println_agent(&active_agent.name, content);
+                                    }
+                                }
+                                if let Some(ref db) = db {
+                                    let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
+                                    let _ = db::save_agent_messages(
+                                        &conn,
+                                        &active_agent.name,
+                                        &active_agent.messages,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                chat_pb.println(&format!("Error processing notification: {}", e));
                             }
                         }
-                        Err(e) => {
-                            if e.downcast_ref::<InterruptedError>().is_some() {
-                                continue;
-                            } else {
-                                return Err(e);
+                    } else {
+                        let multi_progress = global_multi_progress.clone();
+                        let (streaming_pb, status_pb) = setup_progress_bars(&multi_progress)?;
+                        let mode = create_response_mode(streaming_pb.clone(), status_pb.clone());
+
+                        let status_pb_delayed = status_pb.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_secs(5));
+                            status_pb_delayed.set_message("Connecting");
+                            status_pb_delayed.enable_steady_tick(Duration::from_millis(500));
+                        });
+
+                        let streaming_pb_for_context = streaming_pb.clone();
+                        tool_context.println = Box::new(move |msg: &str| {
+                            streaming_pb_for_context.println(msg);
+                        });
+
+                        match execute_ai_request(
+                            active_agent.messages.clone(),
+                            &tools,
+                            &openai_opts,
+                            mode,
+                            &tool_context,
+                            Some(ctrl_c_rx.clone()),
+                            &signal_handler_active,
+                            &status_pb,
+                            &streaming_pb,
+                            &multi_progress,
+                            &mut chat_pb,
+                        ) {
+                            Ok(response) => {
+                                active_agent.messages = response.history;
+                                if let Some(ref db) = db {
+                                    let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
+                                    let _ = db::save_agent_messages(
+                                        &conn,
+                                        &active_agent.name,
+                                        &active_agent.messages,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                if e.downcast_ref::<InterruptedError>().is_some() {
+                                    continue;
+                                } else {
+                                    return Err(e);
+                                }
                             }
                         }
                     }
@@ -3938,6 +4176,9 @@ struct Opts {
     #[clap(long)]
     /// Path to the SQLite database file for persistent storage (agents, tasks, memory)
     db_path: Option<String>,
+    #[clap(long)]
+    /// Start chat session with this agent instead of 'default'
+    agent: Option<String>,
 
     #[clap(subcommand)]
     #[serde(skip)]
@@ -3962,6 +4203,7 @@ impl Default for Opts {
             parameter: Vec::new(),
             no_system_prompts: false,
             db_path: None,
+            agent: None,
             command: CliCommand::Chat {},
             args: Vec::new(),
         }

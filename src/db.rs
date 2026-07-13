@@ -119,7 +119,103 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
         "ALTER TABLE scheduled_tasks ADD COLUMN run_count INTEGER NOT NULL DEFAULT 0;",
     );
 
+    let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN session_id TEXT DEFAULT NULL;");
+    let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN heartbeat_at TEXT DEFAULT NULL;");
+
     Ok(())
+}
+
+// --- Session ownership ---
+
+pub fn claim_agent(
+    conn: &Connection,
+    name: &str,
+    session_id: &str,
+) -> Result<bool, Box<dyn Error>> {
+    let rows = conn.execute(
+        "UPDATE agents SET session_id = ?2, heartbeat_at = datetime('now')
+         WHERE name = ?1 AND (session_id IS NULL OR session_id = ?2
+         OR heartbeat_at IS NULL OR heartbeat_at < datetime('now', '-10 seconds'))",
+        params![name, session_id],
+    )?;
+    Ok(rows > 0)
+}
+
+pub fn heartbeat_all(conn: &Connection, session_id: &str) -> Result<(), Box<dyn Error>> {
+    conn.execute(
+        "UPDATE agents SET heartbeat_at = datetime('now') WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    Ok(())
+}
+
+pub fn release_agent(
+    conn: &Connection,
+    name: &str,
+    session_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    conn.execute(
+        "UPDATE agents SET session_id = NULL, heartbeat_at = NULL
+         WHERE name = ?1 AND session_id = ?2",
+        params![name, session_id],
+    )?;
+    Ok(())
+}
+
+pub fn release_all_agents(conn: &Connection, session_id: &str) -> Result<(), Box<dyn Error>> {
+    conn.execute(
+        "UPDATE agents SET session_id = NULL, heartbeat_at = NULL WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    Ok(())
+}
+
+pub fn poll_notifications_for_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<NotificationRow>, Box<dyn Error>> {
+    conn.execute("BEGIN IMMEDIATE", [])?;
+    let result = (|| -> Result<Vec<NotificationRow>, Box<dyn Error>> {
+        let mut stmt = conn.prepare(
+            "SELECT n.id, n.from_agent, n.to_agent, n.message, n.created_at
+             FROM notifications n
+             INNER JOIN agents a ON n.to_agent = a.name
+             WHERE a.session_id = ?1 AND a.heartbeat_at >= datetime('now', '-10 seconds')
+             ORDER BY n.id",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok(NotificationRow {
+                id: row.get(0)?,
+                from_agent: row.get(1)?,
+                to_agent: row.get(2)?,
+                message: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        let mut notifications = Vec::new();
+        for row in rows {
+            notifications.push(row?);
+        }
+        drop(stmt);
+        if !notifications.is_empty() {
+            let ids: Vec<String> = notifications.iter().map(|n| n.id.to_string()).collect();
+            conn.execute(
+                &format!("DELETE FROM notifications WHERE id IN ({})", ids.join(",")),
+                [],
+            )?;
+        }
+        Ok(notifications)
+    })();
+    match result {
+        Ok(notifications) => {
+            conn.execute("COMMIT", [])?;
+            Ok(notifications)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", []);
+            Err(e)
+        }
+    }
 }
 
 // --- Agent CRUD ---
@@ -520,6 +616,7 @@ pub fn agent_message_count(conn: &Connection, agent_name: &str) -> Result<i64, B
 
 // --- Notifications ---
 
+#[allow(dead_code)]
 pub struct NotificationRow {
     pub id: i64,
     pub from_agent: String,
@@ -539,34 +636,4 @@ pub fn send_notification(
         params![from_agent, to_agent, message],
     )?;
     Ok(conn.last_insert_rowid())
-}
-
-pub fn poll_notifications(
-    conn: &Connection,
-    to_agent: &str,
-) -> Result<Vec<NotificationRow>, Box<dyn Error>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, from_agent, to_agent, message, created_at FROM notifications WHERE to_agent = ?1 ORDER BY id",
-    )?;
-    let rows = stmt.query_map(params![to_agent], |row| {
-        Ok(NotificationRow {
-            id: row.get(0)?,
-            from_agent: row.get(1)?,
-            to_agent: row.get(2)?,
-            message: row.get(3)?,
-            created_at: row.get(4)?,
-        })
-    })?;
-    let mut notifications = Vec::new();
-    for row in rows {
-        notifications.push(row?);
-    }
-    if !notifications.is_empty() {
-        let ids: Vec<String> = notifications.iter().map(|n| n.id.to_string()).collect();
-        conn.execute(
-            &format!("DELETE FROM notifications WHERE id IN ({})", ids.join(",")),
-            [],
-        )?;
-    }
-    Ok(notifications)
 }

@@ -17,6 +17,7 @@
  *
  */
 
+use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 pub mod db;
@@ -27,6 +28,7 @@ pub struct ToolContext {
     pub println: Box<dyn Fn(&str) + Send + Sync>,
     pub db: Option<Arc<Mutex<rusqlite::Connection>>>,
     pub agent_name: Option<String>,
+    pub extra: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl ToolContext {
@@ -38,6 +40,7 @@ impl ToolContext {
             println: Box::new(println_fn),
             db: None,
             agent_name: None,
+            extra: None,
         }
     }
 
