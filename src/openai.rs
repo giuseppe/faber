@@ -92,11 +92,11 @@ pub struct Opts {
 
 pub type ToolCallback = fn(&String, &crate::ToolContext) -> Result<String, Box<dyn Error>>;
 pub type ToolsCollection = HashMap<String, ToolItem>;
+#[derive(Clone)]
 pub struct ToolItem {
     pub callback: ToolCallback,
     pub schema: String,
 }
-
 
 /// Reads the API key from the specified file path.
 fn read_api_key(api_key_file: &String) -> Result<String, Box<dyn Error>> {
@@ -406,7 +406,7 @@ pub fn list_models_from_endpoint(
 }
 
 /// Perform a tool call and return the message to send back.
-fn tool_call(
+pub fn tool_call(
     tools_collection: &ToolsCollection,
     req: &ToolCall,
     ctx: &crate::ToolContext,

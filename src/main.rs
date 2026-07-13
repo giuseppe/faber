@@ -49,9 +49,9 @@ use github::{
     get_github_pull_request, get_github_pull_request_patch, get_github_pull_requests,
 };
 use openai::{
-    InterruptedError, Message, OpenAIResponse, ProgressInfo, ResponseMode, StatusUpdate,
-    ToolCallback, ToolItem, ToolsCollection, list_models_from_endpoint, make_message, post_request,
-    post_request_with_mode,
+    FunctionCall, InterruptedError, Message, OpenAIResponse, ProgressInfo, ResponseMode,
+    StatusUpdate, ToolCall, ToolCallback, ToolItem, ToolsCollection, list_models_from_endpoint,
+    make_message, post_request, post_request_with_mode, tool_call,
 };
 use std::collections::HashMap;
 
@@ -1082,9 +1082,13 @@ fn tool_task_create_cron(params_str: &String, ctx: &ToolContext) -> Result<Strin
         name: String,
         cron_expression: String,
         #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
         description: Option<String>,
         #[serde(default)]
         agent_name: Option<String>,
+        #[serde(default)]
+        max_runs: Option<i64>,
     }
     let params: Params = serde_json::from_str(params_str)?;
     let conn = ctx.db_conn()?;
@@ -1093,7 +1097,9 @@ fn tool_task_create_cron(params_str: &String, ctx: &ToolContext) -> Result<Strin
         &params.name,
         params.description.as_deref().unwrap_or(""),
         &params.cron_expression,
+        params.command.as_deref().unwrap_or(""),
         params.agent_name.as_deref(),
+        params.max_runs,
     )?;
     ctx.println(&format!(
         "Created cron task '{}' (id={}) with schedule '{}'",
@@ -1110,26 +1116,45 @@ fn tool_task_create_oneshot(
     #[derive(Deserialize)]
     struct Params {
         name: String,
-        run_at: String,
+        #[serde(default)]
+        run_at: Option<String>,
+        #[serde(default)]
+        delay_seconds: Option<u64>,
+        #[serde(default)]
+        command: Option<String>,
         #[serde(default)]
         description: Option<String>,
         #[serde(default)]
         agent_name: Option<String>,
     }
     let params: Params = serde_json::from_str(params_str)?;
+
+    let run_at = match (params.run_at, params.delay_seconds) {
+        (Some(t), _) => t,
+        (None, Some(secs)) => {
+            let when = chrono::Utc::now() + chrono::Duration::seconds(secs as i64);
+            when.to_rfc3339()
+        }
+        (None, None) => {
+            return Err("Either 'run_at' or 'delay_seconds' must be provided".into());
+        }
+    };
+
     let conn = ctx.db_conn()?;
     let id = db::create_oneshot_task(
         &conn,
         &params.name,
         params.description.as_deref().unwrap_or(""),
-        &params.run_at,
+        &run_at,
+        params.command.as_deref().unwrap_or(""),
         params.agent_name.as_deref(),
     )?;
     ctx.println(&format!(
         "Created one-shot task '{}' (id={}) scheduled at '{}'",
-        params.name, id, params.run_at
+        params.name, id, run_at
     ));
-    let result = serde_json::json!({"status": "created", "id": id, "name": params.name});
+    let result =
+        serde_json::json!({"status": "created", "id": id, "name": params.name, "run_at": run_at});
     Ok(result.to_string())
 }
 
@@ -1849,7 +1874,7 @@ fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
             "type": "function",
             "function": {
                 "name": "task_create_cron",
-                "description": "Create a recurring scheduled task using a cron expression. Uses 7-field cron format: 'sec min hour day_of_month month day_of_week year'. Example: '0 30 9 * * Mon-Fri *' means 9:30 AM every weekday.",
+                "description": "Create a recurring scheduled task using a cron expression. Uses 7-field cron format: 'sec min hour day_of_month month day_of_week year'. Example: '0 30 9 * * Mon-Fri *' means 9:30 AM every weekday. The command is sent to the AI when the task fires.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1861,6 +1886,10 @@ fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
                             "type": "string",
                             "description": "7-field cron expression: sec min hour day_of_month month day_of_week year"
                         },
+                        "command": {
+                            "type": "string",
+                            "description": "JSON tool call to execute when the task fires, e.g. {\"tool\": \"run_command\", \"arguments\": {\"command\": \"echo hello\"}}"
+                        },
                         "description": {
                             "type": "string",
                             "description": "Optional description of what the task does"
@@ -1868,11 +1897,16 @@ fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
                         "agent_name": {
                             "type": "string",
                             "description": "Optional agent to associate the task with"
+                        },
+                        "max_runs": {
+                            "type": "integer",
+                            "description": "Maximum number of times the task will run before auto-disabling. Omit for unlimited."
                         }
                     },
                     "required": [
                         "name",
-                        "cron_expression"
+                        "cron_expression",
+                        "command"
                     ],
                     "additionalProperties": false
                 }
@@ -1891,7 +1925,7 @@ fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
             "type": "function",
             "function": {
                 "name": "task_create_oneshot",
-                "description": "Create a one-shot scheduled task that runs once at a specific datetime.",
+                "description": "Create a one-shot scheduled task that runs once. Use delay_seconds for relative timing (preferred) or run_at for absolute. The command is sent to the AI when the task fires.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1899,9 +1933,17 @@ fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
                             "type": "string",
                             "description": "Name for the task"
                         },
+                        "command": {
+                            "type": "string",
+                            "description": "JSON tool call to execute when the task fires, e.g. {\"tool\": \"run_command\", \"arguments\": {\"command\": \"echo hello\"}}"
+                        },
+                        "delay_seconds": {
+                            "type": "number",
+                            "description": "Number of seconds from now to fire the task (preferred over run_at)"
+                        },
                         "run_at": {
                             "type": "string",
-                            "description": "When to run, in RFC 3339 format (e.g. '2025-12-31T23:59:59Z')"
+                            "description": "Absolute time in RFC 3339 format (e.g. '2025-12-31T23:59:59Z'). Use delay_seconds instead when possible."
                         },
                         "description": {
                             "type": "string",
@@ -1914,7 +1956,7 @@ fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
                     },
                     "required": [
                         "name",
-                        "run_at"
+                        "command"
                     ],
                     "additionalProperties": false
                 }
@@ -2926,6 +2968,114 @@ fn execute_ai_request(
     Ok(response)
 }
 
+fn execute_scheduled_command(
+    command: &str,
+    tools: &ToolsCollection,
+    db: &Option<Arc<Mutex<rusqlite::Connection>>>,
+) -> Option<(Message, Message)> {
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(command);
+    let (tool_name, arguments) = match parsed {
+        Ok(obj) => {
+            let name = obj
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let args = match obj.get("arguments") {
+                Some(a) if a.is_string() => a.as_str().unwrap().to_string(),
+                Some(a) => a.to_string(),
+                None => "{}".to_string(),
+            };
+            (name, args)
+        }
+        Err(_) => return None,
+    };
+
+    if tool_name.is_empty() {
+        return None;
+    }
+
+    let call_id = format!("scheduled-task-{}", chrono::Utc::now().timestamp_millis());
+
+    let tc = ToolCall {
+        index: None,
+        id: call_id.clone(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: tool_name.clone(),
+            arguments,
+        },
+    };
+
+    let mut tool_context = ToolContext::new(|_: &str| {});
+    tool_context.db = db.clone();
+
+    let tool_msg = match tool_call(tools, &tc, &tool_context) {
+        Ok(msg) => msg,
+        Err(e) => Message {
+            role: "tool".to_string(),
+            content: Some(format!("error: {}", e)),
+            tool_call_id: Some(call_id),
+            name: Some(tool_name),
+            tool_calls: None,
+        },
+    };
+
+    let assistant_msg = Message {
+        role: "assistant".to_string(),
+        content: None,
+        tool_call_id: None,
+        name: None,
+        tool_calls: Some(vec![tc]),
+    };
+
+    Some((assistant_msg, tool_msg))
+}
+
+fn scheduler_loop(
+    db: Arc<Mutex<rusqlite::Connection>>,
+    tools: Arc<ToolsCollection>,
+    tx: mpsc::Sender<(String, Message, Message)>,
+) {
+    let db_opt = Some(db.clone());
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let conn = match db.lock() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let tasks = match db::get_pending_tasks(&conn) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        drop(conn);
+
+        for task in tasks {
+            let command = if task.command.is_empty() {
+                task.description.clone()
+            } else {
+                task.command.clone()
+            };
+
+            if let Some((assistant_msg, tool_msg)) =
+                execute_scheduled_command(&command, &tools, &db_opt)
+            {
+                let _ = tx.send((command, assistant_msg, tool_msg));
+            }
+
+            if let Ok(conn) = db.lock() {
+                let _ = db::mark_task_executed(
+                    &conn,
+                    task.id,
+                    &task.task_type,
+                    task.cron_expression.as_deref(),
+                    task.max_runs,
+                );
+            }
+        }
+    }
+}
+
 /// Interactive session
 fn chat_command(
     opts: &Opts,
@@ -2991,25 +3141,84 @@ fn chat_command(
     })
     .expect("Error setting up Ctrl-C handler");
 
+    let (task_tx, task_rx) = mpsc::channel::<(String, Message, Message)>();
+    if let Some(ref scheduler_db) = db {
+        let scheduler_db = scheduler_db.clone();
+        let scheduler_tools = Arc::new(tools.clone());
+        std::thread::spawn(move || {
+            scheduler_loop(scheduler_db, scheduler_tools, task_tx);
+        });
+    }
+
+    let (input_tx, input_rx) = mpsc::channel::<Result<String, rustyline::error::ReadlineError>>();
+
+    std::thread::spawn(move || {
+        loop {
+            let result = rl.readline("> ");
+            let is_eof = matches!(result, Err(rustyline::error::ReadlineError::Eof));
+            if let Ok(ref line) = result {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    let _ = rl.add_history_entry(trimmed);
+                }
+            }
+            let _ = input_tx.send(result);
+            if is_eof {
+                break;
+            }
+        }
+    });
+
     loop {
         global_multi_progress.clear()?;
 
-        let line = match rl.readline("> ") {
-            Ok(line) => {
-                let trimmed = line.trim().to_string();
-                if !trimmed.is_empty() {
-                    rl.add_history_entry(&trimmed)?;
-                }
-                trimmed
+        while let Ok((command, assistant_msg, tool_msg)) = task_rx.try_recv() {
+            chat_pb.println(&format!("Scheduled task fired: {}", command));
+            if let Some(ref output) = tool_msg.content {
+                let display = if let Ok(obj) = serde_json::from_str::<serde_json::Value>(output) {
+                    let mut parts = Vec::new();
+                    if let Some(stdout) = obj.get("stdout").and_then(|v| v.as_str()) {
+                        let s = stdout.trim();
+                        if !s.is_empty() {
+                            parts.push(s.to_string());
+                        }
+                    }
+                    if let Some(stderr) = obj.get("stderr").and_then(|v| v.as_str()) {
+                        let s = stderr.trim();
+                        if !s.is_empty() {
+                            parts.push(format!("stderr: {}", s));
+                        }
+                    }
+                    if parts.is_empty() {
+                        output.trim().to_string()
+                    } else {
+                        parts.join("\n")
+                    }
+                } else {
+                    output.trim().to_string()
+                };
+                chat_pb.println(&display);
             }
-            Err(rustyline::error::ReadlineError::Interrupted) => {
+            messages.push(assistant_msg);
+            messages.push(tool_msg);
+        }
+
+        let line = match input_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(Ok(line)) => line.trim().to_string(),
+            Ok(Err(rustyline::error::ReadlineError::Interrupted)) => {
                 continue;
             }
-            Err(rustyline::error::ReadlineError::Eof) => {
+            Ok(Err(rustyline::error::ReadlineError::Eof)) => {
                 return Ok(());
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 return Err(Box::new(err));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Ok(());
             }
         };
 

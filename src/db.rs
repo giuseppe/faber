@@ -43,6 +43,9 @@ pub struct TaskRow {
     pub last_run_at: Option<String>,
     pub enabled: bool,
     pub created_at: String,
+    pub command: String,
+    pub max_runs: Option<i64>,
+    pub run_count: i64,
 }
 
 pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -85,7 +88,17 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
             WHERE enabled = 1;
         CREATE INDEX IF NOT EXISTS idx_tasks_agent ON scheduled_tasks(agent_name);
         ",
-    )
+    )?;
+
+    let _ = conn
+        .execute_batch("ALTER TABLE scheduled_tasks ADD COLUMN command TEXT NOT NULL DEFAULT '';");
+    let _ =
+        conn.execute_batch("ALTER TABLE scheduled_tasks ADD COLUMN max_runs INTEGER DEFAULT NULL;");
+    let _ = conn.execute_batch(
+        "ALTER TABLE scheduled_tasks ADD COLUMN run_count INTEGER NOT NULL DEFAULT 0;",
+    );
+
+    Ok(())
 }
 
 // --- Agent CRUD ---
@@ -222,17 +235,22 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         last_run_at: row.get(8)?,
         enabled: row.get::<_, i32>(9)? != 0,
         created_at: row.get(10)?,
+        command: row.get(11)?,
+        max_runs: row.get(12)?,
+        run_count: row.get(13)?,
     })
 }
 
-const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, enabled, created_at";
+const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, enabled, created_at, command, max_runs, run_count";
 
 pub fn create_cron_task(
     conn: &Connection,
     name: &str,
     description: &str,
     cron_expr: &str,
+    command: &str,
     agent_name: Option<&str>,
+    max_runs: Option<i64>,
 ) -> Result<i64, Box<dyn Error>> {
     let schedule = Schedule::from_str(cron_expr)
         .map_err(|e| format!("Invalid cron expression '{}': {}", cron_expr, e))?;
@@ -243,9 +261,9 @@ pub fn create_cron_task(
         .map(|dt| dt.to_rfc3339());
 
     conn.execute(
-        "INSERT INTO scheduled_tasks (name, description, task_type, cron_expression, next_run_at, agent_name)
-         VALUES (?1, ?2, 'cron', ?3, ?4, ?5)",
-        params![name, description, cron_expr, next_run, agent_name],
+        "INSERT INTO scheduled_tasks (name, description, task_type, cron_expression, next_run_at, agent_name, command, max_runs)
+         VALUES (?1, ?2, 'cron', ?3, ?4, ?5, ?6, ?7)",
+        params![name, description, cron_expr, next_run, agent_name, command, max_runs],
     )?;
 
     Ok(conn.last_insert_rowid())
@@ -256,16 +274,16 @@ pub fn create_oneshot_task(
     name: &str,
     description: &str,
     run_at: &str,
+    command: &str,
     agent_name: Option<&str>,
 ) -> Result<i64, Box<dyn Error>> {
-    // Validate the datetime
     chrono::DateTime::parse_from_rfc3339(run_at)
         .map_err(|e| format!("Invalid RFC 3339 datetime '{}': {}", run_at, e))?;
 
     conn.execute(
-        "INSERT INTO scheduled_tasks (name, description, task_type, run_at, next_run_at, agent_name)
-         VALUES (?1, ?2, 'oneshot', ?3, ?3, ?4)",
-        params![name, description, run_at, agent_name],
+        "INSERT INTO scheduled_tasks (name, description, task_type, run_at, next_run_at, agent_name, command)
+         VALUES (?1, ?2, 'oneshot', ?3, ?3, ?4, ?5)",
+        params![name, description, run_at, agent_name, command],
     )?;
 
     Ok(conn.last_insert_rowid())
@@ -343,4 +361,46 @@ pub fn get_pending_tasks(conn: &Connection) -> Result<Vec<TaskRow>, Box<dyn Erro
         tasks.push(row?);
     }
     Ok(tasks)
+}
+
+pub fn mark_task_executed(
+    conn: &Connection,
+    task_id: i64,
+    task_type: &str,
+    cron_expression: Option<&str>,
+    max_runs: Option<i64>,
+) -> Result<(), Box<dyn Error>> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE scheduled_tasks SET run_count = run_count + 1 WHERE id = ?1",
+        params![task_id],
+    )?;
+
+    if task_type == "cron" {
+        if let Some(expr) = cron_expression {
+            let schedule = Schedule::from_str(expr)?;
+            let next_run = schedule
+                .upcoming(chrono::Utc)
+                .next()
+                .map(|dt| dt.to_rfc3339());
+            conn.execute(
+                "UPDATE scheduled_tasks SET last_run_at = ?1, next_run_at = ?2 WHERE id = ?3",
+                params![now, next_run, task_id],
+            )?;
+        }
+    } else {
+        conn.execute(
+            "UPDATE scheduled_tasks SET last_run_at = ?1, enabled = 0 WHERE id = ?2",
+            params![now, task_id],
+        )?;
+    }
+
+    if let Some(max) = max_runs {
+        conn.execute(
+            "UPDATE scheduled_tasks SET enabled = 0 WHERE id = ?1 AND run_count >= ?2",
+            params![task_id, max],
+        )?;
+    }
+
+    Ok(())
 }
