@@ -1,19 +1,19 @@
 /*
- * codehawk
+ * swarmblabla
  *
  * Copyright (C) 2025 Giuseppe Scrivano <giuseppe@scrivano.org>
- * codehawk is free software; you can redistribute it and/or modify
+ * swarmblabla is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
  * (at your option) any later version.
  *
- * codehawk is distributed in the hope that it will be useful,
+ * swarmblabla is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with codehawk.  If not, see <http://www.gnu.org/licenses/>.
+ * along with swarmblabla.  If not, see <http://www.gnu.org/licenses/>.
  *
  */
 
@@ -412,7 +412,7 @@ const X_RATELIMIT_RESET: &str = "x-ratelimit-reset";
 
 fn make_request(url: &String) -> Result<Response, Box<dyn Error>> {
     let mut headers = HeaderMap::new();
-    headers.insert(USER_AGENT, HeaderValue::from_static("codehawk"));
+    headers.insert(USER_AGENT, HeaderValue::from_static("swarmblabla"));
 
     if let Ok(token) = read_github_token() {
         debug!("Using GitHub token for API request to {}", url);

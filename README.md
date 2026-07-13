@@ -1,6 +1,6 @@
-# codehawk
+# swarmblabla
 
-Codehawk is a tool that uses AI to analyze and triage GitHub issues.
+swarmblabla is a multi-agent AI CLI tool for interactive software development.
 
 ### Setup
 
@@ -18,73 +18,12 @@ echo "your-github-token" > ~/.github/token
 
 ## Usage
 
-### Analyze recent issues and pull requests
-
-To get an AI-generated summary of issues and pull requests created or updated in one or
-more repositories within a specific timeframe (defaulting to the last 7 days):
-
-```bash
-codehawk [--endpoint <api_endpoint>] analyze [--days <number_of_days>] <owner/repo> [<owner/repo> ...]
-
---endpoint <api_endpoint>: Optional. API endpoint URL. Defaults to http://localhost:8080.
---days <number_of_days>: Optional. Specifies the number of past days to fetch issues and pull requests from. Defaults to 7.
-
-<owner/repo>: The GitHub repository path(s) (e.g., rust-lang/rust). You can specify multiple repositories.
-```
-
-```
-codehawk analyze --days 14 owner1/repoA owner2/repoB
-```
-
-Example: Analyze issues and pull requests in `my-org/my-project` from the last 7 days:
-
-```
-codehawk analyze my-org/my-project
-```
-
-### Prioritize recent issues and pull requests
-
-To get an AI-generated prioritization of issues and pull requests for more repositories within a specific timeframe (defaulting to the last 7 days):
-
-```bash
-codehawk [--endpoint <api_endpoint>] prioritize [--days <number_of_days>] <owner/repo> [<owner/repo> ...]
-
---endpoint <api_endpoint>: Optional. API endpoint URL. Defaults to http://localhost:8080.
---days <number_of_days>: Optional. Specifies the number of past days to fetch issues and pull requests from. Defaults to 7.
-
-<owner/repo>: The GitHub repository path(s) (e.g., rust-lang/rust). You can specify multiple repositories.
-```
-
-```
-codehawk prioritize --days 14 owner1/repoA owner2/repoB
-```
-
-Example: Prioritize issues and pull requests in `my-org/my-project` from the last 7 days:
-
-```
-codehawk prioritize my-org/my-project
-```
-
-### Triage a specific issue
-To get an AI-generated triage report, potentially including a minimal reproducer, for a specific issue:
-
-```
-codehawk triage <owner/repo> <issue_number>
-```
-
-### Review a pull request
-To get a review for a pull request
-
-```
-codehawk review <owner/repo> <pull_request_number>
-```
-
 ### Chat
 
 To start an interactive chat session with the AI:
 
 ```
-codehawk chat
+swarmblabla chat
 ```
 
 Within the chat session, you can use the following commands:
@@ -99,7 +38,7 @@ Within the chat session, you can use the following commands:
 To list the available AI models:
 
 ```bash
-codehawk models
+swarmblabla models
 ```
 
 This command fetches the list of models from the configured endpoint (defaults to localhost:8080) and displays their IDs, names, pricing, and supported parameters.
@@ -107,7 +46,7 @@ This command fetches the list of models from the configured endpoint (defaults t
 The models command honors the `--endpoint` parameter, allowing you to list models from custom API endpoints:
 
 ```bash
-codehawk --endpoint https://api.openai.com/v1 models
+swarmblabla --endpoint https://api.openai.com/v1 models
 ```
 
 When using a custom endpoint, the command will automatically append `/models` to the endpoint URL to fetch the model list.
@@ -133,48 +72,43 @@ Use `--parameter` to fine-tune the AI model's behavior. You can specify multiple
 
 ```bash
 # Control creativity/randomness (0.0 = deterministic, 1.0 = very creative)
-codehawk --parameter temperature=0.7 chat
+swarmblabla --parameter temperature=0.7 chat
 
 # Control response diversity (nucleus sampling)
-codehawk --parameter top_p=0.9 chat
+swarmblabla --parameter top_p=0.9 chat
 
 # Limit token selection to top K choices
-codehawk --parameter top_k=40 chat
+swarmblabla --parameter top_k=40 chat
 
 # Reduce repetitive text
-codehawk --parameter frequency_penalty=0.3 chat
+swarmblabla --parameter frequency_penalty=0.3 chat
 
 # Encourage new topics/ideas
-codehawk --parameter presence_penalty=0.6 chat
+swarmblabla --parameter presence_penalty=0.6 chat
 
 # Alternative repetition control
-codehawk --parameter repetition_penalty=1.1 chat
+swarmblabla --parameter repetition_penalty=1.1 chat
 
 # Set minimum probability threshold
-codehawk --parameter min_p=0.05 chat
+swarmblabla --parameter min_p=0.05 chat
 
 # Adaptive sampling
-codehawk --parameter top_a=0.2 chat
+swarmblabla --parameter top_a=0.2 chat
 
 # Set seed for reproducible outputs
-codehawk --parameter seed=12345 chat
+swarmblabla --parameter seed=12345 chat
 ```
 
 #### Parameter Examples by Use Case
 
 **Creative Writing** (more random and diverse):
 ```bash
-codehawk --parameter temperature=0.8 --parameter top_p=0.95 --parameter presence_penalty=0.6 prompt "Write a story"
+swarmblabla --parameter temperature=0.8 --parameter top_p=0.95 --parameter presence_penalty=0.6 prompt "Write a story"
 ```
 
 **Code Generation** (more focused and deterministic):
 ```bash
-codehawk --parameter temperature=0.2 --parameter top_p=0.9 --parameter frequency_penalty=0.1 prompt "Write a Python function"
-```
-
-**Analysis Tasks** (balanced and consistent):
-```bash
-codehawk --parameter temperature=0.3 --parameter top_p=0.8 analyze --days 7 owner/repo
+swarmblabla --parameter temperature=0.2 --parameter top_p=0.9 --parameter frequency_penalty=0.1 prompt "Write a Python function"
 ```
 
 #### Parameter Types
@@ -188,10 +122,10 @@ codehawk --parameter temperature=0.3 --parameter top_p=0.8 analyze --days 7 owne
 ### Use a raw query
 
 ```
-codehawk prompt file1 [file2 ....]
+swarmblabla prompt file1 [file2 ....]
 ```
 
 It allows to pass a raw request to the AI model.
 
 ## License
-codehawk is licensed under the GNU General Public License v2.0 or later.
+swarmblabla is licensed under the GNU General Public License v2.0 or later.

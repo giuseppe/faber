@@ -1,19 +1,19 @@
 /*
- * codehawk
+ * swarmblabla
  *
  * Copyright (C) 2025 Giuseppe Scrivano <giuseppe@scrivano.org>
- * codehawk is free software; you can redistribute it and/or modify
+ * swarmblabla is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
  * (at your option) any later version.
  *
- * codehawk is distributed in the hope that it will be useful,
+ * swarmblabla is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with codehawk.  If not, see <http://www.gnu.org/licenses/>.
+ * along with swarmblabla.  If not, see <http://www.gnu.org/licenses/>.
  *
  */
 
@@ -49,8 +49,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use github::{
-    Issues, PullRequests, get_github_issue, get_github_issue_comments, get_github_issues,
-    get_github_pull_request, get_github_pull_request_patch, get_github_pull_requests,
+    get_github_issue, get_github_issue_comments, get_github_issues, get_github_pull_request,
+    get_github_pull_request_patch, get_github_pull_requests,
 };
 use openai::{
     FunctionCall, InterruptedError, Message, OpenAIResponse, ProgressInfo, ResponseMode,
@@ -186,9 +186,8 @@ impl ChatPrinter {
 
 const DEFAULT_ENDPOINT: &str = "http://localhost:8080";
 const DEFAULT_MODEL: &str = "google/gemini-2.5-pro";
-const DEFAULT_DAYS: u64 = 7;
 
-use codehawk::ToolContext;
+use swarmblabla::ToolContext;
 
 /// Parse parameter strings in NAME=VALUE format into a HashMap
 fn parse_parameters(
@@ -664,7 +663,7 @@ fn tool_fetch_web_content(
         } else {
             reqwest::redirect::Policy::none()
         })
-        .user_agent("codehawk/0.1.0")
+        .user_agent("swarmblabla/0.1.0")
         .build()?;
 
     let response = client.get(&params.url).send()?;
@@ -1512,7 +1511,7 @@ fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
                     "properties": {
                         "repo": {
                             "type": "string",
-                            "description": "github repo name, e.g. giuseppe/codehawk"
+                            "description": "github repo name, e.g. owner/repo"
                         },
                         "pull_request": {
                             "type": "number",
@@ -1546,7 +1545,7 @@ fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
                     "properties": {
                         "repo": {
                             "type": "string",
-                            "description": "github repo name, e.g. giuseppe/codehawk"
+                            "description": "github repo name, e.g. owner/repo"
                         },
                         "pull_request": {
                             "type": "number",
@@ -1735,7 +1734,7 @@ fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
                     "properties": {
                         "repo": {
                             "type": "string",
-                            "description": "github repo name, e.g. giuseppe/codehawk"
+                            "description": "github repo name, e.g. owner/repo"
                         },
                         "issue": {
                             "type": "number",
@@ -1769,7 +1768,7 @@ fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
                     "properties": {
                         "repo": {
                             "type": "string",
-                            "description": "github repo name, e.g. giuseppe/codehawk"
+                            "description": "github repo name, e.g. owner/repo"
                         },
                         "issue": {
                             "type": "number",
@@ -1803,7 +1802,7 @@ fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
                     "properties": {
                         "repo": {
                             "type": "string",
-                            "description": "github repo name, e.g. giuseppe/codehawk"
+                            "description": "github repo name, e.g. owner/repo"
                         },
                         "days": {
                             "type": "number",
@@ -1837,7 +1836,7 @@ fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
                     "properties": {
                         "repo": {
                             "type": "string",
-                            "description": "github repo name, e.g. giuseppe/codehawk"
+                            "description": "github repo name, e.g. owner/repo"
                         },
                         "days": {
                             "type": "number",
@@ -2519,7 +2518,7 @@ fn add_tools_prompt(messages: &mut Vec<Message>, use_tools: bool) {
 
 fn add_predefined_system_prompts(messages: &mut Vec<Message>) {
     let predefined_prompts = vec![
-        "You are codehawk, an AI assistant that helps with software development and repository analysis.",
+        "You are swarmblabla, an AI assistant that helps with software development.",
         "When working with code, maintain best practices and consider security implications.",
     ];
 
@@ -2618,124 +2617,6 @@ fn post_request_and_print_output(
         warn!("No choices received in the AI response");
     }
     Ok(())
-}
-
-/// Fetches a GitHub pull request and its patch, then sends them to the AI for review.
-fn review_pull_request(
-    repo: &String,
-    pr_id: u64,
-    opts: &Opts,
-    db: Option<Arc<Mutex<rusqlite::Connection>>>,
-) -> Result<(), Box<dyn Error>> {
-    debug!("Reviewing pull request {}/{}", repo, pr_id);
-
-    let pr = get_github_pull_request(repo, pr_id)?;
-    let patch = get_github_pull_request_patch(repo, pr_id)?;
-
-    let pr_json = serde_json::to_string(&pr)?;
-
-    let system_prompts: Vec<String> = vec![patch, pr_json];
-    let prompt = "Review the following pull request and report any issue with it, pay attention to the code.  Report only what is wrong, don't highlight what is done correctly.".to_string();
-
-    post_request_and_print_output(&prompt, Some(system_prompts), opts, db)
-}
-
-/// Fetches a GitHub issue and its comments, then sends them to the AI for triaging.
-fn triage_issue(
-    repo: &String,
-    issue_id: u64,
-    opts: &Opts,
-    db: Option<Arc<Mutex<rusqlite::Connection>>>,
-) -> Result<(), Box<dyn Error>> {
-    debug!("Triaging issue {}/{}", repo, issue_id);
-
-    let issue = get_github_issue(repo, issue_id)?;
-    let comments = get_github_issue_comments(repo, issue_id)?;
-
-    let prompt = "Provide a triage for the specified issue, show a minimal reproducer for the issue reducing the dependencies needed to run it.".to_string();
-
-    let issue_json = serde_json::to_string(&issue)?;
-    let comments_json = serde_json::to_string(&comments)?;
-
-    let system_prompts: Vec<String> = vec![issue_json, comments_json];
-
-    post_request_and_print_output(&prompt, Some(system_prompts), opts, db)
-}
-
-/// Fetches recent issues and pull requests from specified repositories and sends them to the AI with a given command prompt.
-fn prompt_issues_and_pull_requests(
-    prompt: &str,
-    repos: &Vec<String>,
-    days: Option<u64>,
-    opts: &Opts,
-    db: Option<Arc<Mutex<rusqlite::Connection>>>,
-) -> Result<(), Box<dyn Error>> {
-    let days = days.unwrap_or_else(|| DEFAULT_DAYS);
-    debug!(
-        "Fetching issues and PRs from {} repositories for the past {} days",
-        repos.len(),
-        days
-    );
-
-    let mut issues: Issues = Issues::new();
-    let mut pull_requests: PullRequests = PullRequests::new();
-
-    for repo in repos {
-        debug!("Processing repository: {}", repo);
-
-        let mut repo_issues = get_github_issues(repo, days)?;
-        issues.append(&mut repo_issues);
-
-        let mut repo_pull_requests = get_github_pull_requests(repo, days)?;
-        pull_requests.append(&mut repo_pull_requests);
-    }
-
-    debug!(
-        "Total: {} issues and {} pull requests found",
-        issues.len(),
-        pull_requests.len()
-    );
-
-    let issues_json = serde_json::to_string(&issues)?;
-    let prs_json = serde_json::to_string(&pull_requests)?;
-    let system_prompts: Vec<String> = vec![issues_json, prs_json];
-    let prompt_string = prompt.to_string();
-
-    post_request_and_print_output(&prompt_string, Some(system_prompts), opts, db)
-}
-
-/// Analyzes recent issues and pull requests for the specified repositories.
-fn analyze_repos(
-    repos: &Vec<String>,
-    days: Option<u64>,
-    opts: &Opts,
-    db: Option<Arc<Mutex<rusqlite::Connection>>>,
-) -> Result<(), Box<dyn Error>> {
-    debug!("Analyzing repos: {:?} for past {:?} days", repos, days);
-    prompt_issues_and_pull_requests(
-        "Provide a summary of all the issues and pull requests listed, highlighting the most important ones\n",
-        repos,
-        days,
-        opts,
-        db,
-    )
-}
-
-/// Prioritizes recent issues and pull requests for the specified repositories.
-fn prioritize_repos(
-    repos: &Vec<String>,
-    days: Option<u64>,
-    opts: &Opts,
-    db: Option<Arc<Mutex<rusqlite::Connection>>>,
-) -> Result<(), Box<dyn Error>> {
-    debug!("Prioritizing repos: {:?} for past {:?} days", repos, days);
-    prompt_issues_and_pull_requests(
-        "Given the issues and pull requests listed, order them by importance and highlight the ones I must address first and why\n",
-        repos,
-        days,
-        opts,
-        db,
-    )
 }
 
 /// Sends the concatenated content of specified files as a prompt to the AI.
@@ -4279,38 +4160,6 @@ impl Opts {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
-    /// Prioritize the issues and pull requests happened in the last DAYS
-    Prioritize {
-        /// Maximum age in days for the issue or pull request
-        #[clap(long)]
-        days: Option<u64>,
-        /// Repository
-        repo: Vec<String>,
-    },
-    /// Analyze the issues and pull requests happened in the last DAYS
-    Analyze {
-        /// Maximum age in days for the issue or pull request
-        #[clap(long)]
-        days: Option<u64>,
-        /// Repository
-        repo: Vec<String>,
-    },
-    /// Triage a specific issue
-    Triage {
-        /// Repository
-        repo: String,
-        /// Issue number
-        issue: u64,
-    },
-
-    /// Review a pull request
-    Review {
-        /// Repository
-        repo: String,
-        /// PR number
-        pr: u64,
-    },
-
     /// Pass a request to the AI model and print its response
     Prompt {
         /// Prompt command to pass to the AI model
@@ -4385,18 +4234,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Execute the chosen command
     let result = match &opts.command {
-        CliCommand::Analyze { days, repo } => {
-            analyze_repos(&repo, *days, &opts, db_connection.clone())
-        }
-        CliCommand::Prioritize { days, repo } => {
-            prioritize_repos(&repo, *days, &opts, db_connection.clone())
-        }
-        CliCommand::Triage { repo, issue } => {
-            triage_issue(&repo, *issue, &opts, db_connection.clone())
-        }
-        CliCommand::Review { repo, pr } => {
-            review_pull_request(&repo, *pr, &opts, db_connection.clone())
-        }
         CliCommand::Prompt { prompt, files } => {
             prompt_command(&prompt, &files, &opts, db_connection.clone())
         }
