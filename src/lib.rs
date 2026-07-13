@@ -17,12 +17,15 @@
  *
  */
 
+use std::sync::{Arc, Mutex};
+
+pub mod db;
 pub mod github;
 pub mod openai;
 
-// Context struct for tool execution
 pub struct ToolContext {
     pub println: Box<dyn Fn(&str) + Send + Sync>,
+    pub db: Option<Arc<Mutex<rusqlite::Connection>>>,
 }
 
 impl ToolContext {
@@ -32,10 +35,27 @@ impl ToolContext {
     {
         Self {
             println: Box::new(println_fn),
+            db: None,
         }
     }
 
     pub fn println(&self, msg: &str) {
         (self.println)(msg);
+    }
+
+    pub fn db_conn(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>, Box<dyn std::error::Error>> {
+        self.db
+            .as_ref()
+            .ok_or_else(|| {
+                "Database not configured. Set 'db_path' in your config file."
+                    .to_string()
+                    .into()
+            })
+            .and_then(|arc| {
+                arc.lock()
+                    .map_err(|e| format!("DB lock poisoned: {}", e).into())
+            })
     }
 }

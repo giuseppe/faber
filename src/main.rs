@@ -61,7 +61,6 @@ const DEFAULT_DAYS: u64 = 7;
 // Import ToolContext from the library crate
 use codehawk::ToolContext;
 
-
 /// Parse parameter strings in NAME=VALUE format into a HashMap
 fn parse_parameters(
     param_strings: &[String],
@@ -2402,6 +2401,9 @@ struct Opts {
     #[clap(long)]
     /// Skip adding any system prompts
     no_system_prompts: bool,
+    #[clap(long)]
+    /// Path to the SQLite database file for persistent storage (agents, tasks, memory)
+    db_path: Option<String>,
 
     #[clap(subcommand)]
     #[serde(skip)]
@@ -2425,6 +2427,7 @@ impl Default for Opts {
             api_key: None,
             parameter: Vec::new(),
             no_system_prompts: false,
+            db_path: None,
             command: CliCommand::Chat {},
             args: Vec::new(),
         }
@@ -2488,6 +2491,10 @@ impl Opts {
 
         if !self.no_system_prompts && config.no_system_prompts {
             self.no_system_prompts = true;
+        }
+
+        if self.db_path.is_none() {
+            self.db_path = config.db_path;
         }
 
         debug!("Configuration merge completed");
