@@ -92,11 +92,22 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
             FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_agent TEXT NOT NULL,
+            to_agent TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (from_agent) REFERENCES agents(name) ON DELETE CASCADE,
+            FOREIGN KEY (to_agent) REFERENCES agents(name) ON DELETE CASCADE
+        );
+
         CREATE INDEX IF NOT EXISTS idx_agent_data_agent ON agent_data(agent_name);
         CREATE INDEX IF NOT EXISTS idx_tasks_next_run ON scheduled_tasks(next_run_at)
             WHERE enabled = 1;
         CREATE INDEX IF NOT EXISTS idx_tasks_agent ON scheduled_tasks(agent_name);
         CREATE INDEX IF NOT EXISTS idx_agent_messages_agent_seq ON agent_messages(agent_name, seq);
+        CREATE INDEX IF NOT EXISTS idx_notifications_to_agent ON notifications(to_agent);
         ",
     )?;
 
@@ -505,4 +516,57 @@ pub fn agent_message_count(conn: &Connection, agent_name: &str) -> Result<i64, B
     let mut stmt = conn.prepare("SELECT COUNT(*) FROM agent_messages WHERE agent_name = ?1")?;
     let count: i64 = stmt.query_row(params![agent_name], |row| row.get(0))?;
     Ok(count)
+}
+
+// --- Notifications ---
+
+pub struct NotificationRow {
+    pub id: i64,
+    pub from_agent: String,
+    pub to_agent: String,
+    pub message: String,
+    pub created_at: String,
+}
+
+pub fn send_notification(
+    conn: &Connection,
+    from_agent: &str,
+    to_agent: &str,
+    message: &str,
+) -> Result<i64, Box<dyn Error>> {
+    conn.execute(
+        "INSERT INTO notifications (from_agent, to_agent, message) VALUES (?1, ?2, ?3)",
+        params![from_agent, to_agent, message],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn poll_notifications(
+    conn: &Connection,
+    to_agent: &str,
+) -> Result<Vec<NotificationRow>, Box<dyn Error>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, from_agent, to_agent, message, created_at FROM notifications WHERE to_agent = ?1 ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![to_agent], |row| {
+        Ok(NotificationRow {
+            id: row.get(0)?,
+            from_agent: row.get(1)?,
+            to_agent: row.get(2)?,
+            message: row.get(3)?,
+            created_at: row.get(4)?,
+        })
+    })?;
+    let mut notifications = Vec::new();
+    for row in rows {
+        notifications.push(row?);
+    }
+    if !notifications.is_empty() {
+        let ids: Vec<String> = notifications.iter().map(|n| n.id.to_string()).collect();
+        conn.execute(
+            &format!("DELETE FROM notifications WHERE id IN ({})", ids.join(",")),
+            [],
+        )?;
+    }
+    Ok(notifications)
 }

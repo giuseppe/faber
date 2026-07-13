@@ -1379,6 +1379,24 @@ fn tool_task_pending(params_str: &String, ctx: &ToolContext) -> Result<String, B
     Ok(serde_json::to_string(&tasks)?)
 }
 
+fn tool_send_message(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        to: String,
+        message: String,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let from = ctx.agent_name.as_deref().unwrap_or("default");
+    let conn = ctx.db_conn()?;
+    let id = db::send_notification(&conn, from, &params.to, &params.message)?;
+    ctx.println(&format!(
+        "Message sent to agent '{}' (notification #{})",
+        params.to, id
+    ));
+    let result = serde_json::json!({"status": "sent", "id": id, "from": from, "to": params.to});
+    Ok(result.to_string())
+}
+
 fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
     let mut tools: ToolsCollection = ToolsCollection::new();
 
@@ -2224,6 +2242,40 @@ fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
                     "type": "object",
                     "properties": {},
                     "required": [],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "send_message".to_string(),
+        tool_send_message,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "send_message",
+                "description": "Send a message to another agent. The message will appear in the target agent's session and trigger a response.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "to": {
+                            "type": "string",
+                            "description": "Name of the target agent to send the message to"
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "The message content to send"
+                        }
+                    },
+                    "required": [
+                        "to",
+                        "message"
+                    ],
                     "additionalProperties": false
                 }
             }
@@ -3618,22 +3670,41 @@ fn chat_command(
             }
         }
 
-        let line = match input_rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(Ok(line)) => line.trim().to_string(),
-            Ok(Err(rustyline::error::ReadlineError::Interrupted)) => {
-                continue;
+        let mut pending_notification: Option<String> = None;
+        if let Some(ref db) = db {
+            if let Ok(conn) = db.lock() {
+                if let Ok(notifications) = db::poll_notifications(&conn, &active_agent.name) {
+                    for notif in notifications {
+                        chat_pb.println_agent(&notif.from_agent, &notif.message);
+                        pending_notification = Some(format!(
+                            "[Message from agent '{}']: {}",
+                            notif.from_agent, notif.message
+                        ));
+                    }
+                }
             }
-            Ok(Err(rustyline::error::ReadlineError::Eof)) => {
-                return Ok(());
-            }
-            Ok(Err(err)) => {
-                return Err(Box::new(err));
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                continue;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Ok(());
+        }
+
+        let line = if let Some(injected) = pending_notification {
+            injected
+        } else {
+            match input_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Ok(line)) => line.trim().to_string(),
+                Ok(Err(rustyline::error::ReadlineError::Interrupted)) => {
+                    continue;
+                }
+                Ok(Err(rustyline::error::ReadlineError::Eof)) => {
+                    return Ok(());
+                }
+                Ok(Err(err)) => {
+                    return Err(Box::new(err));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Ok(());
+                }
             }
         };
 
