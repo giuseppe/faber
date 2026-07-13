@@ -65,6 +65,7 @@ struct AgentState {
 }
 
 const CHAT_COMMANDS: &[&str] = &[
+    "/help",
     "/quit",
     "/clear",
     "/show",
@@ -72,6 +73,7 @@ const CHAT_COMMANDS: &[&str] = &[
     "/backtrace",
     "/system",
     "/agents",
+    "/create-agent",
     "/select-agent",
     "/delete-agent",
 ];
@@ -131,6 +133,50 @@ impl Hinter for ChatHelper {
 impl Highlighter for ChatHelper {}
 impl Validator for ChatHelper {}
 impl rustyline::Helper for ChatHelper {}
+
+struct ChatPrinter {
+    inner: Option<Box<dyn rustyline::ExternalPrinter>>,
+}
+
+const AGENT_COLORS: &[console::Color] = &[
+    console::Color::Cyan,
+    console::Color::Green,
+    console::Color::Yellow,
+    console::Color::Magenta,
+    console::Color::Blue,
+    console::Color::Red,
+];
+
+fn agent_style(name: &str) -> Style {
+    let hash: usize = name
+        .bytes()
+        .fold(0usize, |acc, b| acc.wrapping_add(b as usize));
+    Style::new()
+        .fg(AGENT_COLORS[hash % AGENT_COLORS.len()])
+        .bold()
+}
+
+impl ChatPrinter {
+    fn new() -> Self {
+        Self { inner: None }
+    }
+
+    fn println(&mut self, msg: &str) {
+        if let Some(ref mut printer) = self.inner {
+            let _ = printer.print(msg.to_string());
+        } else {
+            println!("{}", msg);
+        }
+    }
+
+    fn println_agent(&mut self, agent_name: &str, msg: &str) {
+        let style = agent_style(agent_name);
+        let prefix = style.apply_to(format!("{}> ", agent_name));
+        for line in msg.lines() {
+            self.println(&format!("{}{}", prefix, line));
+        }
+    }
+}
 
 const DEFAULT_ENDPOINT: &str = "http://localhost:8080";
 const DEFAULT_MODEL: &str = "google/gemini-2.5-pro";
@@ -2528,6 +2574,7 @@ fn prompt_command(
 }
 
 enum ChatCommand {
+    Help,
     Quit,
     Clear,
     Show,
@@ -2535,6 +2582,7 @@ enum ChatCommand {
     Backtrace(usize),
     System(String),
     Agents,
+    CreateAgent(String),
     SelectAgent(String),
     DeleteAgent(String),
     Message(String),
@@ -2553,6 +2601,9 @@ fn parse_chat_command(line: &str) -> ChatCommand {
         line.to_string()
     };
 
+    if normalized == "/help" {
+        return ChatCommand::Help;
+    }
     if normalized == "/quit" {
         return ChatCommand::Quit;
     }
@@ -2593,6 +2644,17 @@ fn parse_chat_command(line: &str) -> ChatCommand {
 
     if normalized == "/agents" {
         return ChatCommand::Agents;
+    }
+    if normalized.starts_with("/create-agent ") {
+        let name = normalized
+            .strip_prefix("/create-agent ")
+            .unwrap()
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            return ChatCommand::Invalid("Usage: /create-agent <name>".to_string());
+        }
+        return ChatCommand::CreateAgent(name);
     }
     if normalized.starts_with("/select-agent ") {
         let name = normalized
@@ -2667,7 +2729,7 @@ fn handle_chat_command(
     active_agent: &mut AgentState,
     tools: &ToolsCollection,
     opts: &Opts,
-    chat_pb: &ProgressBar,
+    chat_pb: &mut ChatPrinter,
     db: &Option<Arc<Mutex<rusqlite::Connection>>>,
     openai_opts: &mut openai::Opts,
     prompt_text: &Arc<Mutex<String>>,
@@ -2675,6 +2737,22 @@ fn handle_chat_command(
 ) -> Result<bool, Box<dyn Error>> {
     let messages = &mut active_agent.messages;
     match command {
+        ChatCommand::Help => {
+            chat_pb.println("Available commands:");
+            chat_pb.println("  /help                  Show this help message");
+            chat_pb.println("  /quit                  Exit the chat session");
+            chat_pb
+                .println("  /clear                 Clear chat history and restore system prompts");
+            chat_pb.println("  /show                  Show current chat history");
+            chat_pb.println("  /limit <n>             Keep only the last n messages");
+            chat_pb.println("  /backtrace <n>         Remove the last n messages");
+            chat_pb.println("  /system <message>      Add a system message to the conversation");
+            chat_pb.println("  /agents                List all agents");
+            chat_pb.println("  /create-agent <name>   Create a new agent");
+            chat_pb.println("  /select-agent <name>   Switch to an existing agent");
+            chat_pb.println("  /delete-agent <name>   Delete an agent");
+            Ok(true)
+        }
         ChatCommand::Quit => Ok(false),
         ChatCommand::Clear => {
             *messages = initialize_chat_messages(tools, opts);
@@ -2791,6 +2869,30 @@ fn handle_chat_command(
             }
             Ok(true)
         }
+        ChatCommand::CreateAgent(name) => {
+            if let Some(db) = db {
+                let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
+                match db::create_agent(&conn, &name, "") {
+                    Ok(_) => {
+                        if let Ok(mut names) = agent_names.lock() {
+                            if !names.contains(&name) {
+                                names.push(name.clone());
+                            }
+                        }
+                        chat_pb.println(&format!(
+                            "Agent '{}' created. Use /select-agent {} to switch.",
+                            name, name
+                        ));
+                    }
+                    Err(e) => {
+                        chat_pb.println(&format!("Failed to create agent: {}", e));
+                    }
+                }
+            } else {
+                chat_pb.println("Database not configured.");
+            }
+            Ok(true)
+        }
         ChatCommand::SelectAgent(name) => {
             if name == active_agent.name {
                 chat_pb.println(&format!("Already on agent '{}'.", name));
@@ -2799,9 +2901,15 @@ fn handle_chat_command(
             if let Some(db) = db {
                 let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
 
-                db::save_agent_messages(&conn, &active_agent.name, &active_agent.messages)?;
+                if db::get_agent(&conn, &name)?.is_none() {
+                    chat_pb.println(&format!(
+                        "Agent '{}' not found. Use /create-agent {} first.",
+                        name, name
+                    ));
+                    return Ok(true);
+                }
 
-                let _ = db::create_agent(&conn, &name, "");
+                db::save_agent_messages(&conn, &active_agent.name, &active_agent.messages)?;
 
                 let agent_config = db::get_agent_config(&conn, &name)?;
                 *openai_opts = build_openai_opts(opts, &agent_config);
@@ -2814,13 +2922,8 @@ fn handle_chat_command(
                     active_agent.messages = loaded;
                 }
 
-                *prompt_text.lock().map_err(|e| format!("lock: {}", e))? = format!("{}> ", name);
-
-                if let Ok(mut names) = agent_names.lock() {
-                    if !names.contains(&name) {
-                        names.push(name.clone());
-                    }
-                }
+                *prompt_text.lock().map_err(|e| format!("lock: {}", e))? =
+                    format!("{}", agent_style(&name).apply_to(format!("{}> ", name)));
 
                 chat_pb.println(&format!("Switched to agent '{}'.", name));
             } else {
@@ -3184,7 +3287,7 @@ fn execute_ai_request(
     status_pb: &ProgressBar,
     streaming_pb: &ProgressBar,
     multi_progress: &Arc<MultiProgress>,
-    chat_pb: &ProgressBar,
+    chat_pb: &mut ChatPrinter,
 ) -> Result<OpenAIResponse, Box<dyn Error>> {
     signal_handler_active.store(true, Ordering::Relaxed);
 
@@ -3231,6 +3334,31 @@ fn execute_ai_request(
     multi_progress.clear()?;
 
     Ok(response)
+}
+
+fn format_tool_output(output: &str) -> String {
+    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(output) {
+        let mut parts = Vec::new();
+        if let Some(stdout) = obj.get("stdout").and_then(|v| v.as_str()) {
+            let s = stdout.trim();
+            if !s.is_empty() {
+                parts.push(s.to_string());
+            }
+        }
+        if let Some(stderr) = obj.get("stderr").and_then(|v| v.as_str()) {
+            let s = stderr.trim();
+            if !s.is_empty() {
+                parts.push(format!("stderr: {}", s));
+            }
+        }
+        if parts.is_empty() {
+            output.trim().to_string()
+        } else {
+            parts.join("\n")
+        }
+    } else {
+        output.trim().to_string()
+    }
 }
 
 fn execute_scheduled_command(
@@ -3349,9 +3477,7 @@ fn chat_command(
 ) -> Result<(), Box<dyn Error>> {
     debug!("Executing chat command");
 
-    // Create a persistent streaming progress bar for chat messages
-    let chat_pb = global_multi_progress.add(ProgressBar::no_length());
-    chat_pb.set_style(ProgressStyle::with_template("{msg}")?);
+    let mut chat_pb = ChatPrinter::new();
 
     // Create rustyline editor with history
     let initial_agent_names = if let Some(ref db) = db {
@@ -3413,7 +3539,10 @@ fn chat_command(
     let mut openai_opts = build_openai_opts(opts, &default_agent_config);
     debug!("Using model: {}", openai_opts.model);
 
-    let prompt_text = Arc::new(Mutex::new("default> ".to_string()));
+    let prompt_text = Arc::new(Mutex::new(format!(
+        "{}",
+        agent_style("default").apply_to("default> ")
+    )));
 
     let (ctrl_c_tx, ctrl_c_rx) = mpsc::channel();
     let ctrl_c_rx = Arc::new(Mutex::new(ctrl_c_rx));
@@ -3440,6 +3569,8 @@ fn chat_command(
     }
 
     let (input_tx, input_rx) = mpsc::channel::<Result<String, rustyline::error::ReadlineError>>();
+
+    chat_pb.inner = Some(Box::new(rl.create_external_printer()?));
 
     let prompt_text_clone = prompt_text.clone();
     std::thread::spawn(move || {
@@ -3469,47 +3600,21 @@ fn chat_command(
         while let Ok((task_agent, command, assistant_msg, tool_msg)) = task_rx.try_recv() {
             let target = task_agent.as_deref().unwrap_or("default");
 
-            if target == active_agent.name {
-                chat_pb.println(&format!("Scheduled task fired: {}", command));
-                if let Some(ref output) = tool_msg.content {
-                    let display = if let Ok(obj) = serde_json::from_str::<serde_json::Value>(output)
-                    {
-                        let mut parts = Vec::new();
-                        if let Some(stdout) = obj.get("stdout").and_then(|v| v.as_str()) {
-                            let s = stdout.trim();
-                            if !s.is_empty() {
-                                parts.push(s.to_string());
-                            }
-                        }
-                        if let Some(stderr) = obj.get("stderr").and_then(|v| v.as_str()) {
-                            let s = stderr.trim();
-                            if !s.is_empty() {
-                                parts.push(format!("stderr: {}", s));
-                            }
-                        }
-                        if parts.is_empty() {
-                            output.trim().to_string()
-                        } else {
-                            parts.join("\n")
-                        }
-                    } else {
-                        output.trim().to_string()
-                    };
-                    chat_pb.println(&display);
-                }
-                active_agent.messages.push(assistant_msg);
-                active_agent.messages.push(tool_msg);
-            } else {
+            chat_pb.println_agent(target, &format!("Scheduled task fired: {}", command));
+            if target != active_agent.name {
                 if let Some(ref db) = db {
                     if let Ok(conn) = db.lock() {
                         let _ = db::append_agent_message(&conn, target, &assistant_msg);
                         let _ = db::append_agent_message(&conn, target, &tool_msg);
                     }
                 }
-                chat_pb.println(&format!(
-                    "Scheduled task fired for agent '{}': {}",
-                    target, command
-                ));
+            }
+            if let Some(ref output) = tool_msg.content {
+                chat_pb.println_agent(target, &format_tool_output(output));
+            }
+            if target == active_agent.name {
+                active_agent.messages.push(assistant_msg);
+                active_agent.messages.push(tool_msg);
             }
         }
 
@@ -3540,7 +3645,7 @@ fn chat_command(
             &mut active_agent,
             &tools,
             opts,
-            &chat_pb,
+            &mut chat_pb,
             &db,
             &mut openai_opts,
             &prompt_text,
@@ -3595,7 +3700,7 @@ fn chat_command(
                         &status_pb,
                         &streaming_pb,
                         &multi_progress,
-                        &chat_pb,
+                        &mut chat_pb,
                     ) {
                         Ok(response) => {
                             debug!(
