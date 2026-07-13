@@ -68,6 +68,7 @@ struct SubAgentContext {
     tools: Arc<ToolsCollection>,
     opts: openai::Opts,
     session_id: String,
+    active_subagents: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 const CHAT_COMMANDS: &[&str] = &[
@@ -169,7 +170,7 @@ impl ChatPrinter {
 
     fn println(&mut self, msg: &str) {
         if let Some(ref mut printer) = self.inner {
-            let _ = printer.print(msg.to_string());
+            let _ = printer.print(format!("{}\n", msg));
         } else {
             println!("{}", msg);
         }
@@ -177,10 +178,12 @@ impl ChatPrinter {
 
     fn println_agent(&mut self, agent_name: &str, msg: &str) {
         let style = agent_style(agent_name);
-        let prefix = style.apply_to(format!("{}> ", agent_name));
+        let header = style.apply_to(format!("── {} ──", agent_name));
+        self.println(&format!("{}", header));
         for line in msg.lines() {
-            self.println(&format!("{}{}", prefix, line));
+            self.println(&format!("  {}", line));
         }
+        self.println("");
     }
 }
 
@@ -1425,6 +1428,9 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
 
     let agent_config = {
         let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
+        if db::get_agent(&conn, &agent_name)?.is_none() {
+            db::create_agent(&conn, &agent_name, &format!("Sub-agent: {}", agent_name))?;
+        }
         let _ = db::claim_agent(&conn, &agent_name, &sa_ctx.session_id);
         db::get_agent_config(&conn, &agent_name)?
     };
@@ -1449,6 +1455,9 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     messages.push(make_message("user", prompt.clone()));
 
     ctx.println(&format!("Spawning sub-agent '{}'...", agent_name));
+
+    let active_counter = sa_ctx.active_subagents.clone();
+    active_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     std::thread::spawn(move || {
         let mut sub_ctx = ToolContext::new(|_: &str| {});
@@ -1486,6 +1495,7 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
             let _ =
                 db::send_notification(&conn, &agent_name, &parent_agent, &notification.to_string());
         }
+        active_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     });
 
     let result =
@@ -3590,6 +3600,7 @@ fn chat_command(
         std::process::id(),
         chrono::Utc::now().timestamp_millis()
     );
+    let active_subagents = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let initial_agent_name = opts.agent.clone().unwrap_or_else(|| "default".to_string());
 
     let agent_config = if let Some(ref db) = db {
@@ -3597,11 +3608,7 @@ fn chat_command(
         db::ensure_default_agent(&conn)?;
         if initial_agent_name != "default" {
             if db::get_agent(&conn, &initial_agent_name)?.is_none() {
-                return Err(format!(
-                    "Agent '{}' does not exist. Create it first.",
-                    initial_agent_name
-                )
-                .into());
+                db::create_agent(&conn, &initial_agent_name, "")?;
             }
         }
         if !db::claim_agent(&conn, &initial_agent_name, &session_id)? {
@@ -3684,12 +3691,16 @@ fn chat_command(
     let tools_arc = Arc::new(tools.clone());
 
     let (input_tx, input_rx) = mpsc::channel::<Result<String, rustyline::error::ReadlineError>>();
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     chat_pb.inner = Some(Box::new(rl.create_external_printer()?));
 
     let prompt_text_clone = prompt_text.clone();
     std::thread::spawn(move || {
         loop {
+            if ready_rx.recv().is_err() {
+                break;
+            }
             let prompt = prompt_text_clone
                 .lock()
                 .map(|p| p.clone())
@@ -3708,6 +3719,8 @@ fn chat_command(
             }
         }
     });
+
+    let mut prompt_shown = false;
 
     loop {
         global_multi_progress.clear()?;
@@ -3766,6 +3779,15 @@ fn chat_command(
         let line = if let Some(injected) = pending_injection {
             injected
         } else {
+            if !prompt_shown {
+                let count = active_subagents.load(std::sync::atomic::Ordering::Relaxed);
+                if count > 0 {
+                    chat_pb.println(&format!("  {} subagent(s) running in background...", count));
+                }
+                let _ = ready_tx.send(());
+                prompt_shown = true;
+            }
+
             match input_rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(Ok(line)) => line.trim().to_string(),
                 Ok(Err(rustyline::error::ReadlineError::Interrupted)) => {
@@ -3795,6 +3817,8 @@ fn chat_command(
                 }
             }
         };
+
+        prompt_shown = false;
 
         debug!("User input: '{}' (length: {})", line, line.len());
 
@@ -3837,6 +3861,7 @@ fn chat_command(
                         tools: tools_arc.clone(),
                         opts: openai_opts.clone(),
                         session_id: session_id.to_string(),
+                        active_subagents: active_subagents.clone(),
                     }));
 
                     if is_injected {
