@@ -110,6 +110,12 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_tasks_agent ON scheduled_tasks(agent_name);
         CREATE INDEX IF NOT EXISTS idx_agent_messages_agent_seq ON agent_messages(agent_name, seq);
         CREATE INDEX IF NOT EXISTS idx_notifications_to_agent ON notifications(to_agent);
+
+        CREATE TABLE IF NOT EXISTS readline_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         ",
     )?;
 

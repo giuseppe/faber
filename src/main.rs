@@ -35,6 +35,7 @@ use rustyline::Editor;
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
+use rustyline::history::{History, MemHistory, SearchDirection, SearchResult};
 use rustyline::validate::Validator;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -144,6 +145,300 @@ impl Hinter for ChatHelper {
 impl Highlighter for ChatHelper {}
 impl Validator for ChatHelper {}
 impl rustyline::Helper for ChatHelper {}
+
+struct DbHistory {
+    conn: Option<Arc<Mutex<rusqlite::Connection>>>,
+    mem: MemHistory,
+    max_len: usize,
+    ignore_space: bool,
+    ignore_dups: bool,
+    row_id: usize,
+}
+
+impl DbHistory {
+    fn new(conn: Option<Arc<Mutex<rusqlite::Connection>>>) -> Self {
+        let row_id = if let Some(ref c) = conn {
+            if let Ok(c) = c.lock() {
+                c.query_row(
+                    "SELECT COALESCE(MAX(id), 0) FROM readline_history",
+                    [],
+                    |r| r.get::<_, usize>(0),
+                )
+                .unwrap_or(0)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        Self {
+            conn,
+            mem: MemHistory::new(),
+            max_len: 1000,
+            ignore_space: false,
+            ignore_dups: true,
+            row_id,
+        }
+    }
+
+    fn ignore(&self, line: &str) -> bool {
+        if self.max_len == 0 {
+            return true;
+        }
+        if line.is_empty() || (self.ignore_space && line.starts_with(' ')) {
+            return true;
+        }
+        false
+    }
+
+    fn is_dup(&self, line: &str) -> bool {
+        if !self.ignore_dups {
+            return false;
+        }
+        if let Some(ref c) = self.conn {
+            if let Ok(c) = c.lock() {
+                let last: Option<String> = c
+                    .query_row(
+                        "SELECT entry FROM readline_history ORDER BY id DESC LIMIT 1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                return last.as_deref() == Some(line);
+            }
+        }
+        false
+    }
+
+    fn enforce_max_len(&self) {
+        if let Some(ref c) = self.conn {
+            if let Ok(c) = c.lock() {
+                let _ = c.execute(
+                    "DELETE FROM readline_history WHERE id IN (
+                        SELECT id FROM readline_history ORDER BY id ASC
+                        LIMIT MAX(0, (SELECT COUNT(*) FROM readline_history) - ?1)
+                    )",
+                    rusqlite::params![self.max_len],
+                );
+            }
+        }
+    }
+}
+
+impl History for DbHistory {
+    fn get(
+        &self,
+        index: usize,
+        dir: SearchDirection,
+    ) -> rustyline::Result<Option<SearchResult<'_>>> {
+        if let Some(ref c) = self.conn {
+            if let Ok(c) = c.lock() {
+                let rowid = index + 1;
+                let (query, param) = match dir {
+                    SearchDirection::Forward => (
+                        "SELECT id, entry FROM readline_history WHERE id >= ?1 ORDER BY id ASC LIMIT 1",
+                        rowid,
+                    ),
+                    SearchDirection::Reverse => (
+                        "SELECT id, entry FROM readline_history WHERE id <= ?1 ORDER BY id DESC LIMIT 1",
+                        rowid,
+                    ),
+                };
+                let result = c.query_row(query, rusqlite::params![param], |r| {
+                    let id: usize = r.get(0)?;
+                    let entry: String = r.get(1)?;
+                    Ok((id, entry))
+                });
+                return match result {
+                    Ok((id, entry)) => Ok(Some(SearchResult {
+                        entry: std::borrow::Cow::Owned(entry),
+                        idx: id - 1,
+                        pos: 0,
+                    })),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(rustyline::error::ReadlineError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e,
+                    ))),
+                };
+            }
+        }
+        self.mem.get(index, dir)
+    }
+
+    fn add(&mut self, line: &str) -> rustyline::Result<bool> {
+        if self.ignore(line) {
+            return Ok(false);
+        }
+        if let Some(ref c) = self.conn {
+            if self.is_dup(line) {
+                return Ok(false);
+            }
+            if let Ok(c) = c.lock() {
+                match c.execute(
+                    "INSERT INTO readline_history (entry) VALUES (?1)",
+                    rusqlite::params![line],
+                ) {
+                    Ok(_) => {
+                        self.row_id = c.last_insert_rowid() as usize;
+                        drop(c);
+                        self.enforce_max_len();
+                        return Ok(true);
+                    }
+                    Err(e) => {
+                        warn!("Failed to save history entry: {}", e);
+                    }
+                }
+            }
+            return Ok(false);
+        }
+        self.mem.add(line)
+    }
+
+    fn add_owned(&mut self, line: String) -> rustyline::Result<bool> {
+        self.add(&line)
+    }
+
+    fn len(&self) -> usize {
+        self.row_id
+    }
+
+    fn is_empty(&self) -> bool {
+        self.row_id == 0
+    }
+
+    fn set_max_len(&mut self, len: usize) -> rustyline::Result<()> {
+        self.max_len = len;
+        self.enforce_max_len();
+        self.mem.set_max_len(len)
+    }
+
+    fn ignore_dups(&mut self, yes: bool) -> rustyline::Result<()> {
+        self.ignore_dups = yes;
+        self.mem.ignore_dups(yes)
+    }
+
+    fn ignore_space(&mut self, yes: bool) {
+        self.ignore_space = yes;
+        self.mem.ignore_space(yes);
+    }
+
+    fn save(&mut self, _path: &std::path::Path) -> rustyline::Result<()> {
+        Ok(())
+    }
+
+    fn append(&mut self, _path: &std::path::Path) -> rustyline::Result<()> {
+        Ok(())
+    }
+
+    fn load(&mut self, _path: &std::path::Path) -> rustyline::Result<()> {
+        Ok(())
+    }
+
+    fn clear(&mut self) -> rustyline::Result<()> {
+        if let Some(ref c) = self.conn {
+            if let Ok(c) = c.lock() {
+                let _ = c.execute("DELETE FROM readline_history", []);
+                self.row_id = 0;
+                return Ok(());
+            }
+        }
+        self.mem.clear()
+    }
+
+    fn search(
+        &self,
+        term: &str,
+        start: usize,
+        dir: SearchDirection,
+    ) -> rustyline::Result<Option<SearchResult<'_>>> {
+        if term.is_empty() || start >= self.len() {
+            return Ok(None);
+        }
+        if let Some(ref c) = self.conn {
+            if let Ok(c) = c.lock() {
+                let rowid = start + 1;
+                let pattern = format!("%{}%", term);
+                let (query, param) = match dir {
+                    SearchDirection::Forward => (
+                        "SELECT id, entry FROM readline_history WHERE entry LIKE ?1 AND id >= ?2 ORDER BY id ASC LIMIT 1",
+                        rowid,
+                    ),
+                    SearchDirection::Reverse => (
+                        "SELECT id, entry FROM readline_history WHERE entry LIKE ?1 AND id <= ?2 ORDER BY id DESC LIMIT 1",
+                        rowid,
+                    ),
+                };
+                let result = c.query_row(query, rusqlite::params![pattern, param], |r| {
+                    let id: usize = r.get(0)?;
+                    let entry: String = r.get(1)?;
+                    Ok((id, entry))
+                });
+                return match result {
+                    Ok((id, entry)) => {
+                        let pos = entry.find(term).unwrap_or(0);
+                        Ok(Some(SearchResult {
+                            entry: std::borrow::Cow::Owned(entry),
+                            idx: id - 1,
+                            pos,
+                        }))
+                    }
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(rustyline::error::ReadlineError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e,
+                    ))),
+                };
+            }
+        }
+        self.mem.search(term, start, dir)
+    }
+
+    fn starts_with(
+        &self,
+        term: &str,
+        start: usize,
+        dir: SearchDirection,
+    ) -> rustyline::Result<Option<SearchResult<'_>>> {
+        if term.is_empty() || start >= self.len() {
+            return Ok(None);
+        }
+        if let Some(ref c) = self.conn {
+            if let Ok(c) = c.lock() {
+                let rowid = start + 1;
+                let pattern = format!("{}%", term);
+                let (query, param) = match dir {
+                    SearchDirection::Forward => (
+                        "SELECT id, entry FROM readline_history WHERE entry LIKE ?1 AND id >= ?2 ORDER BY id ASC LIMIT 1",
+                        rowid,
+                    ),
+                    SearchDirection::Reverse => (
+                        "SELECT id, entry FROM readline_history WHERE entry LIKE ?1 AND id <= ?2 ORDER BY id DESC LIMIT 1",
+                        rowid,
+                    ),
+                };
+                let result = c.query_row(query, rusqlite::params![pattern, param], |r| {
+                    let id: usize = r.get(0)?;
+                    let entry: String = r.get(1)?;
+                    Ok((id, entry))
+                });
+                return match result {
+                    Ok((id, entry)) => Ok(Some(SearchResult {
+                        entry: std::borrow::Cow::Owned(entry),
+                        idx: id - 1,
+                        pos: term.len(),
+                    })),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(e) => Err(rustyline::error::ReadlineError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e,
+                    ))),
+                };
+            }
+        }
+        self.mem.starts_with(term, start, dir)
+    }
+}
 
 #[derive(Clone)]
 struct ChatPrinter {
@@ -3452,6 +3747,7 @@ fn scheduler_loop(
 fn chat_command(
     opts: &Opts,
     db: Option<Arc<dyn DbBackend>>,
+    db_conn: Option<Arc<Mutex<rusqlite::Connection>>>,
     mcp_manager: Option<Arc<swarmblabla::mcp::McpManager>>,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Executing chat command");
@@ -3469,7 +3765,9 @@ fn chat_command(
     let helper = ChatHelper {
         agent_names: agent_names.clone(),
     };
-    let mut rl = Editor::new()?;
+    let config = rustyline::Config::builder().auto_add_history(true).build();
+    let history = DbHistory::new(db_conn);
+    let mut rl = Editor::with_history(config, history)?;
     rl.set_helper(Some(helper));
 
     let allowed_tools = if opts.tools.is_empty() {
@@ -3600,12 +3898,6 @@ fn chat_command(
                 .unwrap_or_else(|_| "> ".to_string());
             let result = rl.readline(&prompt);
             let is_eof = matches!(result, Err(rustyline::error::ReadlineError::Eof));
-            if let Ok(ref line) = result {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    let _ = rl.add_history_entry(trimmed);
-                }
-            }
             let _ = input_tx.send(result);
             if is_eof {
                 break;
@@ -4229,6 +4521,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         opts.model = Some("".to_string());
     }
 
+    let mut db_conn_for_history: Option<Arc<Mutex<rusqlite::Connection>>> = None;
     let db_connection: Option<Arc<dyn DbBackend>> = if let Some(ref server_addr) = opts.server {
         debug!("Connecting to remote server at: {}", server_addr);
         let remote = remote_db::RemoteDb::connect(server_addr)?;
@@ -4248,7 +4541,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         debug!("Opening SQLite database at: {}", db_path);
         let conn = rusqlite::Connection::open(db_path)?;
         db::initialize_db(&conn)?;
-        Some(Arc::new(LocalDb::new(Arc::new(Mutex::new(conn)))))
+        let conn = Arc::new(Mutex::new(conn));
+        db_conn_for_history = Some(conn.clone());
+        Some(Arc::new(LocalDb::new(conn)))
     } else {
         debug!("No db_path configured, database tools will be unavailable");
         None
@@ -4274,7 +4569,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             db_connection.clone(),
             mcp_manager.clone(),
         ),
-        CliCommand::Chat {} => chat_command(&opts, db_connection.clone(), mcp_manager.clone()),
+        CliCommand::Chat {} => chat_command(
+            &opts,
+            db_connection.clone(),
+            db_conn_for_history.clone(),
+            mcp_manager.clone(),
+        ),
         CliCommand::Models {} => list_models_command(&opts),
         CliCommand::ListTools {} => list_tools_command(&mcp_manager),
         CliCommand::Gc {} => gc_command(&opts),
