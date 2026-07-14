@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,7 @@ pub struct StatusBar {
     start_time: Arc<Mutex<Instant>>,
     active: Arc<AtomicBool>,
     stop_ticker: Arc<AtomicBool>,
+    color: Arc<AtomicU8>,
     ticker_handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -42,8 +43,8 @@ impl StatusBar {
         };
 
         eprint!(
-            "\x1b[{};{}r\x1b[{};1H",
-            scroll_top, scroll_bottom, scroll_bottom
+            "\x1b[{};{}r\x1b[{};1H\x1b[2K\x1b[{};1H",
+            scroll_top, scroll_bottom, status_line, scroll_bottom
         );
         let _ = std::io::stderr().flush();
 
@@ -51,12 +52,14 @@ impl StatusBar {
         let start_time = Arc::new(Mutex::new(Instant::now()));
         let active = Arc::new(AtomicBool::new(false));
         let stop_ticker = Arc::new(AtomicBool::new(false));
+        let color = Arc::new(AtomicU8::new(36));
 
         let ticker_handle = {
             let msg = message.clone();
             let time = start_time.clone();
             let active = active.clone();
             let stop = stop_ticker.clone();
+            let color = color.clone();
 
             std::thread::spawn(move || {
                 let mut tick: u64 = 0;
@@ -68,10 +71,11 @@ impl StatusBar {
                         let elapsed = time.lock().map(|t| t.elapsed()).unwrap_or_default();
                         let spinner = SPINNER_CHARS[(tick as usize) % SPINNER_CHARS.len()];
                         let secs = elapsed.as_secs_f64();
+                        let c = color.load(Ordering::Relaxed);
 
                         eprint!(
-                            "\x1b7\x1b[{};1H\x1b[2K {} {} \x1b[90m│ {:.1}s\x1b[0m\x1b8",
-                            status_line, spinner, text, secs
+                            "\x1b7\x1b[{};1H\x1b[2K\x1b[{}m {} {} \x1b[0m\x1b[90m│ {:.1}s\x1b[0m\x1b8",
+                            status_line, c, spinner, text, secs
                         );
                         let _ = std::io::stderr().flush();
                         tick += 1;
@@ -93,6 +97,7 @@ impl StatusBar {
             start_time,
             active,
             stop_ticker,
+            color,
             ticker_handle: Some(ticker_handle),
         }
     }
@@ -104,8 +109,13 @@ impl StatusBar {
             start_time: Arc::new(Mutex::new(Instant::now())),
             active: Arc::new(AtomicBool::new(false)),
             stop_ticker: Arc::new(AtomicBool::new(true)),
+            color: Arc::new(AtomicU8::new(36)),
             ticker_handle: None,
         }
+    }
+
+    pub fn set_color(&self, ansi_code: u8) {
+        self.color.store(ansi_code, Ordering::Relaxed);
     }
 
     pub fn set_status(&self, msg: &str) {

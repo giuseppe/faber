@@ -454,13 +454,21 @@ const AGENT_COLORS: &[console::Color] = &[
     console::Color::Red,
 ];
 
+const AGENT_ANSI_CODES: &[u8] = &[36, 32, 33, 35, 34, 31];
+
+fn agent_color_hash(name: &str) -> usize {
+    name.bytes()
+        .fold(0usize, |acc, b| acc.wrapping_add(b as usize))
+}
+
 fn agent_style(name: &str) -> Style {
-    let hash: usize = name
-        .bytes()
-        .fold(0usize, |acc, b| acc.wrapping_add(b as usize));
     Style::new()
-        .fg(AGENT_COLORS[hash % AGENT_COLORS.len()])
+        .fg(AGENT_COLORS[agent_color_hash(name) % AGENT_COLORS.len()])
         .bold()
+}
+
+fn agent_ansi_code(name: &str) -> u8 {
+    AGENT_ANSI_CODES[agent_color_hash(name) % AGENT_ANSI_CODES.len()]
 }
 
 impl ChatPrinter {
@@ -3113,6 +3121,7 @@ fn handle_chat_command(
     agent_names: &Arc<Mutex<Vec<String>>>,
     session_id: &str,
     mcp_manager: &Option<Arc<swarmblabla::mcp::McpManager>>,
+    status_bar: &status_bar::StatusBar,
 ) -> Result<bool, Box<dyn Error>> {
     let messages = &mut active_agent.messages;
     match command {
@@ -3331,6 +3340,8 @@ fn handle_chat_command(
 
                 *prompt_text.lock().map_err(|e| format!("lock: {}", e))? =
                     format!("{}", agent_style(&name).apply_to(format!("{}> ", name)));
+
+                status_bar.set_color(agent_ansi_code(&name));
 
                 chat_pb.println(&format!("Switched to agent '{}'.\n", name));
             } else {
@@ -3836,6 +3847,7 @@ fn chat_command(
         name: initial_agent_name.clone(),
         messages: initial_messages,
     };
+    status_bar.set_color(agent_ansi_code(&active_agent.name));
 
     let mut openai_opts = build_openai_opts(opts, &agent_config);
     debug!("Using model: {}", openai_opts.model);
@@ -4013,6 +4025,7 @@ fn chat_command(
             &agent_names,
             &session_id,
             &mcp_manager,
+            &status_bar,
         )? {
             true => continue,
             false => {
