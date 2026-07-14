@@ -301,11 +301,20 @@ impl History for DbHistory {
     }
 
     fn len(&self) -> usize {
-        self.row_id
+        if let Some(ref c) = self.conn {
+            if let Ok(c) = c.lock() {
+                return c
+                    .query_row("SELECT COUNT(*) FROM readline_history", [], |r| {
+                        r.get::<_, usize>(0)
+                    })
+                    .unwrap_or(self.row_id);
+            }
+        }
+        self.mem.len()
     }
 
     fn is_empty(&self) -> bool {
-        self.row_id == 0
+        self.len() == 0
     }
 
     fn set_max_len(&mut self, len: usize) -> rustyline::Result<()> {
@@ -359,14 +368,18 @@ impl History for DbHistory {
         if let Some(ref c) = self.conn {
             if let Ok(c) = c.lock() {
                 let rowid = start + 1;
-                let pattern = format!("%{}%", term);
+                let escaped = term
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
+                let pattern = format!("%{}%", escaped);
                 let (query, param) = match dir {
                     SearchDirection::Forward => (
-                        "SELECT id, entry FROM readline_history WHERE entry LIKE ?1 AND id >= ?2 ORDER BY id ASC LIMIT 1",
+                        "SELECT id, entry FROM readline_history WHERE entry LIKE ?1 ESCAPE '\\' AND id >= ?2 ORDER BY id ASC LIMIT 1",
                         rowid,
                     ),
                     SearchDirection::Reverse => (
-                        "SELECT id, entry FROM readline_history WHERE entry LIKE ?1 AND id <= ?2 ORDER BY id DESC LIMIT 1",
+                        "SELECT id, entry FROM readline_history WHERE entry LIKE ?1 ESCAPE '\\' AND id <= ?2 ORDER BY id DESC LIMIT 1",
                         rowid,
                     ),
                 };
@@ -407,14 +420,18 @@ impl History for DbHistory {
         if let Some(ref c) = self.conn {
             if let Ok(c) = c.lock() {
                 let rowid = start + 1;
-                let pattern = format!("{}%", term);
+                let escaped = term
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
+                let pattern = format!("{}%", escaped);
                 let (query, param) = match dir {
                     SearchDirection::Forward => (
-                        "SELECT id, entry FROM readline_history WHERE entry LIKE ?1 AND id >= ?2 ORDER BY id ASC LIMIT 1",
+                        "SELECT id, entry FROM readline_history WHERE entry LIKE ?1 ESCAPE '\\' AND id >= ?2 ORDER BY id ASC LIMIT 1",
                         rowid,
                     ),
                     SearchDirection::Reverse => (
-                        "SELECT id, entry FROM readline_history WHERE entry LIKE ?1 AND id <= ?2 ORDER BY id DESC LIMIT 1",
+                        "SELECT id, entry FROM readline_history WHERE entry LIKE ?1 ESCAPE '\\' AND id <= ?2 ORDER BY id DESC LIMIT 1",
                         rowid,
                     ),
                 };
@@ -526,10 +543,14 @@ fn parse_parameters(
 
             // Try to parse as different types
             let json_value = if let Ok(num) = value_str.parse::<f64>() {
-                serde_json::Value::Number(
-                    serde_json::Number::from_f64(num)
-                        .unwrap_or_else(|| serde_json::Number::from(0)),
-                )
+                if num.is_finite() {
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(num)
+                            .unwrap_or_else(|| serde_json::Number::from(0)),
+                    )
+                } else {
+                    serde_json::Value::String(value_str.to_string())
+                }
             } else if let Ok(bool_val) = value_str.parse::<bool>() {
                 serde_json::Value::Bool(bool_val)
             } else if value_str == "null" {
@@ -661,25 +682,19 @@ fn show_diff(ctx: &ToolContext, old_content: &str, new_content: &str, file_path:
         }
     };
 
-    // Write content to the file descriptors
     let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let old_raw_fd = old_fd.as_raw_fd();
-        let new_raw_fd = new_fd.as_raw_fd();
+        use std::io::Seek;
+        use std::mem::ManuallyDrop;
 
-        let mut old_file = unsafe { std::fs::File::from_raw_fd(old_raw_fd) };
-        let mut new_file = unsafe { std::fs::File::from_raw_fd(new_raw_fd) };
+        let mut old_file =
+            ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(old_fd.as_raw_fd()) });
+        let mut new_file =
+            ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(new_fd.as_raw_fd()) });
 
         old_file.write_all(old_content.as_bytes())?;
         new_file.write_all(new_content.as_bytes())?;
-
-        // Reset file position to beginning for reading
-        use std::io::Seek;
         old_file.seek(std::io::SeekFrom::Start(0))?;
         new_file.seek(std::io::SeekFrom::Start(0))?;
-
-        // Don't let File::drop close the fds, we'll manage them manually
-        std::mem::forget(old_file);
-        std::mem::forget(new_file);
 
         Ok(())
     })();
@@ -798,6 +813,12 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
         match root.open_subpath(&params.path, OpenFlags::O_WRONLY | OpenFlags::O_TRUNC) {
             Ok(file) => {
                 debug!("File '{}' already exists, will overwrite", params.path);
+                use std::os::unix::io::AsRawFd;
+                let mode = rustix::fs::Mode::from_raw_mode(file_mode);
+                let _ = rustix::fs::fchmod(
+                    unsafe { rustix::fd::BorrowedFd::borrow_raw(file.as_raw_fd()) },
+                    mode,
+                );
                 (false, file)
             }
             Err(e) => {
@@ -1060,7 +1081,11 @@ fn tool_fetch_web_content(
         ctx.println("   Content preview:");
         for line in preview_lines {
             let truncated = if line.len() > 100 {
-                format!("{}...", &line[..97])
+                let mut end = 97;
+                while end > 0 && !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}...", &line[..end])
             } else {
                 line.to_string()
             };
@@ -1098,17 +1123,15 @@ fn tool_run_command(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     // Try normal parsing first, fallback to manual parsing if it fails
     let params: Params = serde_json::from_str::<Params>(&params_str)?;
 
-    let mut cmd = if params.command.contains(' ') {
-        // If command contains spaces
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(&params.command);
-        c
-    } else {
-        // Normal command execution
+    let mut cmd = if params.args.is_some() || !params.command.contains(' ') {
         let mut c = Command::new(&params.command);
         if let Some(ref args) = params.args {
             c.args(args);
         }
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(&params.command);
         c
     };
 
@@ -1196,7 +1219,7 @@ fn tool_grep_in_current_directory(
     let mut cmd = Command::new("grep");
     cmd.arg("-r");
     cmd.arg("-n");
-    cmd.arg(&params.pattern);
+    cmd.arg("-e").arg(&params.pattern);
 
     debug!(
         "Grepping for pattern '{}' in current directory",
@@ -2766,7 +2789,10 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
         .to_string(),
     );
 
-    if !unsafe_tools && allowed.is_none() {
+    if !unsafe_tools {
+        if let Some(allowed_list) = allowed {
+            tools.retain(|name, _| allowed_list.iter().any(|a| a == name));
+        }
         return tools;
     }
 
@@ -3220,6 +3246,9 @@ fn handle_chat_command(
             if n == 0 {
                 chat_pb.println("Limit cannot be zero. Clearing history instead.");
                 *messages = initialize_chat_messages(tools, opts);
+                if let Some(db) = db {
+                    db.clear_agent_messages(&active_agent.name)?;
+                }
             } else if messages.len() > n {
                 *messages = messages.split_off(messages.len() - n);
                 chat_pb.println(&format!("Chat history limited to the last {} messages.", n));
@@ -3241,6 +3270,9 @@ fn handle_chat_command(
                     messages.len()
                 ));
                 *messages = initialize_chat_messages(tools, opts);
+                if let Some(db) = db {
+                    db.clear_agent_messages(&active_agent.name)?;
+                }
             } else {
                 messages.truncate(messages.len() - n);
                 chat_pb.println(&format!("Went back {} steps in chat history.", n));
@@ -4679,4 +4711,468 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustyline::history::{History, SearchDirection};
+
+    #[test]
+    fn test_parse_parameters_number() {
+        let params = parse_parameters(&["temperature=0.7".to_string()]).unwrap();
+        assert_eq!(params["temperature"], serde_json::json!(0.7));
+    }
+
+    #[test]
+    fn test_parse_parameters_integer() {
+        let params = parse_parameters(&["count=42".to_string()]).unwrap();
+        assert_eq!(params["count"], serde_json::json!(42.0));
+    }
+
+    #[test]
+    fn test_parse_parameters_bool() {
+        let params = parse_parameters(&["stream=true".to_string()]).unwrap();
+        assert_eq!(params["stream"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_parse_parameters_null() {
+        let params = parse_parameters(&["val=null".to_string()]).unwrap();
+        assert_eq!(params["val"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_parse_parameters_string() {
+        let params = parse_parameters(&["name=hello world".to_string()]).unwrap();
+        assert_eq!(params["name"], serde_json::json!("hello world"));
+    }
+
+    #[test]
+    fn test_parse_parameters_nan_becomes_string() {
+        let params = parse_parameters(&["val=NaN".to_string()]).unwrap();
+        assert_eq!(params["val"], serde_json::json!("NaN"));
+    }
+
+    #[test]
+    fn test_parse_parameters_infinity_becomes_string() {
+        let params = parse_parameters(&["val=inf".to_string()]).unwrap();
+        assert_eq!(params["val"], serde_json::json!("inf"));
+
+        let params = parse_parameters(&["val=Infinity".to_string()]).unwrap();
+        assert_eq!(params["val"], serde_json::json!("Infinity"));
+    }
+
+    #[test]
+    fn test_parse_parameters_invalid_format() {
+        let result = parse_parameters(&["noequals".to_string()]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_parameters_empty() {
+        let params = parse_parameters(&[]).unwrap();
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_parse_chat_command_help() {
+        assert!(matches!(parse_chat_command("/help"), ChatCommand::Help));
+    }
+
+    #[test]
+    fn test_parse_chat_command_quit() {
+        assert!(matches!(parse_chat_command("/quit"), ChatCommand::Quit));
+    }
+
+    #[test]
+    fn test_parse_chat_command_clear() {
+        assert!(matches!(parse_chat_command("/clear"), ChatCommand::Clear));
+    }
+
+    #[test]
+    fn test_parse_chat_command_show() {
+        assert!(matches!(parse_chat_command("/show"), ChatCommand::Show));
+    }
+
+    #[test]
+    fn test_parse_chat_command_limit() {
+        match parse_chat_command("/limit 5") {
+            ChatCommand::Limit(n) => assert_eq!(n, 5),
+            _ => panic!("expected Limit"),
+        }
+    }
+
+    #[test]
+    fn test_parse_chat_command_limit_invalid() {
+        assert!(matches!(
+            parse_chat_command("/limit abc"),
+            ChatCommand::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn test_parse_chat_command_backtrace() {
+        match parse_chat_command("/backtrace 3") {
+            ChatCommand::Backtrace(n) => assert_eq!(n, 3),
+            _ => panic!("expected Backtrace"),
+        }
+    }
+
+    #[test]
+    fn test_parse_chat_command_system() {
+        match parse_chat_command("/system be nice") {
+            ChatCommand::System(msg) => assert_eq!(msg, "be nice"),
+            _ => panic!("expected System"),
+        }
+    }
+
+    #[test]
+    fn test_parse_chat_command_agents() {
+        assert!(matches!(parse_chat_command("/agents"), ChatCommand::Agents));
+    }
+
+    #[test]
+    fn test_parse_chat_command_create_agent() {
+        match parse_chat_command("/create-agent bob") {
+            ChatCommand::CreateAgent(name) => assert_eq!(name, "bob"),
+            _ => panic!("expected CreateAgent"),
+        }
+    }
+
+    #[test]
+    fn test_parse_chat_command_select_agent() {
+        match parse_chat_command("/select-agent bob") {
+            ChatCommand::SelectAgent(name) => assert_eq!(name, "bob"),
+            _ => panic!("expected SelectAgent"),
+        }
+    }
+
+    #[test]
+    fn test_parse_chat_command_delete_agent() {
+        match parse_chat_command("/delete-agent bob") {
+            ChatCommand::DeleteAgent(name) => assert_eq!(name, "bob"),
+            _ => panic!("expected DeleteAgent"),
+        }
+    }
+
+    #[test]
+    fn test_parse_chat_command_mcp_refresh() {
+        assert!(matches!(
+            parse_chat_command("/mcp-refresh"),
+            ChatCommand::McpRefresh
+        ));
+    }
+
+    #[test]
+    fn test_parse_chat_command_tools() {
+        assert!(matches!(parse_chat_command("/tools"), ChatCommand::Tools));
+    }
+
+    #[test]
+    fn test_parse_chat_command_message() {
+        match parse_chat_command("hello world") {
+            ChatCommand::Message(msg) => assert_eq!(msg, "hello world"),
+            _ => panic!("expected Message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_chat_command_empty() {
+        assert!(matches!(parse_chat_command(""), ChatCommand::Empty));
+    }
+
+    #[test]
+    fn test_parse_chat_command_unknown() {
+        assert!(matches!(
+            parse_chat_command("/unknown"),
+            ChatCommand::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn test_parse_chat_command_backslash_prefix() {
+        assert!(matches!(parse_chat_command("\\help"), ChatCommand::Help));
+    }
+
+    #[test]
+    fn test_format_tool_arguments_short() {
+        assert_eq!(
+            format_tool_arguments(r#"{"path":"foo"}"#),
+            r#"{"path":"foo"}"#
+        );
+    }
+
+    #[test]
+    fn test_format_tool_arguments_long_truncated() {
+        let long_args = "a".repeat(100);
+        let result = format_tool_arguments(&long_args);
+        assert!(result.contains("..."));
+        assert!(result.contains("(100)"));
+    }
+
+    #[test]
+    fn test_format_tool_arguments_newlines_removed() {
+        let args = "line1\nline2\tline3";
+        let result = format_tool_arguments(args);
+        assert!(!result.contains('\n'));
+        assert!(!result.contains('\t'));
+    }
+
+    #[test]
+    fn test_agent_color_hash_deterministic() {
+        let hash1 = agent_color_hash("alice");
+        let hash2 = agent_color_hash("alice");
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_agent_color_hash_different_agents() {
+        let hash1 = agent_color_hash("alice");
+        let hash2 = agent_color_hash("bob");
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_agent_ansi_code_in_range() {
+        for name in &["alice", "bob", "charlie", "default", "xyz"] {
+            let code = agent_ansi_code(name);
+            assert!(AGENT_ANSI_CODES.contains(&code));
+        }
+    }
+
+    fn test_db_conn() -> Arc<Mutex<rusqlite::Connection>> {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::initialize_db(&conn).unwrap();
+        Arc::new(Mutex::new(conn))
+    }
+
+    #[test]
+    fn test_db_history_add_and_get() {
+        let conn = test_db_conn();
+        let mut hist = DbHistory::new(Some(conn));
+        hist.add("first").unwrap();
+        hist.add("second").unwrap();
+        let result = hist.get(0, SearchDirection::Forward).unwrap().unwrap();
+        assert_eq!(result.entry.as_ref(), "first");
+        let result = hist.get(1, SearchDirection::Forward).unwrap().unwrap();
+        assert_eq!(result.entry.as_ref(), "second");
+    }
+
+    #[test]
+    fn test_db_history_len() {
+        let conn = test_db_conn();
+        let mut hist = DbHistory::new(Some(conn));
+        assert_eq!(hist.len(), 0);
+        assert!(hist.is_empty());
+        hist.add("first").unwrap();
+        assert_eq!(hist.len(), 1);
+        assert!(!hist.is_empty());
+    }
+
+    #[test]
+    fn test_db_history_ignore_empty() {
+        let conn = test_db_conn();
+        let mut hist = DbHistory::new(Some(conn));
+        hist.add("").unwrap();
+        assert_eq!(hist.len(), 0);
+    }
+
+    #[test]
+    fn test_db_history_ignore_space() {
+        let conn = test_db_conn();
+        let mut hist = DbHistory::new(Some(conn));
+        hist.ignore_space(true);
+        hist.add(" hidden").unwrap();
+        assert_eq!(hist.len(), 0);
+    }
+
+    #[test]
+    fn test_db_history_ignore_dups() {
+        let conn = test_db_conn();
+        let mut hist = DbHistory::new(Some(conn));
+        hist.add("same").unwrap();
+        hist.add("same").unwrap();
+        assert_eq!(hist.len(), 1);
+    }
+
+    #[test]
+    fn test_db_history_search() {
+        let conn = test_db_conn();
+        let mut hist = DbHistory::new(Some(conn));
+        hist.add("cargo build").unwrap();
+        hist.add("cargo test").unwrap();
+        hist.add("git status").unwrap();
+
+        let result = hist
+            .search("cargo", 0, SearchDirection::Forward)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.entry.as_ref(), "cargo build");
+
+        let result = hist
+            .search("cargo", 2, SearchDirection::Reverse)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.entry.as_ref(), "cargo test");
+    }
+
+    #[test]
+    fn test_db_history_search_with_wildcards() {
+        let conn = test_db_conn();
+        let mut hist = DbHistory::new(Some(conn));
+        hist.add("test_file").unwrap();
+        hist.add("testXfile").unwrap();
+
+        let result = hist
+            .search("test_file", 0, SearchDirection::Forward)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.entry.as_ref(), "test_file");
+    }
+
+    #[test]
+    fn test_db_history_starts_with() {
+        let conn = test_db_conn();
+        let mut hist = DbHistory::new(Some(conn));
+        hist.add("cargo build").unwrap();
+        hist.add("cargo test").unwrap();
+        hist.add("git status").unwrap();
+
+        let result = hist
+            .starts_with("cargo", 0, SearchDirection::Forward)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.entry.as_ref(), "cargo build");
+
+        let result = hist
+            .starts_with("git", 0, SearchDirection::Forward)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.entry.as_ref(), "git status");
+    }
+
+    #[test]
+    fn test_db_history_starts_with_wildcard_in_term() {
+        let conn = test_db_conn();
+        let mut hist = DbHistory::new(Some(conn));
+        hist.add("100% done").unwrap();
+        hist.add("something else").unwrap();
+
+        let result = hist
+            .starts_with("100%", 0, SearchDirection::Forward)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.entry.as_ref(), "100% done");
+    }
+
+    #[test]
+    fn test_db_history_clear() {
+        let conn = test_db_conn();
+        let mut hist = DbHistory::new(Some(conn));
+        hist.add("first").unwrap();
+        hist.add("second").unwrap();
+        hist.clear().unwrap();
+        assert_eq!(hist.len(), 0);
+    }
+
+    #[test]
+    fn test_db_history_max_len() {
+        let conn = test_db_conn();
+        let mut hist = DbHistory::new(Some(conn));
+        hist.set_max_len(3).unwrap();
+        for i in 0..5 {
+            hist.add(&format!("entry{}", i)).unwrap();
+        }
+        assert_eq!(hist.len(), 3);
+    }
+
+    #[test]
+    fn test_db_history_reverse_get() {
+        let conn = test_db_conn();
+        let mut hist = DbHistory::new(Some(conn));
+        hist.add("first").unwrap();
+        hist.add("second").unwrap();
+        hist.add("third").unwrap();
+
+        let result = hist.get(2, SearchDirection::Reverse).unwrap().unwrap();
+        assert_eq!(result.entry.as_ref(), "third");
+    }
+
+    #[test]
+    fn test_db_history_mem_fallback() {
+        let mut hist = DbHistory::new(None);
+        hist.add("memory only").unwrap();
+        assert_eq!(hist.len(), 1);
+        let result = hist.get(0, SearchDirection::Forward).unwrap().unwrap();
+        assert_eq!(result.entry.as_ref(), "memory only");
+    }
+
+    #[test]
+    fn test_db_history_search_not_found() {
+        let conn = test_db_conn();
+        let mut hist = DbHistory::new(Some(conn));
+        hist.add("hello").unwrap();
+        let result = hist
+            .search("nonexistent", 0, SearchDirection::Forward)
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_db_history_search_empty_term() {
+        let conn = test_db_conn();
+        let mut hist = DbHistory::new(Some(conn));
+        hist.add("hello").unwrap();
+        let result = hist.search("", 0, SearchDirection::Forward).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_format_tool_output_json() {
+        let output = r#"{"stdout":"hello\n","stderr":"","exit_code":0,"success":true}"#;
+        let result = format_tool_output(output);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_format_tool_output_json_with_stderr() {
+        let output = r#"{"stdout":"out","stderr":"err","exit_code":1,"success":false}"#;
+        let result = format_tool_output(output);
+        assert!(result.contains("out"));
+        assert!(result.contains("stderr: err"));
+    }
+
+    #[test]
+    fn test_format_tool_output_plain_text() {
+        let result = format_tool_output("just plain text");
+        assert_eq!(result, "just plain text");
+    }
+
+    #[test]
+    fn test_initialize_tools_safe() {
+        let tools = initialize_tools(false, None);
+        assert!(tools.contains_key("read_file"));
+        assert!(tools.contains_key("write_file"));
+        assert!(!tools.contains_key("run_command"));
+        assert!(!tools.contains_key("fetch_web_content"));
+    }
+
+    #[test]
+    fn test_initialize_tools_unsafe() {
+        let tools = initialize_tools(true, None);
+        assert!(tools.contains_key("read_file"));
+        assert!(tools.contains_key("run_command"));
+        assert!(tools.contains_key("fetch_web_content"));
+    }
+
+    #[test]
+    fn test_initialize_tools_allowed_filter() {
+        let allowed = vec!["read_file".to_string(), "write_file".to_string()];
+        let tools = initialize_tools(true, Some(&allowed));
+        assert!(tools.contains_key("read_file"));
+        assert!(tools.contains_key("write_file"));
+        assert!(!tools.contains_key("run_command"));
+        assert!(!tools.contains_key("glob"));
+    }
 }

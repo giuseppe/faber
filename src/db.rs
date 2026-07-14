@@ -249,11 +249,13 @@ pub fn create_agent(
 }
 
 pub fn delete_agent(conn: &Connection, name: &str) -> Result<bool, Box<dyn Error>> {
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "DELETE FROM scheduled_tasks WHERE agent_name = ?1",
         params![name],
     )?;
-    let rows = conn.execute("DELETE FROM agents WHERE name = ?1", params![name])?;
+    let rows = tx.execute("DELETE FROM agents WHERE name = ?1", params![name])?;
+    tx.commit()?;
     Ok(rows > 0)
 }
 
@@ -516,6 +518,11 @@ pub fn mark_task_executed(
                 "UPDATE scheduled_tasks SET last_run_at = ?1, next_run_at = ?2 WHERE id = ?3",
                 params![now, next_run, task_id],
             )?;
+        } else {
+            conn.execute(
+                "UPDATE scheduled_tasks SET last_run_at = ?1, enabled = 0 WHERE id = ?2",
+                params![now, task_id],
+            )?;
         }
     } else {
         conn.execute(
@@ -569,17 +576,20 @@ pub fn save_agent_messages<T: Serialize>(
     agent_name: &str,
     messages: &[T],
 ) -> Result<(), Box<dyn Error>> {
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "DELETE FROM agent_messages WHERE agent_name = ?1",
         params![agent_name],
     )?;
-    let mut stmt = conn.prepare(
+    let mut stmt = tx.prepare(
         "INSERT INTO agent_messages (agent_name, seq, message_json) VALUES (?1, ?2, ?3)",
     )?;
     for (i, msg) in messages.iter().enumerate() {
         let json = serde_json::to_string(msg)?;
         stmt.execute(params![agent_name, i as i64, json])?;
     }
+    drop(stmt);
+    tx.commit()?;
     Ok(())
 }
 
@@ -652,7 +662,8 @@ pub fn send_notification(
 }
 
 pub fn gc_agents(conn: &Connection) -> Result<Vec<String>, Box<dyn Error>> {
-    let mut stmt = conn.prepare(
+    let tx = conn.unchecked_transaction()?;
+    let mut stmt = tx.prepare(
         "SELECT name FROM agents
          WHERE name != 'default'
          AND (session_id IS NULL OR heartbeat_at IS NULL
@@ -663,7 +674,7 @@ pub fn gc_agents(conn: &Connection) -> Result<Vec<String>, Box<dyn Error>> {
         .collect::<Result<_, _>>()?;
     drop(stmt);
     if !names.is_empty() {
-        conn.execute(
+        tx.execute(
             "DELETE FROM agents
              WHERE name != 'default'
              AND (session_id IS NULL OR heartbeat_at IS NULL
@@ -671,5 +682,380 @@ pub fn gc_agents(conn: &Connection) -> Result<Vec<String>, Box<dyn Error>> {
             [],
         )?;
     }
+    tx.commit()?;
     Ok(names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_db(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_create_and_get_agent() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "Test agent").unwrap();
+        let agent = get_agent(&conn, "alice").unwrap().unwrap();
+        assert_eq!(agent.name, "alice");
+        assert_eq!(agent.description, "Test agent");
+    }
+
+    #[test]
+    fn test_create_duplicate_agent_fails() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "first").unwrap();
+        let result = create_agent(&conn, "alice", "second");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_delete_agent() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        assert!(delete_agent(&conn, "alice").unwrap());
+        assert!(get_agent(&conn, "alice").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_delete_nonexistent_agent() {
+        let conn = test_db();
+        assert!(!delete_agent(&conn, "nobody").unwrap());
+    }
+
+    #[test]
+    fn test_list_agents() {
+        let conn = test_db();
+        create_agent(&conn, "bob", "").unwrap();
+        create_agent(&conn, "alice", "").unwrap();
+        let agents = list_agents(&conn).unwrap();
+        let names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn test_agent_data_crud() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+
+        set_agent_data(&conn, "alice", "color", "blue").unwrap();
+        assert_eq!(
+            get_agent_data(&conn, "alice", "color").unwrap(),
+            Some("blue".to_string())
+        );
+
+        set_agent_data(&conn, "alice", "color", "red").unwrap();
+        assert_eq!(
+            get_agent_data(&conn, "alice", "color").unwrap(),
+            Some("red".to_string())
+        );
+
+        assert!(delete_agent_data(&conn, "alice", "color").unwrap());
+        assert!(get_agent_data(&conn, "alice", "color").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_list_agent_data() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        set_agent_data(&conn, "alice", "b_key", "val_b").unwrap();
+        set_agent_data(&conn, "alice", "a_key", "val_a").unwrap();
+        let data = list_agent_data(&conn, "alice").unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0].0, "a_key");
+        assert_eq!(data[1].0, "b_key");
+    }
+
+    #[test]
+    fn test_agent_data_cascade_on_delete() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        set_agent_data(&conn, "alice", "k", "v").unwrap();
+        delete_agent(&conn, "alice").unwrap();
+        let data = list_agent_data(&conn, "alice").unwrap();
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn test_save_and_load_agent_messages() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "hello"}),
+            serde_json::json!({"role": "assistant", "content": "hi"}),
+        ];
+        save_agent_messages(&conn, "alice", &msgs).unwrap();
+        let loaded: Vec<serde_json::Value> = load_agent_messages(&conn, "alice").unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0]["content"], "hello");
+        assert_eq!(loaded[1]["content"], "hi");
+    }
+
+    #[test]
+    fn test_save_agent_messages_replaces() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        let msgs1 = vec![serde_json::json!({"role": "user", "content": "first"})];
+        save_agent_messages(&conn, "alice", &msgs1).unwrap();
+        let msgs2 = vec![serde_json::json!({"role": "user", "content": "second"})];
+        save_agent_messages(&conn, "alice", &msgs2).unwrap();
+        let loaded: Vec<serde_json::Value> = load_agent_messages(&conn, "alice").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0]["content"], "second");
+    }
+
+    #[test]
+    fn test_append_agent_message() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        append_agent_message(&conn, "alice", &serde_json::json!({"role": "user"})).unwrap();
+        append_agent_message(&conn, "alice", &serde_json::json!({"role": "assistant"})).unwrap();
+        assert_eq!(agent_message_count(&conn, "alice").unwrap(), 2);
+    }
+
+    #[test]
+    fn test_clear_agent_messages() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        append_agent_message(&conn, "alice", &serde_json::json!({"role": "user"})).unwrap();
+        clear_agent_messages(&conn, "alice").unwrap();
+        assert_eq!(agent_message_count(&conn, "alice").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_claim_and_release_agent() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+
+        assert!(claim_agent(&conn, "alice", "session-1").unwrap());
+        let agent = get_agent(&conn, "alice").unwrap().unwrap();
+        assert_eq!(agent.session_id, Some("session-1".to_string()));
+
+        assert!(!claim_agent(&conn, "alice", "session-2").unwrap());
+
+        release_agent(&conn, "alice", "session-1").unwrap();
+        let agent = get_agent(&conn, "alice").unwrap().unwrap();
+        assert!(agent.session_id.is_none());
+
+        assert!(claim_agent(&conn, "alice", "session-2").unwrap());
+    }
+
+    #[test]
+    fn test_release_all_agents() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        create_agent(&conn, "bob", "").unwrap();
+        claim_agent(&conn, "alice", "s1").unwrap();
+        claim_agent(&conn, "bob", "s1").unwrap();
+        release_all_agents(&conn, "s1").unwrap();
+        let alice = get_agent(&conn, "alice").unwrap().unwrap();
+        let bob = get_agent(&conn, "bob").unwrap().unwrap();
+        assert!(alice.session_id.is_none());
+        assert!(bob.session_id.is_none());
+    }
+
+    #[test]
+    fn test_send_notification() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        create_agent(&conn, "bob", "").unwrap();
+        let id = send_notification(&conn, "alice", "bob", "hello bob").unwrap();
+        assert!(id > 0);
+    }
+
+    #[test]
+    fn test_poll_notifications_for_session() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        create_agent(&conn, "bob", "").unwrap();
+        claim_agent(&conn, "bob", "s1").unwrap();
+        send_notification(&conn, "alice", "bob", "msg1").unwrap();
+        send_notification(&conn, "alice", "bob", "msg2").unwrap();
+
+        let notifs = poll_notifications_for_session(&conn, "s1").unwrap();
+        assert_eq!(notifs.len(), 2);
+        assert_eq!(notifs[0].message, "msg1");
+        assert_eq!(notifs[1].message, "msg2");
+
+        let notifs2 = poll_notifications_for_session(&conn, "s1").unwrap();
+        assert!(notifs2.is_empty());
+    }
+
+    #[test]
+    fn test_create_oneshot_task() {
+        let conn = test_db();
+        let run_at = chrono::Utc::now().to_rfc3339();
+        let id = create_oneshot_task(&conn, "task1", "desc", &run_at, "echo hi", None).unwrap();
+        let task = get_task(&conn, id).unwrap().unwrap();
+        assert_eq!(task.name, "task1");
+        assert_eq!(task.task_type, "oneshot");
+        assert!(task.enabled);
+    }
+
+    #[test]
+    fn test_create_cron_task() {
+        let conn = test_db();
+        let id = create_cron_task(
+            &conn,
+            "cron1",
+            "every sec",
+            "* * * * * * *",
+            "echo hi",
+            None,
+            None,
+        )
+        .unwrap();
+        let task = get_task(&conn, id).unwrap().unwrap();
+        assert_eq!(task.name, "cron1");
+        assert_eq!(task.task_type, "cron");
+    }
+
+    #[test]
+    fn test_create_cron_task_invalid_expression() {
+        let conn = test_db();
+        let result = create_cron_task(&conn, "bad", "", "not a cron", "", None, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_delete_task() {
+        let conn = test_db();
+        let run_at = chrono::Utc::now().to_rfc3339();
+        let id = create_oneshot_task(&conn, "t", "", &run_at, "", None).unwrap();
+        assert!(delete_task(&conn, id).unwrap());
+        assert!(get_task(&conn, id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_set_task_enabled() {
+        let conn = test_db();
+        let run_at = chrono::Utc::now().to_rfc3339();
+        let id = create_oneshot_task(&conn, "t", "", &run_at, "", None).unwrap();
+        set_task_enabled(&conn, id, false).unwrap();
+        let task = get_task(&conn, id).unwrap().unwrap();
+        assert!(!task.enabled);
+    }
+
+    #[test]
+    fn test_mark_oneshot_task_executed() {
+        let conn = test_db();
+        let run_at = chrono::Utc::now().to_rfc3339();
+        let id = create_oneshot_task(&conn, "t", "", &run_at, "", None).unwrap();
+        mark_task_executed(&conn, id, "oneshot", None, None).unwrap();
+        let task = get_task(&conn, id).unwrap().unwrap();
+        assert!(!task.enabled);
+        assert_eq!(task.run_count, 1);
+    }
+
+    #[test]
+    fn test_mark_cron_task_executed_with_max_runs() {
+        let conn = test_db();
+        let id = create_cron_task(&conn, "c", "", "* * * * * * *", "", None, Some(2)).unwrap();
+        mark_task_executed(&conn, id, "cron", Some("* * * * * * *"), Some(2)).unwrap();
+        let task = get_task(&conn, id).unwrap().unwrap();
+        assert!(task.enabled);
+        assert_eq!(task.run_count, 1);
+
+        mark_task_executed(&conn, id, "cron", Some("* * * * * * *"), Some(2)).unwrap();
+        let task = get_task(&conn, id).unwrap().unwrap();
+        assert!(!task.enabled);
+        assert_eq!(task.run_count, 2);
+    }
+
+    #[test]
+    fn test_mark_cron_task_with_no_expression_disables() {
+        let conn = test_db();
+        let id = create_cron_task(&conn, "c", "", "* * * * * * *", "", None, None).unwrap();
+        mark_task_executed(&conn, id, "cron", None, None).unwrap();
+        let task = get_task(&conn, id).unwrap().unwrap();
+        assert!(!task.enabled);
+    }
+
+    #[test]
+    fn test_delete_agent_cascades_tasks() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        create_cron_task(&conn, "t", "", "* * * * * * *", "", Some("alice"), None).unwrap();
+        delete_agent(&conn, "alice").unwrap();
+        let tasks = list_tasks(&conn, Some("alice")).unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn test_get_agent_config() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        set_agent_data(&conn, "alice", "config:model", "gpt-4").unwrap();
+        set_agent_data(&conn, "alice", "config:system_prompt", "be nice").unwrap();
+        let config = get_agent_config(&conn, "alice").unwrap();
+        assert_eq!(config.model, Some("gpt-4".to_string()));
+        assert_eq!(config.system_prompt, Some("be nice".to_string()));
+        assert!(config.endpoint.is_none());
+    }
+
+    #[test]
+    fn test_ensure_default_agent() {
+        let conn = test_db();
+        ensure_default_agent(&conn).unwrap();
+        ensure_default_agent(&conn).unwrap();
+        let agent = get_agent(&conn, "default").unwrap().unwrap();
+        assert_eq!(agent.name, "default");
+    }
+
+    #[test]
+    fn test_gc_agents_removes_dormant() {
+        let conn = test_db();
+        create_agent(&conn, "dormant", "").unwrap();
+        let removed = gc_agents(&conn).unwrap();
+        assert_eq!(removed, vec!["dormant"]);
+        assert!(get_agent(&conn, "dormant").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_gc_agents_preserves_default() {
+        let conn = test_db();
+        ensure_default_agent(&conn).unwrap();
+        let removed = gc_agents(&conn).unwrap();
+        assert!(removed.is_empty());
+        assert!(get_agent(&conn, "default").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_list_tasks_filter_by_agent() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        create_agent(&conn, "bob", "").unwrap();
+        create_cron_task(&conn, "t1", "", "* * * * * * *", "", Some("alice"), None).unwrap();
+        create_cron_task(&conn, "t2", "", "* * * * * * *", "", Some("bob"), None).unwrap();
+        let alice_tasks = list_tasks(&conn, Some("alice")).unwrap();
+        assert_eq!(alice_tasks.len(), 1);
+        assert_eq!(alice_tasks[0].name, "t1");
+        let all_tasks = list_tasks(&conn, None).unwrap();
+        assert_eq!(all_tasks.len(), 2);
+    }
+
+    #[test]
+    fn test_get_pending_tasks() {
+        let conn = test_db();
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+        create_oneshot_task(&conn, "due", "", &past, "echo", None).unwrap();
+        let future = (chrono::Utc::now() + chrono::Duration::seconds(3600)).to_rfc3339();
+        create_oneshot_task(&conn, "later", "", &future, "echo", None).unwrap();
+        let pending = get_pending_tasks(&conn).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, "due");
+    }
+
+    #[test]
+    fn test_readline_history_table_created() {
+        let conn = test_db();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM readline_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
 }

@@ -577,8 +577,8 @@ fn post_request_with_mode_and_recursion(
                         break;
                     }
 
-                    // Retry on server errors (5xx) including 503 Service Unavailable
-                    if status.is_server_error() && attempt < max_retries {
+                    if (status.is_server_error() || status.as_u16() == 429) && attempt < max_retries
+                    {
                         let delay_duration =
                             Duration::from_secs(base_delay_secs * 2_u64.pow(attempt as u32 - 1));
                         warn!(
@@ -673,8 +673,9 @@ fn post_request_with_mode_and_recursion(
                     .finish_reason
                     .clone()
                     .unwrap_or_else(|| "".to_string());
-                finish = finish_reason != ""
-                    && (finish_reason != "tool_calls" || tools_collection.is_empty());
+                let has_tools = !tools_collection.is_empty()
+                    || ctx.mcp_manager.as_ref().map_or(false, |m| m.has_tools());
+                finish = finish_reason != "" && (finish_reason != "tool_calls" || !has_tools);
                 if finish_reason == "error" {
                     let native_finish_reason = choice
                         .native_finish_reason
@@ -867,11 +868,13 @@ fn handle_streaming_response(
             Ok(Ok(line)) => {
                 bytes_read += line.len();
 
-                if line.is_empty() || !line.starts_with("data: ") {
+                let data = if line.starts_with("data: ") {
+                    &line[6..]
+                } else if line.starts_with("data:") {
+                    &line[5..]
+                } else {
                     continue;
-                }
-
-                let data = &line[6..]; // Remove "data: " prefix
+                };
                 chunks_processed += 1;
 
                 if data == "" {
@@ -1190,4 +1193,162 @@ fn handle_streaming_response(
         usage,
         history: vec![],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_endpoint_already_complete() {
+        assert_eq!(
+            normalize_endpoint("http://localhost:8080/chat/completions"),
+            "http://localhost:8080/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_normalize_endpoint_trailing_slash() {
+        assert_eq!(
+            normalize_endpoint("http://localhost:8080/"),
+            "http://localhost:8080/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_normalize_endpoint_no_trailing_slash() {
+        assert_eq!(
+            normalize_endpoint("http://localhost:8080"),
+            "http://localhost:8080/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_normalize_endpoint_with_v1() {
+        assert_eq!(
+            normalize_endpoint("http://localhost:8080/v1"),
+            "http://localhost:8080/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_make_message() {
+        let msg = make_message("user", "hello".to_string());
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.content, Some("hello".to_string()));
+        assert!(msg.tool_calls.is_none());
+        assert!(msg.tool_call_id.is_none());
+        assert!(msg.name.is_none());
+    }
+
+    #[test]
+    fn test_make_message_system() {
+        let msg = make_message("system", "you are helpful".to_string());
+        assert_eq!(msg.role, "system");
+        assert_eq!(msg.content, Some("you are helpful".to_string()));
+    }
+
+    #[test]
+    fn test_tool_call_missing_name() {
+        let tools = ToolsCollection::new();
+        let req = ToolCall {
+            index: None,
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let ctx = crate::ToolContext::new(|_: &str| {});
+        let result = tool_call(&tools, &req, &ctx);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tool_call_missing_arguments() {
+        let tools = ToolsCollection::new();
+        let req = ToolCall {
+            index: None,
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "".to_string(),
+            },
+        };
+        let ctx = crate::ToolContext::new(|_: &str| {});
+        let result = tool_call(&tools, &req, &ctx);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tool_call_missing_id() {
+        let tools = ToolsCollection::new();
+        let req = ToolCall {
+            index: None,
+            id: "".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let ctx = crate::ToolContext::new(|_: &str| {});
+        let result = tool_call(&tools, &req, &ctx);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tool_call_unknown_tool() {
+        let tools = ToolsCollection::new();
+        let req = ToolCall {
+            index: None,
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "nonexistent_tool".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let ctx = crate::ToolContext::new(|_: &str| {});
+        let result = tool_call(&tools, &req, &ctx).unwrap();
+        assert!(result.content.unwrap().contains("invalid tool"));
+    }
+
+    #[test]
+    fn test_interrupted_error_display() {
+        let err = InterruptedError::new("user cancelled");
+        assert_eq!(format!("{}", err), "user cancelled");
+    }
+
+    #[test]
+    fn test_message_serialization() {
+        let msg = Message {
+            role: "assistant".to_string(),
+            content: Some("hello".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.role, "assistant");
+        assert_eq!(parsed.content, Some("hello".to_string()));
+    }
+
+    #[test]
+    fn test_message_skips_none_fields() {
+        let msg = Message {
+            role: "user".to_string(),
+            content: Some("hi".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+            name: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("tool_call_id"));
+        assert!(!json.contains("tool_calls"));
+        assert!(!json.contains("name"));
+    }
 }

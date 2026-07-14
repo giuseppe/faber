@@ -648,6 +648,10 @@ impl McpManager {
         Ok(count)
     }
 
+    pub fn has_tools(&self) -> bool {
+        self.tools.read().map(|t| !t.is_empty()).unwrap_or(false)
+    }
+
     pub fn has_tool(&self, name: &str) -> bool {
         self.tools
             .read()
