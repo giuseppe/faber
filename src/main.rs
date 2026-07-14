@@ -17,9 +17,12 @@
  *
  */
 
-mod db;
 mod github;
 mod openai;
+mod remote_db;
+mod server;
+
+use swarmblabla::db;
 
 use clap::{Parser, Subcommand};
 use console::Style;
@@ -191,6 +194,8 @@ const DEFAULT_ENDPOINT: &str = "http://localhost:8080";
 const DEFAULT_MODEL: &str = "google/gemini-2.5-pro";
 
 use swarmblabla::ToolContext;
+use swarmblabla::db_backend::DbBackend;
+use swarmblabla::local_db::LocalDb;
 
 /// Parse parameter strings in NAME=VALUE format into a HashMap
 fn parse_parameters(
@@ -1058,12 +1063,8 @@ fn tool_agent_create(params_str: &String, ctx: &ToolContext) -> Result<String, B
         description: Option<String>,
     }
     let params: Params = serde_json::from_str(params_str)?;
-    let conn = ctx.db_conn()?;
-    db::create_agent(
-        &conn,
-        &params.name,
-        params.description.as_deref().unwrap_or(""),
-    )?;
+    let db = ctx.db()?;
+    db.create_agent(&params.name, params.description.as_deref().unwrap_or(""))?;
     ctx.println(&format!("Agent '{}' created successfully", params.name));
     let result = serde_json::json!({"status": "created", "name": params.name});
     Ok(result.to_string())
@@ -1075,8 +1076,8 @@ fn tool_agent_delete(params_str: &String, ctx: &ToolContext) -> Result<String, B
         name: String,
     }
     let params: Params = serde_json::from_str(params_str)?;
-    let conn = ctx.db_conn()?;
-    let deleted = db::delete_agent(&conn, &params.name)?;
+    let db = ctx.db()?;
+    let deleted = db.delete_agent(&params.name)?;
     if deleted {
         ctx.println(&format!("Agent '{}' deleted", params.name));
         let result = serde_json::json!({"status": "deleted", "name": params.name});
@@ -1089,8 +1090,8 @@ fn tool_agent_delete(params_str: &String, ctx: &ToolContext) -> Result<String, B
 
 fn tool_agent_list(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     let _ = params_str;
-    let conn = ctx.db_conn()?;
-    let agents = db::list_agents(&conn)?;
+    let db = ctx.db()?;
+    let agents = db.list_agents()?;
     ctx.println(&format!("Found {} agent(s)", agents.len()));
     for a in &agents {
         ctx.println(&format!("  - {} ({})", a.name, a.description));
@@ -1104,8 +1105,8 @@ fn tool_agent_get(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
         name: String,
     }
     let params: Params = serde_json::from_str(params_str)?;
-    let conn = ctx.db_conn()?;
-    match db::get_agent(&conn, &params.name)? {
+    let db = ctx.db()?;
+    match db.get_agent(&params.name)? {
         Some(agent) => {
             ctx.println(&format!("Agent '{}': {}", agent.name, agent.description));
             Ok(serde_json::to_string(&agent)?)
@@ -1125,8 +1126,8 @@ fn tool_agent_data_set(params_str: &String, ctx: &ToolContext) -> Result<String,
         value: String,
     }
     let params: Params = serde_json::from_str(params_str)?;
-    let conn = ctx.db_conn()?;
-    db::set_agent_data(&conn, &params.agent, &params.key, &params.value)?;
+    let db = ctx.db()?;
+    db.set_agent_data(&params.agent, &params.key, &params.value)?;
     ctx.println(&format!(
         "Set data for agent '{}': {} = {}",
         params.agent, params.key, params.value
@@ -1142,8 +1143,8 @@ fn tool_agent_data_get(params_str: &String, ctx: &ToolContext) -> Result<String,
         key: String,
     }
     let params: Params = serde_json::from_str(params_str)?;
-    let conn = ctx.db_conn()?;
-    match db::get_agent_data(&conn, &params.agent, &params.key)? {
+    let db = ctx.db()?;
+    match db.get_agent_data(&params.agent, &params.key)? {
         Some(value) => {
             ctx.println(&format!(
                 "Agent '{}' data: {} = {}",
@@ -1171,8 +1172,8 @@ fn tool_agent_data_delete(
         key: String,
     }
     let params: Params = serde_json::from_str(params_str)?;
-    let conn = ctx.db_conn()?;
-    let deleted = db::delete_agent_data(&conn, &params.agent, &params.key)?;
+    let db = ctx.db()?;
+    let deleted = db.delete_agent_data(&params.agent, &params.key)?;
     if deleted {
         ctx.println(&format!(
             "Deleted key '{}' for agent '{}'",
@@ -1189,8 +1190,8 @@ fn tool_agent_data_list(params_str: &String, ctx: &ToolContext) -> Result<String
         agent: String,
     }
     let params: Params = serde_json::from_str(params_str)?;
-    let conn = ctx.db_conn()?;
-    let data = db::list_agent_data(&conn, &params.agent)?;
+    let db = ctx.db()?;
+    let data = db.list_agent_data(&params.agent)?;
     ctx.println(&format!(
         "Agent '{}' has {} data entries",
         params.agent,
@@ -1222,9 +1223,8 @@ fn tool_task_create_cron(params_str: &String, ctx: &ToolContext) -> Result<Strin
     }
     let params: Params = serde_json::from_str(params_str)?;
     let agent = params.agent_name.as_deref().or(ctx.agent_name.as_deref());
-    let conn = ctx.db_conn()?;
-    let id = db::create_cron_task(
-        &conn,
+    let db = ctx.db()?;
+    let id = db.create_cron_task(
         &params.name,
         params.description.as_deref().unwrap_or(""),
         &params.cron_expression,
@@ -1272,9 +1272,8 @@ fn tool_task_create_oneshot(
     };
 
     let agent = params.agent_name.as_deref().or(ctx.agent_name.as_deref());
-    let conn = ctx.db_conn()?;
-    let id = db::create_oneshot_task(
-        &conn,
+    let db = ctx.db()?;
+    let id = db.create_oneshot_task(
         &params.name,
         params.description.as_deref().unwrap_or(""),
         &run_at,
@@ -1296,8 +1295,8 @@ fn tool_task_delete(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         id: i64,
     }
     let params: Params = serde_json::from_str(params_str)?;
-    let conn = ctx.db_conn()?;
-    let deleted = db::delete_task(&conn, params.id)?;
+    let db = ctx.db()?;
+    let deleted = db.delete_task(params.id)?;
     if deleted {
         ctx.println(&format!("Deleted task id={}", params.id));
     }
@@ -1312,8 +1311,8 @@ fn tool_task_list(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
         agent_name: Option<String>,
     }
     let params: Params = serde_json::from_str(params_str)?;
-    let conn = ctx.db_conn()?;
-    let tasks = db::list_tasks(&conn, params.agent_name.as_deref())?;
+    let db = ctx.db()?;
+    let tasks = db.list_tasks(params.agent_name.as_deref())?;
     ctx.println(&format!("Found {} task(s)", tasks.len()));
     for t in &tasks {
         let status = if t.enabled { "enabled" } else { "disabled" };
@@ -1331,8 +1330,8 @@ fn tool_task_get(params_str: &String, ctx: &ToolContext) -> Result<String, Box<d
         id: i64,
     }
     let params: Params = serde_json::from_str(params_str)?;
-    let conn = ctx.db_conn()?;
-    match db::get_task(&conn, params.id)? {
+    let db = ctx.db()?;
+    match db.get_task(params.id)? {
         Some(task) => {
             ctx.println(&format!(
                 "Task [{}]: {} ({})",
@@ -1354,8 +1353,8 @@ fn tool_task_set_enabled(params_str: &String, ctx: &ToolContext) -> Result<Strin
         enabled: bool,
     }
     let params: Params = serde_json::from_str(params_str)?;
-    let conn = ctx.db_conn()?;
-    let updated = db::set_task_enabled(&conn, params.id, params.enabled)?;
+    let db = ctx.db()?;
+    let updated = db.set_task_enabled(params.id, params.enabled)?;
     let status = if params.enabled {
         "enabled"
     } else {
@@ -1371,8 +1370,8 @@ fn tool_task_set_enabled(params_str: &String, ctx: &ToolContext) -> Result<Strin
 
 fn tool_task_pending(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     let _ = params_str;
-    let conn = ctx.db_conn()?;
-    let tasks = db::get_pending_tasks(&conn)?;
+    let db = ctx.db()?;
+    let tasks = db.get_pending_tasks()?;
     ctx.println(&format!("Found {} pending task(s)", tasks.len()));
     for t in &tasks {
         ctx.println(&format!(
@@ -1394,8 +1393,8 @@ fn tool_send_message(params_str: &String, ctx: &ToolContext) -> Result<String, B
     }
     let params: Params = serde_json::from_str(params_str)?;
     let from = ctx.agent_name.as_deref().unwrap_or("default");
-    let conn = ctx.db_conn()?;
-    let id = db::send_notification(&conn, from, &params.to, &params.message)?;
+    let db = ctx.db()?;
+    let id = db.send_notification(from, &params.to, &params.message)?;
     ctx.println(&format!(
         "Message sent to agent '{}' (notification #{})",
         params.to, id
@@ -1427,12 +1426,11 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     let prompt = params.prompt.clone();
 
     let agent_config = {
-        let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
-        if db::get_agent(&conn, &agent_name)?.is_none() {
-            db::create_agent(&conn, &agent_name, &format!("Sub-agent: {}", agent_name))?;
+        if db.get_agent(&agent_name)?.is_none() {
+            db.create_agent(&agent_name, &format!("Sub-agent: {}", agent_name))?;
         }
-        let _ = db::claim_agent(&conn, &agent_name, &sa_ctx.session_id);
-        db::get_agent_config(&conn, &agent_name)?
+        let _ = db.claim_agent(&agent_name, &sa_ctx.session_id);
+        db.get_agent_config(&agent_name)?
     };
 
     if let Some(ref model) = agent_config.model {
@@ -1485,16 +1483,13 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
             }
             Err(e) => format!("Error: {}", e),
         };
-        if let Ok(conn) = db.lock() {
-            let notification = serde_json::json!({
-                "type": "subagent_result",
-                "agent": agent_name,
-                "prompt": prompt,
-                "response": response_text,
-            });
-            let _ =
-                db::send_notification(&conn, &agent_name, &parent_agent, &notification.to_string());
-        }
+        let notification = serde_json::json!({
+            "type": "subagent_result",
+            "agent": agent_name,
+            "prompt": prompt,
+            "response": response_text,
+        });
+        let _ = db.send_notification(&agent_name, &parent_agent, &notification.to_string());
         active_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     });
 
@@ -2566,7 +2561,7 @@ fn post_request_and_print_output(
     prompt: &String,
     system_prompts: Option<Vec<String>>,
     opts: &Opts,
-    db: Option<Arc<Mutex<rusqlite::Connection>>>,
+    db: Option<Arc<dyn DbBackend>>,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Prompt: {}", prompt);
 
@@ -2643,7 +2638,7 @@ fn prompt_command(
     prompt: &String,
     files: &Vec<String>,
     opts: &Opts,
-    db: Option<Arc<Mutex<rusqlite::Connection>>>,
+    db: Option<Arc<dyn DbBackend>>,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Executing prompt command with {} files", files.len());
     let mut system_prompts: Vec<String> = vec![];
@@ -2813,7 +2808,7 @@ fn handle_chat_command(
     tools: &ToolsCollection,
     opts: &Opts,
     chat_pb: &mut ChatPrinter,
-    db: &Option<Arc<Mutex<rusqlite::Connection>>>,
+    db: &Option<Arc<dyn DbBackend>>,
     openai_opts: &mut openai::Opts,
     prompt_text: &Arc<Mutex<String>>,
     agent_names: &Arc<Mutex<Vec<String>>>,
@@ -2841,8 +2836,7 @@ fn handle_chat_command(
         ChatCommand::Clear => {
             *messages = initialize_chat_messages(tools, opts);
             if let Some(db) = db {
-                let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
-                db::clear_agent_messages(&conn, &active_agent.name)?;
+                db.clear_agent_messages(&active_agent.name)?;
             }
             chat_pb.println("Chat history cleared and system prompts restored.");
             Ok(true)
@@ -2919,8 +2913,7 @@ fn handle_chat_command(
         }
         ChatCommand::Agents => {
             if let Some(db) = db {
-                let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
-                let agents = db::list_agents(&conn)?;
+                let agents = db.list_agents()?;
                 if agents.is_empty() {
                     chat_pb.println("No agents.");
                 } else {
@@ -2933,7 +2926,7 @@ fn handle_chat_command(
                         Cell::new("Active"),
                     ]));
                     for agent in &agents {
-                        let count = db::agent_message_count(&conn, &agent.name)?;
+                        let count = db.agent_message_count(&agent.name)?;
                         let active = if agent.name == active_agent.name {
                             "* (this session)"
                         } else if agent.session_id.is_some()
@@ -2968,8 +2961,7 @@ fn handle_chat_command(
         }
         ChatCommand::CreateAgent(name) => {
             if let Some(db) = db {
-                let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
-                match db::create_agent(&conn, &name, "") {
+                match db.create_agent(&name, "") {
                     Ok(_) => {
                         if let Ok(mut names) = agent_names.lock() {
                             if !names.contains(&name) {
@@ -2996,9 +2988,7 @@ fn handle_chat_command(
                 return Ok(true);
             }
             if let Some(db) = db {
-                let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
-
-                if db::get_agent(&conn, &name)?.is_none() {
+                if db.get_agent(&name)?.is_none() {
                     chat_pb.println(&format!(
                         "Agent '{}' not found. Use /create-agent {} first.",
                         name, name
@@ -3006,7 +2996,7 @@ fn handle_chat_command(
                     return Ok(true);
                 }
 
-                if !db::claim_agent(&conn, &name, session_id)? {
+                if !db.claim_agent(&name, session_id)? {
                     chat_pb.println(&format!(
                         "Agent '{}' is already claimed by another session.",
                         name
@@ -3014,13 +3004,22 @@ fn handle_chat_command(
                     return Ok(true);
                 }
 
-                db::save_agent_messages(&conn, &active_agent.name, &active_agent.messages)?;
-                db::release_agent(&conn, &active_agent.name, session_id)?;
+                let msgs: Vec<serde_json::Value> = active_agent
+                    .messages
+                    .iter()
+                    .map(|m| serde_json::to_value(m).unwrap())
+                    .collect();
+                db.save_agent_messages(&active_agent.name, &msgs)?;
+                db.release_agent(&active_agent.name, session_id)?;
 
-                let agent_config = db::get_agent_config(&conn, &name)?;
+                let agent_config = db.get_agent_config(&name)?;
                 *openai_opts = build_openai_opts(opts, &agent_config);
 
-                let loaded: Vec<Message> = db::load_agent_messages(&conn, &name)?;
+                let vals = db.load_agent_messages(&name)?;
+                let loaded: Vec<Message> = vals
+                    .into_iter()
+                    .map(|v| serde_json::from_value(v).unwrap())
+                    .collect();
                 active_agent.name = name.clone();
                 if loaded.is_empty() {
                     active_agent.messages = initialize_agent_messages(tools, opts, &agent_config);
@@ -3047,8 +3046,7 @@ fn handle_chat_command(
                 return Ok(true);
             }
             if let Some(db) = db {
-                let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
-                if db::delete_agent(&conn, &name)? {
+                if db.delete_agent(&name)? {
                     if let Ok(mut names) = agent_names.lock() {
                         names.retain(|n| n != &name);
                     }
@@ -3474,7 +3472,7 @@ fn format_tool_output(output: &str) -> String {
 fn execute_scheduled_command(
     command: &str,
     tools: &ToolsCollection,
-    db: &Option<Arc<Mutex<rusqlite::Connection>>>,
+    db: &Option<Arc<dyn DbBackend>>,
 ) -> Option<(Message, Message)> {
     let parsed: Result<serde_json::Value, _> = serde_json::from_str(command);
     let (tool_name, arguments) = match parsed {
@@ -3536,22 +3534,17 @@ fn execute_scheduled_command(
 }
 
 fn scheduler_loop(
-    db: Arc<Mutex<rusqlite::Connection>>,
+    db: Arc<dyn DbBackend>,
     tools: Arc<ToolsCollection>,
     tx: mpsc::Sender<(Option<String>, String, Message, Message)>,
 ) {
-    let db_opt = Some(db.clone());
+    let db_opt: Option<Arc<dyn DbBackend>> = Some(db.clone());
     loop {
         std::thread::sleep(Duration::from_secs(1));
-        let conn = match db.lock() {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let tasks = match db::get_pending_tasks(&conn) {
+        let tasks = match db.get_pending_tasks() {
             Ok(t) => t,
             Err(_) => continue,
         };
-        drop(conn);
 
         for task in tasks {
             let command = if task.command.is_empty() {
@@ -3566,15 +3559,12 @@ fn scheduler_loop(
                 let _ = tx.send((task.agent_name.clone(), command, assistant_msg, tool_msg));
             }
 
-            if let Ok(conn) = db.lock() {
-                let _ = db::mark_task_executed(
-                    &conn,
-                    task.id,
-                    &task.task_type,
-                    task.cron_expression.as_deref(),
-                    task.max_runs,
-                );
-            }
+            let _ = db.mark_task_executed(
+                task.id,
+                &task.task_type,
+                task.cron_expression.as_deref(),
+                task.max_runs,
+            );
         }
     }
 }
@@ -3583,7 +3573,7 @@ fn scheduler_loop(
 fn chat_command(
     opts: &Opts,
     global_multi_progress: Arc<MultiProgress>,
-    db: Option<Arc<Mutex<rusqlite::Connection>>>,
+    db: Option<Arc<dyn DbBackend>>,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Executing chat command");
 
@@ -3591,11 +3581,7 @@ fn chat_command(
 
     // Create rustyline editor with history
     let initial_agent_names = if let Some(ref db) = db {
-        let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
-        db::list_agents(&conn)?
-            .iter()
-            .map(|a| a.name.clone())
-            .collect()
+        db.list_agents()?.iter().map(|a| a.name.clone()).collect()
     } else {
         vec!["default".to_string()]
     };
@@ -3631,21 +3617,20 @@ fn chat_command(
     let initial_agent_name = opts.agent.clone().unwrap_or_else(|| "default".to_string());
 
     let agent_config = if let Some(ref db) = db {
-        let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
-        db::ensure_default_agent(&conn)?;
+        db.ensure_default_agent()?;
         if initial_agent_name != "default" {
-            if db::get_agent(&conn, &initial_agent_name)?.is_none() {
-                db::create_agent(&conn, &initial_agent_name, "")?;
+            if db.get_agent(&initial_agent_name)?.is_none() {
+                db.create_agent(&initial_agent_name, "")?;
             }
         }
-        if !db::claim_agent(&conn, &initial_agent_name, &session_id)? {
+        if !db.claim_agent(&initial_agent_name, &session_id)? {
             return Err(format!(
                 "Agent '{}' is already claimed by another session.",
                 initial_agent_name
             )
             .into());
         }
-        db::get_agent_config(&conn, &initial_agent_name)?
+        db.get_agent_config(&initial_agent_name)?
     } else {
         db::AgentConfig {
             model: None,
@@ -3655,8 +3640,11 @@ fn chat_command(
     };
 
     let initial_messages = if let Some(ref db) = db {
-        let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
-        let loaded: Vec<Message> = db::load_agent_messages(&conn, &initial_agent_name)?;
+        let vals = db.load_agent_messages(&initial_agent_name)?;
+        let loaded: Vec<Message> = vals
+            .into_iter()
+            .map(|v| serde_json::from_value(v).unwrap())
+            .collect();
         if loaded.is_empty() {
             initialize_agent_messages(&tools, opts, &agent_config)
         } else {
@@ -3708,9 +3696,7 @@ fn chat_command(
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_secs(5));
-                if let Ok(conn) = heartbeat_db.lock() {
-                    let _ = db::heartbeat_all(&conn, &heartbeat_session);
-                }
+                let _ = heartbeat_db.heartbeat_all(&heartbeat_session);
             }
         });
     }
@@ -3758,10 +3744,10 @@ fn chat_command(
             chat_pb.println_agent(target, &format!("Scheduled task fired: {}", command));
             if target != active_agent.name {
                 if let Some(ref db) = db {
-                    if let Ok(conn) = db.lock() {
-                        let _ = db::append_agent_message(&conn, target, &assistant_msg);
-                        let _ = db::append_agent_message(&conn, target, &tool_msg);
-                    }
+                    let assistant_val = serde_json::to_value(&assistant_msg).unwrap();
+                    let tool_val = serde_json::to_value(&tool_msg).unwrap();
+                    let _ = db.append_agent_message(target, &assistant_val);
+                    let _ = db.append_agent_message(target, &tool_val);
                 }
             }
             if let Some(ref output) = tool_msg.content {
@@ -3775,29 +3761,27 @@ fn chat_command(
 
         let mut pending_injection: Option<String> = None;
         if let Some(ref db) = db {
-            if let Ok(conn) = db.lock() {
-                if let Ok(notifications) = db::poll_notifications_for_session(&conn, &session_id) {
-                    for notif in notifications {
-                        let display_msg = if let Ok(obj) =
-                            serde_json::from_str::<serde_json::Value>(&notif.message)
-                        {
-                            if obj.get("type").and_then(|v| v.as_str()) == Some("subagent_result") {
-                                obj.get("response")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or(&notif.message)
-                                    .to_string()
-                            } else {
-                                notif.message.clone()
-                            }
+            if let Ok(notifications) = db.poll_notifications_for_session(&session_id) {
+                for notif in notifications {
+                    let display_msg = if let Ok(obj) =
+                        serde_json::from_str::<serde_json::Value>(&notif.message)
+                    {
+                        if obj.get("type").and_then(|v| v.as_str()) == Some("subagent_result") {
+                            obj.get("response")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(&notif.message)
+                                .to_string()
                         } else {
                             notif.message.clone()
-                        };
-                        chat_pb.println_agent(&notif.from_agent, &display_msg);
-                        pending_injection = Some(format!(
-                            "[Message from agent '{}']: {}",
-                            notif.from_agent, notif.message
-                        ));
-                    }
+                        }
+                    } else {
+                        notif.message.clone()
+                    };
+                    chat_pb.println_agent(&notif.from_agent, &display_msg);
+                    pending_injection = Some(format!(
+                        "[Message from agent '{}']: {}",
+                        notif.from_agent, notif.message
+                    ));
                 }
             }
         }
@@ -3823,9 +3807,7 @@ fn chat_command(
                 }
                 Ok(Err(rustyline::error::ReadlineError::Eof)) => {
                     if let Some(ref db) = db {
-                        if let Ok(conn) = db.lock() {
-                            let _ = db::release_all_agents(&conn, &session_id);
-                        }
+                        let _ = db.release_all_agents(&session_id);
                     }
                     return Ok(());
                 }
@@ -3837,9 +3819,7 @@ fn chat_command(
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     if let Some(ref db) = db {
-                        if let Ok(conn) = db.lock() {
-                            let _ = db::release_all_agents(&conn, &session_id);
-                        }
+                        let _ = db.release_all_agents(&session_id);
                     }
                     return Ok(());
                 }
@@ -3867,13 +3847,13 @@ fn chat_command(
             false => {
                 if let ChatCommand::Quit = parse_chat_command(&line) {
                     if let Some(ref db) = db {
-                        let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
-                        let _ = db::save_agent_messages(
-                            &conn,
-                            &active_agent.name,
-                            &active_agent.messages,
-                        );
-                        let _ = db::release_all_agents(&conn, &session_id);
+                        let msgs: Vec<serde_json::Value> = active_agent
+                            .messages
+                            .iter()
+                            .map(|m| serde_json::to_value(m).unwrap())
+                            .collect();
+                        let _ = db.save_agent_messages(&active_agent.name, &msgs);
+                        let _ = db.release_all_agents(&session_id);
                     }
                     return Ok(());
                 }
@@ -3911,12 +3891,12 @@ fn chat_command(
                                     }
                                 }
                                 if let Some(ref db) = db {
-                                    let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
-                                    let _ = db::save_agent_messages(
-                                        &conn,
-                                        &active_agent.name,
-                                        &active_agent.messages,
-                                    );
+                                    let msgs: Vec<serde_json::Value> = active_agent
+                                        .messages
+                                        .iter()
+                                        .map(|m| serde_json::to_value(m).unwrap())
+                                        .collect();
+                                    let _ = db.save_agent_messages(&active_agent.name, &msgs);
                                 }
                             }
                             Err(e) => {
@@ -3956,12 +3936,12 @@ fn chat_command(
                             Ok(response) => {
                                 active_agent.messages = response.history;
                                 if let Some(ref db) = db {
-                                    let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
-                                    let _ = db::save_agent_messages(
-                                        &conn,
-                                        &active_agent.name,
-                                        &active_agent.messages,
-                                    );
+                                    let msgs: Vec<serde_json::Value> = active_agent
+                                        .messages
+                                        .iter()
+                                        .map(|m| serde_json::to_value(m).unwrap())
+                                        .collect();
+                                    let _ = db.save_agent_messages(&active_agent.name, &msgs);
                                 }
                             }
                             Err(e) => {
@@ -3988,7 +3968,8 @@ fn gc_command(opts: &Opts) -> Result<(), Box<dyn Error>> {
         .ok_or("No db_path configured. Set 'db_path' in your config file.")?;
     let conn = rusqlite::Connection::open(db_path)?;
     db::initialize_db(&conn)?;
-    let removed = db::gc_agents(&conn)?;
+    let db = LocalDb::new(Arc::new(Mutex::new(conn)));
+    let removed = db.gc_agents()?;
     if removed.is_empty() {
         println!("No dormant agents to clean up.");
     } else {
@@ -4154,6 +4135,15 @@ struct Opts {
     #[clap(long)]
     /// Start chat session with this agent instead of 'default'
     agent: Option<String>,
+    #[clap(long)]
+    /// Connect to a remote swarmblabla server instead of using a local database
+    server: Option<String>,
+    #[clap(long)]
+    /// Pre-shared key for server authentication
+    server_key: Option<String>,
+    #[clap(long)]
+    /// Read server key from file (first line)
+    server_key_file: Option<String>,
 
     #[clap(subcommand)]
     #[serde(skip)]
@@ -4180,6 +4170,9 @@ impl Default for Opts {
             no_system_prompts: false,
             db_path: None,
             agent: None,
+            server: None,
+            server_key: None,
+            server_key_file: None,
             command: CliCommand::Chat {},
             args: Vec::new(),
         }
@@ -4249,6 +4242,18 @@ impl Opts {
             self.db_path = config.db_path;
         }
 
+        if self.server.is_none() {
+            self.server = config.server;
+        }
+
+        if self.server_key.is_none() {
+            self.server_key = config.server_key;
+        }
+
+        if self.server_key_file.is_none() {
+            self.server_key_file = config.server_key_file;
+        }
+
         debug!("Configuration merge completed");
     }
 }
@@ -4274,6 +4279,19 @@ enum CliCommand {
 
     /// Remove dormant agents (no active session)
     Gc {},
+
+    /// Start a server exposing the DB API over TCP
+    Serve {
+        /// Address to bind to
+        #[clap(long, default_value = "127.0.0.1:9090")]
+        bind: String,
+        /// Pre-shared key for client authentication
+        #[clap(long)]
+        auth_key: Option<String>,
+        /// Read auth key from file (first line)
+        #[clap(long)]
+        auth_key_file: Option<String>,
+    },
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -4323,11 +4341,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         opts.model = Some("".to_string());
     }
 
-    let db_connection = if let Some(ref db_path) = opts.db_path {
+    let db_connection: Option<Arc<dyn DbBackend>> = if let Some(ref server_addr) = opts.server {
+        debug!("Connecting to remote server at: {}", server_addr);
+        let remote = remote_db::RemoteDb::connect(server_addr)?;
+        let key = match (&opts.server_key, &opts.server_key_file) {
+            (Some(k), _) => Some(k.clone()),
+            (_, Some(f)) => {
+                let content = std::fs::read_to_string(f)?;
+                Some(content.lines().next().unwrap_or("").to_string())
+            }
+            _ => None,
+        };
+        if let Some(ref k) = key {
+            remote.authenticate(k)?;
+        }
+        Some(Arc::new(remote))
+    } else if let Some(ref db_path) = opts.db_path {
         debug!("Opening SQLite database at: {}", db_path);
         let conn = rusqlite::Connection::open(db_path)?;
         db::initialize_db(&conn)?;
-        Some(Arc::new(Mutex::new(conn)))
+        Some(Arc::new(LocalDb::new(Arc::new(Mutex::new(conn)))))
     } else {
         debug!("No db_path configured, database tools will be unavailable");
         None
@@ -4344,6 +4377,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Models {} => list_models_command(&opts),
         CliCommand::ListTools {} => list_tools_command(),
         CliCommand::Gc {} => gc_command(&opts),
+        CliCommand::Serve {
+            bind,
+            auth_key,
+            auth_key_file,
+        } => {
+            let db_path = opts
+                .db_path
+                .as_ref()
+                .ok_or("--db-path is required for serve command")?;
+            let key = match (auth_key, auth_key_file) {
+                (Some(k), _) => Some(k.clone()),
+                (_, Some(f)) => {
+                    let content = std::fs::read_to_string(f)?;
+                    Some(content.lines().next().unwrap_or("").to_string())
+                }
+                _ => None,
+            };
+            server::serve_command(bind, db_path, key.as_deref())
+        }
     };
 
     result

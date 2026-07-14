@@ -119,6 +119,43 @@ swarmblabla --parameter temperature=0.2 --parameter top_p=0.9 --parameter freque
 
 **Note**: Parameter availability depends on the model being used. Check your model's documentation for supported parameters.
 
+### Serve (multi-node)
+
+Start a server that exposes the database over TCP so remote swarmblabla
+instances can share state (agents, notifications, tasks) as if they
+were on the same machine:
+
+```bash
+swarmblabla --db-path state.db serve --bind 127.0.0.1:9090
+```
+
+With authentication:
+
+```bash
+swarmblabla --db-path state.db serve --bind 127.0.0.1:9090 --auth-key mysecret
+```
+
+Or read the key from a file:
+
+```bash
+swarmblabla --db-path state.db serve --auth-key-file /path/to/keyfile
+```
+
+Remote clients connect with `--server` instead of `--db-path`:
+
+```bash
+swarmblabla --server 127.0.0.1:9090 --server-key mysecret chat
+```
+
+The protocol is newline-delimited JSON over TCP. TLS is not built in —
+use SSH tunneling, WireGuard, or a reverse proxy for encryption:
+
+```bash
+# SSH tunnel example
+ssh -L 9090:localhost:9090 remote-host
+swarmblabla --server 127.0.0.1:9090 --server-key mysecret chat
+```
+
 ### Use a raw query
 
 ```

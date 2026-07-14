@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::str::FromStr;
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct AgentRow {
     pub name: String,
     pub description: String,
@@ -32,7 +32,7 @@ pub struct AgentRow {
     pub heartbeat_at: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TaskRow {
     pub id: i64,
     pub agent_name: Option<String>,
@@ -526,6 +526,7 @@ pub fn mark_task_executed(
 
 // --- Agent Config ---
 
+#[derive(Serialize, Deserialize)]
 pub struct AgentConfig {
     pub model: Option<String>,
     pub endpoint: Option<String>,
@@ -618,7 +619,7 @@ pub fn agent_message_count(conn: &Connection, agent_name: &str) -> Result<i64, B
 
 // --- Notifications ---
 
-#[allow(dead_code)]
+#[derive(Serialize, Deserialize)]
 pub struct NotificationRow {
     pub id: i64,
     pub from_agent: String,

@@ -18,15 +18,19 @@
  */
 
 use std::any::Any;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 pub mod db;
+pub mod db_backend;
 pub mod github;
+pub mod local_db;
 pub mod openai;
+#[allow(dead_code)]
+pub mod protocol;
 
 pub struct ToolContext {
     pub println: Box<dyn Fn(&str) + Send + Sync>,
-    pub db: Option<Arc<Mutex<rusqlite::Connection>>>,
+    pub db: Option<Arc<dyn db_backend::DbBackend>>,
     pub agent_name: Option<String>,
     pub extra: Option<Arc<dyn Any + Send + Sync>>,
 }
@@ -48,19 +52,11 @@ impl ToolContext {
         (self.println)(msg);
     }
 
-    pub fn db_conn(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, rusqlite::Connection>, Box<dyn std::error::Error>> {
-        self.db
-            .as_ref()
-            .ok_or_else(|| {
-                "Database not configured. Set 'db_path' in your config file."
-                    .to_string()
-                    .into()
-            })
-            .and_then(|arc| {
-                arc.lock()
-                    .map_err(|e| format!("DB lock poisoned: {}", e).into())
-            })
+    pub fn db(&self) -> Result<&dyn db_backend::DbBackend, Box<dyn std::error::Error>> {
+        self.db.as_ref().map(|arc| arc.as_ref()).ok_or_else(|| {
+            "Database not configured. Set 'db_path' in your config file."
+                .to_string()
+                .into()
+        })
     }
 }
