@@ -15,8 +15,19 @@ pub enum Position {
 pub const STATUS_LINE_COUNT: u16 = 1;
 pub const POSITION: Position = Position::Bottom;
 
+fn set_terminal_rows(rows: u16) {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
+            ws.ws_row = rows;
+            libc::ioctl(libc::STDERR_FILENO, libc::TIOCSWINSZ, &ws);
+        }
+    }
+}
+
 pub struct StatusBar {
     enabled: bool,
+    original_rows: u16,
     message: Arc<Mutex<String>>,
     start_time: Arc<Mutex<Instant>>,
     active: Arc<AtomicBool>,
@@ -47,6 +58,8 @@ impl StatusBar {
             scroll_top, scroll_bottom, status_line, scroll_bottom
         );
         let _ = std::io::stderr().flush();
+
+        set_terminal_rows(rows - STATUS_LINE_COUNT);
 
         let message = Arc::new(Mutex::new(String::new()));
         let start_time = Arc::new(Mutex::new(Instant::now()));
@@ -93,6 +106,7 @@ impl StatusBar {
 
         Self {
             enabled: true,
+            original_rows: rows,
             message,
             start_time,
             active,
@@ -105,6 +119,7 @@ impl StatusBar {
     fn disabled() -> Self {
         Self {
             enabled: false,
+            original_rows: 0,
             message: Arc::new(Mutex::new(String::new())),
             start_time: Arc::new(Mutex::new(Instant::now())),
             active: Arc::new(AtomicBool::new(false)),
@@ -149,12 +164,11 @@ impl Drop for StatusBar {
             let _ = handle.join();
         }
         if self.enabled {
-            let term = console::Term::stderr();
-            let (rows, _) = term.size();
+            set_terminal_rows(self.original_rows);
             eprint!(
                 "\x1b[r\x1b[{};1H\x1b[2K\x1b[{};1H",
-                rows,
-                rows - STATUS_LINE_COUNT
+                self.original_rows,
+                self.original_rows - STATUS_LINE_COUNT
             );
             let _ = std::io::stderr().flush();
         }
