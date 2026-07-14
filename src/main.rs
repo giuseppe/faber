@@ -763,14 +763,12 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
 
     let file_mode = if params.mode.starts_with("0o") {
         u32::from_str_radix(&params.mode[2..], 8)
+    } else if params.mode.starts_with("0x") {
+        u32::from_str_radix(&params.mode[2..], 16)
     } else if params.mode.starts_with("0") && params.mode.len() > 1 {
         u32::from_str_radix(&params.mode[1..], 8)
     } else {
-        if params.mode.starts_with("0x") {
-            u32::from_str_radix(&params.mode[2..], 16)
-        } else {
-            params.mode.parse::<u32>()
-        }
+        params.mode.parse::<u32>()
     }
     .map_err(|_| {
         format!(
