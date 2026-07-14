@@ -2529,32 +2529,11 @@ fn add_tools_prompt(messages: &mut Vec<Message>, use_tools: bool) {
     }
 }
 
-fn add_predefined_system_prompts(messages: &mut Vec<Message>) {
-    let predefined_prompts = vec![
-        "You are swarmblabla, an AI assistant that helps with software development.",
-        "When working with code, maintain best practices and consider security implications.",
-    ];
-
-    for prompt in predefined_prompts {
-        messages.push(make_message("system", prompt.to_string()));
-    }
-}
-
-fn initialize_chat_messages(tools: &ToolsCollection, opts: &Opts) -> Vec<Message> {
+fn initialize_chat_messages(tools: &ToolsCollection, _opts: &Opts) -> Vec<Message> {
     let mut messages: Vec<Message> = vec![];
 
-    // Add predefined system prompts unless explicitly disabled
-    if !opts.no_system_prompts {
-        add_predefined_system_prompts(&mut messages);
-
-        let use_tools = !tools.is_empty()
-            && match opts.tool_choice {
-                Some(ref v) => v != "none",
-                None => true,
-            };
-
-        add_tools_prompt(&mut messages, use_tools);
-    }
+    let use_tools = !tools.is_empty();
+    add_tools_prompt(&mut messages, use_tools);
 
     debug!("Initialized chat with {} system messages", messages.len());
     messages
@@ -4221,9 +4200,6 @@ struct Opts {
     /// Set model parameters in NAME=VALUE format (e.g., --parameter temperature=0.7 --parameter top_p=0.9)
     parameter: Vec<String>,
     #[clap(long)]
-    /// Skip adding any system prompts
-    no_system_prompts: bool,
-    #[clap(long)]
     /// Path to the SQLite database file for persistent storage (agents, tasks, memory)
     db_path: Option<String>,
     #[clap(long)]
@@ -4265,7 +4241,6 @@ impl Default for Opts {
             tool_choice: None,
             api_key: None,
             parameter: Vec::new(),
-            no_system_prompts: false,
             db_path: None,
             agent: None,
             server: None,
@@ -4331,10 +4306,6 @@ impl Opts {
             let mut merged_params = config.parameter;
             merged_params.extend(self.parameter.clone());
             self.parameter = merged_params;
-        }
-
-        if !self.no_system_prompts && config.no_system_prompts {
-            self.no_system_prompts = true;
         }
 
         if self.db_path.is_none() {

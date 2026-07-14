@@ -62,8 +62,6 @@ You can customize the AI interaction using global options placed before the comm
 --endpoint <url>: Override the API endpoint URL. Automatically appends "/chat/completions" for requests.
 
 --parameter <name>=<value>: Set model parameters to control AI behavior. Can be used multiple times.
-
---no-system-prompts: Skip adding any system prompts to the conversation.
 ```
 
 ### Model Parameters
