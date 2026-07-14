@@ -257,6 +257,7 @@ pub enum StatusUpdate {
     StreamProcessing {
         bytes_read: usize,
         chunks_processed: u32,
+        #[allow(dead_code)]
         latest_content: String,
     },
     Complete {

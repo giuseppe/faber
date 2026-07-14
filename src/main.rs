@@ -21,14 +21,13 @@ mod github;
 mod openai;
 mod remote_db;
 mod server;
+mod status_bar;
 
 use swarmblabla::db;
 
 use clap::{Parser, Subcommand};
 use console::Style;
 use env_logger::Env;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use indicatif_log_bridge::LogWrapper;
 use log::{debug, trace, warn};
 use pathrs::{Root, flags::OpenFlags};
 use prettytable::{Cell, Row, Table, format};
@@ -146,8 +145,9 @@ impl Highlighter for ChatHelper {}
 impl Validator for ChatHelper {}
 impl rustyline::Helper for ChatHelper {}
 
+#[derive(Clone)]
 struct ChatPrinter {
-    inner: Option<Box<dyn rustyline::ExternalPrinter>>,
+    printer: Arc<Mutex<Option<Box<dyn rustyline::ExternalPrinter + Send>>>>,
 }
 
 const AGENT_COLORS: &[console::Color] = &[
@@ -170,18 +170,28 @@ fn agent_style(name: &str) -> Style {
 
 impl ChatPrinter {
     fn new() -> Self {
-        Self { inner: None }
-    }
-
-    fn println(&mut self, msg: &str) {
-        if let Some(ref mut printer) = self.inner {
-            let _ = printer.print(format!("{}\n", msg));
-        } else {
-            println!("{}", msg);
+        Self {
+            printer: Arc::new(Mutex::new(None)),
         }
     }
 
-    fn println_agent(&mut self, agent_name: &str, msg: &str) {
+    fn set_printer(&self, p: Box<dyn rustyline::ExternalPrinter + Send>) {
+        if let Ok(mut guard) = self.printer.lock() {
+            *guard = Some(p);
+        }
+    }
+
+    fn println(&self, msg: &str) {
+        if let Ok(mut guard) = self.printer.lock() {
+            if let Some(ref mut p) = *guard {
+                let _ = p.print(format!("{}\n", msg));
+                return;
+            }
+        }
+        println!("{}", msg);
+    }
+
+    fn println_agent(&self, agent_name: &str, msg: &str) {
         let style = agent_style(agent_name);
         let header = style.apply_to(format!("── {} ──", agent_name));
         self.println(&format!("{}", header));
@@ -2801,7 +2811,7 @@ fn handle_chat_command(
     active_agent: &mut AgentState,
     tools: &ToolsCollection,
     opts: &Opts,
-    chat_pb: &mut ChatPrinter,
+    chat_pb: &ChatPrinter,
     db: &Option<Arc<dyn DbBackend>>,
     openai_opts: &mut openai::Opts,
     prompt_text: &Arc<Mutex<String>>,
@@ -3133,32 +3143,21 @@ fn format_tool_arguments(args_json: &str) -> String {
     }
 }
 
-fn setup_progress_bars(
-    global_multi_progress: &Arc<MultiProgress>,
-) -> Result<(ProgressBar, ProgressBar), Box<dyn Error>> {
-    let streaming_pb = global_multi_progress.add(ProgressBar::no_length());
-    streaming_pb.set_style(ProgressStyle::with_template("{msg}")?);
-
-    let status_pb = global_multi_progress.add(ProgressBar::new_spinner());
-    status_pb.set_style(
-        ProgressStyle::with_template("{spinner:.cyan.bold} {msg:.white.bold} │ {elapsed}")?
-            .tick_strings(&["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]),
-    );
-
-    Ok((streaming_pb, status_pb))
-}
-
-fn create_response_mode(streaming_pb: ProgressBar, status_pb: ProgressBar) -> ResponseMode {
+fn create_response_mode(
+    printer: ChatPrinter,
+    status_bar: Arc<status_bar::StatusBar>,
+) -> ResponseMode {
     let tool_active = Arc::new(AtomicBool::new(false));
-    let stream_buffer = Arc::new(std::sync::Mutex::new(String::new()));
-    let previous_status = Arc::new(std::sync::Mutex::new(Option::<(String, String)>::None));
+    let completed = Arc::new(AtomicBool::new(false));
+    let stream_buffer = Arc::new(Mutex::new(String::new()));
 
-    let status_pb_progress_clone = status_pb.clone();
-    let streaming_pb_progress_clone = streaming_pb.clone();
-    let tool_active_stream_clone = tool_active.clone();
+    let printer_for_stream = printer.clone();
+    let tool_active_for_stream = tool_active.clone();
     let stream_buffer_clone = stream_buffer.clone();
-    let streaming_pb_clone = streaming_pb.clone();
-    let previous_status_clone = previous_status.clone();
+
+    let printer_for_progress = printer;
+    let tool_active_for_progress = tool_active;
+    let completed_for_progress = completed;
 
     ResponseMode::Streaming {
         stream_handler: Box::new(move |chunk: &str| {
@@ -3166,153 +3165,51 @@ fn create_response_mode(streaming_pb: ProgressBar, status_pb: ProgressBar) -> Re
             if chunk.is_empty() {
                 if let Ok(mut buffer) = stream_buffer_clone.lock() {
                     if !buffer.is_empty() {
-                        let remaining_content = buffer.clone();
-                        streaming_pb_clone
-                            .println(response_style.apply_to(remaining_content).to_string());
+                        printer_for_stream.println(&response_style.apply_to(&*buffer).to_string());
                         buffer.clear();
                     }
                 }
-                streaming_pb_clone.finish_and_clear();
                 return Ok(());
             }
 
-            if tool_active_stream_clone.load(Ordering::Relaxed) {
+            if tool_active_for_stream.load(Ordering::Relaxed) {
                 return Ok(());
             }
 
             if let Ok(mut buffer) = stream_buffer_clone.lock() {
                 buffer.push_str(chunk);
-
                 if buffer.contains('\n') {
                     let mut lines: Vec<&str> = buffer.split('\n').collect();
                     let remaining = lines.pop().unwrap_or("").to_string();
-
                     for line in lines {
-                        streaming_pb_clone.println(response_style.apply_to(line).to_string());
+                        printer_for_stream.println(&response_style.apply_to(line).to_string());
                     }
-
-                    *buffer = remaining.clone();
-                    streaming_pb_clone.set_message(remaining);
-                } else {
-                    let current_buffer = buffer.clone();
-                    streaming_pb_clone.set_message(current_buffer);
+                    *buffer = remaining;
                 }
             }
-
             Ok(())
         }),
         progress_handler: Box::new(move |progress_info: &ProgressInfo| {
-            let elapsed_secs = progress_info.elapsed_ms as f64 / 1000.0;
-
-            let is_tool_status = |status_name: &str| {
-                matches!(
-                    status_name,
-                    "ToolAccumulating" | "ToolExecuting" | "ToolComplete"
-                )
-            };
-
-            let print_previous_and_update = |status_name: &str, message: String| -> bool {
-                if let Ok(mut prev_status) = previous_status_clone.lock() {
-                    let status_changed =
-                        if let Some((prev_name, _prev_message)) = prev_status.as_ref() {
-                            prev_name != status_name
-                        } else {
-                            true
-                        };
-                    *prev_status = Some((status_name.to_string(), message));
-                    status_changed
-                } else {
-                    true
-                }
-            };
-
+            if completed_for_progress.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             match &progress_info.status {
                 StatusUpdate::Thinking => {
-                    let message = "Thinking".to_string();
-                    let status_changed = print_previous_and_update("Thinking", message);
-
-                    if status_changed {
-                        status_pb_progress_clone.reset_elapsed();
-                    }
-
-                    status_pb_progress_clone.set_style(
-                        ProgressStyle::with_template(
-                            "{spinner:.blue.bold} {msg:.blue} │ {elapsed}",
-                        )?
-                        .tick_strings(&["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]),
-                    );
-                    status_pb_progress_clone.set_message("Thinking");
-                    status_pb_progress_clone.enable_steady_tick(Duration::from_millis(500));
+                    status_bar.set_status("Thinking");
+                    status_bar.reset_timer();
                 }
                 StatusUpdate::ToolAccumulating { name, arguments } => {
-                    let clean_args = arguments
-                        .replace('\n', " ")
-                        .replace('\r', " ")
-                        .replace('\t', " ");
-
-                    let formatted_args = if clean_args.len() > 50 {
-                        format!("{} (length: {})", &clean_args[..47], clean_args.len())
-                    } else {
-                        clean_args
-                    };
-
-                    let message = format!("Preparing {}({})", name, formatted_args);
-                    let status_changed = print_previous_and_update("ToolAccumulating", message);
-
-                    if status_changed {
-                        status_pb_progress_clone.reset_elapsed();
-                    }
-
-                    status_pb_progress_clone.set_style(
-                        ProgressStyle::with_template(
-                            "{spinner:.cyan.bold} {msg:.white.bold} │ {elapsed}",
-                        )?
-                        .tick_strings(&["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]),
-                    );
-                    status_pb_progress_clone
-                        .set_message(format!("Preparing {}({})", name, formatted_args));
-                    status_pb_progress_clone.enable_steady_tick(Duration::from_millis(500));
-
-                    streaming_pb_progress_clone
-                        .set_message(format!("Preparing {}({})", name, formatted_args));
+                    let formatted_args = format_tool_arguments(arguments);
+                    status_bar.set_status(&format!("Preparing {}({})", name, formatted_args));
                 }
                 StatusUpdate::ToolStart { name, arguments } => {
                     let formatted_args = format_tool_arguments(arguments);
-                    let message = format!("Starting {}({})", name, formatted_args);
-                    let status_changed = print_previous_and_update("ToolStart", message);
-
-                    if status_changed {
-                        status_pb_progress_clone.reset_elapsed();
-                    }
-
-                    status_pb_progress_clone.set_style(
-                        ProgressStyle::with_template(
-                            "{spinner:.yellow.bold} {msg:.white} │ {elapsed}",
-                        )?
-                        .tick_strings(&["🚀", "⚡", "✨", "🔧", "⚙️", "🛠️", "🎯", "🚀"]),
-                    );
-                    status_pb_progress_clone
-                        .set_message(format!("Starting {}({})", name, formatted_args));
-                    status_pb_progress_clone.enable_steady_tick(Duration::from_millis(500));
+                    status_bar.set_status(&format!("Running {}({})", name, formatted_args));
+                    status_bar.reset_timer();
                 }
                 StatusUpdate::ToolExecuting { name, arguments } => {
                     let formatted_args = format_tool_arguments(arguments);
-                    let message = format!("Processing {}({})", name, formatted_args);
-                    let status_changed = print_previous_and_update("ToolExecuting", message);
-
-                    if status_changed {
-                        status_pb_progress_clone.reset_elapsed();
-                    }
-
-                    status_pb_progress_clone.set_style(
-                        ProgressStyle::with_template(
-                            "{spinner:.red.bold} {msg:.white} │ {elapsed}",
-                        )?
-                        .tick_strings(&["⣾⣿", "⣽⣿", "⣻⣿", "⢿⣿", "⡿⣿", "⣟⣿", "⣯⣿", "⣷⣿"]),
-                    );
-                    status_pb_progress_clone
-                        .set_message(format!("Processing {}({})", name, formatted_args));
-                    status_pb_progress_clone.enable_steady_tick(Duration::from_millis(500));
+                    status_bar.set_status(&format!("Running {}({})", name, formatted_args));
                 }
                 StatusUpdate::ToolComplete {
                     name,
@@ -3320,114 +3217,58 @@ fn create_response_mode(streaming_pb: ProgressBar, status_pb: ProgressBar) -> Re
                     duration_ms,
                 } => {
                     let duration_secs = *duration_ms as f64 / 1000.0;
-                    tool_active.store(false, Ordering::Relaxed);
-
+                    tool_active_for_progress.store(false, Ordering::Relaxed);
                     let formatted_args = format_tool_arguments(arguments);
-                    let completion_msg = format!(
-                        "✅ {}({}) │ completed in {:.1}s",
+                    printer_for_progress.println(&format!(
+                        "Tool {}({}) completed in {:.1}s",
                         name, formatted_args, duration_secs
-                    );
-                    status_pb_progress_clone.println(&completion_msg);
-                    streaming_pb_progress_clone.set_message("");
+                    ));
                 }
                 StatusUpdate::StreamProcessing {
                     bytes_read,
                     chunks_processed,
-                    latest_content,
+                    ..
                 } => {
-                    let content_preview = if latest_content.len() > 30 {
-                        format!("{}...", &latest_content[..27])
-                    } else {
-                        latest_content.clone()
-                    };
-                    let message = format!(
-                        "Streaming {} bytes, {} chunks - \"{}\"",
-                        bytes_read,
-                        chunks_processed,
-                        content_preview.trim()
-                    );
-                    let status_changed = print_previous_and_update("StreamProcessing", message);
-
-                    if status_changed {
-                        status_pb_progress_clone.reset_elapsed();
-                    }
-
-                    status_pb_progress_clone.set_style(
-                        ProgressStyle::with_template(
-                            "{spinner:.blue.bold} {msg:.blue} │ {elapsed}",
-                        )?
-                        .tick_strings(&[
-                            "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█", "▇", "▆", "▅", "▄", "▃", "▂",
-                        ]),
-                    );
-                    status_pb_progress_clone.set_message(format!(
-                        "Streaming {} bytes, {} chunks - \"{}\"",
-                        bytes_read,
-                        chunks_processed,
-                        content_preview.trim()
+                    status_bar.set_status(&format!(
+                        "Streaming ({} bytes, {} chunks)",
+                        bytes_read, chunks_processed
                     ));
-                    status_pb_progress_clone.enable_steady_tick(Duration::from_millis(500));
                 }
                 StatusUpdate::Continuing => {
-                    let message = "Continuing conversation".to_string();
-                    let status_changed = print_previous_and_update("Continuing", message);
-
-                    if status_changed {
-                        status_pb_progress_clone.reset_elapsed();
-                    }
-
-                    status_pb_progress_clone.set_style(
-                        ProgressStyle::with_template(
-                            "{spinner:.magenta.bold} {msg:.white} │ {elapsed}",
-                        )?
-                        .tick_strings(&["💭", "🧠", "💡", "🔄", "🔀", "💫", "🌟", "💭"]),
-                    );
-                    status_pb_progress_clone.set_message("Continuing conversation");
-                    status_pb_progress_clone.enable_steady_tick(Duration::from_millis(500));
+                    status_bar.set_status("Continuing");
+                    status_bar.reset_timer();
                 }
                 StatusUpdate::Complete { usage } => {
-                    if let Ok(mut prev_status) = previous_status_clone.lock() {
-                        if let Some((prev_name, prev_message)) = prev_status.take() {
-                            let indent = if is_tool_status(&prev_name) { "  " } else { "" };
-                            status_pb_progress_clone
-                                .println(&format!("{}{}", indent, prev_message));
-                        }
-                    }
+                    completed_for_progress.store(true, Ordering::Relaxed);
+                    let elapsed_secs = progress_info.elapsed_ms as f64 / 1000.0;
+                    status_bar.clear_status();
 
                     if let Some(usage) = usage {
                         let mut parts = Vec::new();
-
                         if let Some(input_tokens) = usage.prompt_tokens {
-                            parts.push(format!("Input: {} tokens", input_tokens));
+                            parts.push(format!("Input: {}", input_tokens));
                         }
-
                         if let Some(output_tokens) = usage.completion_tokens {
-                            parts.push(format!("Output: {} tokens", output_tokens));
+                            parts.push(format!("Output: {}", output_tokens));
                         }
-
                         if let Some(total_tokens) = usage.total_tokens {
                             parts.push(format!("Total: {}", total_tokens));
                         }
-
                         if !parts.is_empty() {
-                            let completion_msg = format!(
-                                "🎯 Response complete │ {} │ {:.1}s",
-                                parts.join(" → "),
+                            printer_for_progress.println(&format!(
+                                "Complete | {} | {:.1}s",
+                                parts.join(" > "),
                                 elapsed_secs
-                            );
-                            status_pb_progress_clone.println(&completion_msg);
+                            ));
                         } else {
-                            let completion_msg =
-                                format!("🎯 Response complete │ {:.1}s", elapsed_secs);
-                            status_pb_progress_clone.println(&completion_msg);
+                            printer_for_progress
+                                .println(&format!("Complete | {:.1}s", elapsed_secs));
                         }
                     } else {
-                        let completion_msg = format!("🎯 Response complete │ {:.1}s", elapsed_secs);
-                        status_pb_progress_clone.println(&completion_msg);
+                        printer_for_progress.println(&format!("Complete | {:.1}s", elapsed_secs));
                     }
                 }
             }
-
             Ok(())
         }),
     }
@@ -3441,10 +3282,8 @@ fn execute_ai_request(
     tool_context: &ToolContext,
     ctrl_c_rx: Option<Arc<Mutex<mpsc::Receiver<()>>>>,
     signal_handler_active: &Arc<AtomicBool>,
-    status_pb: &ProgressBar,
-    streaming_pb: &ProgressBar,
-    multi_progress: &Arc<MultiProgress>,
-    chat_pb: &mut ChatPrinter,
+    status_bar: &Arc<status_bar::StatusBar>,
+    chat_pb: &ChatPrinter,
 ) -> Result<OpenAIResponse, Box<dyn Error>> {
     signal_handler_active.store(true, Ordering::Relaxed);
 
@@ -3472,24 +3311,15 @@ fn execute_ai_request(
                     while receiver.try_recv().is_ok() {}
                 }
             }
-
-            status_pb.finish_and_clear();
-            streaming_pb.finish_and_clear();
-            multi_progress.clear()?;
-
-            if let Some(_interrupted) = e.downcast_ref::<InterruptedError>() {
-                chat_pb.println("Operation interrupted. Type your next message or \\quit to exit.");
-                return Err(e);
-            } else {
-                return Err(e);
+            status_bar.clear_status();
+            if e.downcast_ref::<InterruptedError>().is_some() {
+                chat_pb.println("Operation interrupted. Type your next message or /quit to exit.");
             }
+            return Err(e);
         }
     };
 
-    status_pb.finish_and_clear();
-    streaming_pb.finish_and_clear();
-    multi_progress.clear()?;
-
+    status_bar.clear_status();
     Ok(response)
 }
 
@@ -3621,13 +3451,13 @@ fn scheduler_loop(
 /// Interactive session
 fn chat_command(
     opts: &Opts,
-    global_multi_progress: Arc<MultiProgress>,
     db: Option<Arc<dyn DbBackend>>,
     mcp_manager: Option<Arc<swarmblabla::mcp::McpManager>>,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Executing chat command");
 
-    let mut chat_pb = ChatPrinter::new();
+    let status_bar = Arc::new(status_bar::StatusBar::new());
+    let chat_pb = ChatPrinter::new();
 
     // Create rustyline editor with history
     let initial_agent_names = if let Some(ref db) = db {
@@ -3756,7 +3586,7 @@ fn chat_command(
     let (input_tx, input_rx) = mpsc::channel::<Result<String, rustyline::error::ReadlineError>>();
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
-    chat_pb.inner = Some(Box::new(rl.create_external_printer()?));
+    chat_pb.set_printer(Box::new(rl.create_external_printer()?));
 
     let prompt_text_clone = prompt_text.clone();
     std::thread::spawn(move || {
@@ -3786,8 +3616,6 @@ fn chat_command(
     let mut prompt_shown = false;
 
     loop {
-        global_multi_progress.clear()?;
-
         while let Ok((task_agent, command, assistant_msg, tool_msg)) = task_rx.try_recv() {
             let target = task_agent.as_deref().unwrap_or("default");
 
@@ -3886,7 +3714,7 @@ fn chat_command(
             &mut active_agent,
             &tools,
             opts,
-            &mut chat_pb,
+            &chat_pb,
             &db,
             &mut openai_opts,
             &prompt_text,
@@ -3956,22 +3784,15 @@ fn chat_command(
                             }
                         }
                     } else {
-                        let multi_progress = global_multi_progress.clone();
-                        let (streaming_pb, status_pb) = setup_progress_bars(&multi_progress)?;
-                        let mode = create_response_mode(streaming_pb.clone(), status_pb.clone());
+                        let mode = create_response_mode(chat_pb.clone(), status_bar.clone());
 
-                        let status_pb_delayed = status_pb.clone();
-                        std::thread::spawn(move || {
-                            std::thread::sleep(Duration::from_secs(5));
-                            status_pb_delayed.set_message("Connecting");
-                            status_pb_delayed.enable_steady_tick(Duration::from_millis(500));
-                        });
-
-                        let streaming_pb_for_context = streaming_pb.clone();
+                        let printer_for_tool = chat_pb.clone();
                         tool_context.println = Box::new(move |msg: &str| {
-                            streaming_pb_for_context.println(msg);
+                            printer_for_tool.println(msg);
                         });
 
+                        status_bar.set_status("Connecting");
+                        status_bar.reset_timer();
                         match execute_ai_request(
                             active_agent.messages.clone(),
                             &tools,
@@ -3980,10 +3801,8 @@ fn chat_command(
                             &tool_context,
                             Some(ctrl_c_rx.clone()),
                             &signal_handler_active,
-                            &status_pb,
-                            &streaming_pb,
-                            &multi_progress,
-                            &mut chat_pb,
+                            &status_bar,
+                            &chat_pb,
                         ) {
                             Ok(response) => {
                                 active_agent.messages = response.history;
@@ -4369,15 +4188,10 @@ enum CliCommand {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // Initialize environment logger with custom configuration
     let env = Env::new()
         .filter_or("RUST_LOG", "warning")
         .write_style_or("LOG_STYLE", "always");
-
-    // Set up indicatif log bridge to prevent logging interference with progress bars
-    let logger = env_logger::Builder::from_env(env).build();
-    let global_multi_progress = Arc::new(MultiProgress::new());
-    LogWrapper::new((*global_multi_progress).clone(), logger).try_init()?;
+    env_logger::Builder::from_env(env).init();
 
     // Parse command line arguments
     let mut opts = Opts::parse();
@@ -4460,12 +4274,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             db_connection.clone(),
             mcp_manager.clone(),
         ),
-        CliCommand::Chat {} => chat_command(
-            &opts,
-            global_multi_progress.clone(),
-            db_connection.clone(),
-            mcp_manager.clone(),
-        ),
+        CliCommand::Chat {} => chat_command(&opts, db_connection.clone(), mcp_manager.clone()),
         CliCommand::Models {} => list_models_command(&opts),
         CliCommand::ListTools {} => list_tools_command(&mcp_manager),
         CliCommand::Gc {} => gc_command(&opts),
