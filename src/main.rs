@@ -87,6 +87,7 @@ const CHAT_COMMANDS: &[&str] = &[
     "/select-agent",
     "/delete-agent",
     "/mcp-refresh",
+    "/tools",
 ];
 
 struct ChatHelper {
@@ -2670,6 +2671,7 @@ enum ChatCommand {
     SelectAgent(String),
     DeleteAgent(String),
     McpRefresh,
+    Tools,
     Message(String),
     Empty,
     Invalid(String),
@@ -2766,6 +2768,9 @@ fn parse_chat_command(line: &str) -> ChatCommand {
     if normalized == "/mcp-refresh" {
         return ChatCommand::McpRefresh;
     }
+    if normalized == "/tools" {
+        return ChatCommand::Tools;
+    }
 
     if normalized.starts_with('/') {
         return ChatCommand::Invalid(format!("Unknown command: {}", normalized));
@@ -2842,6 +2847,7 @@ fn handle_chat_command(
             chat_pb.println("  /select-agent <name>   Switch to an existing agent");
             chat_pb.println("  /delete-agent <name>   Delete an agent");
             chat_pb.println("  /mcp-refresh           Refresh MCP tool definitions");
+            chat_pb.println("  /tools                 List all available tools");
             Ok(true)
         }
         ChatCommand::Quit => Ok(false),
@@ -3083,6 +3089,43 @@ fn handle_chat_command(
                 }
             } else {
                 chat_pb.println("No MCP servers configured.");
+            }
+            Ok(true)
+        }
+        ChatCommand::Tools => {
+            let mut names: Vec<&String> = tools.keys().collect();
+            names.sort();
+            if !names.is_empty() {
+                chat_pb.println("Built-in tools:");
+                for name in &names {
+                    chat_pb.println(&format!("  {}", name));
+                }
+            }
+            if let Some(mcp) = mcp_manager {
+                let schemas = mcp.get_tool_schemas();
+                if !schemas.is_empty() {
+                    chat_pb.println("MCP tools:");
+                    let mut mcp_names: Vec<String> = schemas
+                        .iter()
+                        .filter_map(|s| {
+                            s.get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|n| n.as_str())
+                                .map(|n| n.to_string())
+                        })
+                        .collect();
+                    mcp_names.sort();
+                    for name in &mcp_names {
+                        chat_pb.println(&format!("  {}", name));
+                    }
+                }
+            }
+            if names.is_empty()
+                && mcp_manager
+                    .as_ref()
+                    .map_or(true, |m| m.get_tool_schemas().is_empty())
+            {
+                chat_pb.println("No tools available.");
             }
             Ok(true)
         }
@@ -4011,8 +4054,9 @@ fn gc_command(opts: &Opts) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Handles the listing of models by calling the openai module.
-fn list_tools_command() -> Result<(), Box<dyn Error>> {
+fn list_tools_command(
+    mcp_manager: &Option<Arc<swarmblabla::mcp::McpManager>>,
+) -> Result<(), Box<dyn Error>> {
     let safe_tools = initialize_tools(false, None);
     let all_tools = initialize_tools(true, None);
 
@@ -4026,6 +4070,26 @@ fn list_tools_command() -> Result<(), Box<dyn Error>> {
             " [unsafe]"
         };
         println!("  {}{}", name, marker);
+    }
+
+    if let Some(mcp) = mcp_manager {
+        let schemas = mcp.get_tool_schemas();
+        if !schemas.is_empty() {
+            println!("MCP tools:");
+            let mut mcp_names: Vec<String> = schemas
+                .iter()
+                .filter_map(|s| {
+                    s.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .map(|n| n.to_string())
+                })
+                .collect();
+            mcp_names.sort();
+            for name in &mcp_names {
+                println!("  {}", name);
+            }
+        }
     }
 
     Ok(())
@@ -4432,7 +4496,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             mcp_manager.clone(),
         ),
         CliCommand::Models {} => list_models_command(&opts),
-        CliCommand::ListTools {} => list_tools_command(),
+        CliCommand::ListTools {} => list_tools_command(&mcp_manager),
         CliCommand::Gc {} => gc_command(&opts),
         CliCommand::Serve {
             bind,
