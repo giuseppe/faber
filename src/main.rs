@@ -1503,7 +1503,7 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     Ok(result.to_string())
 }
 
-fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
+fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsCollection {
     let mut tools: ToolsCollection = ToolsCollection::new();
 
     append_tool(
@@ -2424,7 +2424,7 @@ fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
         .to_string(),
     );
 
-    if !unsafe_tools {
+    if !unsafe_tools && allowed.is_none() {
         return tools;
     }
 
@@ -2504,6 +2504,10 @@ fn initialize_tools(unsafe_tools: bool) -> ToolsCollection {
 "#
         .to_string(),
     );
+
+    if let Some(allowed_list) = allowed {
+        tools.retain(|name, _| allowed_list.iter().any(|a| a == name));
+    }
 
     debug!("Tools initialization completed with {} tools", tools.len());
     tools
@@ -2588,6 +2592,11 @@ fn post_request_and_print_output(
         parameters,
     };
 
+    let allowed_tools = if opts.tools.is_empty() {
+        None
+    } else {
+        Some(opts.tools.clone())
+    };
     let tools = match opts.no_tools {
         true => {
             debug!("Tools are disabled");
@@ -2595,7 +2604,7 @@ fn post_request_and_print_output(
         }
         false => {
             debug!("Initializing tools for AI request");
-            initialize_tools(opts.unsafe_tools)
+            initialize_tools(opts.unsafe_tools, allowed_tools.as_deref())
         }
     };
 
@@ -3584,6 +3593,11 @@ fn chat_command(
     let mut rl = Editor::new()?;
     rl.set_helper(Some(helper));
 
+    let allowed_tools = if opts.tools.is_empty() {
+        None
+    } else {
+        Some(opts.tools.clone())
+    };
     let tools = match opts.no_tools {
         true => {
             debug!("Tools are disabled");
@@ -3591,7 +3605,7 @@ fn chat_command(
         }
         false => {
             debug!("Initializing tools for AI request");
-            initialize_tools(opts.unsafe_tools)
+            initialize_tools(opts.unsafe_tools, allowed_tools.as_deref())
         }
     };
 
@@ -3954,6 +3968,25 @@ fn chat_command(
 // ModelInfo and ModelsApiResponse structs are removed from here.
 
 /// Handles the listing of models by calling the openai module.
+fn list_tools_command() -> Result<(), Box<dyn Error>> {
+    let safe_tools = initialize_tools(false, None);
+    let all_tools = initialize_tools(true, None);
+
+    let mut names: Vec<&String> = all_tools.keys().collect();
+    names.sort();
+
+    for name in names {
+        let marker = if safe_tools.contains_key(name) {
+            ""
+        } else {
+            " [unsafe]"
+        };
+        println!("  {}{}", name, marker);
+    }
+
+    Ok(())
+}
+
 fn list_models_command(opts: &Opts) -> Result<(), Box<dyn Error>> {
     let base_endpoint = opts
         .endpoint
@@ -4067,6 +4100,9 @@ struct Opts {
     /// Enable unsafe tools
     #[clap(long)]
     unsafe_tools: bool,
+    #[clap(long, value_delimiter = ',')]
+    /// Only enable the specified tools (comma-separated). Overrides --unsafe-tools
+    tools: Vec<String>,
     #[clap(long)]
     /// Control when tools are used: "auto" (default), "none", "required"
     tool_choice: Option<String>,
@@ -4104,6 +4140,7 @@ impl Default for Opts {
             endpoint: None,
             no_tools: false,
             unsafe_tools: false,
+            tools: Vec::new(),
             tool_choice: None,
             api_key: None,
             parameter: Vec::new(),
@@ -4198,6 +4235,9 @@ enum CliCommand {
 
     /// List available models from the configured endpoint
     Models {},
+
+    /// List all available tools
+    ListTools {},
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -4266,6 +4306,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             chat_command(&opts, global_multi_progress.clone(), db_connection.clone())
         }
         CliCommand::Models {} => list_models_command(&opts),
+        CliCommand::ListTools {} => list_tools_command(),
     };
 
     result
