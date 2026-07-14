@@ -3967,6 +3967,25 @@ fn chat_command(
 
 // ModelInfo and ModelsApiResponse structs are removed from here.
 
+fn gc_command(opts: &Opts) -> Result<(), Box<dyn Error>> {
+    let db_path = opts
+        .db_path
+        .as_ref()
+        .ok_or("No db_path configured. Set 'db_path' in your config file.")?;
+    let conn = rusqlite::Connection::open(db_path)?;
+    db::initialize_db(&conn)?;
+    let removed = db::gc_agents(&conn)?;
+    if removed.is_empty() {
+        println!("No dormant agents to clean up.");
+    } else {
+        println!("Removed {} agent(s):", removed.len());
+        for name in &removed {
+            println!("  {}", name);
+        }
+    }
+    Ok(())
+}
+
 /// Handles the listing of models by calling the openai module.
 fn list_tools_command() -> Result<(), Box<dyn Error>> {
     let safe_tools = initialize_tools(false, None);
@@ -4238,6 +4257,9 @@ enum CliCommand {
 
     /// List all available tools
     ListTools {},
+
+    /// Remove dormant agents (no active session)
+    Gc {},
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -4307,6 +4329,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         CliCommand::Models {} => list_models_command(&opts),
         CliCommand::ListTools {} => list_tools_command(),
+        CliCommand::Gc {} => gc_command(&opts),
     };
 
     result

@@ -637,3 +637,26 @@ pub fn send_notification(
     )?;
     Ok(conn.last_insert_rowid())
 }
+
+pub fn gc_agents(conn: &Connection) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut stmt = conn.prepare(
+        "SELECT name FROM agents
+         WHERE name != 'default'
+         AND (session_id IS NULL OR heartbeat_at IS NULL
+              OR heartbeat_at < datetime('now', '-10 seconds'))",
+    )?;
+    let names: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    drop(stmt);
+    if !names.is_empty() {
+        conn.execute(
+            "DELETE FROM agents
+             WHERE name != 'default'
+             AND (session_id IS NULL OR heartbeat_at IS NULL
+                  OR heartbeat_at < datetime('now', '-10 seconds'))",
+            [],
+        )?;
+    }
+    Ok(names)
+}
