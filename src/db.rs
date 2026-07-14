@@ -28,6 +28,8 @@ pub struct AgentRow {
     pub name: String,
     pub description: String,
     pub created_at: String,
+    pub session_id: Option<String>,
+    pub heartbeat_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -245,16 +247,22 @@ pub fn delete_agent(conn: &Connection, name: &str) -> Result<bool, Box<dyn Error
     Ok(rows > 0)
 }
 
+fn row_to_agent(row: &rusqlite::Row) -> rusqlite::Result<AgentRow> {
+    Ok(AgentRow {
+        name: row.get(0)?,
+        description: row.get(1)?,
+        created_at: row.get(2)?,
+        session_id: row.get(3)?,
+        heartbeat_at: row.get(4)?,
+    })
+}
+
+const AGENT_COLUMNS: &str = "name, description, created_at, session_id, heartbeat_at";
+
 pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRow>, Box<dyn Error>> {
-    let mut stmt =
-        conn.prepare("SELECT name, description, created_at FROM agents ORDER BY name")?;
-    let rows = stmt.query_map([], |row| {
-        Ok(AgentRow {
-            name: row.get(0)?,
-            description: row.get(1)?,
-            created_at: row.get(2)?,
-        })
-    })?;
+    let sql = format!("SELECT {} FROM agents ORDER BY name", AGENT_COLUMNS);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_agent)?;
     let mut agents = Vec::new();
     for row in rows {
         agents.push(row?);
@@ -263,15 +271,9 @@ pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRow>, Box<dyn Error>> {
 }
 
 pub fn get_agent(conn: &Connection, name: &str) -> Result<Option<AgentRow>, Box<dyn Error>> {
-    let mut stmt =
-        conn.prepare("SELECT name, description, created_at FROM agents WHERE name = ?1")?;
-    let mut rows = stmt.query_map(params![name], |row| {
-        Ok(AgentRow {
-            name: row.get(0)?,
-            description: row.get(1)?,
-            created_at: row.get(2)?,
-        })
-    })?;
+    let sql = format!("SELECT {} FROM agents WHERE name = ?1", AGENT_COLUMNS);
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query_map(params![name], row_to_agent)?;
     match rows.next() {
         Some(row) => Ok(Some(row?)),
         None => Ok(None),

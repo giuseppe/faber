@@ -2935,7 +2935,20 @@ fn handle_chat_command(
                     for agent in &agents {
                         let count = db::agent_message_count(&conn, &agent.name)?;
                         let active = if agent.name == active_agent.name {
-                            "*"
+                            "* (this session)"
+                        } else if agent.session_id.is_some()
+                            && agent.heartbeat_at.as_ref().is_some_and(|hb| {
+                                chrono::NaiveDateTime::parse_from_str(hb, "%Y-%m-%d %H:%M:%S")
+                                    .is_ok_and(|dt| {
+                                        chrono::Utc::now()
+                                            .naive_utc()
+                                            .signed_duration_since(dt)
+                                            .num_seconds()
+                                            < 10
+                                    })
+                            })
+                        {
+                            "* (other session)"
                         } else {
                             ""
                         };
