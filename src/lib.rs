@@ -24,6 +24,7 @@ pub mod db;
 pub mod db_backend;
 pub mod github;
 pub mod local_db;
+pub mod mcp;
 pub mod openai;
 #[allow(dead_code)]
 pub mod protocol;
@@ -33,6 +34,7 @@ pub struct ToolContext {
     pub db: Option<Arc<dyn db_backend::DbBackend>>,
     pub agent_name: Option<String>,
     pub extra: Option<Arc<dyn Any + Send + Sync>>,
+    pub mcp_manager: Option<Arc<mcp::McpManager>>,
 }
 
 impl ToolContext {
@@ -45,6 +47,7 @@ impl ToolContext {
             db: None,
             agent_name: None,
             extra: None,
+            mcp_manager: None,
         }
     }
 

@@ -86,6 +86,7 @@ const CHAT_COMMANDS: &[&str] = &[
     "/create-agent",
     "/select-agent",
     "/delete-agent",
+    "/mcp-refresh",
 ];
 
 struct ChatHelper {
@@ -1457,9 +1458,11 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     let active_counter = sa_ctx.active_subagents.clone();
     active_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+    let mcp_for_sub = ctx.mcp_manager.clone();
     std::thread::spawn(move || {
         let mut sub_ctx = ToolContext::new(|_: &str| {});
         sub_ctx.db = Some(db.clone());
+        sub_ctx.mcp_manager = mcp_for_sub;
         let result = post_request_with_mode(
             messages,
             &tools,
@@ -2562,6 +2565,7 @@ fn post_request_and_print_output(
     system_prompts: Option<Vec<String>>,
     opts: &Opts,
     db: Option<Arc<dyn DbBackend>>,
+    mcp_manager: Option<Arc<swarmblabla::mcp::McpManager>>,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Prompt: {}", prompt);
 
@@ -2617,6 +2621,7 @@ fn post_request_and_print_output(
         println!("{}", msg);
     });
     tool_context.db = db;
+    tool_context.mcp_manager = mcp_manager;
 
     let response: OpenAIResponse = post_request(messages, &tools, &openai_opts, &tool_context)?;
 
@@ -2639,6 +2644,7 @@ fn prompt_command(
     files: &Vec<String>,
     opts: &Opts,
     db: Option<Arc<dyn DbBackend>>,
+    mcp_manager: Option<Arc<swarmblabla::mcp::McpManager>>,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Executing prompt command with {} files", files.len());
     let mut system_prompts: Vec<String> = vec![];
@@ -2648,7 +2654,7 @@ fn prompt_command(
         let contents = fs::read_to_string(file)?;
         system_prompts.push(contents);
     }
-    post_request_and_print_output(prompt, Some(system_prompts), opts, db)
+    post_request_and_print_output(prompt, Some(system_prompts), opts, db, mcp_manager)
 }
 
 enum ChatCommand {
@@ -2663,6 +2669,7 @@ enum ChatCommand {
     CreateAgent(String),
     SelectAgent(String),
     DeleteAgent(String),
+    McpRefresh,
     Message(String),
     Empty,
     Invalid(String),
@@ -2756,6 +2763,9 @@ fn parse_chat_command(line: &str) -> ChatCommand {
         }
         return ChatCommand::DeleteAgent(name);
     }
+    if normalized == "/mcp-refresh" {
+        return ChatCommand::McpRefresh;
+    }
 
     if normalized.starts_with('/') {
         return ChatCommand::Invalid(format!("Unknown command: {}", normalized));
@@ -2813,6 +2823,7 @@ fn handle_chat_command(
     prompt_text: &Arc<Mutex<String>>,
     agent_names: &Arc<Mutex<Vec<String>>>,
     session_id: &str,
+    mcp_manager: &Option<Arc<swarmblabla::mcp::McpManager>>,
 ) -> Result<bool, Box<dyn Error>> {
     let messages = &mut active_agent.messages;
     match command {
@@ -2830,6 +2841,7 @@ fn handle_chat_command(
             chat_pb.println("  /create-agent <name>   Create a new agent");
             chat_pb.println("  /select-agent <name>   Switch to an existing agent");
             chat_pb.println("  /delete-agent <name>   Delete an agent");
+            chat_pb.println("  /mcp-refresh           Refresh MCP tool definitions");
             Ok(true)
         }
         ChatCommand::Quit => Ok(false),
@@ -3056,6 +3068,21 @@ fn handle_chat_command(
                 }
             } else {
                 chat_pb.println("Database not configured.");
+            }
+            Ok(true)
+        }
+        ChatCommand::McpRefresh => {
+            if let Some(mcp) = mcp_manager {
+                match mcp.refresh() {
+                    Ok(count) => {
+                        chat_pb.println(&format!("MCP tools refreshed: {} tools available", count));
+                    }
+                    Err(e) => {
+                        chat_pb.println(&format!("MCP refresh failed: {}", e));
+                    }
+                }
+            } else {
+                chat_pb.println("No MCP servers configured.");
             }
             Ok(true)
         }
@@ -3574,6 +3601,7 @@ fn chat_command(
     opts: &Opts,
     global_multi_progress: Arc<MultiProgress>,
     db: Option<Arc<dyn DbBackend>>,
+    mcp_manager: Option<Arc<swarmblabla::mcp::McpManager>>,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Executing chat command");
 
@@ -3842,6 +3870,7 @@ fn chat_command(
             &prompt_text,
             &agent_names,
             &session_id,
+            &mcp_manager,
         )? {
             true => continue,
             false => {
@@ -3865,6 +3894,7 @@ fn chat_command(
                     let mut tool_context = ToolContext::new(|_: &str| {});
                     tool_context.db = db.clone();
                     tool_context.agent_name = Some(active_agent.name.clone());
+                    tool_context.mcp_manager = mcp_manager.clone();
                     tool_context.extra = Some(Arc::new(SubAgentContext {
                         tools: tools_arc.clone(),
                         opts: openai_opts.clone(),
@@ -4145,6 +4175,10 @@ struct Opts {
     /// Read server key from file (first line)
     server_key_file: Option<String>,
 
+    #[clap(skip)]
+    #[serde(default)]
+    mcp_servers: HashMap<String, swarmblabla::mcp::McpServerConfig>,
+
     #[clap(subcommand)]
     #[serde(skip)]
     command: CliCommand,
@@ -4173,6 +4207,7 @@ impl Default for Opts {
             server: None,
             server_key: None,
             server_key_file: None,
+            mcp_servers: HashMap::new(),
             command: CliCommand::Chat {},
             args: Vec::new(),
         }
@@ -4252,6 +4287,10 @@ impl Opts {
 
         if self.server_key_file.is_none() {
             self.server_key_file = config.server_key_file;
+        }
+
+        if self.mcp_servers.is_empty() {
+            self.mcp_servers = config.mcp_servers;
         }
 
         debug!("Configuration merge completed");
@@ -4366,14 +4405,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         None
     };
 
+    let mcp_manager: Option<Arc<swarmblabla::mcp::McpManager>> = if !opts.mcp_servers.is_empty() {
+        match swarmblabla::mcp::McpManager::new(opts.mcp_servers.clone()) {
+            Ok(mgr) => Some(Arc::new(mgr)),
+            Err(e) => {
+                return Err(format!("Failed to initialize MCP servers: {}", e).into());
+            }
+        }
+    } else {
+        None
+    };
+
     // Execute the chosen command
     let result = match &opts.command {
-        CliCommand::Prompt { prompt, files } => {
-            prompt_command(&prompt, &files, &opts, db_connection.clone())
-        }
-        CliCommand::Chat {} => {
-            chat_command(&opts, global_multi_progress.clone(), db_connection.clone())
-        }
+        CliCommand::Prompt { prompt, files } => prompt_command(
+            &prompt,
+            &files,
+            &opts,
+            db_connection.clone(),
+            mcp_manager.clone(),
+        ),
+        CliCommand::Chat {} => chat_command(
+            &opts,
+            global_multi_progress.clone(),
+            db_connection.clone(),
+            mcp_manager.clone(),
+        ),
         CliCommand::Models {} => list_models_command(&opts),
         CliCommand::ListTools {} => list_tools_command(),
         CliCommand::Gc {} => gc_command(&opts),
@@ -4397,6 +4454,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             server::serve_command(bind, db_path, key.as_deref())
         }
     };
+
+    if let Some(ref mcp) = mcp_manager {
+        mcp.shutdown();
+    }
 
     result
 }

@@ -113,38 +113,6 @@ fn read_api_key(api_key_file: &String) -> Result<String, Box<dyn Error>> {
     Ok(api_key)
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ParameterProperty {
-    #[serde(rename = "type")]
-    pub param_type: String,
-    pub description: String,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ToolParameters {
-    #[serde(rename = "type")]
-    pub param_type: String,
-    pub properties: HashMap<String, ParameterProperty>,
-    pub required: Vec<String>,
-
-    #[serde(rename = "additionalProperties")]
-    pub additional_properties: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Function {
-    pub name: String,
-    pub description: String,
-    pub parameters: ToolParameters,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct Tool {
-    #[serde(rename = "type")]
-    pub tool_type: String,
-    pub function: Function,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FunctionCall {
     pub name: String,
@@ -167,7 +135,7 @@ pub struct OpenAIRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     pub messages: Vec<Message>,
-    pub tools: Option<Vec<Tool>>,
+    pub tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -426,6 +394,29 @@ pub fn tool_call(
     }
 
     info!("Requesting tool {}", tool_name);
+
+    if let Some(ref mcp) = ctx.mcp_manager {
+        if mcp.has_tool(tool_name) {
+            info!("Dispatching to MCP tool {}", tool_name);
+            let content = match mcp.call_tool(tool_name, &req.function.arguments) {
+                Ok(result) => result,
+                Err(e) => {
+                    let error_msg = format!("error: MCP tool '{}' failed: {}", tool_name, e);
+                    warn!("{}", error_msg);
+                    error_msg
+                }
+            };
+            let msg = Message {
+                role: "tool".to_string(),
+                content: Some(content),
+                tool_call_id: Some(req.id.clone()),
+                name: Some(tool_name.clone()),
+                tool_calls: None,
+            };
+            return Ok(msg);
+        }
+    }
+
     let tool = tools_collection.get(tool_name);
     let content: String = match tool {
         None => {
@@ -523,10 +514,13 @@ fn post_request_with_mode_and_recursion(
             headers.insert(AUTHORIZATION, HeaderValue::from_str(&bearer_auth)?);
         }
 
-        let mut tools: Vec<Tool> = vec![];
+        let mut tools: Vec<serde_json::Value> = vec![];
         for t in tools_collection.values() {
-            let tool_schema = serde_json::from_str::<Tool>(&t.schema)?;
+            let tool_schema: serde_json::Value = serde_json::from_str(&t.schema)?;
             tools.push(tool_schema);
+        }
+        if let Some(ref mcp) = ctx.mcp_manager {
+            tools.extend(mcp.get_tool_schemas());
         }
 
         let tool_choice = if tools.len() > 0 {
