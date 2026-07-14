@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 const SPINNER_CHARS: &[&str] = &["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 const TICK_INTERVAL_MS: u64 = 200;
+const CYCLE_TICKS: u64 = 10; // cycle to next agent every 10 ticks (2s)
 
 #[allow(dead_code)]
 pub enum Position {
@@ -14,6 +15,12 @@ pub enum Position {
 
 pub const STATUS_LINE_COUNT: u16 = 1;
 pub const POSITION: Position = Position::Bottom;
+
+struct AgentEntry {
+    message: String,
+    start_time: Instant,
+    color: u8,
+}
 
 fn set_terminal_rows(rows: u16) {
     unsafe {
@@ -28,11 +35,9 @@ fn set_terminal_rows(rows: u16) {
 pub struct StatusBar {
     enabled: bool,
     original_rows: u16,
-    message: Arc<Mutex<String>>,
-    start_time: Arc<Mutex<Instant>>,
-    active: Arc<AtomicBool>,
+    entries: Arc<Mutex<Vec<(String, AgentEntry)>>>,
     stop_ticker: Arc<AtomicBool>,
-    color: Arc<AtomicU8>,
+    default_color: Arc<AtomicU8>,
     ticker_handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -61,42 +66,55 @@ impl StatusBar {
 
         set_terminal_rows(rows - STATUS_LINE_COUNT);
 
-        let message = Arc::new(Mutex::new(String::new()));
-        let start_time = Arc::new(Mutex::new(Instant::now()));
-        let active = Arc::new(AtomicBool::new(false));
+        let entries: Arc<Mutex<Vec<(String, AgentEntry)>>> = Arc::new(Mutex::new(Vec::new()));
         let stop_ticker = Arc::new(AtomicBool::new(false));
-        let color = Arc::new(AtomicU8::new(36));
+        let default_color = Arc::new(AtomicU8::new(36));
 
         let ticker_handle = {
-            let msg = message.clone();
-            let time = start_time.clone();
-            let active = active.clone();
+            let entries = entries.clone();
             let stop = stop_ticker.clone();
-            let color = color.clone();
 
             std::thread::spawn(move || {
                 let mut tick: u64 = 0;
                 let mut was_active = false;
                 while !stop.load(Ordering::Relaxed) {
-                    let is_active = active.load(Ordering::Relaxed);
-                    if is_active {
-                        let text = msg.lock().map(|m| m.clone()).unwrap_or_default();
-                        let elapsed = time.lock().map(|t| t.elapsed()).unwrap_or_default();
-                        let spinner = SPINNER_CHARS[(tick as usize) % SPINNER_CHARS.len()];
-                        let secs = elapsed.as_secs_f64();
-                        let c = color.load(Ordering::Relaxed);
+                    let is_active;
+                    if let Ok(guard) = entries.lock() {
+                        is_active = !guard.is_empty();
+                        if is_active {
+                            let idx = if guard.len() > 1 {
+                                ((tick / CYCLE_TICKS) as usize) % guard.len()
+                            } else {
+                                0
+                            };
+                            let (agent, entry) = &guard[idx];
+                            let spinner = SPINNER_CHARS[(tick as usize) % SPINNER_CHARS.len()];
+                            let secs = entry.start_time.elapsed().as_secs_f64();
+                            let c = entry.color;
+                            let count = guard.len();
 
-                        eprint!(
-                            "\x1b7\x1b[{};1H\x1b[2K\x1b[{}m {} {} \x1b[0m\x1b[90m│ {:.1}s\x1b[0m\x1b8",
-                            status_line, c, spinner, text, secs
-                        );
-                        let _ = std::io::stderr().flush();
-                        tick += 1;
-                    } else if was_active {
+                            let suffix = if count > 1 {
+                                format!(" \x1b[90m(+{} more)\x1b[0m", count - 1)
+                            } else {
+                                String::new()
+                            };
+
+                            eprint!(
+                                "\x1b7\x1b[{};1H\x1b[2K\x1b[{}m {} {}: {} \x1b[0m\x1b[90m│ {:.1}s\x1b[0m{}\x1b8",
+                                status_line, c, spinner, agent, entry.message, secs, suffix
+                            );
+                            let _ = std::io::stderr().flush();
+                        }
+                    } else {
+                        is_active = false;
+                    }
+
+                    if !is_active && was_active {
                         eprint!("\x1b7\x1b[{};1H\x1b[2K\x1b8", status_line);
                         let _ = std::io::stderr().flush();
                     }
                     was_active = is_active;
+                    tick += 1;
                     std::thread::sleep(Duration::from_millis(TICK_INTERVAL_MS));
                 }
                 eprint!("\x1b7\x1b[{};1H\x1b[2K\x1b8", status_line);
@@ -107,11 +125,9 @@ impl StatusBar {
         Self {
             enabled: true,
             original_rows: rows,
-            message,
-            start_time,
-            active,
+            entries,
             stop_ticker,
-            color,
+            default_color,
             ticker_handle: Some(ticker_handle),
         }
     }
@@ -120,40 +136,55 @@ impl StatusBar {
         Self {
             enabled: false,
             original_rows: 0,
-            message: Arc::new(Mutex::new(String::new())),
-            start_time: Arc::new(Mutex::new(Instant::now())),
-            active: Arc::new(AtomicBool::new(false)),
+            entries: Arc::new(Mutex::new(Vec::new())),
             stop_ticker: Arc::new(AtomicBool::new(true)),
-            color: Arc::new(AtomicU8::new(36)),
+            default_color: Arc::new(AtomicU8::new(36)),
             ticker_handle: None,
         }
     }
 
     pub fn set_color(&self, ansi_code: u8) {
-        self.color.store(ansi_code, Ordering::Relaxed);
+        self.default_color.store(ansi_code, Ordering::Relaxed);
     }
 
-    pub fn set_status(&self, msg: &str) {
+    pub fn set_agent_status(&self, agent: &str, msg: &str, reset_timer: bool) {
         if !self.enabled {
             return;
         }
-        if let Ok(mut m) = self.message.lock() {
-            *m = msg.to_string();
+        if let Ok(mut guard) = self.entries.lock() {
+            if let Some(pos) = guard.iter().position(|(name, _)| name == agent) {
+                guard[pos].1.message = msg.to_string();
+                if reset_timer {
+                    guard[pos].1.start_time = Instant::now();
+                }
+            } else {
+                guard.push((
+                    agent.to_string(),
+                    AgentEntry {
+                        message: msg.to_string(),
+                        start_time: Instant::now(),
+                        color: self.default_color.load(Ordering::Relaxed),
+                    },
+                ));
+            }
         }
-        self.active.store(true, Ordering::Relaxed);
     }
 
-    pub fn reset_timer(&self) {
-        if let Ok(mut t) = self.start_time.lock() {
-            *t = Instant::now();
+    pub fn set_agent_color(&self, agent: &str, ansi_code: u8) {
+        if let Ok(mut guard) = self.entries.lock() {
+            if let Some(pos) = guard.iter().position(|(name, _)| name == agent) {
+                guard[pos].1.color = ansi_code;
+            }
         }
     }
 
-    pub fn clear_status(&self) {
+    pub fn clear_agent_status(&self, agent: &str) {
         if !self.enabled {
             return;
         }
-        self.active.store(false, Ordering::Relaxed);
+        if let Ok(mut guard) = self.entries.lock() {
+            guard.retain(|(name, _)| name != agent);
+        }
     }
 }
 

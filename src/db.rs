@@ -249,6 +249,10 @@ pub fn create_agent(
 }
 
 pub fn delete_agent(conn: &Connection, name: &str) -> Result<bool, Box<dyn Error>> {
+    conn.execute(
+        "DELETE FROM scheduled_tasks WHERE agent_name = ?1",
+        params![name],
+    )?;
     let rows = conn.execute("DELETE FROM agents WHERE name = ?1", params![name])?;
     Ok(rows > 0)
 }

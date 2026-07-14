@@ -72,6 +72,7 @@ struct SubAgentContext {
     opts: openai::Opts,
     session_id: String,
     active_subagents: Arc<std::sync::atomic::AtomicUsize>,
+    status_bar: Arc<status_bar::StatusBar>,
 }
 
 const CHAT_COMMANDS: &[&str] = &[
@@ -1772,8 +1773,40 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     let active_counter = sa_ctx.active_subagents.clone();
     active_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+    let sub_status_bar = sa_ctx.status_bar.clone();
+    let agent_name_for_status = agent_name.clone();
+    sub_status_bar.set_agent_status(&agent_name_for_status, "Running", true);
+    sub_status_bar.set_agent_color(
+        &agent_name_for_status,
+        agent_ansi_code(&agent_name_for_status),
+    );
+
+    let session_id_for_sub = sa_ctx.session_id.clone();
     let mcp_for_sub = ctx.mcp_manager.clone();
     std::thread::spawn(move || {
+        struct SubAgentGuard {
+            status_bar: Arc<status_bar::StatusBar>,
+            counter: Arc<std::sync::atomic::AtomicUsize>,
+            db: Arc<dyn DbBackend>,
+            name: String,
+            session_id: String,
+        }
+        impl Drop for SubAgentGuard {
+            fn drop(&mut self) {
+                self.status_bar.clear_agent_status(&self.name);
+                self.counter
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = self.db.release_agent(&self.name, &self.session_id);
+            }
+        }
+        let _guard = SubAgentGuard {
+            status_bar: sub_status_bar,
+            counter: active_counter,
+            db: db.clone(),
+            name: agent_name_for_status,
+            session_id: session_id_for_sub,
+        };
+
         let mut sub_ctx = ToolContext::new(|_: &str| {});
         sub_ctx.db = Some(db.clone());
         sub_ctx.mcp_manager = mcp_for_sub;
@@ -1807,7 +1840,6 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
             "response": response_text,
         });
         let _ = db.send_notification(&agent_name, &parent_agent, &notification.to_string());
-        active_counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     });
 
     let result =
@@ -3452,6 +3484,7 @@ fn format_tool_arguments(args_json: &str) -> String {
 fn create_response_mode(
     printer: ChatPrinter,
     status_bar: Arc<status_bar::StatusBar>,
+    agent_name: String,
 ) -> ResponseMode {
     let tool_active = Arc::new(AtomicBool::new(false));
     let completed = Arc::new(AtomicBool::new(false));
@@ -3501,21 +3534,31 @@ fn create_response_mode(
             }
             match &progress_info.status {
                 StatusUpdate::Thinking => {
-                    status_bar.set_status("Thinking");
-                    status_bar.reset_timer();
+                    status_bar.set_agent_status(&agent_name, "Thinking", true);
                 }
                 StatusUpdate::ToolAccumulating { name, arguments } => {
                     let formatted_args = format_tool_arguments(arguments);
-                    status_bar.set_status(&format!("Preparing {}({})", name, formatted_args));
+                    status_bar.set_agent_status(
+                        &agent_name,
+                        &format!("Preparing {}({})", name, formatted_args),
+                        false,
+                    );
                 }
                 StatusUpdate::ToolStart { name, arguments } => {
                     let formatted_args = format_tool_arguments(arguments);
-                    status_bar.set_status(&format!("Running {}({})", name, formatted_args));
-                    status_bar.reset_timer();
+                    status_bar.set_agent_status(
+                        &agent_name,
+                        &format!("Running {}({})", name, formatted_args),
+                        true,
+                    );
                 }
                 StatusUpdate::ToolExecuting { name, arguments } => {
                     let formatted_args = format_tool_arguments(arguments);
-                    status_bar.set_status(&format!("Running {}({})", name, formatted_args));
+                    status_bar.set_agent_status(
+                        &agent_name,
+                        &format!("Running {}({})", name, formatted_args),
+                        false,
+                    );
                 }
                 StatusUpdate::ToolComplete {
                     name,
@@ -3535,19 +3578,22 @@ fn create_response_mode(
                     chunks_processed,
                     ..
                 } => {
-                    status_bar.set_status(&format!(
-                        "Streaming ({} bytes, {} chunks)",
-                        bytes_read, chunks_processed
-                    ));
+                    status_bar.set_agent_status(
+                        &agent_name,
+                        &format!(
+                            "Streaming ({} bytes, {} chunks)",
+                            bytes_read, chunks_processed
+                        ),
+                        false,
+                    );
                 }
                 StatusUpdate::Continuing => {
-                    status_bar.set_status("Continuing");
-                    status_bar.reset_timer();
+                    status_bar.set_agent_status(&agent_name, "Continuing", true);
                 }
                 StatusUpdate::Complete { usage } => {
                     completed_for_progress.store(true, Ordering::Relaxed);
                     let elapsed_secs = progress_info.elapsed_ms as f64 / 1000.0;
-                    status_bar.clear_status();
+                    status_bar.clear_agent_status(&agent_name);
 
                     if let Some(usage) = usage {
                         let mut parts = Vec::new();
@@ -3590,6 +3636,7 @@ fn execute_ai_request(
     signal_handler_active: &Arc<AtomicBool>,
     status_bar: &Arc<status_bar::StatusBar>,
     chat_pb: &ChatPrinter,
+    agent_name: &str,
 ) -> Result<OpenAIResponse, Box<dyn Error>> {
     signal_handler_active.store(true, Ordering::Relaxed);
 
@@ -3617,7 +3664,7 @@ fn execute_ai_request(
                     while receiver.try_recv().is_ok() {}
                 }
             }
-            status_bar.clear_status();
+            status_bar.clear_agent_status(agent_name);
             if e.downcast_ref::<InterruptedError>().is_some() {
                 chat_pb.println("Operation interrupted. Type your next message or /quit to exit.");
             }
@@ -3625,7 +3672,7 @@ fn execute_ai_request(
         }
     };
 
-    status_bar.clear_status();
+    status_bar.clear_agent_status(agent_name);
     Ok(response)
 }
 
@@ -3941,7 +3988,7 @@ fn chat_command(
             }
         }
 
-        let mut pending_injection: Option<String> = None;
+        let mut pending_injections: Vec<String> = Vec::new();
         if let Some(ref db) = db {
             if let Ok(notifications) = db.poll_notifications_for_session(&session_id) {
                 for notif in notifications {
@@ -3949,6 +3996,13 @@ fn chat_command(
                         serde_json::from_str::<serde_json::Value>(&notif.message)
                     {
                         if obj.get("type").and_then(|v| v.as_str()) == Some("subagent_result") {
+                            if let Some(agent) = obj.get("agent").and_then(|v| v.as_str()) {
+                                status_bar.clear_agent_status(agent);
+                                let _ = db.delete_agent(agent);
+                                if let Ok(mut names) = agent_names.lock() {
+                                    names.retain(|n| n != agent);
+                                }
+                            }
                             obj.get("response")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or(&notif.message)
@@ -3960,13 +4014,18 @@ fn chat_command(
                         notif.message.clone()
                     };
                     chat_pb.println_agent(&notif.from_agent, &display_msg);
-                    pending_injection = Some(format!(
+                    pending_injections.push(format!(
                         "[Message from agent '{}']: {}",
                         notif.from_agent, notif.message
                     ));
                 }
             }
         }
+        let pending_injection: Option<String> = if pending_injections.is_empty() {
+            None
+        } else {
+            Some(pending_injections.join("\n"))
+        };
 
         let is_injected = pending_injection.is_some();
         let line = if let Some(injected) = pending_injection {
@@ -4055,6 +4114,7 @@ fn chat_command(
                         opts: openai_opts.clone(),
                         session_id: session_id.to_string(),
                         active_subagents: active_subagents.clone(),
+                        status_bar: status_bar.clone(),
                     }));
 
                     if is_injected {
@@ -4089,15 +4149,18 @@ fn chat_command(
                             }
                         }
                     } else {
-                        let mode = create_response_mode(chat_pb.clone(), status_bar.clone());
+                        let mode = create_response_mode(
+                            chat_pb.clone(),
+                            status_bar.clone(),
+                            active_agent.name.clone(),
+                        );
 
                         let printer_for_tool = chat_pb.clone();
                         tool_context.println = Box::new(move |msg: &str| {
                             printer_for_tool.println(msg);
                         });
 
-                        status_bar.set_status("Connecting");
-                        status_bar.reset_timer();
+                        status_bar.set_agent_status(&active_agent.name, "Connecting", true);
                         match execute_ai_request(
                             active_agent.messages.clone(),
                             &tools,
@@ -4108,6 +4171,7 @@ fn chat_command(
                             &signal_handler_active,
                             &status_bar,
                             &chat_pb,
+                            &active_agent.name,
                         ) {
                             Ok(response) => {
                                 active_agent.messages = response.history;
