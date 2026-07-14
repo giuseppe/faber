@@ -3818,6 +3818,7 @@ fn chat_command(
             match input_rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(Ok(line)) => line.trim().to_string(),
                 Ok(Err(rustyline::error::ReadlineError::Interrupted)) => {
+                    prompt_shown = false;
                     continue;
                 }
                 Ok(Err(rustyline::error::ReadlineError::Eof)) => {
