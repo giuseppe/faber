@@ -752,6 +752,18 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
         content: String,
         #[serde(default = "default_file_mode")]
         mode: String,
+        #[serde(default)]
+        offset: Option<u64>,
+        #[serde(default)]
+        length: Option<u64>,
+        #[serde(default)]
+        start_line: Option<u64>,
+        #[serde(default)]
+        end_line: Option<u64>,
+        #[serde(default)]
+        old_content: Option<String>,
+        #[serde(default)]
+        replace_all: Option<bool>,
     }
 
     #[derive(Serialize)]
@@ -760,6 +772,7 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
         bytes_written: usize,
         mode: String,
         created: bool,
+        operation: String,
         message: String,
     }
 
@@ -794,10 +807,194 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
 
     debug!("Parsed file mode: {} (octal: {:o})", file_mode, file_mode);
 
+    let has_offset = params.offset.is_some();
+    let has_start_line = params.start_line.is_some();
+    let has_old_content = params.old_content.is_some();
+
+    if has_old_content && (has_offset || has_start_line) {
+        return Err("Cannot combine old_content with offset or start_line parameters".into());
+    }
+    if has_offset && has_start_line {
+        return Err("Cannot combine offset with start_line parameters".into());
+    }
+    if has_offset && params.length.is_none() {
+        return Err("offset requires length to be specified".into());
+    }
+    if has_start_line && params.end_line.is_none() {
+        return Err("start_line requires end_line to be specified".into());
+    }
+
+    let is_partial = has_offset || has_start_line || has_old_content;
+
     let root = Root::open(".")?;
     let path_buf = PathBuf::from(&params.path);
 
-    // Try to read existing file content for diff display
+    if is_partial {
+        let mut file = root
+            .open_subpath(&params.path, OpenFlags::O_RDONLY)
+            .map_err(|_| format!("File '{}' must exist for partial writes", params.path))?;
+        let mut existing_bytes = Vec::new();
+        file.read_to_end(&mut existing_bytes)?;
+        drop(file);
+
+        let (new_bytes, operation) = if has_old_content {
+            let old_text = params.old_content.as_ref().unwrap();
+            let existing_str = String::from_utf8(existing_bytes.clone())
+                .map_err(|_| "File contains invalid UTF-8, cannot use search-and-replace mode")?;
+
+            if old_text == &params.content {
+                return Err("old_content and content are identical, nothing to replace".into());
+            }
+
+            let match_count = existing_str.matches(old_text.as_str()).count();
+            if match_count == 0 {
+                return Err(format!(
+                    "old_content not found in file '{}'",
+                    params.path
+                )
+                .into());
+            }
+
+            let replace_all = params.replace_all.unwrap_or(false);
+            if match_count > 1 && !replace_all {
+                return Err(format!(
+                    "old_content matches {} times in '{}'. Set replace_all=true or provide more context to make it unique",
+                    match_count, params.path
+                ).into());
+            }
+
+            let new_str = if replace_all {
+                existing_str.replace(old_text.as_str(), &params.content)
+            } else {
+                existing_str.replacen(old_text.as_str(), &params.content, 1)
+            };
+            (new_str.into_bytes(), "patch_search_replace")
+        } else if has_offset {
+            let offset = params.offset.unwrap() as usize;
+            let length = params.length.unwrap() as usize;
+
+            if offset > existing_bytes.len() {
+                return Err(format!(
+                    "offset {} is beyond file size {}",
+                    offset,
+                    existing_bytes.len()
+                )
+                .into());
+            }
+            if offset + length > existing_bytes.len() {
+                return Err(format!(
+                    "offset ({}) + length ({}) = {} exceeds file size {}",
+                    offset,
+                    length,
+                    offset + length,
+                    existing_bytes.len()
+                )
+                .into());
+            }
+
+            let mut new_bytes = Vec::with_capacity(
+                existing_bytes.len() - length + params.content.len(),
+            );
+            new_bytes.extend_from_slice(&existing_bytes[..offset]);
+            new_bytes.extend_from_slice(params.content.as_bytes());
+            new_bytes.extend_from_slice(&existing_bytes[offset + length..]);
+            (new_bytes, "patch_offset")
+        } else {
+            let existing_str = String::from_utf8(existing_bytes.clone())
+                .map_err(|_| "File contains invalid UTF-8, cannot use line-number mode")?;
+
+            let lines: Vec<&str> = existing_str.lines().collect();
+            let start = params.start_line.unwrap() as usize;
+            let end = params.end_line.unwrap() as usize;
+
+            if start == 0 {
+                return Err("start_line is 1-based, cannot be 0".into());
+            }
+            if end < start {
+                return Err(format!(
+                    "end_line ({}) must be >= start_line ({})",
+                    end, start
+                )
+                .into());
+            }
+            if start > lines.len() {
+                return Err(format!(
+                    "start_line {} exceeds file line count {}",
+                    start,
+                    lines.len()
+                )
+                .into());
+            }
+            if end > lines.len() {
+                return Err(format!(
+                    "end_line {} exceeds file line count {}",
+                    end,
+                    lines.len()
+                )
+                .into());
+            }
+
+            let mut new_lines: Vec<&str> = Vec::new();
+            new_lines.extend_from_slice(&lines[..start - 1]);
+            for line in params.content.lines() {
+                new_lines.push(line);
+            }
+            new_lines.extend_from_slice(&lines[end..]);
+
+            let mut new_str = new_lines.join("\n");
+            if existing_str.ends_with('\n') {
+                new_str.push('\n');
+            }
+            (new_str.into_bytes(), "patch_lines")
+        };
+
+        let old_content_for_diff = String::from_utf8(existing_bytes).ok();
+
+        let mut file =
+            root.open_subpath(&params.path, OpenFlags::O_WRONLY | OpenFlags::O_TRUNC)?;
+        {
+            use std::os::unix::io::AsRawFd;
+            let mode = rustix::fs::Mode::from_raw_mode(file_mode);
+            let _ = rustix::fs::fchmod(
+                unsafe { rustix::fd::BorrowedFd::borrow_raw(file.as_raw_fd()) },
+                mode,
+            );
+        }
+        file.write_all(&new_bytes)?;
+
+        let bytes_written = new_bytes.len();
+        let op_display = match operation {
+            "patch_offset" => "PATCH (byte offset)",
+            "patch_lines" => "PATCH (line range)",
+            _ => "PATCH (search & replace)",
+        };
+
+        let result = WriteFileResult {
+            path: params.path.clone(),
+            bytes_written,
+            mode: format!("{:o}", file_mode),
+            created: false,
+            operation: operation.to_string(),
+            message: format!("File '{}' patched successfully", params.path),
+        };
+
+        ctx.println(&format!("\u{1f4dd} {}", result.message));
+        ctx.println(&format!("   Path: {}", result.path));
+        ctx.println(&format!("   Bytes written: {}", result.bytes_written));
+        ctx.println(&format!("   File mode: {}", result.mode));
+        ctx.println(&format!("   Operation: {}", op_display));
+
+        if let Some(old_str) = old_content_for_diff {
+            if let Ok(new_str) = std::str::from_utf8(&new_bytes) {
+                show_diff(ctx, &old_str, new_str, &params.path);
+            }
+        }
+
+        let json_result = serde_json::to_string(&result)?;
+        return Ok(json_result);
+    }
+
+    // Full write mode (existing behavior)
     let existing_content = match root.open_subpath(&params.path, OpenFlags::O_RDONLY) {
         Ok(mut file) => {
             let mut content = Vec::new();
@@ -824,7 +1021,6 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
             Err(e) => {
                 debug!("File '{}' does not exist ({}), will create", params.path, e);
 
-                // Create parent directories if needed
                 if let Some(parent) = path_buf.parent() {
                     if !parent.as_os_str().is_empty() {
                         debug!("Creating parent directories for: {}", parent.display());
@@ -848,13 +1044,18 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
     let bytes_written = params.content.len();
     debug!("Writing {} bytes to file: {}", bytes_written, params.path);
 
-    file.write_all(&params.content.as_bytes())?;
+    file.write_all(params.content.as_bytes())?;
 
     let result = WriteFileResult {
         path: params.path.clone(),
         bytes_written,
         mode: format!("{:o}", file_mode),
-        created: created,
+        created,
+        operation: if created {
+            "create".to_string()
+        } else {
+            "overwrite".to_string()
+        },
         message: if created {
             format!("File '{}' created successfully", params.path)
         } else {
@@ -867,8 +1068,7 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
         bytes_written, params.path, file_mode
     );
 
-    // Display output using context callback
-    ctx.println(&format!("📝 {}", result.message));
+    ctx.println(&format!("\u{1f4dd} {}", result.message));
     ctx.println(&format!("   Path: {}", result.path));
     ctx.println(&format!("   Bytes written: {}", result.bytes_written));
     ctx.println(&format!("   File mode: {}", result.mode));
@@ -881,7 +1081,6 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
         }
     ));
 
-    // Show diff if overwriting an existing textual file
     if !created {
         if let Some(old_content_bytes) = existing_content {
             if std::str::from_utf8(params.content.as_bytes()).is_ok() {
@@ -2006,7 +2205,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create or replace the content of a file stored in the repository. Returns detailed information about the write operation including bytes written, file mode, and whether the file was created or overwritten.",
+                "description": "Create or replace the content of a file, or partially edit it. For full writes, provide path and content. For partial edits, use one of: (1) offset+length for byte-level patching, (2) start_line+end_line for line-range replacement, or (3) old_content for search-and-replace. Only one partial edit mode can be used at a time. Partial edits require the file to already exist.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2016,12 +2215,36 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         },
                         "content": {
                             "type": "string",
-                            "description": "the content of the new file"
+                            "description": "the file content for full writes, or the replacement text for partial edits"
                         },
                         "mode": {
                             "type": "string",
                             "description": "file permissions mode in octal format (e.g., '0644', '0755', '0600'). Defaults to '0644' for regular files. Use '0755' for executable files.",
                             "default": "0644"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "byte offset (0-based) to start the partial write. Requires 'length'. Cannot be combined with start_line or old_content."
+                        },
+                        "length": {
+                            "type": "integer",
+                            "description": "number of bytes to replace starting from 'offset'. The replaced region is substituted with 'content'."
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "description": "1-based line number to start replacing. Requires 'end_line'. Cannot be combined with offset or old_content."
+                        },
+                        "end_line": {
+                            "type": "integer",
+                            "description": "1-based line number to stop replacing (inclusive). Lines from start_line to end_line are replaced with 'content'."
+                        },
+                        "old_content": {
+                            "type": "string",
+                            "description": "exact text to find in the file and replace with 'content'. Must match exactly once unless replace_all is true. Cannot be combined with offset or start_line."
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "if true, replace all occurrences of old_content. Defaults to false (requires unique match)."
                         }
                     },
                     "required": [
@@ -5174,5 +5397,357 @@ mod tests {
         assert!(tools.contains_key("write_file"));
         assert!(!tools.contains_key("run_command"));
         assert!(!tools.contains_key("glob"));
+    }
+
+    fn test_ctx() -> ToolContext {
+        ToolContext::new(|_| {})
+    }
+
+    fn write_test_file(name: &str, content: &str) {
+        std::fs::write(name, content).unwrap();
+    }
+
+    fn read_test_file(name: &str) -> String {
+        std::fs::read_to_string(name).unwrap()
+    }
+
+    fn cleanup(name: &str) {
+        let _ = std::fs::remove_file(name);
+    }
+
+    #[test]
+    fn test_write_file_full_create() {
+        let path = "_test_wf_full_create.tmp";
+        cleanup(path);
+        let params = serde_json::json!({
+            "path": path,
+            "content": "hello world\n"
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx()).unwrap();
+        let res: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(res["created"], true);
+        assert_eq!(res["operation"], "create");
+        assert_eq!(res["bytes_written"], 12);
+        assert_eq!(read_test_file(path), "hello world\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_full_overwrite() {
+        let path = "_test_wf_full_overwrite.tmp";
+        write_test_file(path, "old content\n");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "new content\n"
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx()).unwrap();
+        let res: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(res["created"], false);
+        assert_eq!(res["operation"], "overwrite");
+        assert_eq!(read_test_file(path), "new content\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_search_replace() {
+        let path = "_test_wf_search_replace.tmp";
+        write_test_file(path, "line one\nline two\nline three\n");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "line TWO",
+            "old_content": "line two"
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx()).unwrap();
+        let res: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(res["operation"], "patch_search_replace");
+        assert_eq!(read_test_file(path), "line one\nline TWO\nline three\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_search_replace_all() {
+        let path = "_test_wf_search_replace_all.tmp";
+        write_test_file(path, "aaa bbb aaa ccc aaa\n");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "XXX",
+            "old_content": "aaa",
+            "replace_all": true
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx()).unwrap();
+        let res: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(res["operation"], "patch_search_replace");
+        assert_eq!(read_test_file(path), "XXX bbb XXX ccc XXX\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_search_replace_not_found() {
+        let path = "_test_wf_sr_notfound.tmp";
+        write_test_file(path, "hello world\n");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "replacement",
+            "old_content": "nonexistent"
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_search_replace_multiple_without_flag() {
+        let path = "_test_wf_sr_multi.tmp";
+        write_test_file(path, "foo bar foo baz foo\n");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "X",
+            "old_content": "foo"
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("matches 3 times"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_search_replace_identical() {
+        let path = "_test_wf_sr_identical.tmp";
+        write_test_file(path, "hello world\n");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "hello",
+            "old_content": "hello"
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("identical"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_byte_offset() {
+        let path = "_test_wf_byte_offset.tmp";
+        write_test_file(path, "Hello, World!");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "Rust",
+            "offset": 7,
+            "length": 5
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx()).unwrap();
+        let res: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(res["operation"], "patch_offset");
+        assert_eq!(read_test_file(path), "Hello, Rust!");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_byte_offset_expand() {
+        let path = "_test_wf_byte_offset_expand.tmp";
+        write_test_file(path, "ABCDE");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "XXXX",
+            "offset": 1,
+            "length": 2
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx()).unwrap();
+        assert_eq!(read_test_file(path), "AXXXXDE");
+        let res: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(res["bytes_written"], 7);
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_byte_offset_out_of_bounds() {
+        let path = "_test_wf_byte_oob.tmp";
+        write_test_file(path, "short");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "x",
+            "offset": 100,
+            "length": 1
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("beyond file size"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_byte_offset_length_exceeds() {
+        let path = "_test_wf_byte_len_oob.tmp";
+        write_test_file(path, "short");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "x",
+            "offset": 3,
+            "length": 10
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds file size"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_line_range() {
+        let path = "_test_wf_line_range.tmp";
+        write_test_file(path, "line1\nline2\nline3\nline4\nline5\n");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "NEW2\nNEW3",
+            "start_line": 2,
+            "end_line": 3
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx()).unwrap();
+        let res: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(res["operation"], "patch_lines");
+        assert_eq!(read_test_file(path), "line1\nNEW2\nNEW3\nline4\nline5\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_line_range_single_line() {
+        let path = "_test_wf_line_single.tmp";
+        write_test_file(path, "aaa\nbbb\nccc\n");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "BBB",
+            "start_line": 2,
+            "end_line": 2
+        });
+        let _result = tool_write_file(&params.to_string(), &test_ctx()).unwrap();
+        assert_eq!(read_test_file(path), "aaa\nBBB\nccc\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_line_range_out_of_bounds() {
+        let path = "_test_wf_line_oob.tmp";
+        write_test_file(path, "one\ntwo\n");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "x",
+            "start_line": 1,
+            "end_line": 10
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds file line count"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_line_range_zero_start() {
+        let path = "_test_wf_line_zero.tmp";
+        write_test_file(path, "one\ntwo\n");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "x",
+            "start_line": 0,
+            "end_line": 1
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("1-based"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_line_range_end_before_start() {
+        let path = "_test_wf_line_inv.tmp";
+        write_test_file(path, "one\ntwo\nthree\n");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "x",
+            "start_line": 3,
+            "end_line": 1
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must be >="));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_conflicting_params_old_content_and_offset() {
+        let path = "_test_wf_conflict1.tmp";
+        write_test_file(path, "content");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "x",
+            "old_content": "con",
+            "offset": 0,
+            "length": 3
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Cannot combine"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_conflicting_params_offset_and_start_line() {
+        let path = "_test_wf_conflict2.tmp";
+        write_test_file(path, "content\n");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "x",
+            "offset": 0,
+            "length": 1,
+            "start_line": 1,
+            "end_line": 1
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Cannot combine"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_offset_without_length() {
+        let path = "_test_wf_no_len.tmp";
+        write_test_file(path, "content");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "x",
+            "offset": 0
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("requires length"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_start_line_without_end_line() {
+        let path = "_test_wf_no_end.tmp";
+        write_test_file(path, "content\n");
+        let params = serde_json::json!({
+            "path": path,
+            "content": "x",
+            "start_line": 1
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("requires end_line"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_write_file_partial_on_nonexistent_file() {
+        let path = "_test_wf_nofile.tmp";
+        cleanup(path);
+        let params = serde_json::json!({
+            "path": path,
+            "content": "x",
+            "old_content": "y"
+        });
+        let result = tool_write_file(&params.to_string(), &test_ctx());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must exist"));
     }
 }
