@@ -490,6 +490,15 @@ pub fn post_request_with_mode(
     ctx: &crate::ToolContext,
     ctrl_c_rx: Option<Arc<Mutex<mpsc::Receiver<()>>>>,
 ) -> Result<OpenAIResponse, Box<dyn Error>> {
+    if crate::dummy_llm::is_dummy_model(&opts.model) {
+        return crate::dummy_llm::post_request_dummy(
+            messages,
+            tools_collection,
+            mode,
+            ctx,
+            ctrl_c_rx,
+        );
+    }
     post_request_with_mode_and_recursion(messages, tools_collection, opts, mode, ctx, ctrl_c_rx)
 }
 

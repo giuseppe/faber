@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,6 +21,17 @@ struct AgentEntry {
     color: u8,
 }
 
+fn write_stderr(s: &str) {
+    let bytes = s.as_bytes();
+    unsafe {
+        libc::write(
+            libc::STDERR_FILENO,
+            bytes.as_ptr() as *const libc::c_void,
+            bytes.len(),
+        );
+    }
+}
+
 fn set_terminal_rows(rows: u16) {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
@@ -37,6 +47,7 @@ pub struct StatusBar {
     original_rows: u16,
     entries: Arc<Mutex<Vec<(String, AgentEntry)>>>,
     stop_ticker: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     default_color: Arc<AtomicU8>,
     ticker_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -58,28 +69,31 @@ impl StatusBar {
             Position::Bottom => (1, rows - STATUS_LINE_COUNT, rows),
         };
 
-        eprint!(
+        write_stderr(&format!(
             "\x1b[{};{}r\x1b[{};1H\x1b[2K\x1b[{};1H",
             scroll_top, scroll_bottom, status_line, scroll_bottom
-        );
-        let _ = std::io::stderr().flush();
+        ));
 
         set_terminal_rows(rows - STATUS_LINE_COUNT);
 
         let entries: Arc<Mutex<Vec<(String, AgentEntry)>>> = Arc::new(Mutex::new(Vec::new()));
         let stop_ticker = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
         let default_color = Arc::new(AtomicU8::new(36));
 
         let ticker_handle = {
             let entries = entries.clone();
             let stop = stop_ticker.clone();
+            let paused = paused.clone();
 
             std::thread::spawn(move || {
                 let mut tick: u64 = 0;
                 let mut was_active = false;
                 while !stop.load(Ordering::Relaxed) {
                     let is_active;
-                    if let Ok(guard) = entries.lock() {
+                    if paused.load(Ordering::Relaxed) {
+                        is_active = false;
+                    } else if let Ok(guard) = entries.lock() {
                         is_active = !guard.is_empty();
                         if is_active {
                             let idx = if guard.len() > 1 {
@@ -99,26 +113,29 @@ impl StatusBar {
                                 String::new()
                             };
 
-                            eprint!(
+                            write_stderr(&format!(
                                 "\x1b7\x1b[{};1H\x1b[2K\x1b[{}m {} {}: {} \x1b[0m\x1b[90m│ {:.1}s\x1b[0m{}\x1b8",
                                 status_line, c, spinner, agent, entry.message, secs, suffix
-                            );
-                            let _ = std::io::stderr().flush();
+                            ));
                         }
                     } else {
                         is_active = false;
                     }
 
                     if !is_active && was_active {
-                        eprint!("\x1b7\x1b[{};1H\x1b[2K\x1b8", status_line);
-                        let _ = std::io::stderr().flush();
+                        write_stderr(&format!(
+                            "\x1b7\x1b[{};1H\x1b[2K\x1b8",
+                            status_line
+                        ));
                     }
                     was_active = is_active;
                     tick += 1;
                     std::thread::sleep(Duration::from_millis(TICK_INTERVAL_MS));
                 }
-                eprint!("\x1b7\x1b[{};1H\x1b[2K\x1b8", status_line);
-                let _ = std::io::stderr().flush();
+                write_stderr(&format!(
+                    "\x1b7\x1b[{};1H\x1b[2K\x1b8",
+                    status_line
+                ));
             })
         };
 
@@ -127,6 +144,7 @@ impl StatusBar {
             original_rows: rows,
             entries,
             stop_ticker,
+            paused,
             default_color,
             ticker_handle: Some(ticker_handle),
         }
@@ -138,6 +156,7 @@ impl StatusBar {
             original_rows: 0,
             entries: Arc::new(Mutex::new(Vec::new())),
             stop_ticker: Arc::new(AtomicBool::new(true)),
+            paused: Arc::new(AtomicBool::new(true)),
             default_color: Arc::new(AtomicU8::new(36)),
             ticker_handle: None,
         }
@@ -145,6 +164,14 @@ impl StatusBar {
 
     pub fn set_color(&self, ansi_code: u8) {
         self.default_color.store(ansi_code, Ordering::Relaxed);
+    }
+
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Relaxed);
     }
 
     pub fn set_agent_status(&self, agent: &str, msg: &str, reset_timer: bool) {
@@ -196,12 +223,11 @@ impl Drop for StatusBar {
         }
         if self.enabled {
             set_terminal_rows(self.original_rows);
-            eprint!(
+            write_stderr(&format!(
                 "\x1b[r\x1b[{};1H\x1b[2K\x1b[{};1H",
                 self.original_rows,
                 self.original_rows - STATUS_LINE_COUNT
-            );
-            let _ = std::io::stderr().flush();
+            ));
         }
     }
 }

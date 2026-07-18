@@ -17,6 +17,7 @@
  *
  */
 
+mod dummy_llm;
 mod github;
 mod openai;
 mod remote_db;
@@ -461,6 +462,7 @@ impl History for DbHistory {
 #[derive(Clone)]
 struct ChatPrinter {
     printer: Arc<Mutex<Option<Box<dyn rustyline::ExternalPrinter + Send>>>>,
+    direct_mode: Arc<AtomicBool>,
 }
 
 const AGENT_COLORS: &[console::Color] = &[
@@ -493,6 +495,7 @@ impl ChatPrinter {
     fn new() -> Self {
         Self {
             printer: Arc::new(Mutex::new(None)),
+            direct_mode: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -502,14 +505,30 @@ impl ChatPrinter {
         }
     }
 
+    fn set_direct_mode(&self, direct: bool) {
+        self.direct_mode.store(direct, Ordering::Relaxed);
+    }
+
     fn println(&self, msg: &str) {
-        if let Ok(mut guard) = self.printer.lock() {
-            if let Some(ref mut p) = *guard {
-                let _ = p.print(format!("{}\n", msg));
-                return;
+        if !self.direct_mode.load(Ordering::Relaxed) {
+            if let Ok(mut guard) = self.printer.lock() {
+                if let Some(ref mut p) = *guard {
+                    let _ = p.print(format!("{}\n", msg));
+                    return;
+                }
             }
         }
-        println!("{}", msg);
+        use std::io::Write;
+        let output = format!("{}\n", msg);
+        let bytes = output.as_bytes();
+        unsafe {
+            libc::write(
+                libc::STDERR_FILENO,
+                bytes.as_ptr() as *const libc::c_void,
+                bytes.len(),
+            );
+        }
+        let _ = std::io::stderr().flush();
     }
 
     fn println_agent(&self, agent_name: &str, msg: &str) {
@@ -4289,29 +4308,42 @@ fn chat_command(
                 if count > 0 {
                     chat_pb.println(&format!("  {} subagent(s) running in background...", count));
                 }
+                chat_pb.set_direct_mode(false);
+                status_bar.pause();
                 let _ = ready_tx.send(());
                 prompt_shown = true;
             }
 
             match input_rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(Ok(line)) => line.trim().to_string(),
+                Ok(Ok(line)) => {
+                    status_bar.resume();
+                    chat_pb.set_direct_mode(true);
+                    line.trim().to_string()
+                }
                 Ok(Err(rustyline::error::ReadlineError::Interrupted)) => {
+                    status_bar.resume();
+                    chat_pb.set_direct_mode(true);
                     prompt_shown = false;
                     continue;
                 }
                 Ok(Err(rustyline::error::ReadlineError::Eof)) => {
+                    status_bar.resume();
+                    chat_pb.set_direct_mode(true);
                     if let Some(ref db) = db {
                         let _ = db.release_all_agents(&session_id);
                     }
                     return Ok(());
                 }
                 Ok(Err(err)) => {
+                    status_bar.resume();
+                    chat_pb.set_direct_mode(true);
                     return Err(Box::new(err));
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    status_bar.resume();
                     if let Some(ref db) = db {
                         let _ = db.release_all_agents(&session_id);
                     }
@@ -4320,7 +4352,9 @@ fn chat_command(
             }
         };
 
-        prompt_shown = false;
+        if !is_injected {
+            prompt_shown = false;
+        }
 
         debug!("User input: '{}' (length: {})", line, line.len());
 

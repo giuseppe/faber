@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 pub mod db;
 pub mod db_backend;
+pub mod dummy_llm;
 pub mod github;
 pub mod local_db;
 pub mod mcp;
