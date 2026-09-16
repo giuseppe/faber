@@ -4359,7 +4359,7 @@ fn chat_command(
         debug!("User input: '{}' (length: {})", line, line.len());
 
         let command = parse_chat_command(&line);
-        match handle_chat_command(
+        let handled = match handle_chat_command(
             command,
             &mut active_agent,
             &tools,
@@ -4372,7 +4372,14 @@ fn chat_command(
             &session_id,
             &mcp_manager,
             &status_bar,
-        )? {
+        ) {
+            Ok(handled) => handled,
+            Err(e) => {
+                chat_pb.println(&format!("Error: {}", e));
+                continue;
+            }
+        };
+        match handled {
             true => continue,
             false => {
                 if let ChatCommand::Quit = parse_chat_command(&line) {
@@ -4474,9 +4481,9 @@ fn chat_command(
                             Err(e) => {
                                 if e.downcast_ref::<InterruptedError>().is_some() {
                                     continue;
-                                } else {
-                                    return Err(e);
                                 }
+                                chat_pb.println(&format!("Error: {}", e));
+                                continue;
                             }
                         }
                     }
