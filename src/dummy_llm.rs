@@ -324,6 +324,7 @@ pub fn post_request_dummy(
         if let ResponseMode::Streaming {
             ref stream_handler,
             ref progress_handler,
+            ..
         } = mode
         {
             progress_handler(&ProgressInfo {

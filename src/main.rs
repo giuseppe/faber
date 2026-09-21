@@ -3952,6 +3952,34 @@ fn format_tool_arguments(args_json: &str) -> String {
     }
 }
 
+/// Returns a stream handler that prints `style`d text one line at a time; an
+/// empty chunk flushes the unfinished line.
+fn line_streamer(
+    printer: ChatPrinter,
+    style: Style,
+) -> impl Fn(&str) -> Result<(), Box<dyn Error>> {
+    let buffer = Mutex::new(String::new());
+    move |chunk: &str| {
+        if let Ok(mut buffer) = buffer.lock() {
+            buffer.push_str(chunk);
+            if chunk.is_empty() {
+                if !buffer.is_empty() {
+                    printer.println(&style.apply_to(&*buffer).to_string());
+                    buffer.clear();
+                }
+            } else if buffer.contains('\n') {
+                let mut lines: Vec<&str> = buffer.split('\n').collect();
+                let remaining = lines.pop().unwrap_or("").to_string();
+                for line in lines {
+                    printer.println(&style.apply_to(line).to_string());
+                }
+                *buffer = remaining;
+            }
+        }
+        Ok(())
+    }
+}
+
 fn create_response_mode(
     printer: ChatPrinter,
     status_bar: Arc<status_bar::StatusBar>,
@@ -3959,46 +3987,22 @@ fn create_response_mode(
 ) -> ResponseMode {
     let tool_active = Arc::new(AtomicBool::new(false));
     let completed = Arc::new(AtomicBool::new(false));
-    let stream_buffer = Arc::new(Mutex::new(String::new()));
 
-    let printer_for_stream = printer.clone();
+    let answer = line_streamer(printer.clone(), Style::new().cyan());
     let tool_active_for_stream = tool_active.clone();
-    let stream_buffer_clone = stream_buffer.clone();
 
-    let printer_for_progress = printer;
+    let printer_for_progress = printer.clone();
     let tool_active_for_progress = tool_active;
     let completed_for_progress = completed;
 
     ResponseMode::Streaming {
         stream_handler: Box::new(move |chunk: &str| {
-            let response_style = Style::new().cyan();
-            if chunk.is_empty() {
-                if let Ok(mut buffer) = stream_buffer_clone.lock() {
-                    if !buffer.is_empty() {
-                        printer_for_stream.println(&response_style.apply_to(&*buffer).to_string());
-                        buffer.clear();
-                    }
-                }
+            if !chunk.is_empty() && tool_active_for_stream.load(Ordering::Relaxed) {
                 return Ok(());
             }
-
-            if tool_active_for_stream.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-
-            if let Ok(mut buffer) = stream_buffer_clone.lock() {
-                buffer.push_str(chunk);
-                if buffer.contains('\n') {
-                    let mut lines: Vec<&str> = buffer.split('\n').collect();
-                    let remaining = lines.pop().unwrap_or("").to_string();
-                    for line in lines {
-                        printer_for_stream.println(&response_style.apply_to(line).to_string());
-                    }
-                    *buffer = remaining;
-                }
-            }
-            Ok(())
+            answer(chunk)
         }),
+        reasoning_handler: Box::new(line_streamer(printer, Style::new().color256(244).italic())),
         progress_handler: Box::new(move |progress_info: &ProgressInfo| {
             if completed_for_progress.load(Ordering::Relaxed) {
                 return Ok(());
@@ -4145,6 +4149,22 @@ fn execute_ai_request(
 
     status_bar.clear_agent_status(agent_name);
     Ok(response)
+}
+
+/// Tells the user when the model stopped because it ran out of tokens rather
+/// than because it was done, which otherwise looks like a complete answer.
+fn warn_if_truncated(response: &OpenAIResponse, chat_pb: &ChatPrinter) {
+    let finish_reason = response
+        .choices
+        .as_ref()
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.finish_reason.as_deref());
+    if finish_reason == Some("length") {
+        chat_pb.println(
+            "Warning: the response was cut off (finish reason: length).  The token limit or \
+             the context window was reached; try /summarize, /clear or fewer tools.",
+        );
+    }
 }
 
 fn save_agent_history(db: &Option<Arc<dyn DbBackend>>, agent: &AgentState) {
@@ -4732,6 +4752,7 @@ fn chat_command(
                             },
                         ) {
                             Ok(response) => {
+                                warn_if_truncated(&response, &chat_pb);
                                 active_agent.messages = response.history;
                                 if let Some(ref choices) = response.choices {
                                     if let Some(content) =
@@ -4770,7 +4791,11 @@ fn chat_command(
                                     status_bar.clone(),
                                     agent_name.clone(),
                                 );
-                                status_bar.set_agent_status(&agent_name, "Connecting", true);
+                                status_bar.set_agent_status(
+                                    &agent_name,
+                                    "Waiting for response",
+                                    true,
+                                );
                                 execute_ai_request(
                                     messages,
                                     &tools,
@@ -4786,6 +4811,7 @@ fn chat_command(
                             },
                         ) {
                             Ok(response) => {
+                                warn_if_truncated(&response, &chat_pb);
                                 active_agent.messages = response.history;
                                 save_agent_history(&db, &active_agent);
                             }

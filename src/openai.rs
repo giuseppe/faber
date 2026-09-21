@@ -328,6 +328,9 @@ pub enum ResponseMode {
     Complete,
     Streaming {
         stream_handler: Box<dyn Fn(&str) -> Result<(), Box<dyn Error>>>,
+        /// Receives the model's reasoning ("thinking") tokens, which are shown
+        /// but never stored in the conversation history.
+        reasoning_handler: Box<dyn Fn(&str) -> Result<(), Box<dyn Error>>>,
         progress_handler: Box<dyn Fn(&ProgressInfo) -> Result<(), Box<dyn Error>>>,
     },
 }
@@ -892,11 +895,12 @@ fn handle_streaming_response(
     mode: &ResponseMode,
     ctrl_c_rx: Option<Arc<Mutex<mpsc::Receiver<()>>>>,
 ) -> Result<OpenAIResponse, Box<dyn Error>> {
-    let (stream_handler, progress_handler) = match mode {
+    let (stream_handler, reasoning_handler, progress_handler) = match mode {
         ResponseMode::Streaming {
             stream_handler,
+            reasoning_handler,
             progress_handler,
-        } => (stream_handler, progress_handler),
+        } => (stream_handler, reasoning_handler, progress_handler),
         ResponseMode::Complete => return Err("Invalid mode for streaming response".into()),
     };
 
@@ -909,6 +913,7 @@ fn handle_streaming_response(
     let mut chunks_processed = 0u32;
     let mut tool_accumulation_start: Option<std::time::Instant> = None;
     let mut thinking_reported = false;
+    let mut reasoning_active = false;
     let start_time = std::time::Instant::now();
 
     // Create a channel for line reading
@@ -985,9 +990,24 @@ fn handle_streaming_response(
                             thinking_reported = true;
                         }
 
+                        // Reasoning tokens arrive in a separate field, whose name depends on the server
+                        for reasoning in [&choice.delta.thinking, &choice.delta.reasoning_content]
+                            .into_iter()
+                            .flatten()
+                        {
+                            if !reasoning.is_empty() {
+                                reasoning_handler(reasoning)?;
+                                reasoning_active = true;
+                            }
+                        }
+
                         // Handle regular content
                         if let Some(content) = &choice.delta.content {
                             if content != "" {
+                                if reasoning_active {
+                                    reasoning_handler("")?;
+                                    reasoning_active = false;
+                                }
                                 accumulated_content.push_str(content);
                                 stream_handler(content)?;
 
@@ -997,46 +1017,6 @@ fn handle_streaming_response(
                                             bytes_read,
                                             chunks_processed,
                                             latest_content: content.clone(),
-                                        },
-                                        elapsed_ms: 0,
-                                    };
-                                    let _ = progress_handler(&progress_info);
-                                }
-                            }
-                        }
-
-                        // Handle thinking content (might come in a separate field)
-                        if let Some(thinking_content) = &choice.delta.thinking {
-                            if thinking_content != "" {
-                                accumulated_content.push_str(thinking_content);
-                                stream_handler(thinking_content)?;
-
-                                if chunks_processed % 10 == 0 {
-                                    let progress_info = ProgressInfo {
-                                        status: StatusUpdate::StreamProcessing {
-                                            bytes_read,
-                                            chunks_processed,
-                                            latest_content: thinking_content.clone(),
-                                        },
-                                        elapsed_ms: 0,
-                                    };
-                                    let _ = progress_handler(&progress_info);
-                                }
-                            }
-                        }
-
-                        // Handle reasoning content (used by some APIs for thinking)
-                        if let Some(reasoning_content) = &choice.delta.reasoning_content {
-                            if reasoning_content != "" {
-                                accumulated_content.push_str(reasoning_content);
-                                stream_handler(reasoning_content)?;
-
-                                if chunks_processed % 10 == 0 {
-                                    let progress_info = ProgressInfo {
-                                        status: StatusUpdate::StreamProcessing {
-                                            bytes_read,
-                                            chunks_processed,
-                                            latest_content: reasoning_content.clone(),
                                         },
                                         elapsed_ms: 0,
                                     };
@@ -1161,7 +1141,8 @@ fn handle_streaming_response(
         }
     }
 
-    // Ensure we call the handler one final time to flush output
+    // Ensure we call the handlers one final time to flush output
+    reasoning_handler("")?;
     stream_handler("")?;
 
     // Build the complete response
@@ -1421,6 +1402,122 @@ mod tests {
 
         let err = classify_context_error("connection reset".into(), &history);
         assert!(err.downcast_ref::<ContextLengthError>().is_none());
+    }
+
+    /// Serves one canned server-sent-events response on a local port and
+    /// returns the endpoint to use.
+    fn serve_sse(events: Vec<serde_json::Value>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            let (header_end, content_length) = loop {
+                let n = stream.read(&mut buf).unwrap();
+                request.extend_from_slice(&buf[..n]);
+                if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..pos]).to_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    break (pos + 4, length);
+                }
+            };
+            while request.len() < header_end + content_length {
+                let n = stream.read(&mut buf).unwrap();
+                request.extend_from_slice(&buf[..n]);
+            }
+            let mut response = String::from(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            for event in events {
+                response.push_str(&format!("data: {}\n\n", event));
+            }
+            response.push_str("data: [DONE]\n\n");
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://{}/chat/completions", addr)
+    }
+
+    fn delta(field: &str, text: &str, finish: Option<&str>) -> serde_json::Value {
+        serde_json::json!({"choices": [{"delta": {field: text}, "finish_reason": finish}]})
+    }
+
+    fn stream_to_vecs(events: Vec<serde_json::Value>) -> (OpenAIResponse, String, String) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let answer = Rc::new(RefCell::new(String::new()));
+        let reasoning = Rc::new(RefCell::new(String::new()));
+        let (answer_out, reasoning_out) = (answer.clone(), reasoning.clone());
+        let mode = ResponseMode::Streaming {
+            stream_handler: Box::new(move |chunk| {
+                answer_out.borrow_mut().push_str(chunk);
+                Ok(())
+            }),
+            reasoning_handler: Box::new(move |chunk| {
+                reasoning_out.borrow_mut().push_str(chunk);
+                Ok(())
+            }),
+            progress_handler: Box::new(|_| Ok(())),
+        };
+        let opts = Opts {
+            max_tokens: None,
+            model: "test-model".to_string(),
+            endpoint: serve_sse(events),
+            tool_choice: None,
+            api_key: None,
+            max_retries: Some(1),
+            retry_base_delay_secs: None,
+            parameters: HashMap::new(),
+        };
+        let ctx = crate::ToolContext::new(|_: &str| {});
+        let response = post_request_with_mode(
+            vec![make_message("user", "hi".to_string())],
+            &ToolsCollection::new(),
+            &opts,
+            mode,
+            &ctx,
+            None,
+        )
+        .unwrap();
+        let (answer, reasoning) = (answer.borrow().clone(), reasoning.borrow().clone());
+        (response, answer, reasoning)
+    }
+
+    #[test]
+    fn test_streaming_reasoning_is_separate_and_not_in_history() {
+        for field in ["reasoning_content", "thinking"] {
+            let (response, answer, reasoning) = stream_to_vecs(vec![
+                delta(field, "The user", None),
+                delta(field, " said hi", None),
+                delta("content", "Hello", None),
+                delta("content", "!", Some("stop")),
+            ]);
+            assert_eq!(reasoning, "The user said hi");
+            assert_eq!(answer, "Hello!");
+            let last = response.history.last().unwrap();
+            assert_eq!(last.role, "assistant");
+            assert_eq!(last.content.as_deref(), Some("Hello!"));
+        }
+    }
+
+    #[test]
+    fn test_streaming_truncated_response_reports_length() {
+        let (response, answer, reasoning) = stream_to_vecs(vec![
+            delta("reasoning_content", "The user said hello. This is", None),
+            delta("reasoning_content", "", Some("length")),
+        ]);
+        assert_eq!(answer, "");
+        assert_eq!(reasoning, "The user said hello. This is");
+        let choice = &response.choices.as_ref().unwrap()[0];
+        assert_eq!(choice.finish_reason.as_deref(), Some("length"));
+        // Reasoning alone must not end up in the history as an answer.
+        assert_eq!(response.history.len(), 1);
     }
 
     #[test]

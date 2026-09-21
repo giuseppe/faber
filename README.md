@@ -74,6 +74,12 @@ swarmblabla --db-path state.db --agent mybot chat  # start as a specific agent
 
 Commands can also use `\` as the prefix (e.g. `\quit`).
 
+Reasoning ("thinking") tokens from models that stream them separately are shown
+in grey italics.  They are not kept in the conversation history, so they do not
+use up the context window on later requests.  If the model stops because it hit
+its token limit, the chat prints a warning instead of showing a silently
+truncated answer.
+
 When a request fails because the conversation no longer fits in the model's
 context window, the chat summarizes the history automatically and retries the
 request once.  Work done by tool calls earlier in the failed turn is included
