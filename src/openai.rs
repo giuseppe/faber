@@ -75,6 +75,8 @@ const CONTEXT_LENGTH_MARKERS: &[&str] = &[
     "maximum context length",
     "context length exceeded",
     "context window",
+    "context size",
+    "exceed_context_size",
     "prompt is too long",
     "input is too long",
     "reduce the length of the messages",
@@ -1397,6 +1399,10 @@ mod tests {
         ));
         assert!(is_context_length_error(
             "Input exceeds the CONTEXT WINDOW of the model"
+        ));
+        // llama.cpp server
+        assert!(is_context_length_error(
+            r#"got error code: 400 Bad Request: {"error":{"code":400,"message":"request (4115 tokens) exceeds the available context size (4096 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":4115,"n_ctx":4096}}"#
         ));
         assert!(!is_context_length_error(
             "Rate limit reached: too many tokens per minute"
