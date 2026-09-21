@@ -2075,6 +2075,154 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     Ok(result.to_string())
 }
 
+/// entrypoint for the patch_file tool
+///
+/// Applies a batch of search-and-replace edits to an existing file.  The file
+/// is opened once (read-write) through `Root`, every edit is applied in
+/// memory and validated before anything is written, and only the bytes that
+/// actually changed are written back, without truncating the file first.
+fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    use serde::Serialize;
+    use std::os::unix::fs::FileExt;
+
+    #[derive(Deserialize)]
+    struct Edit {
+        old_content: String,
+        new_content: String,
+        #[serde(default)]
+        replace_all: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct Params {
+        path: String,
+        edits: Vec<Edit>,
+    }
+
+    #[derive(Serialize)]
+    struct PatchFileResult {
+        path: String,
+        edits_applied: usize,
+        replacements: usize,
+        bytes_before: usize,
+        bytes_after: usize,
+        bytes_written: usize,
+        message: String,
+    }
+
+    let params: Params = serde_json::from_str::<Params>(params_str)?;
+
+    debug!(
+        "patch_file received params: path='{}', edits={}",
+        params.path,
+        params.edits.len()
+    );
+
+    if params.edits.is_empty() {
+        return Err("edits must contain at least one edit".into());
+    }
+
+    let root = Root::open(".")?;
+    let file = root
+        .open_subpath(&params.path, OpenFlags::O_RDWR)
+        .map_err(|e| format!("File '{}' must exist and be writable: {}", params.path, e))?;
+    if !file.metadata()?.is_file() {
+        return Err(format!("'{}' is not a regular file", params.path).into());
+    }
+
+    let mut original = Vec::new();
+    (&file).read_to_end(&mut original)?;
+    let mut text = String::from_utf8(original.clone())
+        .map_err(|_| format!("File '{}' contains invalid UTF-8", params.path))?;
+
+    let mut replacements = 0;
+    for (i, edit) in params.edits.iter().enumerate() {
+        let n = i + 1;
+        if edit.old_content.is_empty() {
+            return Err(format!("edit {}: old_content must not be empty", n).into());
+        }
+        if edit.old_content == edit.new_content {
+            return Err(format!("edit {}: old_content and new_content are identical", n).into());
+        }
+
+        let first = text
+            .find(edit.old_content.as_str())
+            .ok_or_else(|| format!("edit {}: old_content not found in '{}'", n, params.path))?;
+
+        if edit.replace_all {
+            replacements += text.matches(edit.old_content.as_str()).count();
+            text = text.replace(edit.old_content.as_str(), &edit.new_content);
+        } else {
+            // Look for a second match starting after the first character of
+            // the first one, so overlapping matches count as ambiguous too.
+            let skip = first + edit.old_content.chars().next().map_or(1, char::len_utf8);
+            if text[skip..].contains(edit.old_content.as_str()) {
+                return Err(format!(
+                    "edit {}: old_content matches multiple times in '{}'. Set replace_all=true or provide more context to make it unique",
+                    n, params.path
+                )
+                .into());
+            }
+            text.replace_range(first..first + edit.old_content.len(), &edit.new_content);
+            replacements += 1;
+        }
+    }
+
+    let new_bytes = text.as_bytes();
+
+    // Only rewrite the region between the first and the last differing byte.
+    let prefix = original
+        .iter()
+        .zip(new_bytes)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let suffix = if original.len() == new_bytes.len() {
+        original[prefix..]
+            .iter()
+            .rev()
+            .zip(new_bytes[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count()
+    } else {
+        0
+    };
+    let end = new_bytes.len() - suffix;
+
+    if prefix < end {
+        file.write_all_at(&new_bytes[prefix..end], prefix as u64)?;
+    }
+    if new_bytes.len() != original.len() {
+        file.set_len(new_bytes.len() as u64)?;
+    }
+
+    let result = PatchFileResult {
+        path: params.path.clone(),
+        edits_applied: params.edits.len(),
+        replacements,
+        bytes_before: original.len(),
+        bytes_after: new_bytes.len(),
+        bytes_written: end.saturating_sub(prefix),
+        message: format!("File '{}' patched successfully", params.path),
+    };
+
+    ctx.println(&format!("\u{1f4dd} {}", result.message));
+    ctx.println(&format!("   Path: {}", result.path));
+    ctx.println(&format!(
+        "   Edits: {} ({} replacements)",
+        result.edits_applied, result.replacements
+    ));
+    ctx.println(&format!(
+        "   Bytes: {} -> {} ({} written)",
+        result.bytes_before, result.bytes_after, result.bytes_written
+    ));
+
+    if let Ok(old_str) = String::from_utf8(original) {
+        show_diff(ctx, &old_str, &text, &params.path);
+    }
+
+    Ok(serde_json::to_string(&result)?)
+}
+
 fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsCollection {
     let mut tools: ToolsCollection = ToolsCollection::new();
 
@@ -2258,6 +2406,63 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                     "required": [
                         "path",
                         "content"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "patch_file".to_string(),
+        tool_patch_file,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "patch_file",
+                "description": "Apply one or more search-and-replace edits to an existing file in a single call. Prefer this over write_file for changing several places in a file: the edits are applied in order (each one sees the result of the previous ones), validated together, and either all applied or none, and only the changed bytes are rewritten. Each old_content must match exactly once unless replace_all is true.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "path of the existing file under the repository, e.g. src/main.rs"
+                        },
+                        "edits": {
+                            "type": "array",
+                            "description": "the edits to apply, in order",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "old_content": {
+                                        "type": "string",
+                                        "description": "exact, non-empty text to find in the file"
+                                    },
+                                    "new_content": {
+                                        "type": "string",
+                                        "description": "text that replaces old_content (may be empty to delete it)"
+                                    },
+                                    "replace_all": {
+                                        "type": "boolean",
+                                        "description": "if true, replace every occurrence of old_content. Defaults to false (requires a unique match)."
+                                    }
+                                },
+                                "required": [
+                                    "old_content",
+                                    "new_content"
+                                ],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": [
+                        "path",
+                        "edits"
                     ],
                     "additionalProperties": false
                 }
@@ -5561,6 +5766,474 @@ mod tests {
         assert!(tools.contains_key("write_file"));
         assert!(!tools.contains_key("run_command"));
         assert!(!tools.contains_key("glob"));
+    }
+
+    fn patch(path: &str, edits: serde_json::Value) -> Result<serde_json::Value, Box<dyn Error>> {
+        let params = serde_json::json!({ "path": path, "edits": edits });
+        tool_patch_file(&params.to_string(), &test_ctx()).map(|r| serde_json::from_str(&r).unwrap())
+    }
+
+    #[test]
+    fn test_patch_file_registered_as_safe_tool() {
+        let tools = initialize_tools(false, None);
+        assert!(tools.contains_key("patch_file"));
+    }
+
+    #[test]
+    fn test_patch_file_multiple_edits() {
+        let path = "_test_pf_multi.tmp";
+        write_test_file(path, "one\ntwo\nthree\n");
+        let res = patch(
+            path,
+            serde_json::json!([
+                {"old_content": "one", "new_content": "1"},
+                {"old_content": "three", "new_content": "THREE!"}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(res["edits_applied"], 2);
+        assert_eq!(res["replacements"], 2);
+        assert_eq!(read_test_file(path), "1\ntwo\nTHREE!\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_edits_apply_in_order() {
+        let path = "_test_pf_order.tmp";
+        write_test_file(path, "alpha\n");
+        patch(
+            path,
+            serde_json::json!([
+                {"old_content": "alpha", "new_content": "beta"},
+                {"old_content": "beta", "new_content": "gamma"}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(read_test_file(path), "gamma\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_is_atomic() {
+        let path = "_test_pf_atomic.tmp";
+        write_test_file(path, "keep me\nchange me\n");
+        let err = patch(
+            path,
+            serde_json::json!([
+                {"old_content": "change me", "new_content": "changed"},
+                {"old_content": "missing", "new_content": "x"}
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("edit 2"));
+        assert_eq!(read_test_file(path), "keep me\nchange me\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_ambiguous_match() {
+        let path = "_test_pf_ambiguous.tmp";
+        write_test_file(path, "aa bb aa\n");
+        let err = patch(
+            path,
+            serde_json::json!([{"old_content": "aa", "new_content": "x"}]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("multiple times"));
+        assert_eq!(read_test_file(path), "aa bb aa\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_overlapping_match_is_ambiguous() {
+        let path = "_test_pf_overlap.tmp";
+        write_test_file(path, "aaa\n");
+        assert!(
+            patch(
+                path,
+                serde_json::json!([{"old_content": "aa", "new_content": "x"}])
+            )
+            .is_err()
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_replace_all() {
+        let path = "_test_pf_all.tmp";
+        write_test_file(path, "aa bb aa cc aa\n");
+        let res = patch(
+            path,
+            serde_json::json!([{"old_content": "aa", "new_content": "X", "replace_all": true}]),
+        )
+        .unwrap();
+        assert_eq!(res["replacements"], 3);
+        assert_eq!(read_test_file(path), "X bb X cc X\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_shrinks_and_grows() {
+        let path = "_test_pf_resize.tmp";
+        write_test_file(path, "head\nmiddle part\ntail\n");
+        let res = patch(
+            path,
+            serde_json::json!([{"old_content": "middle part\n", "new_content": ""}]),
+        )
+        .unwrap();
+        assert_eq!(res["bytes_after"], 10);
+        assert_eq!(read_test_file(path), "head\ntail\n");
+        patch(
+            path,
+            serde_json::json!([{"old_content": "head\n", "new_content": "a much longer head\n"}]),
+        )
+        .unwrap();
+        assert_eq!(read_test_file(path), "a much longer head\ntail\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_writes_only_changed_bytes() {
+        let path = "_test_pf_minimal.tmp";
+        write_test_file(path, "prefix XXXX suffix\n");
+        let res = patch(
+            path,
+            serde_json::json!([{"old_content": "XXXX", "new_content": "YYYY"}]),
+        )
+        .unwrap();
+        assert_eq!(res["bytes_written"], 4);
+        assert_eq!(read_test_file(path), "prefix YYYY suffix\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_preserves_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = "_test_pf_mode.tmp";
+        write_test_file(path, "#!/bin/sh\necho hi\n");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        patch(
+            path,
+            serde_json::json!([{"old_content": "hi", "new_content": "ho"}]),
+        )
+        .unwrap();
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_unicode() {
+        let path = "_test_pf_unicode.tmp";
+        write_test_file(path, "héllo wörld\n");
+        patch(
+            path,
+            serde_json::json!([{"old_content": "wörld", "new_content": "monde"}]),
+        )
+        .unwrap();
+        assert_eq!(read_test_file(path), "héllo monde\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_rejects_bad_input() {
+        let path = "_test_pf_bad.tmp";
+        write_test_file(path, "content\n");
+        assert!(patch(path, serde_json::json!([])).is_err());
+        assert!(
+            patch(
+                path,
+                serde_json::json!([{"old_content": "", "new_content": "x"}])
+            )
+            .is_err()
+        );
+        assert!(
+            patch(
+                path,
+                serde_json::json!([{"old_content": "content", "new_content": "content"}])
+            )
+            .is_err()
+        );
+        assert!(
+            patch(
+                "_test_pf_missing.tmp",
+                serde_json::json!([{"old_content": "a", "new_content": "b"}])
+            )
+            .is_err()
+        );
+        assert_eq!(read_test_file(path), "content\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_rejects_invalid_utf8_and_directories() {
+        let path = "_test_pf_binary.tmp";
+        std::fs::write(path, [0xff, 0xfe, b'a']).unwrap();
+        assert!(
+            patch(
+                path,
+                serde_json::json!([{"old_content": "a", "new_content": "b"}])
+            )
+            .is_err()
+        );
+        cleanup(path);
+        assert!(
+            patch(
+                "src",
+                serde_json::json!([{"old_content": "a", "new_content": "b"}])
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_patch_file_cannot_escape_the_root() {
+        let outside = "../_test_pf_outside.tmp";
+        std::fs::write(outside, "outside\n").unwrap();
+        let res = patch(
+            outside,
+            serde_json::json!([{"old_content": "outside", "new_content": "hacked"}]),
+        );
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside\n");
+        assert!(res.is_err());
+        let _ = std::fs::remove_file(outside);
+    }
+
+    #[test]
+    fn test_patch_file_schema_and_dispatch() {
+        let tools = initialize_tools(false, None);
+        let schema: serde_json::Value = serde_json::from_str(&tools["patch_file"].schema).unwrap();
+        assert_eq!(schema["function"]["name"], "patch_file");
+        assert_eq!(
+            schema["function"]["parameters"]["required"],
+            serde_json::json!(["path", "edits"])
+        );
+        assert_eq!(
+            schema["function"]["parameters"]["properties"]["edits"]["items"]["required"],
+            serde_json::json!(["old_content", "new_content"])
+        );
+
+        let path = "_test_pf_dispatch.tmp";
+        write_test_file(path, "before\n");
+        let call = ToolCall {
+            index: None,
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "patch_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": path,
+                    "edits": [{"old_content": "before", "new_content": "after"}]
+                })
+                .to_string(),
+            },
+        };
+        let msg = tool_call(&tools, &call, &test_ctx()).unwrap();
+        assert_eq!(msg.role, "tool");
+        assert_eq!(msg.name.as_deref(), Some("patch_file"));
+        assert!(msg.content.unwrap().contains("patched successfully"));
+        assert_eq!(read_test_file(path), "after\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_malformed_params() {
+        let ctx = test_ctx();
+        for params in [
+            "not json",
+            r#"{"path": "x"}"#,
+            r#"{"edits": []}"#,
+            r#"{"path": "x", "edits": "nope"}"#,
+            r#"{"path": "x", "edits": [{"old_content": "a"}]}"#,
+        ] {
+            assert!(
+                tool_patch_file(&params.to_string(), &ctx).is_err(),
+                "{}",
+                params
+            );
+        }
+    }
+
+    #[test]
+    fn test_patch_file_replace_all_not_found() {
+        let path = "_test_pf_all_missing.tmp";
+        write_test_file(path, "abc\n");
+        let err = patch(
+            path,
+            serde_json::json!([{"old_content": "zzz", "new_content": "x", "replace_all": true}]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not found"));
+        assert_eq!(read_test_file(path), "abc\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_replace_all_deletes() {
+        let path = "_test_pf_all_delete.tmp";
+        write_test_file(path, "a-b-c-d\n");
+        let res = patch(
+            path,
+            serde_json::json!([{"old_content": "-", "new_content": "", "replace_all": true}]),
+        )
+        .unwrap();
+        assert_eq!(res["bytes_after"], 5);
+        assert_eq!(read_test_file(path), "abcd\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_edits_that_cancel_out_write_nothing() {
+        let path = "_test_pf_cancel.tmp";
+        write_test_file(path, "one two\n");
+        let res = patch(
+            path,
+            serde_json::json!([
+                {"old_content": "one", "new_content": "1"},
+                {"old_content": "1", "new_content": "one"}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(res["edits_applied"], 2);
+        assert_eq!(res["bytes_written"], 0);
+        assert_eq!(read_test_file(path), "one two\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_same_length_edits_write_only_the_changed_span() {
+        let path = "_test_pf_span.tmp";
+        write_test_file(path, "AAAA----------------BBBB\n");
+        let res = patch(
+            path,
+            serde_json::json!([
+                {"old_content": "AAAA", "new_content": "aaaa"},
+                {"old_content": "BBBB", "new_content": "bbbb"}
+            ]),
+        )
+        .unwrap();
+        // From the first to the last changed byte, not the whole file.
+        assert_eq!(res["bytes_written"], 24);
+        assert_eq!(read_test_file(path), "aaaa----------------bbbb\n");
+
+        let res = patch(
+            path,
+            serde_json::json!([{"old_content": "aaaa", "new_content": "AAAA"}]),
+        )
+        .unwrap();
+        assert_eq!(res["bytes_written"], 4);
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_growing_edit_writes_from_first_change_to_end() {
+        let path = "_test_pf_grow_tail.tmp";
+        write_test_file(path, "keep keep keep X tail\n");
+        let res = patch(
+            path,
+            serde_json::json!([{"old_content": "X", "new_content": "XYZ"}]),
+        )
+        .unwrap();
+        assert_eq!(res["bytes_written"], 8);
+        assert_eq!(read_test_file(path), "keep keep keep XYZ tail\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_multiline_and_crlf() {
+        let path = "_test_pf_crlf.tmp";
+        write_test_file(path, "fn a() {\r\n    1\r\n}\r\nfn b() {\r\n    2\r\n}\r\n");
+        patch(
+            path,
+            serde_json::json!([{
+                "old_content": "fn a() {\r\n    1\r\n}\r\n",
+                "new_content": "fn a() {\r\n    42\r\n}\r\n"
+            }]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_test_file(path),
+            "fn a() {\r\n    42\r\n}\r\nfn b() {\r\n    2\r\n}\r\n"
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_empty_file_cannot_match() {
+        let path = "_test_pf_empty.tmp";
+        write_test_file(path, "");
+        assert!(
+            patch(
+                path,
+                serde_json::json!([{"old_content": "a", "new_content": "b"}])
+            )
+            .is_err()
+        );
+        assert_eq!(read_test_file(path), "");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_follows_symlink_inside_root() {
+        let target = "_test_pf_sym_target.tmp";
+        let link = "_test_pf_sym_link.tmp";
+        write_test_file(target, "linked content\n");
+        let _ = std::fs::remove_file(link);
+        std::os::unix::fs::symlink(target, link).unwrap();
+        patch(
+            link,
+            serde_json::json!([{"old_content": "linked", "new_content": "patched"}]),
+        )
+        .unwrap();
+        assert_eq!(read_test_file(target), "patched content\n");
+        cleanup(link);
+        cleanup(target);
+    }
+
+    #[test]
+    fn test_patch_file_symlinks_cannot_escape_the_root() {
+        let outside = std::env::temp_dir().join("_test_pf_symlink_outside.tmp");
+        std::fs::write(&outside, "outside\n").unwrap();
+
+        // Absolute and relative links pointing outside the working directory
+        // are resolved relative to the root, never to the real filesystem.
+        let abs_link = "_test_pf_abs_link.tmp";
+        let rel_link = "_test_pf_rel_link.tmp";
+        let _ = std::fs::remove_file(abs_link);
+        let _ = std::fs::remove_file(rel_link);
+        std::os::unix::fs::symlink(&outside, abs_link).unwrap();
+        std::os::unix::fs::symlink("../../../../../../../../../../tmp", rel_link).unwrap();
+
+        let edits = serde_json::json!([{"old_content": "outside", "new_content": "hacked"}]);
+        assert!(patch(abs_link, edits.clone()).is_err());
+        assert!(patch(rel_link, edits).is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside\n");
+
+        cleanup(abs_link);
+        cleanup(rel_link);
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn test_patch_file_large_file() {
+        let path = "_test_pf_large.tmp";
+        let line = "The quick brown fox jumps over the lazy dog.\n";
+        let original = line.repeat(20_000);
+        write_test_file(path, &original);
+        let res = patch(
+            path,
+            serde_json::json!([
+                {"old_content": "quick", "new_content": "slow", "replace_all": true},
+                {"old_content": "lazy", "new_content": "energetic", "replace_all": true}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(res["replacements"], 40_000);
+        assert_eq!(
+            read_test_file(path),
+            "The slow brown fox jumps over the energetic dog.\n".repeat(20_000)
+        );
+        cleanup(path);
     }
 
     fn test_ctx() -> ToolContext {

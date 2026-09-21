@@ -180,6 +180,7 @@ scheduler thread checks for pending tasks every second.
 |---|---|
 | `read_file` | Read file contents |
 | `write_file` | Create or overwrite a file with specified permissions |
+| `patch_file` | Apply a batch of search-and-replace edits to a file, all-or-nothing, rewriting only the changed bytes |
 | `delete_path` | Delete a file or directory |
 | `glob` | Find files matching a glob pattern |
 | `grep_in_current_directory` | Search for a pattern in the current directory |
