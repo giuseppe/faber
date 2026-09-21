@@ -50,6 +50,57 @@ impl InterruptedError {
     }
 }
 
+/// Error returned when a request does not fit in the model's context window.
+#[derive(Debug)]
+pub struct ContextLengthError {
+    pub message: String,
+    /// The conversation as it stood when the request failed, including the
+    /// tool calls already made during the current turn.
+    pub history: Vec<Message>,
+}
+
+impl std::fmt::Display for ContextLengthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for ContextLengthError {}
+
+/// Phrases providers use to report that the prompt is larger than the
+/// context window.  Rate-limit messages ("too many tokens per minute") are
+/// deliberately not matched.
+const CONTEXT_LENGTH_MARKERS: &[&str] = &[
+    "context_length_exceeded",
+    "maximum context length",
+    "context length exceeded",
+    "context window",
+    "prompt is too long",
+    "input is too long",
+    "reduce the length of the messages",
+];
+
+pub fn is_context_length_error(text: &str) -> bool {
+    let text = text.to_lowercase();
+    CONTEXT_LENGTH_MARKERS
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+/// Turns `err` into a `ContextLengthError` when it reports a context
+/// overflow, so callers can recover by shrinking `messages`.
+fn classify_context_error(err: Box<dyn Error>, messages: &[Message]) -> Box<dyn Error> {
+    let text = err.to_string();
+    if is_context_length_error(&text) {
+        Box::new(ContextLengthError {
+            message: text,
+            history: messages.to_vec(),
+        })
+    } else {
+        err
+    }
+}
+
 /// Normalize endpoint URL to ensure it ends with "/chat/completions"
 pub fn normalize_endpoint(endpoint: &str) -> String {
     if endpoint.ends_with("/chat/completions") {
@@ -614,7 +665,13 @@ fn post_request_with_mode_and_recursion(
                     let error_text = resp
                         .text()
                         .unwrap_or_else(|_| "Unable to read response".to_string());
-                    return Err(format!("got error code: {}: {}", status, error_text).into());
+                    let err: Box<dyn Error> =
+                        format!("got error code: {}: {}", status, error_text).into();
+                    return Err(if matches!(status.as_u16(), 400 | 413 | 422) {
+                        classify_context_error(err, &messages)
+                    } else {
+                        err
+                    });
                 }
                 Err(e) => {
                     if attempt < max_retries {
@@ -647,7 +704,8 @@ fn post_request_with_mode_and_recursion(
         let response = response.ok_or("Max retries reached without successful response")?;
 
         let mut openai_response: OpenAIResponse = if use_streaming {
-            handle_streaming_response(response, &mode, ctrl_c_rx.clone())?
+            handle_streaming_response(response, &mode, ctrl_c_rx.clone())
+                .map_err(|e| classify_context_error(e, &messages))?
         } else {
             let response_text = response.text()?;
             trace!("Got response {:?}", response_text);
@@ -664,12 +722,13 @@ fn post_request_with_mode_and_recursion(
                     }
                 }
             }
-            return Err(format!(
+            let err: Box<dyn Error> = format!(
                 "got API error code: {}: {}",
                 err.code.unwrap_or_else(|| 400),
                 err.message
             )
-            .into());
+            .into();
+            return Err(classify_context_error(err, &messages));
         }
 
         let mut finish: bool = true;
@@ -1323,6 +1382,39 @@ mod tests {
         let ctx = crate::ToolContext::new(|_: &str| {});
         let result = tool_call(&tools, &req, &ctx).unwrap();
         assert!(result.content.unwrap().contains("invalid tool"));
+    }
+
+    #[test]
+    fn test_is_context_length_error() {
+        assert!(is_context_length_error(
+            "got error code: 400 Bad Request: {\"error\":{\"code\":\"context_length_exceeded\"}}"
+        ));
+        assert!(is_context_length_error(
+            "This model's maximum context length is 8192 tokens. However, you requested 9000"
+        ));
+        assert!(is_context_length_error(
+            "prompt is too long: 250000 tokens > 200000 maximum"
+        ));
+        assert!(is_context_length_error(
+            "Input exceeds the CONTEXT WINDOW of the model"
+        ));
+        assert!(!is_context_length_error(
+            "Rate limit reached: too many tokens per minute"
+        ));
+        assert!(!is_context_length_error(
+            "got error code: 401: invalid api key"
+        ));
+    }
+
+    #[test]
+    fn test_classify_context_error_keeps_history() {
+        let history = vec![make_message("user", "hi".to_string())];
+        let err = classify_context_error("prompt is too long".into(), &history);
+        let overflow = err.downcast_ref::<ContextLengthError>().unwrap();
+        assert_eq!(overflow.history.len(), 1);
+
+        let err = classify_context_error("connection reset".into(), &history);
+        assert!(err.downcast_ref::<ContextLengthError>().is_none());
     }
 
     #[test]

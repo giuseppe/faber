@@ -23,6 +23,7 @@ mod openai;
 mod remote_db;
 mod server;
 mod status_bar;
+mod summarize;
 
 use swarmblabla::db;
 
@@ -83,6 +84,7 @@ const CHAT_COMMANDS: &[&str] = &[
     "/show",
     "/limit",
     "/backtrace",
+    "/summarize",
     "/system",
     "/agents",
     "/create-agent",
@@ -867,11 +869,7 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
 
             let match_count = existing_str.matches(old_text.as_str()).count();
             if match_count == 0 {
-                return Err(format!(
-                    "old_content not found in file '{}'",
-                    params.path
-                )
-                .into());
+                return Err(format!("old_content not found in file '{}'", params.path).into());
             }
 
             let replace_all = params.replace_all.unwrap_or(false);
@@ -911,9 +909,8 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
                 .into());
             }
 
-            let mut new_bytes = Vec::with_capacity(
-                existing_bytes.len() - length + params.content.len(),
-            );
+            let mut new_bytes =
+                Vec::with_capacity(existing_bytes.len() - length + params.content.len());
             new_bytes.extend_from_slice(&existing_bytes[..offset]);
             new_bytes.extend_from_slice(params.content.as_bytes());
             new_bytes.extend_from_slice(&existing_bytes[offset + length..]);
@@ -930,11 +927,7 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
                 return Err("start_line is 1-based, cannot be 0".into());
             }
             if end < start {
-                return Err(format!(
-                    "end_line ({}) must be >= start_line ({})",
-                    end, start
-                )
-                .into());
+                return Err(format!("end_line ({}) must be >= start_line ({})", end, start).into());
             }
             if start > lines.len() {
                 return Err(format!(
@@ -945,12 +938,9 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
                 .into());
             }
             if end > lines.len() {
-                return Err(format!(
-                    "end_line {} exceeds file line count {}",
-                    end,
-                    lines.len()
-                )
-                .into());
+                return Err(
+                    format!("end_line {} exceeds file line count {}", end, lines.len()).into(),
+                );
             }
 
             let mut new_lines: Vec<&str> = Vec::new();
@@ -969,8 +959,7 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
 
         let old_content_for_diff = String::from_utf8(existing_bytes).ok();
 
-        let mut file =
-            root.open_subpath(&params.path, OpenFlags::O_WRONLY | OpenFlags::O_TRUNC)?;
+        let mut file = root.open_subpath(&params.path, OpenFlags::O_WRONLY | OpenFlags::O_TRUNC)?;
         {
             use std::os::unix::io::AsRawFd;
             let mode = rustix::fs::Mode::from_raw_mode(file_mode);
@@ -3255,6 +3244,7 @@ enum ChatCommand {
     Show,
     Limit(usize),
     Backtrace(usize),
+    Summarize,
     System(String),
     Agents,
     CreateAgent(String),
@@ -3307,6 +3297,9 @@ fn parse_chat_command(line: &str) -> ChatCommand {
             }
         }
         return ChatCommand::Invalid("Usage: /backtrace <number_of_messages>".to_string());
+    }
+    if normalized == "/summarize" {
+        return ChatCommand::Summarize;
     }
     if normalized.starts_with("/system ") {
         let system_message = normalized
@@ -3432,6 +3425,7 @@ fn handle_chat_command(
             chat_pb.println("  /show                  Show current chat history");
             chat_pb.println("  /limit <n>             Keep only the last n messages");
             chat_pb.println("  /backtrace <n>         Remove the last n messages");
+            chat_pb.println("  /summarize             Replace the chat history with a summary");
             chat_pb.println("  /system <message>      Add a system message to the conversation");
             chat_pb.println("  /agents                List all agents");
             chat_pb.println("  /create-agent <name>   Create a new agent");
@@ -3728,7 +3722,7 @@ fn handle_chat_command(
             }
             Ok(true)
         }
-        ChatCommand::Message(_) => Ok(false),
+        ChatCommand::Summarize | ChatCommand::Message(_) => Ok(false),
         ChatCommand::Empty => Ok(true),
         ChatCommand::Invalid(error_msg) => {
             chat_pb.println(&error_msg);
@@ -3946,6 +3940,107 @@ fn execute_ai_request(
 
     status_bar.clear_agent_status(agent_name);
     Ok(response)
+}
+
+fn save_agent_history(db: &Option<Arc<dyn DbBackend>>, agent: &AgentState) {
+    if let Some(db) = db {
+        let msgs: Vec<serde_json::Value> = agent
+            .messages
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        let _ = db.save_agent_messages(&agent.name, &msgs);
+    }
+}
+
+/// Replaces the agent's history with a summary of `source` (the current
+/// history, or the one recovered from a failed request) and saves it.
+fn summarize_agent_history(
+    agent: &mut AgentState,
+    source: &[Message],
+    keep_last_user: bool,
+    openai_opts: &openai::Opts,
+    db: &Option<Arc<dyn DbBackend>>,
+    ctrl_c_rx: &Arc<Mutex<mpsc::Receiver<()>>>,
+    signal_handler_active: &Arc<AtomicBool>,
+    status_bar: &Arc<status_bar::StatusBar>,
+    chat_pb: &ChatPrinter,
+) -> Result<(), Box<dyn Error>> {
+    status_bar.set_agent_status(&agent.name, "Summarizing", true);
+    signal_handler_active.store(true, Ordering::Relaxed);
+    let result = summarize::summarize_conversation(
+        source,
+        keep_last_user,
+        openai_opts,
+        &Some(ctrl_c_rx.clone()),
+    );
+    signal_handler_active.store(false, Ordering::Relaxed);
+    if let Ok(receiver) = ctrl_c_rx.lock() {
+        while receiver.try_recv().is_ok() {}
+    }
+    status_bar.clear_agent_status(&agent.name);
+
+    let summarized = result.map_err(|e| {
+        if e.downcast_ref::<InterruptedError>().is_some() {
+            chat_pb.println("Operation interrupted. Type your next message or /quit to exit.");
+        }
+        e
+    })?;
+    chat_pb.println(&format!(
+        "Conversation summarized: {} messages -> {}.",
+        source.len(),
+        summarized.len()
+    ));
+    if let Some(summary) = summarized.iter().find(|m| summarize::is_summary(m)) {
+        chat_pb.println(summary.content.as_deref().unwrap_or(""));
+    }
+    agent.messages = summarized;
+    save_agent_history(db, agent);
+    Ok(())
+}
+
+/// Runs `request` on a copy of the agent's history.  If the request fails
+/// because the conversation no longer fits in the model's context window, the
+/// history is summarized and the request is run once more.
+fn request_with_summary_fallback<T>(
+    agent: &mut AgentState,
+    openai_opts: &openai::Opts,
+    db: &Option<Arc<dyn DbBackend>>,
+    ctrl_c_rx: &Arc<Mutex<mpsc::Receiver<()>>>,
+    signal_handler_active: &Arc<AtomicBool>,
+    status_bar: &Arc<status_bar::StatusBar>,
+    chat_pb: &ChatPrinter,
+    mut request: impl FnMut(Vec<Message>) -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
+    let err = match request(agent.messages.clone()) {
+        Err(e) => e,
+        ok => return ok,
+    };
+    let history = match err.downcast_ref::<openai::ContextLengthError>() {
+        Some(overflow) => overflow.history.clone(),
+        None => return Err(err),
+    };
+
+    chat_pb.println("Context length exceeded, summarizing the conversation and retrying...");
+    summarize_agent_history(
+        agent,
+        &history,
+        true,
+        openai_opts,
+        db,
+        ctrl_c_rx,
+        signal_handler_active,
+        status_bar,
+        chat_pb,
+    )
+    .map_err(|e| -> Box<dyn Error> {
+        if e.downcast_ref::<InterruptedError>().is_some() {
+            e
+        } else {
+            format!("{} (summarization failed: {})", err, e).into()
+        }
+    })?;
+    request(agent.messages.clone())
 }
 
 fn format_tool_output(output: &str) -> String {
@@ -4412,13 +4507,24 @@ fn chat_command(
                     }));
 
                     if is_injected {
-                        match post_request_with_mode(
-                            active_agent.messages.clone(),
-                            &tools,
+                        match request_with_summary_fallback(
+                            &mut active_agent,
                             &openai_opts,
-                            ResponseMode::Complete,
-                            &tool_context,
-                            None,
+                            &db,
+                            &ctrl_c_rx,
+                            &signal_handler_active,
+                            &status_bar,
+                            &chat_pb,
+                            |messages| {
+                                post_request_with_mode(
+                                    messages,
+                                    &tools,
+                                    &openai_opts,
+                                    ResponseMode::Complete,
+                                    &tool_context,
+                                    None,
+                                )
+                            },
                         ) {
                             Ok(response) => {
                                 active_agent.messages = response.history;
@@ -4429,62 +4535,79 @@ fn chat_command(
                                         chat_pb.println_agent(&active_agent.name, content);
                                     }
                                 }
-                                if let Some(ref db) = db {
-                                    let msgs: Vec<serde_json::Value> = active_agent
-                                        .messages
-                                        .iter()
-                                        .map(|m| serde_json::to_value(m).unwrap())
-                                        .collect();
-                                    let _ = db.save_agent_messages(&active_agent.name, &msgs);
-                                }
+                                save_agent_history(&db, &active_agent);
                             }
                             Err(e) => {
-                                chat_pb.println(&format!("Error processing notification: {}", e));
+                                if e.downcast_ref::<InterruptedError>().is_none() {
+                                    chat_pb
+                                        .println(&format!("Error processing notification: {}", e));
+                                }
                             }
                         }
                     } else {
-                        let mode = create_response_mode(
-                            chat_pb.clone(),
-                            status_bar.clone(),
-                            active_agent.name.clone(),
-                        );
-
                         let printer_for_tool = chat_pb.clone();
                         tool_context.println = Box::new(move |msg: &str| {
                             printer_for_tool.println(msg);
                         });
 
-                        status_bar.set_agent_status(&active_agent.name, "Connecting", true);
-                        match execute_ai_request(
-                            active_agent.messages.clone(),
-                            &tools,
+                        let agent_name = active_agent.name.clone();
+                        match request_with_summary_fallback(
+                            &mut active_agent,
                             &openai_opts,
-                            mode,
-                            &tool_context,
-                            Some(ctrl_c_rx.clone()),
+                            &db,
+                            &ctrl_c_rx,
                             &signal_handler_active,
                             &status_bar,
                             &chat_pb,
-                            &active_agent.name,
+                            |messages| {
+                                let mode = create_response_mode(
+                                    chat_pb.clone(),
+                                    status_bar.clone(),
+                                    agent_name.clone(),
+                                );
+                                status_bar.set_agent_status(&agent_name, "Connecting", true);
+                                execute_ai_request(
+                                    messages,
+                                    &tools,
+                                    &openai_opts,
+                                    mode,
+                                    &tool_context,
+                                    Some(ctrl_c_rx.clone()),
+                                    &signal_handler_active,
+                                    &status_bar,
+                                    &chat_pb,
+                                    &agent_name,
+                                )
+                            },
                         ) {
                             Ok(response) => {
                                 active_agent.messages = response.history;
-                                if let Some(ref db) = db {
-                                    let msgs: Vec<serde_json::Value> = active_agent
-                                        .messages
-                                        .iter()
-                                        .map(|m| serde_json::to_value(m).unwrap())
-                                        .collect();
-                                    let _ = db.save_agent_messages(&active_agent.name, &msgs);
-                                }
+                                save_agent_history(&db, &active_agent);
                             }
                             Err(e) => {
-                                if e.downcast_ref::<InterruptedError>().is_some() {
-                                    continue;
+                                if e.downcast_ref::<InterruptedError>().is_none() {
+                                    chat_pb.println(&format!("Error: {}", e));
                                 }
-                                chat_pb.println(&format!("Error: {}", e));
                                 continue;
                             }
+                        }
+                    }
+                }
+                if let ChatCommand::Summarize = parse_chat_command(&line) {
+                    let history = active_agent.messages.clone();
+                    if let Err(e) = summarize_agent_history(
+                        &mut active_agent,
+                        &history,
+                        false,
+                        &openai_opts,
+                        &db,
+                        &ctrl_c_rx,
+                        &signal_handler_active,
+                        &status_bar,
+                        &chat_pb,
+                    ) {
+                        if e.downcast_ref::<InterruptedError>().is_none() {
+                            chat_pb.println(&format!("Error: {}", e));
                         }
                     }
                 }
@@ -5629,7 +5752,12 @@ mod tests {
         });
         let result = tool_write_file(&params.to_string(), &test_ctx());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exceeds file size"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds file size")
+        );
         cleanup(path);
     }
 
@@ -5677,7 +5805,12 @@ mod tests {
         });
         let result = tool_write_file(&params.to_string(), &test_ctx());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exceeds file line count"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds file line count")
+        );
         cleanup(path);
     }
 
@@ -5774,7 +5907,12 @@ mod tests {
         });
         let result = tool_write_file(&params.to_string(), &test_ctx());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("requires end_line"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("requires end_line")
+        );
         cleanup(path);
     }
 

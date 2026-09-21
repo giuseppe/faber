@@ -63,6 +63,7 @@ swarmblabla --db-path state.db --agent mybot chat  # start as a specific agent
 | `/show` | Display current chat history |
 | `/limit N` | Keep only the last N messages (0 clears) |
 | `/backtrace N` | Remove the last N messages |
+| `/summarize` | Replace the chat history with a model-written summary (system prompts are kept) |
 | `/system <msg>` | Inject a system message into the conversation |
 | `/agents` | List all agents with message counts and status |
 | `/create-agent <name>` | Create a new agent |
@@ -72,6 +73,11 @@ swarmblabla --db-path state.db --agent mybot chat  # start as a specific agent
 | `/tools` | List all available tools (built-in + MCP) |
 
 Commands can also use `\` as the prefix (e.g. `\quit`).
+
+When a request fails because the conversation no longer fits in the model's
+context window, the chat summarizes the history automatically and retries the
+request once.  Work done by tool calls earlier in the failed turn is included
+in the summary, and your last message is kept verbatim after it.
 
 ### Prompt (one-shot)
 

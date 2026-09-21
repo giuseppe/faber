@@ -3,13 +3,17 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::openai::{
-    Choice, FunctionCall, InterruptedError, Message, OpenAIResponse, ProgressInfo, ResponseMode,
-    StatusUpdate, ToolCall, Usage, tool_call,
+    Choice, ContextLengthError, FunctionCall, InterruptedError, Message, OpenAIResponse,
+    ProgressInfo, ResponseMode, StatusUpdate, ToolCall, Usage, tool_call,
 };
 
 static TURN_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 const MAX_LINES: usize = 10_000;
+
+/// Requests carrying more text than this are rejected the way a real API
+/// rejects a prompt that exceeds the context window.
+const CONTEXT_LIMIT_CHARS: usize = 15_000;
 
 struct DummyToolCall {
     name: &'static str,
@@ -80,6 +84,20 @@ fn last_user_message(messages: &[Message]) -> &str {
         .find(|m| m.role == "user")
         .and_then(|m| m.content.as_deref())
         .unwrap_or("")
+}
+
+fn conversation_chars(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|m| {
+            m.content.as_ref().map_or(0, |c| c.len())
+                + m.tool_calls
+                    .iter()
+                    .flatten()
+                    .map(|tc| tc.function.arguments.len())
+                    .sum::<usize>()
+        })
+        .sum()
 }
 
 fn make_long_text(num_lines: usize) -> String {
@@ -270,15 +288,24 @@ pub fn post_request_dummy(
     loop {
         check_interrupted(&ctrl_c_rx)?;
 
+        let chars = conversation_chars(&messages);
+        if chars > CONTEXT_LIMIT_CHARS {
+            return Err(Box::new(ContextLengthError {
+                message: format!(
+                    "got API error code: 400: This model's maximum context length is {} characters, \
+                     however the request has {} characters (context_length_exceeded)",
+                    CONTEXT_LIMIT_CHARS, chars
+                ),
+                history: messages,
+            }));
+        }
+
         std::thread::sleep(Duration::from_millis(50));
 
         let turn = TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
 
         let has_tools = !tools_collection.is_empty();
-        let is_tool_result = messages
-            .last()
-            .map(|m| m.role == "tool")
-            .unwrap_or(false);
+        let is_tool_result = messages.last().map(|m| m.role == "tool").unwrap_or(false);
         let cmd = parse_dummy_command(last_user_message(&messages));
         let is_tool_turn = turn % 2 == 1 && !cmd.forces_text();
 
