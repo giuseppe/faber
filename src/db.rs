@@ -654,6 +654,19 @@ pub fn send_notification(
     to_agent: &str,
     message: &str,
 ) -> Result<i64, Box<dyn Error>> {
+    // Both columns are foreign keys into `agents`; checking first turns a
+    // cryptic "FOREIGN KEY constraint failed" (no indication which key, or
+    // why) into a message that actually says what's wrong.
+    if get_agent(conn, to_agent)?.is_none() {
+        return Err(format!(
+            "Agent '{}' does not exist. Use agent_list to see available agents.",
+            to_agent
+        )
+        .into());
+    }
+    if get_agent(conn, from_agent)?.is_none() {
+        return Err(format!("Sending agent '{}' no longer exists", from_agent).into());
+    }
     conn.execute(
         "INSERT INTO notifications (from_agent, to_agent, message) VALUES (?1, ?2, ?3)",
         params![from_agent, to_agent, message],
@@ -865,6 +878,40 @@ mod tests {
         create_agent(&conn, "bob", "").unwrap();
         let id = send_notification(&conn, "alice", "bob", "hello bob").unwrap();
         assert!(id > 0);
+    }
+
+    #[test]
+    fn test_send_notification_unknown_recipient_gives_a_clear_error() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        let err = send_notification(&conn, "alice", "does-not-exist", "hi").unwrap_err();
+        let message = err.to_string();
+        // Must name the actual problem, not leak the raw SQL constraint
+        // error ("FOREIGN KEY constraint failed") that INSERT would
+        // otherwise fail with.
+        assert!(message.contains("does-not-exist"));
+        assert!(message.contains("does not exist"));
+        assert!(!message.to_lowercase().contains("constraint"));
+    }
+
+    #[test]
+    fn test_send_notification_unknown_sender_gives_a_clear_error() {
+        let conn = test_db();
+        create_agent(&conn, "bob", "").unwrap();
+        let err = send_notification(&conn, "ghost", "bob", "hi").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("ghost"));
+        assert!(!message.to_lowercase().contains("constraint"));
+    }
+
+    #[test]
+    fn test_send_notification_unknown_recipient_does_not_insert_a_row() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        assert!(send_notification(&conn, "alice", "does-not-exist", "hi").is_err());
+        claim_agent(&conn, "alice", "s1").unwrap();
+        let notifs = poll_notifications_for_session(&conn, "s1").unwrap();
+        assert!(notifs.is_empty());
     }
 
     #[test]
