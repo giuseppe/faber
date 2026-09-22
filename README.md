@@ -168,7 +168,11 @@ entry is deleted from the database and the status bar entry is removed.
 
 Agents can send messages to each other using the `send_message` tool.
 Messages are delivered as notifications and injected into the receiving
-agent's next conversation turn.
+agent's next conversation turn - but only once a live session is actually
+running that agent (claimed it, e.g. via `--agent` or `/select-agent`) and
+polling for it. A message to an agent nobody is currently running just
+waits in the database and is delivered whenever a session next picks that
+agent up, however much later that is.
 
 ### Session ownership
 
