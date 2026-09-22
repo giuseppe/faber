@@ -192,9 +192,9 @@ scheduler thread checks for pending tasks every second.
 
 | Tool | Description |
 |---|---|
-| `read_file` | Read file contents |
+| `read_file` | Read file contents, optionally just a `start_line`..`end_line` range; reports `total_lines` |
 | `write_file` | Create or overwrite a file with specified permissions |
-| `patch_file` | Apply a batch of search-and-replace edits to a file, all-or-nothing, rewriting only the changed bytes |
+| `patch_file` | Apply a batch of search-and-replace edits to a file, all-or-nothing, rewriting only the changed bytes; the result includes a numbered-context preview of where each edit landed, so a follow-up `read_file` usually isn't needed to confirm it |
 | `delete_path` | Delete a file or directory |
 | `glob` | Find files matching a glob pattern |
 | `grep_in_current_directory` | Search for a pattern in the current directory |

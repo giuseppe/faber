@@ -623,17 +623,42 @@ fn tool_read_file(params_str: &String, _ctx: &ToolContext) -> Result<String, Box
     #[derive(Deserialize)]
     struct Params {
         path: String,
+        #[serde(default)]
+        start_line: Option<u64>,
+        #[serde(default)]
+        end_line: Option<u64>,
     }
 
     #[derive(Serialize)]
     struct ReadFileResult {
         content: Option<String>,
         error: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total_lines: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        start_line: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        end_line: Option<u64>,
+    }
+
+    fn error(message: String) -> ReadFileResult {
+        ReadFileResult {
+            content: None,
+            error: Some(message),
+            total_lines: None,
+            start_line: None,
+            end_line: None,
+        }
     }
 
     let params: Params = serde_json::from_str::<Params>(&params_str)?;
 
     debug!("Reading file: {}", params.path);
+
+    if params.start_line.is_some() != params.end_line.is_some() {
+        let result = error("start_line and end_line must be given together".to_string());
+        return Ok(serde_json::to_string(&result)?);
+    }
 
     let root = Root::open(".")?;
     let path = PathBuf::from(&params.path);
@@ -643,20 +668,56 @@ fn tool_read_file(params_str: &String, _ctx: &ToolContext) -> Result<String, Box
         Ok(mut file) => {
             let mut contents = String::new();
             match file.read_to_string(&mut contents) {
-                Ok(_) => ReadFileResult {
-                    content: Some(contents),
-                    error: None,
-                },
-                Err(e) => ReadFileResult {
-                    content: None,
-                    error: Some(format!("Failed to read file: {}", e)),
-                },
+                Ok(_) => {
+                    // Each element keeps its own trailing newline, so joining
+                    // a slice of them back together exactly reproduces the
+                    // original bytes for that range.
+                    let full_lines: Vec<&str> = contents.split_inclusive('\n').collect();
+                    let total_lines = full_lines.len();
+
+                    match (params.start_line, params.end_line) {
+                        (Some(start), Some(end)) => {
+                            if start == 0 {
+                                error("start_line is 1-based, cannot be 0".to_string())
+                            } else if end < start {
+                                error(format!(
+                                    "end_line ({}) must be >= start_line ({})",
+                                    end, start
+                                ))
+                            } else if start as usize > total_lines {
+                                error(format!(
+                                    "start_line {} exceeds file line count {}",
+                                    start, total_lines
+                                ))
+                            } else if end as usize > total_lines {
+                                error(format!(
+                                    "end_line {} exceeds file line count {}",
+                                    end, total_lines
+                                ))
+                            } else {
+                                let slice = full_lines[(start - 1) as usize..end as usize].concat();
+                                ReadFileResult {
+                                    content: Some(slice),
+                                    error: None,
+                                    total_lines: Some(total_lines),
+                                    start_line: Some(start),
+                                    end_line: Some(end),
+                                }
+                            }
+                        }
+                        _ => ReadFileResult {
+                            content: Some(contents),
+                            error: None,
+                            total_lines: Some(total_lines),
+                            start_line: None,
+                            end_line: None,
+                        },
+                    }
+                }
+                Err(e) => error(format!("Failed to read file: {}", e)),
             }
         }
-        Err(e) => ReadFileResult {
-            content: None,
-            error: Some(format!("File not found or cannot be opened: {}", e)),
-        },
+        Err(e) => error(format!("File not found or cannot be opened: {}", e)),
     };
 
     let json_result = serde_json::to_string(&result)?;
@@ -2071,6 +2132,57 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
 /// is opened once (read-write) through `Root`, every edit is applied in
 /// memory and validated before anything is written, and only the bytes that
 /// actually changed are written back, without truncating the file first.
+/// How many lines of unchanged context to include above and below each
+/// edit's preview in the `patch_file` result.
+const PATCH_PREVIEW_CONTEXT_LINES: usize = 2;
+
+/// Returns the 1-based line number of `text` containing byte offset `pos`
+/// (or the last line, for a `pos` at or past the end).
+fn line_of(lines: &[&str], pos: usize) -> usize {
+    let mut end = 0;
+    for (i, line) in lines.iter().enumerate() {
+        end += line.len();
+        if pos < end {
+            return i + 1;
+        }
+    }
+    lines.len().max(1)
+}
+
+/// Renders a few lines of numbered context around `text[byte_start..byte_end]`,
+/// so a caller can see the effect of a change without reading the whole file.
+/// Returns the 1-based (start_line, end_line) of the changed span itself,
+/// plus the rendered snippet (which includes the context lines around it).
+fn line_context(text: &str, byte_start: usize, byte_end: usize) -> (usize, usize, String) {
+    use std::fmt::Write;
+
+    // Each element keeps its own trailing newline, so line numbers can be
+    // computed directly from cumulative byte lengths.
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+
+    let start_line = line_of(&lines, byte_start);
+    let end_line = if byte_end > byte_start {
+        line_of(&lines, byte_end - 1)
+    } else {
+        start_line
+    };
+
+    let from = start_line
+        .saturating_sub(PATCH_PREVIEW_CONTEXT_LINES)
+        .max(1);
+    let to = (end_line + PATCH_PREVIEW_CONTEXT_LINES).min(lines.len());
+
+    let mut snippet = String::new();
+    for (offset, line) in lines[from.saturating_sub(1)..to].iter().enumerate() {
+        let _ = write!(snippet, "{:>5}  {}", from + offset, line);
+        if !line.ends_with('\n') {
+            snippet.push('\n');
+        }
+    }
+
+    (start_line, end_line, snippet)
+}
+
 fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     use serde::Serialize;
     use std::os::unix::fs::FileExt;
@@ -2090,6 +2202,16 @@ fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
     }
 
     #[derive(Serialize)]
+    struct EditPreview {
+        /// 1-based line where this edit's replacement text starts.
+        start_line: usize,
+        /// 1-based line where this edit's replacement text ends.
+        end_line: usize,
+        /// A few lines of numbered context around the change.
+        snippet: String,
+    }
+
+    #[derive(Serialize)]
     struct PatchFileResult {
         path: String,
         edits_applied: usize,
@@ -2098,6 +2220,10 @@ fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
         bytes_after: usize,
         bytes_written: usize,
         message: String,
+        /// One entry per edit, in order, showing where it landed in the
+        /// final file - lets the caller confirm the change without a
+        /// separate read_file call.
+        previews: Vec<EditPreview>,
     }
 
     let params: Params = serde_json::from_str::<Params>(params_str)?;
@@ -2125,6 +2251,11 @@ fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
     let mut text = String::from_utf8(original.clone())
         .map_err(|_| format!("File '{}' contains invalid UTF-8", params.path))?;
 
+    // Byte span of each edit's replacement text, tracked through the loop so
+    // it stays correct in the final `text` even as later edits shift things
+    // around; used to build the previews below.
+    let mut edit_spans: Vec<(usize, usize)> = Vec::with_capacity(params.edits.len());
+
     let mut replacements = 0;
     for (i, edit) in params.edits.iter().enumerate() {
         let n = i + 1;
@@ -2142,6 +2273,13 @@ fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
         if edit.replace_all {
             replacements += text.matches(edit.old_content.as_str()).count();
             text = text.replace(edit.old_content.as_str(), &edit.new_content);
+            // Multiple occurrences move independently, so exact tracking
+            // isn't practical here; show the first one as representative.
+            edit_spans.push(
+                text.find(edit.new_content.as_str())
+                    .map(|pos| (pos, pos + edit.new_content.len()))
+                    .unwrap_or((first, first)),
+            );
         } else {
             // Look for a second match starting after the first character of
             // the first one, so overlapping matches count as ambiguous too.
@@ -2153,7 +2291,18 @@ fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
                 )
                 .into());
             }
-            text.replace_range(first..first + edit.old_content.len(), &edit.new_content);
+
+            let old_end = first + edit.old_content.len();
+            let delta = edit.new_content.len() as isize - edit.old_content.len() as isize;
+            for (s, e) in edit_spans.iter_mut() {
+                if *s >= old_end {
+                    *s = (*s as isize + delta) as usize;
+                    *e = (*e as isize + delta) as usize;
+                }
+            }
+            edit_spans.push((first, first + edit.new_content.len()));
+
+            text.replace_range(first..old_end, &edit.new_content);
             replacements += 1;
         }
     }
@@ -2185,6 +2334,18 @@ fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
         file.set_len(new_bytes.len() as u64)?;
     }
 
+    let previews: Vec<EditPreview> = edit_spans
+        .iter()
+        .map(|&(span_start, span_end)| {
+            let (start_line, end_line, snippet) = line_context(&text, span_start, span_end);
+            EditPreview {
+                start_line,
+                end_line,
+                snippet,
+            }
+        })
+        .collect();
+
     let result = PatchFileResult {
         path: params.path.clone(),
         edits_applied: params.edits.len(),
@@ -2193,6 +2354,7 @@ fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
         bytes_after: new_bytes.len(),
         bytes_written: end.saturating_sub(prefix),
         message: format!("File '{}' patched successfully", params.path),
+        previews,
     };
 
     ctx.println(&format!("\u{1f4dd} {}", result.message));
@@ -2293,13 +2455,21 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Get the content of a file stored in the repository. Returns JSON with 'content' field containing file content on success, or 'error' field with error message on failure.",
+                "description": "Get the content of a file stored in the repository. Returns JSON with 'content' field containing file content on success, or 'error' field with error message on failure. 'total_lines' is always included on success. For a large file, pass start_line and end_line to read only that range instead of the whole file.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {
                             "type": "string",
                             "description": "path of the file under the repository, e.g. src/main.rs"
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "description": "1-based line number to start reading from (inclusive). Requires end_line. Omit both to read the whole file."
+                        },
+                        "end_line": {
+                            "type": "integer",
+                            "description": "1-based line number to stop reading at (inclusive). Requires start_line."
                         }
                     },
                     "required": [
@@ -2414,7 +2584,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "patch_file",
-                "description": "Apply one or more search-and-replace edits to an existing file in a single call. Prefer this over write_file for changing several places in a file: the edits are applied in order (each one sees the result of the previous ones), validated together, and either all applied or none, and only the changed bytes are rewritten. Each old_content must match exactly once unless replace_all is true.",
+                "description": "Apply one or more search-and-replace edits to an existing file in a single call. Prefer this over write_file for changing several places in a file: the edits are applied in order (each one sees the result of the previous ones), validated together, and either all applied or none, and only the changed bytes are rewritten. Each old_content must match exactly once unless replace_all is true. The result includes a 'previews' entry per edit with a few lines of numbered context around where it landed, so there's usually no need to call read_file afterward just to confirm the change.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -6515,6 +6685,195 @@ mod tests {
 
     fn cleanup(name: &str) {
         let _ = std::fs::remove_file(name);
+    }
+
+    fn read(params: serde_json::Value) -> Result<serde_json::Value, Box<dyn Error>> {
+        tool_read_file(&params.to_string(), &test_ctx()).map(|r| serde_json::from_str(&r).unwrap())
+    }
+
+    #[test]
+    fn test_read_file_full_content_reports_total_lines() {
+        let path = "_test_rf_full.tmp";
+        write_test_file(path, "one\ntwo\nthree\n");
+        let res = read(serde_json::json!({"path": path})).unwrap();
+        assert_eq!(res["content"], "one\ntwo\nthree\n");
+        assert_eq!(res["total_lines"], 3);
+        assert!(res.get("start_line").is_none());
+        assert!(res.get("end_line").is_none());
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_read_file_missing_file_errors() {
+        let res = read(serde_json::json!({"path": "_test_rf_missing.tmp"})).unwrap();
+        assert!(res["content"].is_null());
+        assert!(res["error"].as_str().unwrap().contains("not found"));
+    }
+
+    #[test]
+    fn test_read_file_partial_range() {
+        let path = "_test_rf_partial.tmp";
+        write_test_file(path, "one\ntwo\nthree\nfour\nfive\n");
+        let res = read(serde_json::json!({"path": path, "start_line": 2, "end_line": 4})).unwrap();
+        assert_eq!(res["content"], "two\nthree\nfour\n");
+        assert_eq!(res["total_lines"], 5);
+        assert_eq!(res["start_line"], 2);
+        assert_eq!(res["end_line"], 4);
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_read_file_partial_range_single_line() {
+        let path = "_test_rf_single.tmp";
+        write_test_file(path, "one\ntwo\nthree\n");
+        let res = read(serde_json::json!({"path": path, "start_line": 2, "end_line": 2})).unwrap();
+        assert_eq!(res["content"], "two\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_read_file_partial_range_no_trailing_newline() {
+        let path = "_test_rf_no_nl.tmp";
+        write_test_file(path, "one\ntwo\nthree");
+        let res = read(serde_json::json!({"path": path, "start_line": 3, "end_line": 3})).unwrap();
+        assert_eq!(res["content"], "three");
+        assert_eq!(res["total_lines"], 3);
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_read_file_range_validation() {
+        let path = "_test_rf_validate.tmp";
+        write_test_file(path, "one\ntwo\nthree\n");
+
+        let res = read(serde_json::json!({"path": path, "start_line": 0, "end_line": 1})).unwrap();
+        assert!(res["error"].as_str().unwrap().contains("1-based"));
+
+        let res = read(serde_json::json!({"path": path, "start_line": 3, "end_line": 1})).unwrap();
+        assert!(res["error"].as_str().unwrap().contains("must be >="));
+
+        let res =
+            read(serde_json::json!({"path": path, "start_line": 10, "end_line": 12})).unwrap();
+        assert!(
+            res["error"]
+                .as_str()
+                .unwrap()
+                .contains("exceeds file line count")
+        );
+
+        let res = read(serde_json::json!({"path": path, "start_line": 1, "end_line": 10})).unwrap();
+        assert!(
+            res["error"]
+                .as_str()
+                .unwrap()
+                .contains("exceeds file line count")
+        );
+
+        let res = read(serde_json::json!({"path": path, "start_line": 2})).unwrap();
+        assert!(res["error"].as_str().unwrap().contains("together"));
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_preview_shows_where_the_edit_landed() {
+        let path = "_test_pf_preview_basic.tmp";
+        write_test_file(
+            path,
+            "line one\nline two\nline three\nline four\nline five\nline six\nline seven\n",
+        );
+        let res = patch(
+            path,
+            serde_json::json!([{"old_content": "line five", "new_content": "LINE FIVE"}]),
+        )
+        .unwrap();
+        let previews = res["previews"].as_array().unwrap();
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0]["start_line"], 5);
+        assert_eq!(previews[0]["end_line"], 5);
+        let snippet = previews[0]["snippet"].as_str().unwrap();
+        assert!(snippet.contains("LINE FIVE"));
+        assert!(snippet.contains("line four"));
+        assert!(snippet.contains("line six"));
+        assert!(!snippet.contains("line one"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_preview_multiline_replacement() {
+        let path = "_test_pf_preview_multiline.tmp";
+        write_test_file(path, "a\nb\nc\nd\n");
+        let res = patch(
+            path,
+            serde_json::json!([{"old_content": "b\nc", "new_content": "B\nC\nEXTRA"}]),
+        )
+        .unwrap();
+        let previews = res["previews"].as_array().unwrap();
+        assert_eq!(previews[0]["start_line"], 2);
+        assert_eq!(previews[0]["end_line"], 4);
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_preview_accounts_for_earlier_edit_shifting_it() {
+        // The second edit is textually before the first one in the file, so
+        // applying it must shift the first edit's already-recorded preview
+        // position by the resulting length difference.
+        let path = "_test_pf_preview_shift.tmp";
+        write_test_file(path, "header\nkeep\ntarget\nkeep\n");
+        let res = patch(
+            path,
+            serde_json::json!([
+                {"old_content": "target", "new_content": "TARGET"},
+                {"old_content": "header", "new_content": "a much longer header line"}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            read_test_file(path),
+            "a much longer header line\nkeep\nTARGET\nkeep\n"
+        );
+        let previews = res["previews"].as_array().unwrap();
+        // "TARGET" is still on line 3, even though the header edit (applied
+        // second, but positioned earlier in the file) grew by 19 bytes.
+        assert_eq!(previews[0]["start_line"], 3);
+        assert_eq!(previews[0]["end_line"], 3);
+        assert!(previews[0]["snippet"].as_str().unwrap().contains("TARGET"));
+        assert_eq!(previews[1]["start_line"], 1);
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_preview_for_deletion() {
+        let path = "_test_pf_preview_delete.tmp";
+        write_test_file(path, "keep this\nremove this\nkeep this too\n");
+        let res = patch(
+            path,
+            serde_json::json!([{"old_content": "remove this\n", "new_content": ""}]),
+        )
+        .unwrap();
+        let previews = res["previews"].as_array().unwrap();
+        assert_eq!(previews.len(), 1);
+        // Nothing left to show for an empty replacement; the snippet should
+        // still center on the right place without panicking.
+        let snippet = previews[0]["snippet"].as_str().unwrap();
+        assert!(snippet.contains("keep this"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_preview_replace_all_has_one_entry() {
+        let path = "_test_pf_preview_all.tmp";
+        write_test_file(path, "x x x\n");
+        let res = patch(
+            path,
+            serde_json::json!([{"old_content": "x", "new_content": "y", "replace_all": true}]),
+        )
+        .unwrap();
+        let previews = res["previews"].as_array().unwrap();
+        assert_eq!(previews.len(), 1);
+        assert!(previews[0]["snippet"].as_str().unwrap().contains('y'));
+        cleanup(path);
     }
 
     #[test]
