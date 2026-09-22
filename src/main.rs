@@ -4302,6 +4302,13 @@ fn format_tool_arguments(args_json: &str) -> String {
     }
 }
 
+/// Above this many characters with no newline in sight, the buffered text is
+/// flushed anyway instead of waiting indefinitely for one - otherwise a
+/// model that degenerates into repeating itself with no line breaks streams
+/// megabytes of content while the terminal shows nothing at all but a
+/// growing byte count.
+const MAX_STREAM_LINE_CHARS: usize = 400;
+
 /// Returns a stream handler that prints `style`d text one line at a time; an
 /// empty chunk flushes the unfinished line.
 fn line_streamer(
@@ -4324,6 +4331,9 @@ fn line_streamer(
                     printer.println(&style.apply_to(line).to_string());
                 }
                 *buffer = remaining;
+            } else if buffer.chars().count() >= MAX_STREAM_LINE_CHARS {
+                printer.println(&style.apply_to(&*buffer).to_string());
+                buffer.clear();
             }
         }
         Ok(())
@@ -5868,6 +5878,90 @@ mod tests {
     #[test]
     fn test_parse_chat_command_backslash_prefix() {
         assert!(matches!(parse_chat_command("\\help"), ChatCommand::Help));
+    }
+
+    struct CapturingPrinter {
+        lines: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl rustyline::ExternalPrinter for CapturingPrinter {
+        fn print(&mut self, msg: String) -> rustyline::Result<()> {
+            self.lines.lock().unwrap().push(msg);
+            Ok(())
+        }
+    }
+
+    fn capturing_chat_printer() -> (ChatPrinter, Arc<Mutex<Vec<String>>>) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let printer = ChatPrinter::new();
+        printer.set_printer(Box::new(CapturingPrinter {
+            lines: lines.clone(),
+        }));
+        printer.set_direct_mode(false);
+        (printer, lines)
+    }
+
+    fn plain_lines(lines: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        lines
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|l| {
+                console::strip_ansi_codes(l)
+                    .trim_end_matches('\n')
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_line_streamer_prints_on_newline() {
+        let (printer, lines) = capturing_chat_printer();
+        let stream = line_streamer(printer, Style::new());
+        stream("hello ").unwrap();
+        stream("world\n").unwrap();
+        assert_eq!(plain_lines(&lines), vec!["hello world"]);
+    }
+
+    #[test]
+    fn test_line_streamer_flushes_at_end_of_stream() {
+        let (printer, lines) = capturing_chat_printer();
+        let stream = line_streamer(printer, Style::new());
+        stream("no newline yet").unwrap();
+        assert!(plain_lines(&lines).is_empty());
+        stream("").unwrap(); // end-of-stream flush
+        assert_eq!(plain_lines(&lines), vec!["no newline yet"]);
+    }
+
+    #[test]
+    fn test_line_streamer_force_flushes_when_no_newline_arrives() {
+        // A model stuck repeating itself with no line breaks must not make
+        // the streamed text invisible until (if ever) it finally emits a
+        // newline or the whole response ends.
+        let (printer, lines) = capturing_chat_printer();
+        let stream = line_streamer(printer, Style::new());
+        for _ in 0..10 {
+            stream(&"x".repeat(100)).unwrap();
+        }
+        // Force-flushes happen well before the stream ends (at 400 chars),
+        // so output must already be visible at this point.
+        let printed_mid_stream = plain_lines(&lines);
+        assert!(
+            !printed_mid_stream.is_empty(),
+            "1000 chars with no newline produced no output before the stream even ended"
+        );
+        for line in &printed_mid_stream {
+            assert!(
+                line.chars().count() <= MAX_STREAM_LINE_CHARS,
+                "line exceeded the force-flush threshold: {} chars",
+                line.chars().count()
+            );
+        }
+
+        stream("").unwrap(); // end-of-stream flush for whatever's left
+        let printed = plain_lines(&lines);
+        let total: usize = printed.iter().map(|l| l.chars().count()).sum();
+        assert_eq!(total, 1000);
     }
 
     #[test]
