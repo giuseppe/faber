@@ -3926,6 +3926,153 @@ fn handle_chat_command(
     }
 }
 
+/// Extracts a live preview from a tool call's JSON arguments while they're
+/// still streaming in: the `key=value` pairs that have already arrived in
+/// full, in order, formatted as `key=value, key2=value2`. Stops at the
+/// first key or value that isn't complete yet (still returning whatever
+/// came before it) and returns `None` if nothing is complete yet, so the
+/// status line can show real progress ("path=\"Cargo.toml\"") instead of a
+/// meaningless byte count, without ever displaying broken-looking partial
+/// JSON.
+fn preview_partial_tool_arguments(args_json: &str) -> Option<String> {
+    let bytes = args_json.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return None;
+    }
+
+    // Scans a JSON string starting at its opening quote, returning the
+    // index just past the closing quote, or None if it isn't closed yet.
+    fn scan_string(bytes: &[u8], start: usize) -> Option<usize> {
+        let mut i = start + 1;
+        let mut escaped = false;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if !escaped => escaped = true,
+                b'"' if !escaped => return Some(i + 1),
+                _ => escaped = false,
+            }
+            i += 1;
+        }
+        None
+    }
+
+    // Scans a nested object/array value starting at its opening brace or
+    // bracket, returning the index just past its matching close, or None
+    // if it isn't closed yet.
+    fn scan_nested(bytes: &[u8], start: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (offset, &b) in bytes[start..].iter().enumerate() {
+            if in_string {
+                match b {
+                    b'\\' if !escaped => escaped = true,
+                    b'"' if !escaped => in_string = false,
+                    _ => escaped = false,
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_string = true,
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(start + offset + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    }
+
+    let mut pairs = Vec::new();
+    let mut i = skip_ws(bytes, 1); // past the opening '{'
+    while i < bytes.len() && bytes[i] == b'"' {
+        let key_end = match scan_string(bytes, i) {
+            Some(end) => end,
+            None => break,
+        };
+        let key = &args_json[i + 1..key_end - 1];
+
+        i = skip_ws(bytes, key_end);
+        if bytes.get(i) != Some(&b':') {
+            break;
+        }
+        i = skip_ws(bytes, i + 1);
+        if i >= bytes.len() {
+            break;
+        }
+
+        let (value, value_end) = match bytes[i] {
+            b'"' => match scan_string(bytes, i) {
+                Some(end) => {
+                    let raw = &args_json[i..end];
+                    let display = serde_json::from_str::<String>(raw)
+                        .map(|s| format!("{:?}", s))
+                        .unwrap_or_else(|_| raw.to_string());
+                    (display, end)
+                }
+                None => break,
+            },
+            b'{' | b'[' => match scan_nested(bytes, i) {
+                Some(end) => (args_json[i..end].to_string(), end),
+                None => break,
+            },
+            _ => {
+                // A number, bool or null: only complete once followed by an
+                // actual delimiter, never just because the buffer ends here
+                // (more digits could still be on the way).
+                let start = i;
+                let mut j = i;
+                while j < bytes.len() && !matches!(bytes[j], b',' | b'}' | b' ' | b'\t' | b'\n') {
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    break;
+                }
+                (args_json[start..j].to_string(), j)
+            }
+        };
+        pairs.push(format!("{}={}", key, value));
+
+        i = skip_ws(bytes, value_end);
+        if bytes.get(i) == Some(&b',') {
+            i = skip_ws(bytes, i + 1);
+        } else {
+            // Either the object just closed, or something unexpected
+            // follows; either way there's nothing more to safely extract.
+            break;
+        }
+    }
+
+    if pairs.is_empty() {
+        None
+    } else {
+        // Guarantee single-line output regardless of caller: a nested
+        // object/array value is copied through verbatim and could be
+        // pretty-printed with real newlines, and a string value with an
+        // unescaped control character (invalid JSON, but tolerated by the
+        // scanner above) would otherwise carry a literal newline straight
+        // into the status line.
+        let joined = pairs.join(", ");
+        Some(
+            joined
+                .replace('\n', " ")
+                .replace('\r', " ")
+                .replace('\t', " "),
+        )
+    }
+}
+
 fn format_tool_arguments(args_json: &str) -> String {
     let clean_args = args_json
         .replace('\n', " ")
@@ -4005,12 +4152,16 @@ fn create_response_mode(
                     // The arguments are still being streamed in, so they're
                     // incomplete/invalid JSON at this point; showing them raw
                     // (as format_tool_arguments does once they're complete)
-                    // would just look like a broken tool call.
-                    status_bar.set_agent_status(
-                        &agent_name,
-                        &format!("Preparing {} ({} chars)", name, arguments.len()),
-                        false,
-                    );
+                    // would just look like a broken tool call. Show whatever
+                    // key/value pairs have already arrived in full instead,
+                    // falling back to a byte count until the first one lands.
+                    let status = match preview_partial_tool_arguments(arguments) {
+                        Some(preview) => {
+                            format!("Preparing {}({})", name, format_tool_arguments(&preview))
+                        }
+                        None => format!("Preparing {} ({} chars)", name, arguments.len()),
+                    };
+                    status_bar.set_agent_status(&agent_name, &status, false);
                 }
                 StatusUpdate::ToolStart { name, arguments } => {
                     tool_active_for_progress.store(true, Ordering::Relaxed);
@@ -5523,6 +5674,106 @@ mod tests {
         let result = format_tool_arguments(args);
         assert!(!result.contains('\n'));
         assert!(!result.contains('\t'));
+    }
+
+    #[test]
+    fn test_preview_partial_tool_arguments_nothing_yet() {
+        assert_eq!(preview_partial_tool_arguments(""), None);
+        assert_eq!(preview_partial_tool_arguments("{"), None);
+        assert_eq!(preview_partial_tool_arguments(r#"{"pa"#), None);
+        assert_eq!(preview_partial_tool_arguments("not json"), None);
+    }
+
+    #[test]
+    fn test_preview_partial_tool_arguments_incomplete_string_value() {
+        // The key is complete but the value's closing quote hasn't arrived.
+        assert_eq!(preview_partial_tool_arguments(r#"{"path":"Cargo.t"#), None);
+    }
+
+    #[test]
+    fn test_preview_partial_tool_arguments_single_complete_pair() {
+        // Complete even though the outer object hasn't closed yet - this is
+        // the common single-argument case (e.g. read_file) where waiting
+        // for a top-level comma would never show anything.
+        assert_eq!(
+            preview_partial_tool_arguments(r#"{"path":"Cargo.toml"#),
+            None
+        );
+        assert_eq!(
+            preview_partial_tool_arguments(r#"{"path":"Cargo.toml""#),
+            Some(r#"path="Cargo.toml""#.to_string())
+        );
+    }
+
+    #[test]
+    fn test_preview_partial_tool_arguments_keeps_earlier_pairs_when_later_one_is_incomplete() {
+        let partial = r#"{"path":"Cargo.toml","old_content":"fo"#;
+        assert_eq!(
+            preview_partial_tool_arguments(partial),
+            Some(r#"path="Cargo.toml""#.to_string())
+        );
+    }
+
+    #[test]
+    fn test_preview_partial_tool_arguments_multiple_complete_pairs() {
+        let complete = r#"{"path":"Cargo.toml","replace_all":true}"#;
+        assert_eq!(
+            preview_partial_tool_arguments(complete),
+            Some(r#"path="Cargo.toml", replace_all=true"#.to_string())
+        );
+    }
+
+    #[test]
+    fn test_preview_partial_tool_arguments_number_bool_null() {
+        assert_eq!(
+            preview_partial_tool_arguments(r#"{"n":42,"ok":false,"x":null,"#),
+            Some("n=42, ok=false, x=null".to_string())
+        );
+        // A number isn't complete just because the buffer ends right after
+        // it - more digits could still be coming.
+        assert_eq!(preview_partial_tool_arguments(r#"{"n":4"#), None);
+    }
+
+    #[test]
+    fn test_preview_partial_tool_arguments_nested_value() {
+        let partial = r#"{"options":{"a":1,"b":2},"path":"x"#;
+        assert_eq!(
+            preview_partial_tool_arguments(partial),
+            Some(r#"options={"a":1,"b":2}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn test_preview_partial_tool_arguments_escaped_quote_in_string() {
+        let args = r#"{"content":"say \"hi\""}"#;
+        assert_eq!(
+            preview_partial_tool_arguments(args),
+            Some(r#"content="say \"hi\"""#.to_string())
+        );
+    }
+
+    #[test]
+    fn test_preview_partial_tool_arguments_never_produces_multiple_lines() {
+        // A value with an embedded real newline (e.g. a pretty-printed
+        // nested object, or an unescaped control character some server
+        // tolerates) must never turn into an actual line break on the
+        // status line.
+        let with_newline_in_nested_value = "{\"options\":{\"a\":\n1}}";
+        let preview = preview_partial_tool_arguments(with_newline_in_nested_value).unwrap();
+        assert!(
+            !preview.contains('\n'),
+            "preview contained a newline: {:?}",
+            preview
+        );
+
+        let with_raw_newline_in_string = "{\"content\":\"line1\nline2\"}";
+        if let Some(preview) = preview_partial_tool_arguments(with_raw_newline_in_string) {
+            assert!(
+                !preview.contains('\n'),
+                "preview contained a newline: {:?}",
+                preview
+            );
+        }
     }
 
     #[test]
