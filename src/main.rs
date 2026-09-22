@@ -5360,7 +5360,7 @@ struct Opts {
     /// {
     ///   "model": "granite",
     ///   "api_key": "~/.path/to/key",
-    ///   "parameters": ["temperature=0.7"]
+    ///   "parameter": ["temperature=0.7"]
     /// }
     ///
     /// CLI arguments override config file values.
