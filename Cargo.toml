@@ -1,0 +1,28 @@
+[package]
+name = "faber"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+reqwest = { version = "0.11", features = ["json", "blocking"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5.0"
+string-builder = "0.2.0"
+clap = { version = "~4.5.34", features = ["derive", "env"] }
+chrono = "0.4.40"
+pathrs = { git = "https://github.com/openSUSE/libpathrs.git" }
+log = "0.4"
+env_logger = "0.11.8"
+rustyline = "16.0"
+prettytable = "0.10.0"
+console = "0.15"
+ctrlc = "3.4"
+rustix = { version = "0.38", features = ["fs"] }
+libc = "0.2"
+glob = "0.3"
+rusqlite = { version = "0.31", features = ["bundled"] }
+cron = "0.15"
+
+[lib]
+crate-type = ["rlib"]
