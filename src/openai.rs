@@ -431,6 +431,22 @@ pub fn list_models_from_endpoint(
     Ok(models_api_response.data)
 }
 
+/// Walks an error's cause chain and returns the deepest (most specific)
+/// message available, falling back to the error's own message when it has
+/// no cause chain. Some wrappers (notably pathrs, used for every safe file
+/// tool) have an uninformative top-level message like "openat2 one-shot
+/// open failed" while the actual reason ("No such file or directory") is a
+/// couple of `source()` calls deeper; this surfaces that instead.
+pub fn describe_error(e: &(dyn Error + 'static)) -> String {
+    let mut deepest = e.to_string();
+    let mut source = e.source();
+    while let Some(s) = source {
+        deepest = s.to_string();
+        source = s.source();
+    }
+    deepest
+}
+
 /// Perform a tool call and return the message to send back.
 pub fn tool_call(
     tools_collection: &ToolsCollection,
@@ -458,7 +474,11 @@ pub fn tool_call(
             let content = match mcp.call_tool(tool_name, &req.function.arguments) {
                 Ok(result) => result,
                 Err(e) => {
-                    let error_msg = format!("error: MCP tool '{}' failed: {}", tool_name, e);
+                    let error_msg = format!(
+                        "error: MCP tool '{}' failed: {}",
+                        tool_name,
+                        describe_error(e.as_ref())
+                    );
                     warn!("{}", error_msg);
                     error_msg
                 }
@@ -490,7 +510,11 @@ pub fn tool_call(
             match (t.callback)(&req.function.arguments, ctx) {
                 Ok(result) => result,
                 Err(e) => {
-                    let error_msg = format!("error: tool '{}' failed: {}", tool_name, e);
+                    let error_msg = format!(
+                        "error: tool '{}' failed: {}",
+                        tool_name,
+                        describe_error(e.as_ref())
+                    );
                     warn!("{}", error_msg);
                     error_msg
                 }
@@ -1690,6 +1714,56 @@ mod tests {
         };
 
         assert!(bytes_for(&long) > bytes_for(&short) + 40_000);
+    }
+
+    #[derive(Debug)]
+    struct WrapperError {
+        message: &'static str,
+        source: Option<Box<dyn Error>>,
+    }
+
+    impl std::fmt::Display for WrapperError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+
+    impl Error for WrapperError {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            self.source.as_deref()
+        }
+    }
+
+    #[test]
+    fn test_describe_error_no_source_returns_own_message() {
+        let err = WrapperError {
+            message: "top level failure",
+            source: None,
+        };
+        assert_eq!(describe_error(&err), "top level failure");
+    }
+
+    #[test]
+    fn test_describe_error_walks_to_deepest_cause() {
+        // Mirrors the real case this was written for: pathrs wraps the
+        // actual OS error behind an uninformative "openat2 ... failed"
+        // message, several `source()` calls deep.
+        let os_error = WrapperError {
+            message: "No such file or directory (os error 2)",
+            source: None,
+        };
+        let syscall = WrapperError {
+            message: "openat2(...)",
+            source: Some(Box::new(os_error)),
+        };
+        let top = WrapperError {
+            message: "openat2 one-shot open failed",
+            source: Some(Box::new(syscall)),
+        };
+        assert_eq!(
+            describe_error(&top),
+            "No such file or directory (os error 2)"
+        );
     }
 
     #[test]

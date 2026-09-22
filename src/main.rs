@@ -59,8 +59,8 @@ use github::{
 };
 use openai::{
     FunctionCall, InterruptedError, Message, OpenAIResponse, ProgressInfo, ResponseMode,
-    StatusUpdate, ToolCall, ToolCallback, ToolItem, ToolsCollection, list_models_from_endpoint,
-    make_message, post_request, post_request_with_mode, tool_call,
+    StatusUpdate, ToolCall, ToolCallback, ToolItem, ToolsCollection, describe_error,
+    list_models_from_endpoint, make_message, post_request, post_request_with_mode, tool_call,
 };
 use std::collections::HashMap;
 
@@ -732,10 +732,13 @@ fn tool_read_file(params_str: &String, _ctx: &ToolContext) -> Result<String, Box
                         },
                     }
                 }
-                Err(e) => error(format!("Failed to read file: {}", e)),
+                Err(e) => error(format!("Failed to read file: {}", describe_error(&e))),
             }
         }
-        Err(e) => error(format!("File not found or cannot be opened: {}", e)),
+        Err(e) => error(format!(
+            "File not found or cannot be opened: {}",
+            describe_error(&e)
+        )),
     };
 
     let json_result = serde_json::to_string(&result)?;
@@ -2259,7 +2262,13 @@ fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
     let root = Root::open(".")?;
     let file = root
         .open_subpath(&params.path, OpenFlags::O_RDWR)
-        .map_err(|e| format!("File '{}' must exist and be writable: {}", params.path, e))?;
+        .map_err(|e| {
+            format!(
+                "File '{}' must exist and be writable: {}",
+                params.path,
+                describe_error(&e)
+            )
+        })?;
     if !file.metadata()?.is_file() {
         return Err(format!("'{}' is not a regular file", params.path).into());
     }
@@ -6428,12 +6437,19 @@ mod tests {
             )
             .is_err()
         );
+        let missing_err = patch(
+            "_test_pf_missing.tmp",
+            serde_json::json!([{"old_content": "a", "new_content": "b"}]),
+        )
+        .unwrap_err();
+        // The underlying OS reason, not just pathrs's generic wrapper
+        // message ("openat2 one-shot open failed"), must come through.
         assert!(
-            patch(
-                "_test_pf_missing.tmp",
-                serde_json::json!([{"old_content": "a", "new_content": "b"}])
-            )
-            .is_err()
+            missing_err
+                .to_string()
+                .contains("No such file or directory"),
+            "error message dropped the underlying cause: {}",
+            missing_err
         );
         assert_eq!(read_test_file(path), "content\n");
         cleanup(path);
@@ -6746,7 +6762,15 @@ mod tests {
     fn test_read_file_missing_file_errors() {
         let res = read(serde_json::json!({"path": "_test_rf_missing.tmp"})).unwrap();
         assert!(res["content"].is_null());
-        assert!(res["error"].as_str().unwrap().contains("not found"));
+        let error = res["error"].as_str().unwrap();
+        assert!(error.contains("not found"));
+        // The underlying OS reason, not just pathrs's generic wrapper
+        // message ("openat2 one-shot open failed"), must come through.
+        assert!(
+            error.contains("No such file or directory"),
+            "error message dropped the underlying cause: {}",
+            error
+        );
     }
 
     #[test]
