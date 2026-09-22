@@ -1042,6 +1042,21 @@ fn handle_streaming_response(
                         }
 
                         if let Some(tool_calls) = &choice.delta.tool_calls {
+                            // Reasoning or content may have been streaming
+                            // just before the model switched to emitting a
+                            // tool call in the same response, with no
+                            // newline to naturally close its partial line.
+                            // Close it now (a no-op if there's nothing to
+                            // close) so the status bar's spinner isn't left
+                            // suppressed - thinking there's still an open
+                            // partial line to protect - for however long
+                            // tool-call argument accumulation takes.
+                            if reasoning_active {
+                                reasoning_handler("")?;
+                                reasoning_active = false;
+                            }
+                            stream_handler("")?;
+
                             // Set accumulation start time if this is the first tool call chunk
                             if tool_accumulation_start.is_none() {
                                 tool_accumulation_start = Some(std::time::Instant::now());
@@ -1472,38 +1487,69 @@ mod tests {
     }
 
     fn stream_to_vecs(events: Vec<serde_json::Value>) -> (OpenAIResponse, String, String) {
-        let (response, answer, reasoning, _statuses) =
+        let (response, answer, reasoning, _statuses, _events) =
             stream_to_vecs_with(serve_sse(events), &ToolsCollection::new());
         (response, answer, reasoning)
     }
 
+    /// One thing observed while streaming, in the order it actually
+    /// happened - used to check *ordering* between reasoning's flush and
+    /// the tool-call statuses, which a plain count can't do (a reasoning
+    /// flush also happens harmlessly once at the end of every turn, tool
+    /// call or not, so counting alone can't tell a flush that happened
+    /// too late, or not at the right place, from one that didn't).
+    #[derive(Debug, Clone)]
+    enum TestEvent {
+        ReasoningFlush,
+        Status(StatusUpdate),
+    }
+
     /// Like `stream_to_vecs`, but against a caller-provided endpoint (so a
-    /// multi-turn `serve_sse_turns` can be used) and tools collection, and
-    /// also returns every `StatusUpdate` reported via the progress handler,
-    /// in order.
+    /// multi-turn `serve_sse_turns` can be used) and tools collection.
+    /// Returns every `StatusUpdate` reported via the progress handler, in
+    /// order, and (interleaved with those) every reasoning-flush event, in
+    /// the single combined order everything actually happened in.
     fn stream_to_vecs_with(
         endpoint: String,
         tools: &ToolsCollection,
-    ) -> (OpenAIResponse, String, String, Vec<StatusUpdate>) {
+    ) -> (
+        OpenAIResponse,
+        String,
+        String,
+        Vec<StatusUpdate>,
+        Vec<TestEvent>,
+    ) {
         use std::cell::RefCell;
         use std::rc::Rc;
 
         let answer = Rc::new(RefCell::new(String::new()));
         let reasoning = Rc::new(RefCell::new(String::new()));
         let statuses = Rc::new(RefCell::new(Vec::new()));
-        let (answer_out, reasoning_out, statuses_out) =
-            (answer.clone(), reasoning.clone(), statuses.clone());
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let (answer_out, reasoning_out, statuses_out, events_out) = (
+            answer.clone(),
+            reasoning.clone(),
+            statuses.clone(),
+            events.clone(),
+        );
+        let events_out2 = events.clone();
         let mode = ResponseMode::Streaming {
             stream_handler: Box::new(move |chunk| {
                 answer_out.borrow_mut().push_str(chunk);
                 Ok(())
             }),
             reasoning_handler: Box::new(move |chunk| {
+                if chunk.is_empty() {
+                    events_out.borrow_mut().push(TestEvent::ReasoningFlush);
+                }
                 reasoning_out.borrow_mut().push_str(chunk);
                 Ok(())
             }),
             progress_handler: Box::new(move |info| {
                 statuses_out.borrow_mut().push(info.status.clone());
+                events_out2
+                    .borrow_mut()
+                    .push(TestEvent::Status(info.status.clone()));
                 Ok(())
             }),
         };
@@ -1527,12 +1573,13 @@ mod tests {
             None,
         )
         .unwrap();
-        let (answer, reasoning, statuses) = (
+        let (answer, reasoning, statuses, events) = (
             answer.borrow().clone(),
             reasoning.borrow().clone(),
             statuses.borrow().clone(),
+            events.borrow().clone(),
         );
-        (response, answer, reasoning, statuses)
+        (response, answer, reasoning, statuses, events)
     }
 
     #[test]
@@ -1575,7 +1622,7 @@ mod tests {
             .map(|_| delta("reasoning_content", "word ", None))
             .collect();
         *events.last_mut().unwrap() = delta("reasoning_content", "word ", Some("stop"));
-        let (_response, _answer, reasoning, statuses) =
+        let (_response, _answer, reasoning, statuses, _events) =
             stream_to_vecs_with(serve_sse(events), &ToolsCollection::new());
         assert_eq!(reasoning, "word ".repeat(10));
         assert!(
@@ -1593,7 +1640,7 @@ mod tests {
         // expected yet, but SendingRequest (before the request goes out)
         // and the initial "Thinking" (on the first byte back) must still
         // fire immediately, in that order.
-        let (_response, _answer, _reasoning, statuses) = stream_to_vecs_with(
+        let (_response, _answer, _reasoning, statuses, _events) = stream_to_vecs_with(
             serve_sse(vec![delta("reasoning_content", "hi", Some("stop"))]),
             &ToolsCollection::new(),
         );
@@ -1629,7 +1676,8 @@ mod tests {
             vec![delta("content", "done", Some("stop"))],
         ]);
 
-        let (response, answer, _reasoning, statuses) = stream_to_vecs_with(endpoint, &tools);
+        let (response, answer, _reasoning, statuses, _events) =
+            stream_to_vecs_with(endpoint, &tools);
         assert_eq!(answer, "done");
         assert_eq!(
             response.choices.unwrap()[0].finish_reason.as_deref(),
@@ -1665,6 +1713,72 @@ mod tests {
         assert!(sending.iter().all(|&b| b > 0));
         // The second request includes the tool result, so it's larger.
         assert!(sending[1] > sending[0]);
+    }
+
+    #[test]
+    fn test_reasoning_directly_into_a_tool_call_flushes_reasoning_first() {
+        // The bug this guards against: the model reasons about which tool
+        // to use, then calls it directly with no answer content in
+        // between (very common - there's no reason for a model to say
+        // anything before invoking a tool). Reasoning's partial line must
+        // be closed as soon as tool-call streaming starts, not left open
+        // for the whole tool-accumulation phase (which is exactly when
+        // the status bar has the most to show - "Preparing tool(...)").
+        let mut tools = ToolsCollection::new();
+        tools.insert(
+            "lookup".to_string(),
+            ToolItem {
+                callback: ok_tool,
+                schema: r#"{"type":"function","function":{"name":"lookup","parameters":{}}}"#
+                    .to_string(),
+            },
+        );
+
+        let reasoning_chunk = delta("reasoning_content", "I should look this up", None);
+        let call = serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "call_1", "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"}
+        }]}, "finish_reason": "tool_calls"}]});
+        let endpoint = serve_sse_turns(vec![
+            vec![reasoning_chunk, call],
+            vec![delta("content", "done", Some("stop"))],
+        ]);
+
+        let (_response, _answer, reasoning, _statuses, events) =
+            stream_to_vecs_with(endpoint, &tools);
+        assert_eq!(reasoning, "I should look this up");
+
+        // A reasoning flush also happens harmlessly once at the end of
+        // every turn regardless of tool calls (existing behavior, not
+        // this fix), so a plain count can't distinguish "flushed too
+        // late" from "flushed at the right time" - only ordering can:
+        // the *first* reasoning flush must come no later than the *first*
+        // ToolStart, proving reasoning's partial line was closed before
+        // (or, at worst, in the same processing pass as) tool-call
+        // accumulation begins, not left open for however long that takes.
+        let first_flush = events
+            .iter()
+            .position(|e| matches!(e, TestEvent::ReasoningFlush))
+            .expect("reasoning's partial line was never closed - left dangling");
+        // Check against ToolAccumulating specifically, not ToolStart:
+        // ToolStart/ToolComplete fire from the *outer* function only after
+        // the whole SSE stream (and its own trailing end-of-stream flush)
+        // has already finished, so they'd always come after some flush
+        // regardless of this fix. ToolAccumulating fires from within the
+        // same delta-processing loop as the fix, while the stream is
+        // still being read - exactly the window the bug left the spinner
+        // suppressed for.
+        let first_accumulating = events
+            .iter()
+            .position(|e| matches!(e, TestEvent::Status(StatusUpdate::ToolAccumulating { .. })))
+            .expect("expected a ToolAccumulating status");
+        assert!(
+            first_flush <= first_accumulating,
+            "reasoning flushed at position {} but ToolAccumulating was already reported at \
+             position {} - the status bar's spinner would have been suppressed until then",
+            first_flush,
+            first_accumulating
+        );
     }
 
     #[test]

@@ -90,11 +90,13 @@ leave the status looking frozen. Tool calls show `Preparing <tool>` while
 their arguments are still streaming in, then `Running <tool>(<args>)` once
 they're complete.
 
-Output is normally printed a line at a time as it streams in. If a response
-runs long with no newline in sight (e.g. a model that degenerates into
-repeating itself), the text is flushed anyway every 400 characters, so a
-runaway response is always visible - not just a growing byte count with
-nothing to show for it - and can be interrupted with Ctrl-C.
+Output is printed in real time as it streams in, character by character
+rather than a line at a time, with the terminal's own wrapping handling
+long lines. This means a response is never invisible while it accumulates,
+however it's broken into lines and however long it runs - including a
+model that degenerates into repeating itself with no line breaks at all -
+and can always be interrupted with Ctrl-C as soon as something looks
+wrong.
 
 Reading a large file in full sends its entire content to the model as
 context, which both grows every later request and can turn the next one
