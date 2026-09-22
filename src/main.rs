@@ -520,17 +520,7 @@ impl ChatPrinter {
                 }
             }
         }
-        use std::io::Write;
-        let output = format!("{}\n", msg);
-        let bytes = output.as_bytes();
-        unsafe {
-            libc::write(
-                libc::STDERR_FILENO,
-                bytes.as_ptr() as *const libc::c_void,
-                bytes.len(),
-            );
-        }
-        let _ = std::io::stderr().flush();
+        status_bar::write_stderr(&format!("{}\n", msg));
     }
 
     fn println_agent(&self, agent_name: &str, msg: &str) {
