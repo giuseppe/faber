@@ -302,7 +302,13 @@ pub enum StatusUpdate {
         arguments: String,
         duration_ms: u64,
     },
-    Continuing,
+    /// About to send a request and wait for the response - reported once
+    /// per turn (the first request and every one that follows a tool call),
+    /// with the size of the outgoing request body, so a long wait on a
+    /// large prompt doesn't look indistinguishable from a hang.
+    SendingRequest {
+        bytes: usize,
+    },
     StreamProcessing {
         bytes_read: usize,
         chunks_processed: u32,
@@ -610,6 +616,19 @@ fn post_request_with_mode_and_recursion(
         trace!("Send request: {}", request_json);
         debug!("Request has {} custom parameters", opts.parameters.len());
 
+        if let ResponseMode::Streaming {
+            progress_handler, ..
+        } = &mode
+        {
+            let progress_info = ProgressInfo {
+                status: StatusUpdate::SendingRequest {
+                    bytes: request_json.len(),
+                },
+                elapsed_ms: start_time.elapsed().as_millis() as u64,
+            };
+            progress_handler(&progress_info)?;
+        }
+
         let client = ReqwestClient::builder()
             .timeout(Duration::from_secs(1000))
             .build()?;
@@ -831,19 +850,8 @@ fn post_request_with_mode_and_recursion(
                 messages.len()
             );
 
-            // Show continuing status
-            if let ResponseMode::Streaming {
-                progress_handler, ..
-            } = &mode
-            {
-                let progress_info = ProgressInfo {
-                    status: StatusUpdate::Continuing,
-                    elapsed_ms: start_time.elapsed().as_millis() as u64,
-                };
-                progress_handler(&progress_info)?;
-            }
-
-            // Continue the loop to make another API request with the updated messages
+            // The next iteration reports SendingRequest once it has built
+            // the next request body, so there's nothing to show here.
             continue;
         }
 
@@ -1557,13 +1565,19 @@ mod tests {
 
     #[test]
     fn test_streaming_progress_does_not_wait_for_content() {
-        // Fewer than the reporting cadence: no progress update is expected
-        // yet, but the initial "Thinking" must still fire immediately.
+        // Fewer than the reporting cadence: no StreamProcessing update is
+        // expected yet, but SendingRequest (before the request goes out)
+        // and the initial "Thinking" (on the first byte back) must still
+        // fire immediately, in that order.
         let (_response, _answer, _reasoning, statuses) = stream_to_vecs_with(
             serve_sse(vec![delta("reasoning_content", "hi", Some("stop"))]),
             &ToolsCollection::new(),
         );
-        assert!(matches!(statuses.first(), Some(StatusUpdate::Thinking)));
+        assert!(matches!(
+            statuses.first(),
+            Some(StatusUpdate::SendingRequest { .. })
+        ));
+        assert!(matches!(statuses.get(1), Some(StatusUpdate::Thinking)));
     }
 
     fn ok_tool(_args: &String, _ctx: &crate::ToolContext) -> Result<String, Box<dyn Error>> {
@@ -1612,6 +1626,70 @@ mod tests {
             .count();
         assert_eq!(starts, 1);
         assert_eq!(completes, 1);
+
+        // One SendingRequest per turn (the tool call's turn, and the
+        // follow-up that reports the result), each with a plausible,
+        // nonzero size for the request actually sent at that point.
+        let sending: Vec<usize> = statuses
+            .iter()
+            .filter_map(|s| match s {
+                StatusUpdate::SendingRequest { bytes } => Some(*bytes),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sending.len(), 2);
+        assert!(sending.iter().all(|&b| b > 0));
+        // The second request includes the tool result, so it's larger.
+        assert!(sending[1] > sending[0]);
+    }
+
+    #[test]
+    fn test_sending_request_reports_actual_request_size() {
+        // A bigger prompt must be reflected in a bigger reported size, not
+        // a placeholder - this is what lets the status line explain a long
+        // wait instead of looking like a hang.
+        let short = "hi".to_string();
+        let long = "x".repeat(50_000);
+
+        let bytes_for = |user_message: &str| -> usize {
+            use std::cell::RefCell;
+            use std::rc::Rc;
+            let sizes = Rc::new(RefCell::new(Vec::new()));
+            let sizes_out = sizes.clone();
+            let mode = ResponseMode::Streaming {
+                stream_handler: Box::new(|_| Ok(())),
+                reasoning_handler: Box::new(|_| Ok(())),
+                progress_handler: Box::new(move |info| {
+                    if let StatusUpdate::SendingRequest { bytes } = info.status {
+                        sizes_out.borrow_mut().push(bytes);
+                    }
+                    Ok(())
+                }),
+            };
+            let opts = Opts {
+                max_tokens: None,
+                model: "test-model".to_string(),
+                endpoint: serve_sse(vec![delta("content", "ok", Some("stop"))]),
+                tool_choice: None,
+                api_key: None,
+                max_retries: Some(1),
+                retry_base_delay_secs: None,
+                parameters: HashMap::new(),
+            };
+            let ctx = crate::ToolContext::new(|_: &str| {});
+            post_request_with_mode(
+                vec![make_message("user", user_message.to_string())],
+                &ToolsCollection::new(),
+                &opts,
+                mode,
+                &ctx,
+                None,
+            )
+            .unwrap();
+            sizes.borrow()[0]
+        };
+
+        assert!(bytes_for(&long) > bytes_for(&short) + 40_000);
     }
 
     #[test]
