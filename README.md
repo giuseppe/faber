@@ -1,4 +1,4 @@
-# swarmblabla
+# faber
 
 A multi-agent AI CLI tool for interactive software development. Supports
 multiple concurrent agents, sub-agent spawning, inter-agent messaging,
@@ -48,9 +48,9 @@ echo "your-github-token" > ~/.github/token
 ### Chat (interactive session)
 
 ```bash
-swarmblabla chat
-swarmblabla --db-path state.db chat          # with persistence
-swarmblabla --db-path state.db --agent mybot chat  # start as a specific agent
+faber chat
+faber --db-path state.db chat          # with persistence
+faber --db-path state.db --agent mybot chat  # start as a specific agent
 ```
 
 ### Chat commands
@@ -90,7 +90,7 @@ in the summary, and your last message is kept verbatim after it.
 Send a single prompt and print the response:
 
 ```bash
-swarmblabla prompt "Explain this code" src/main.rs src/lib.rs
+faber prompt "Explain this code" src/main.rs src/lib.rs
 ```
 
 Files listed after the prompt are loaded as system context.
@@ -98,20 +98,20 @@ Files listed after the prompt are loaded as system context.
 ### List models
 
 ```bash
-swarmblabla models
-swarmblabla --endpoint https://api.openai.com/v1 models
+faber models
+faber --endpoint https://api.openai.com/v1 models
 ```
 
 ### List tools
 
 ```bash
-swarmblabla list-tools
+faber list-tools
 ```
 
 ### Garbage collect dormant agents
 
 ```bash
-swarmblabla --db-path state.db gc
+faber --db-path state.db gc
 ```
 
 Removes agents with no active session (stale heartbeat or no session_id),
@@ -224,14 +224,14 @@ scheduler thread checks for pending tasks every second.
 ### Tool filtering
 
 ```bash
-swarmblabla --tools read_file,write_file,glob chat   # only these tools
-swarmblabla --no-tools chat                           # disable all tools
-swarmblabla --tool-choice required chat               # force tool usage
+faber --tools read_file,write_file,glob chat   # only these tools
+faber --no-tools chat                           # disable all tools
+faber --tool-choice required chat               # force tool usage
 ```
 
 ## MCP (Model Context Protocol)
 
-swarmblabla can connect to external tool servers using the MCP protocol.
+faber can connect to external tool servers using the MCP protocol.
 Three transports are supported:
 
 ### Stdio (local process)
@@ -297,15 +297,15 @@ Start a server that exposes the database over TCP so remote instances
 can share state:
 
 ```bash
-swarmblabla --db-path state.db serve --bind 127.0.0.1:9090
-swarmblabla --db-path state.db serve --bind 0.0.0.0:9090 --auth-key mysecret
-swarmblabla --db-path state.db serve --auth-key-file /path/to/keyfile
+faber --db-path state.db serve --bind 127.0.0.1:9090
+faber --db-path state.db serve --bind 0.0.0.0:9090 --auth-key mysecret
+faber --db-path state.db serve --auth-key-file /path/to/keyfile
 ```
 
 Clients connect with `--server` instead of `--db-path`:
 
 ```bash
-swarmblabla --server 127.0.0.1:9090 --server-key mysecret chat
+faber --server 127.0.0.1:9090 --server-key mysecret chat
 ```
 
 The protocol is newline-delimited JSON over TCP. TLS is not built in --
@@ -313,7 +313,7 @@ use SSH tunneling, WireGuard, or a reverse proxy for encryption:
 
 ```bash
 ssh -L 9090:localhost:9090 remote-host
-swarmblabla --server 127.0.0.1:9090 --server-key mysecret chat
+faber --server 127.0.0.1:9090 --server-key mysecret chat
 ```
 
 ## Options
@@ -331,7 +331,7 @@ swarmblabla --server 127.0.0.1:9090 --server-key mysecret chat
     --parameter <K=V>        Model parameter (can be repeated)
     --db-path <PATH>         SQLite database for persistent storage
     --agent <NAME>           Start chat as this agent instead of 'default'
-    --server <ADDR>          Connect to a remote swarmblabla server
+    --server <ADDR>          Connect to a remote faber server
     --server-key <KEY>       Pre-shared key for server authentication
     --server-key-file <PATH> Read server key from file
 ```
@@ -341,8 +341,8 @@ swarmblabla --server 127.0.0.1:9090 --server-key mysecret chat
 Use `--parameter` to tune model behavior:
 
 ```bash
-swarmblabla --parameter temperature=0.7 chat
-swarmblabla --parameter temperature=0.2 --parameter top_p=0.9 chat
+faber --parameter temperature=0.7 chat
+faber --parameter temperature=0.2 --parameter top_p=0.9 chat
 ```
 
 Parameter types are auto-detected: numbers, booleans (`true`/`false`),
@@ -356,4 +356,4 @@ cargo build --release
 
 ## License
 
-swarmblabla is licensed under the GNU General Public License v2.0 or later.
+faber is licensed under the GNU General Public License v2.0 or later.

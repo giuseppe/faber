@@ -1,19 +1,19 @@
 /*
- * swarmblabla
+ * faber
  *
  * Copyright (C) 2025 Giuseppe Scrivano <giuseppe@scrivano.org>
- * swarmblabla is free software; you can redistribute it and/or modify
+ * faber is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
  * (at your option) any later version.
  *
- * swarmblabla is distributed in the hope that it will be useful,
+ * faber is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with swarmblabla.  If not, see <http://www.gnu.org/licenses/>.
+ * along with faber.  If not, see <http://www.gnu.org/licenses/>.
  *
  */
 
@@ -25,7 +25,7 @@ mod server;
 mod status_bar;
 mod summarize;
 
-use swarmblabla::db;
+use faber::db;
 
 use clap::{Parser, Subcommand};
 use console::Style;
@@ -537,9 +537,9 @@ impl ChatPrinter {
 const DEFAULT_ENDPOINT: &str = "http://localhost:8080";
 const DEFAULT_MODEL: &str = "google/gemini-2.5-pro";
 
-use swarmblabla::ToolContext;
-use swarmblabla::db_backend::DbBackend;
-use swarmblabla::local_db::LocalDb;
+use faber::ToolContext;
+use faber::db_backend::DbBackend;
+use faber::local_db::LocalDb;
 
 /// Parse parameter strings in NAME=VALUE format into a HashMap
 fn parse_parameters(
@@ -1203,7 +1203,7 @@ fn tool_fetch_web_content(
         } else {
             reqwest::redirect::Policy::none()
         })
-        .user_agent("swarmblabla/0.1.0")
+        .user_agent("faber/0.1.0")
         .build()?;
 
     let response = client.get(&params.url).send()?;
@@ -3340,7 +3340,7 @@ fn post_request_and_print_output(
     system_prompts: Option<Vec<String>>,
     opts: &Opts,
     db: Option<Arc<dyn DbBackend>>,
-    mcp_manager: Option<Arc<swarmblabla::mcp::McpManager>>,
+    mcp_manager: Option<Arc<faber::mcp::McpManager>>,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Prompt: {}", prompt);
 
@@ -3419,7 +3419,7 @@ fn prompt_command(
     files: &Vec<String>,
     opts: &Opts,
     db: Option<Arc<dyn DbBackend>>,
-    mcp_manager: Option<Arc<swarmblabla::mcp::McpManager>>,
+    mcp_manager: Option<Arc<faber::mcp::McpManager>>,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Executing prompt command with {} files", files.len());
     let mut system_prompts: Vec<String> = vec![];
@@ -3606,7 +3606,7 @@ fn handle_chat_command(
     prompt_text: &Arc<Mutex<String>>,
     agent_names: &Arc<Mutex<Vec<String>>>,
     session_id: &str,
-    mcp_manager: &Option<Arc<swarmblabla::mcp::McpManager>>,
+    mcp_manager: &Option<Arc<faber::mcp::McpManager>>,
     status_bar: &status_bar::StatusBar,
 ) -> Result<bool, Box<dyn Error>> {
     let messages = &mut active_agent.messages;
@@ -4388,7 +4388,7 @@ fn chat_command(
     opts: &Opts,
     db: Option<Arc<dyn DbBackend>>,
     db_conn: Option<Arc<Mutex<rusqlite::Connection>>>,
-    mcp_manager: Option<Arc<swarmblabla::mcp::McpManager>>,
+    mcp_manager: Option<Arc<faber::mcp::McpManager>>,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Executing chat command");
 
@@ -4860,7 +4860,7 @@ fn gc_command(opts: &Opts) -> Result<(), Box<dyn Error>> {
 }
 
 fn list_tools_command(
-    mcp_manager: &Option<Arc<swarmblabla::mcp::McpManager>>,
+    mcp_manager: &Option<Arc<faber::mcp::McpManager>>,
 ) -> Result<(), Box<dyn Error>> {
     let safe_tools = initialize_tools(false, None);
     let all_tools = initialize_tools(true, None);
@@ -5032,7 +5032,7 @@ struct Opts {
     /// Start chat session with this agent instead of 'default'
     agent: Option<String>,
     #[clap(long)]
-    /// Connect to a remote swarmblabla server instead of using a local database
+    /// Connect to a remote faber server instead of using a local database
     server: Option<String>,
     #[clap(long)]
     /// Pre-shared key for server authentication
@@ -5043,7 +5043,7 @@ struct Opts {
 
     #[clap(skip)]
     #[serde(default)]
-    mcp_servers: HashMap<String, swarmblabla::mcp::McpServerConfig>,
+    mcp_servers: HashMap<String, faber::mcp::McpServerConfig>,
 
     #[clap(subcommand)]
     #[serde(skip)]
@@ -5264,8 +5264,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         None
     };
 
-    let mcp_manager: Option<Arc<swarmblabla::mcp::McpManager>> = if !opts.mcp_servers.is_empty() {
-        match swarmblabla::mcp::McpManager::new(opts.mcp_servers.clone()) {
+    let mcp_manager: Option<Arc<faber::mcp::McpManager>> = if !opts.mcp_servers.is_empty() {
+        match faber::mcp::McpManager::new(opts.mcp_servers.clone()) {
             Ok(mgr) => Some(Arc::new(mgr)),
             Err(e) => {
                 return Err(format!("Failed to initialize MCP servers: {}", e).into());

@@ -1,19 +1,19 @@
 /*
- * swarmblabla
+ * faber
  *
  * Copyright (C) 2025 Giuseppe Scrivano <giuseppe@scrivano.org>
- * swarmblabla is free software; you can redistribute it and/or modify
+ * faber is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
  * (at your option) any later version.
  *
- * swarmblabla is distributed in the hope that it will be useful,
+ * faber is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with swarmblabla.  If not, see <http://www.gnu.org/licenses/>.
+ * along with faber.  If not, see <http://www.gnu.org/licenses/>.
  *
  */
 
@@ -498,7 +498,7 @@ impl McpServer {
             "protocolVersion": "2025-03-26",
             "capabilities": {},
             "clientInfo": {
-                "name": "swarmblabla",
+                "name": "faber",
                 "version": "0.1.0"
             }
         });
