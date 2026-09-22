@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::{BufRead, BufReader};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -299,7 +300,6 @@ pub enum StatusUpdate {
     },
     ToolComplete {
         name: String,
-        arguments: String,
         duration_ms: u64,
     },
     /// About to send a request and wait for the response - reported once
@@ -838,7 +838,16 @@ fn post_request_with_mode_and_recursion(
                             tool_call_request.function.arguments.len()
                         );
                         let tool_start_time = start_time.elapsed();
-                        let msg = tool_call(&tools_collection, tool_call_request, ctx)?;
+                        // Mark the tool's own output as "boxed" for the
+                        // duration of the call only, so a println closure
+                        // that wants to frame it can tell it apart from
+                        // unrelated output - reset unconditionally (even on
+                        // error) so the flag never gets stuck on for later,
+                        // unrelated println calls.
+                        ctx.boxed.store(true, Ordering::Relaxed);
+                        let result = tool_call(&tools_collection, tool_call_request, ctx);
+                        ctx.boxed.store(false, Ordering::Relaxed);
+                        let msg = result?;
                         let tool_duration = start_time.elapsed() - tool_start_time;
 
                         // Show progress for tool execution completion
@@ -849,7 +858,6 @@ fn post_request_with_mode_and_recursion(
                             let progress_info = ProgressInfo {
                                 status: StatusUpdate::ToolComplete {
                                     name: tool_call_request.function.name.clone(),
-                                    arguments: tool_call_request.function.arguments.clone(),
                                     duration_ms: tool_duration.as_millis() as u64,
                                 },
                                 elapsed_ms: start_time.elapsed().as_millis() as u64,

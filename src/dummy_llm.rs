@@ -391,7 +391,6 @@ pub fn post_request_dummy(
                     progress_handler(&ProgressInfo {
                         status: StatusUpdate::ToolComplete {
                             name: tc.function.name.clone(),
-                            arguments: tc.function.arguments.clone(),
                             duration_ms: tool_duration.as_millis() as u64,
                         },
                         elapsed_ms: start_time.elapsed().as_millis() as u64,

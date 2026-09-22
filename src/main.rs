@@ -493,6 +493,42 @@ fn agent_ansi_code(name: &str) -> u8 {
     AGENT_ANSI_CODES[agent_color_hash(name) % AGENT_ANSI_CODES.len()]
 }
 
+/// Style for framing a tool call's own output: the same muted grey used for
+/// reasoning text and other secondary/meta information, so the frame reads
+/// as "chrome" rather than model content.
+fn tool_box_style() -> Style {
+    Style::new().color256(244)
+}
+
+/// The opening marker for a tool call's boxed output block.
+fn tool_box_open(name: &str, args: &str) -> String {
+    tool_box_style()
+        .apply_to(format!("── {}({}) ──", name, args))
+        .to_string()
+}
+
+/// The closing marker for a tool call's boxed output block.
+fn tool_box_close(name: &str, duration_secs: f64) -> String {
+    tool_box_style()
+        .apply_to(format!("── {} done in {:.1}s ──", name, duration_secs))
+        .to_string()
+}
+
+/// Prefixes each line of a tool's own output with a dim "│ " bar so it
+/// reads as visually distinct from surrounding model text, while leaving
+/// the line's own content (and any color codes it already carries, e.g.
+/// `patch_file`'s diff output) untouched.
+fn tool_box_prefix_lines(msg: &str) -> String {
+    let bar = tool_box_style().apply_to("│").to_string();
+    if msg.is_empty() {
+        return bar;
+    }
+    msg.lines()
+        .map(|line| format!("{} {}", bar, line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 impl ChatPrinter {
     fn new() -> Self {
         Self {
@@ -4469,19 +4505,12 @@ fn create_response_mode(
                         &format!("Running {}({})", name, formatted_args),
                         true,
                     );
+                    printer_for_progress.println(&tool_box_open(name, &formatted_args));
                 }
-                StatusUpdate::ToolComplete {
-                    name,
-                    arguments,
-                    duration_ms,
-                } => {
+                StatusUpdate::ToolComplete { name, duration_ms } => {
                     let duration_secs = *duration_ms as f64 / 1000.0;
                     tool_active_for_progress.store(false, Ordering::Relaxed);
-                    let formatted_args = format_tool_arguments(arguments);
-                    printer_for_progress.println(&format!(
-                        "Tool {}({}) completed in {:.1}s",
-                        name, formatted_args, duration_secs
-                    ));
+                    printer_for_progress.println(&tool_box_close(name, duration_secs));
                 }
                 StatusUpdate::StreamProcessing {
                     bytes_read,
@@ -5214,8 +5243,13 @@ fn chat_command(
                         }
                     } else {
                         let printer_for_tool = chat_pb.clone();
+                        let boxed_for_tool = tool_context.boxed.clone();
                         tool_context.println = Box::new(move |msg: &str| {
-                            printer_for_tool.println(msg);
+                            if boxed_for_tool.load(Ordering::Relaxed) {
+                                printer_for_tool.println(&tool_box_prefix_lines(msg));
+                            } else {
+                                printer_for_tool.println(msg);
+                            }
                         });
 
                         let agent_name = active_agent.name.clone();

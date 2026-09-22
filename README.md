@@ -88,7 +88,15 @@ bytes, M chunks)` while tokens keep arriving, including during a long
 reasoning phase, so a model that "thinks out loud" for a while doesn't
 leave the status looking frozen. Tool calls show `Preparing <tool>` while
 their arguments are still streaming in, then `Running <tool>(<args>)` once
-they're complete.
+they're complete. The spinner and status text always render in the same
+fixed color, separate from the agent's own color (shown on its name within
+the status line and its prompt), so "something's in progress" is always
+recognizable at a glance regardless of which agent is active.
+
+A tool call's own output is framed between `── <tool>(<args>) ──` and
+`── <tool> done in <N>s ──` markers, with each line in between prefixed by
+`│ `, so it's clear where a tool's diagnostics start and end even when
+several tool calls or a long model response follow one another.
 
 Output is printed in real time as it streams in, character by character
 rather than a line at a time, with the terminal's own wrapping handling
