@@ -4002,27 +4002,23 @@ fn create_response_mode(
                     status_bar.set_agent_status(&agent_name, "Thinking", true);
                 }
                 StatusUpdate::ToolAccumulating { name, arguments } => {
-                    let formatted_args = format_tool_arguments(arguments);
+                    // The arguments are still being streamed in, so they're
+                    // incomplete/invalid JSON at this point; showing them raw
+                    // (as format_tool_arguments does once they're complete)
+                    // would just look like a broken tool call.
                     status_bar.set_agent_status(
                         &agent_name,
-                        &format!("Preparing {}({})", name, formatted_args),
+                        &format!("Preparing {} ({} chars)", name, arguments.len()),
                         false,
                     );
                 }
                 StatusUpdate::ToolStart { name, arguments } => {
+                    tool_active_for_progress.store(true, Ordering::Relaxed);
                     let formatted_args = format_tool_arguments(arguments);
                     status_bar.set_agent_status(
                         &agent_name,
                         &format!("Running {}({})", name, formatted_args),
                         true,
-                    );
-                }
-                StatusUpdate::ToolExecuting { name, arguments } => {
-                    let formatted_args = format_tool_arguments(arguments);
-                    status_bar.set_agent_status(
-                        &agent_name,
-                        &format!("Running {}({})", name, formatted_args),
-                        false,
                     );
                 }
                 StatusUpdate::ToolComplete {
@@ -4041,7 +4037,6 @@ fn create_response_mode(
                 StatusUpdate::StreamProcessing {
                     bytes_read,
                     chunks_processed,
-                    ..
                 } => {
                     status_bar.set_agent_status(
                         &agent_name,
@@ -4053,7 +4048,10 @@ fn create_response_mode(
                     );
                 }
                 StatusUpdate::Continuing => {
-                    status_bar.set_agent_status(&agent_name, "Continuing", true);
+                    // Same wait as the initial request (blocked on the
+                    // network for the model's next turn); keep the wording
+                    // consistent instead of using a less descriptive label.
+                    status_bar.set_agent_status(&agent_name, "Waiting for response", true);
                 }
                 StatusUpdate::Complete { usage } => {
                     completed_for_progress.store(true, Ordering::Relaxed);

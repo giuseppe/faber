@@ -297,10 +297,6 @@ pub enum StatusUpdate {
         name: String,
         arguments: String,
     },
-    ToolExecuting {
-        name: String,
-        arguments: String,
-    },
     ToolComplete {
         name: String,
         arguments: String,
@@ -310,8 +306,6 @@ pub enum StatusUpdate {
     StreamProcessing {
         bytes_read: usize,
         chunks_processed: u32,
-        #[allow(dead_code)]
-        latest_content: String,
     },
     Complete {
         usage: Option<Usage>,
@@ -795,21 +789,6 @@ fn post_request_with_mode_and_recursion(
                             progress_handler(&progress_info)?;
                         }
 
-                        // Show progress for tool execution
-                        if let ResponseMode::Streaming {
-                            progress_handler, ..
-                        } = &mode
-                        {
-                            let progress_info = ProgressInfo {
-                                status: StatusUpdate::ToolExecuting {
-                                    name: tool_call_request.function.name.clone(),
-                                    arguments: tool_call_request.function.arguments.clone(),
-                                },
-                                elapsed_ms: start_time.elapsed().as_millis() as u64,
-                            };
-                            progress_handler(&progress_info)?;
-                        }
-
                         debug!(
                             "Executing tool call '{}' with complete arguments (length: {})",
                             tool_call_request.function.name,
@@ -990,6 +969,23 @@ fn handle_streaming_response(
                             thinking_reported = true;
                         }
 
+                        // Report progress on a cadence regardless of what kind of
+                        // payload this chunk carries: reasoning-heavy models can
+                        // spend most (or all) of a turn generating reasoning
+                        // tokens, and without this a long reasoning phase would
+                        // otherwise leave the status frozen on "Thinking" with no
+                        // sign that anything is happening.
+                        if chunks_processed % 10 == 0 {
+                            let progress_info = ProgressInfo {
+                                status: StatusUpdate::StreamProcessing {
+                                    bytes_read,
+                                    chunks_processed,
+                                },
+                                elapsed_ms: 0,
+                            };
+                            let _ = progress_handler(&progress_info);
+                        }
+
                         // Reasoning tokens arrive in a separate field, whose name depends on the server
                         for reasoning in [&choice.delta.thinking, &choice.delta.reasoning_content]
                             .into_iter()
@@ -1010,18 +1006,6 @@ fn handle_streaming_response(
                                 }
                                 accumulated_content.push_str(content);
                                 stream_handler(content)?;
-
-                                if chunks_processed % 10 == 0 {
-                                    let progress_info = ProgressInfo {
-                                        status: StatusUpdate::StreamProcessing {
-                                            bytes_read,
-                                            chunks_processed,
-                                            latest_content: content.clone(),
-                                        },
-                                        elapsed_ms: 0,
-                                    };
-                                    let _ = progress_handler(&progress_info);
-                                }
                             }
                         }
 
@@ -1407,38 +1391,46 @@ mod tests {
     /// Serves one canned server-sent-events response on a local port and
     /// returns the endpoint to use.
     fn serve_sse(events: Vec<serde_json::Value>) -> String {
+        serve_sse_turns(vec![events])
+    }
+
+    /// Like `serve_sse`, but serves one set of events per request, in order
+    /// (each round trip through a tool call is a separate HTTP request).
+    fn serve_sse_turns(turns: Vec<Vec<serde_json::Value>>) -> String {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut buf = [0u8; 4096];
-            let (header_end, content_length) = loop {
-                let n = stream.read(&mut buf).unwrap();
-                request.extend_from_slice(&buf[..n]);
-                if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&request[..pos]).to_lowercase();
-                    let length = headers
-                        .lines()
-                        .find_map(|l| l.strip_prefix("content-length:"))
-                        .and_then(|v| v.trim().parse::<usize>().ok())
-                        .unwrap_or(0);
-                    break (pos + 4, length);
+            for events in turns {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                let (header_end, content_length) = loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..pos]).to_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        break (pos + 4, length);
+                    }
+                };
+                while request.len() < header_end + content_length {
+                    let n = stream.read(&mut buf).unwrap();
+                    request.extend_from_slice(&buf[..n]);
                 }
-            };
-            while request.len() < header_end + content_length {
-                let n = stream.read(&mut buf).unwrap();
-                request.extend_from_slice(&buf[..n]);
+                let mut response = String::from(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                );
+                for event in events {
+                    response.push_str(&format!("data: {}\n\n", event));
+                }
+                response.push_str("data: [DONE]\n\n");
+                stream.write_all(response.as_bytes()).unwrap();
             }
-            let mut response = String::from(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-            );
-            for event in events {
-                response.push_str(&format!("data: {}\n\n", event));
-            }
-            response.push_str("data: [DONE]\n\n");
-            stream.write_all(response.as_bytes()).unwrap();
         });
         format!("http://{}/chat/completions", addr)
     }
@@ -1448,12 +1440,27 @@ mod tests {
     }
 
     fn stream_to_vecs(events: Vec<serde_json::Value>) -> (OpenAIResponse, String, String) {
+        let (response, answer, reasoning, _statuses) =
+            stream_to_vecs_with(serve_sse(events), &ToolsCollection::new());
+        (response, answer, reasoning)
+    }
+
+    /// Like `stream_to_vecs`, but against a caller-provided endpoint (so a
+    /// multi-turn `serve_sse_turns` can be used) and tools collection, and
+    /// also returns every `StatusUpdate` reported via the progress handler,
+    /// in order.
+    fn stream_to_vecs_with(
+        endpoint: String,
+        tools: &ToolsCollection,
+    ) -> (OpenAIResponse, String, String, Vec<StatusUpdate>) {
         use std::cell::RefCell;
         use std::rc::Rc;
 
         let answer = Rc::new(RefCell::new(String::new()));
         let reasoning = Rc::new(RefCell::new(String::new()));
-        let (answer_out, reasoning_out) = (answer.clone(), reasoning.clone());
+        let statuses = Rc::new(RefCell::new(Vec::new()));
+        let (answer_out, reasoning_out, statuses_out) =
+            (answer.clone(), reasoning.clone(), statuses.clone());
         let mode = ResponseMode::Streaming {
             stream_handler: Box::new(move |chunk| {
                 answer_out.borrow_mut().push_str(chunk);
@@ -1463,12 +1470,15 @@ mod tests {
                 reasoning_out.borrow_mut().push_str(chunk);
                 Ok(())
             }),
-            progress_handler: Box::new(|_| Ok(())),
+            progress_handler: Box::new(move |info| {
+                statuses_out.borrow_mut().push(info.status.clone());
+                Ok(())
+            }),
         };
         let opts = Opts {
             max_tokens: None,
             model: "test-model".to_string(),
-            endpoint: serve_sse(events),
+            endpoint,
             tool_choice: None,
             api_key: None,
             max_retries: Some(1),
@@ -1478,15 +1488,19 @@ mod tests {
         let ctx = crate::ToolContext::new(|_: &str| {});
         let response = post_request_with_mode(
             vec![make_message("user", "hi".to_string())],
-            &ToolsCollection::new(),
+            tools,
             &opts,
             mode,
             &ctx,
             None,
         )
         .unwrap();
-        let (answer, reasoning) = (answer.borrow().clone(), reasoning.borrow().clone());
-        (response, answer, reasoning)
+        let (answer, reasoning, statuses) = (
+            answer.borrow().clone(),
+            reasoning.borrow().clone(),
+            statuses.borrow().clone(),
+        );
+        (response, answer, reasoning, statuses)
     }
 
     #[test]
@@ -1518,6 +1532,86 @@ mod tests {
         assert_eq!(choice.finish_reason.as_deref(), Some("length"));
         // Reasoning alone must not end up in the history as an answer.
         assert_eq!(response.history.len(), 1);
+    }
+
+    #[test]
+    fn test_streaming_reports_progress_during_pure_reasoning() {
+        // A long reasoning-only stream (no answer content at all) used to
+        // leave the status frozen on "Thinking" for its whole duration,
+        // since progress was only ever reported from the content branch.
+        let mut events: Vec<_> = (0..10)
+            .map(|_| delta("reasoning_content", "word ", None))
+            .collect();
+        *events.last_mut().unwrap() = delta("reasoning_content", "word ", Some("stop"));
+        let (_response, _answer, reasoning, statuses) =
+            stream_to_vecs_with(serve_sse(events), &ToolsCollection::new());
+        assert_eq!(reasoning, "word ".repeat(10));
+        assert!(
+            statuses
+                .iter()
+                .any(|s| matches!(s, StatusUpdate::StreamProcessing { .. })),
+            "expected at least one StreamProcessing update during reasoning, got {:?}",
+            statuses
+        );
+    }
+
+    #[test]
+    fn test_streaming_progress_does_not_wait_for_content() {
+        // Fewer than the reporting cadence: no progress update is expected
+        // yet, but the initial "Thinking" must still fire immediately.
+        let (_response, _answer, _reasoning, statuses) = stream_to_vecs_with(
+            serve_sse(vec![delta("reasoning_content", "hi", Some("stop"))]),
+            &ToolsCollection::new(),
+        );
+        assert!(matches!(statuses.first(), Some(StatusUpdate::Thinking)));
+    }
+
+    fn ok_tool(_args: &String, _ctx: &crate::ToolContext) -> Result<String, Box<dyn Error>> {
+        Ok("tool result".to_string())
+    }
+
+    #[test]
+    fn test_streaming_tool_call_reports_a_single_start_and_complete() {
+        let mut tools = ToolsCollection::new();
+        tools.insert(
+            "lookup".to_string(),
+            ToolItem {
+                callback: ok_tool,
+                schema: r#"{"type":"function","function":{"name":"lookup","parameters":{}}}"#
+                    .to_string(),
+            },
+        );
+
+        let call = serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "call_1", "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"}
+        }]}, "finish_reason": "tool_calls"}]});
+        let endpoint = serve_sse_turns(vec![
+            vec![call],
+            vec![delta("content", "done", Some("stop"))],
+        ]);
+
+        let (response, answer, _reasoning, statuses) = stream_to_vecs_with(endpoint, &tools);
+        assert_eq!(answer, "done");
+        assert_eq!(
+            response.choices.unwrap()[0].finish_reason.as_deref(),
+            Some("stop")
+        );
+
+        // Exactly one "starting" update and one "complete" update per tool
+        // call: no separate, redundant "executing" update in between (the
+        // two used to be reported back to back with identical text and no
+        // way to tell them apart).
+        let starts = statuses
+            .iter()
+            .filter(|s| matches!(s, StatusUpdate::ToolStart { name, .. } if name == "lookup"))
+            .count();
+        let completes = statuses
+            .iter()
+            .filter(|s| matches!(s, StatusUpdate::ToolComplete { name, .. } if name == "lookup"))
+            .count();
+        assert_eq!(starts, 1);
+        assert_eq!(completes, 1);
     }
 
     #[test]

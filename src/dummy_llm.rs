@@ -377,13 +377,6 @@ pub fn post_request_dummy(
                         },
                         elapsed_ms: start_time.elapsed().as_millis() as u64,
                     })?;
-                    progress_handler(&ProgressInfo {
-                        status: StatusUpdate::ToolExecuting {
-                            name: tc.function.name.clone(),
-                            arguments: tc.function.arguments.clone(),
-                        },
-                        elapsed_ms: start_time.elapsed().as_millis() as u64,
-                    })?;
                 }
 
                 let tool_start = start_time.elapsed();

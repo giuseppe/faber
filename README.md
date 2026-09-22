@@ -80,6 +80,14 @@ use up the context window on later requests.  If the model stops because it hit
 its token limit, the chat prints a warning instead of showing a silently
 truncated answer.
 
+The status bar reports `Waiting for response` while a request is in flight,
+`Thinking` once the model starts responding, and `Streaming (N bytes, M
+chunks)` while tokens keep arriving — including during a long reasoning
+phase, so a model that "thinks out loud" for a while doesn't leave the
+status looking frozen. Tool calls show `Preparing <tool>` while their
+arguments are still streaming in, then `Running <tool>(<args>)` once
+they're complete.
+
 When a request fails because the conversation no longer fits in the model's
 context window, the chat summarizes the history automatically and retries the
 request once.  Work done by tool calls earlier in the failed turn is included
