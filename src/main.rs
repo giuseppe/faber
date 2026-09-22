@@ -523,6 +523,55 @@ impl ChatPrinter {
         status_bar::write_stderr(&format!("{}\n", msg));
     }
 
+    /// Appends `msg` (no trailing newline) to the current line, so streamed
+    /// text is visible the instant it arrives instead of waiting for a full
+    /// line to accumulate. Only meaningful in direct mode (while a response
+    /// is actively streaming); indirect mode (the idle prompt, for injected
+    /// messages) has no concept of an open partial line, so it just falls
+    /// back to a complete one.
+    fn print_partial(&self, msg: &str) {
+        if msg.is_empty() {
+            return;
+        }
+        if !self.direct_mode.load(Ordering::Relaxed) {
+            if let Ok(mut guard) = self.printer.lock() {
+                if let Some(ref mut p) = *guard {
+                    let _ = p.print(msg.to_string());
+                    return;
+                }
+            }
+        }
+        status_bar::write_partial(msg);
+    }
+
+    /// Writes an explicit newline byte from a stream's own output - always,
+    /// even to reproduce a deliberate blank line exactly as the stream
+    /// wrote it. See `print_partial` for the direct/indirect mode split.
+    fn write_newline(&self) {
+        if !self.direct_mode.load(Ordering::Relaxed) {
+            if let Ok(mut guard) = self.printer.lock() {
+                if let Some(ref mut p) = *guard {
+                    let _ = p.print("\n".to_string());
+                    return;
+                }
+            }
+        }
+        status_bar::write_newline();
+    }
+
+    /// Closes the current line if (and only if) there's an open partial
+    /// line to close - a safe no-op otherwise, so it never prints a
+    /// spurious blank line. Indirect mode has no concept of an open
+    /// partial line, so it can't tell either way; it does nothing there,
+    /// which is the safe default (it's never actually reached during
+    /// active streaming, which is the only time this matters).
+    fn finish_partial_line(&self) {
+        if !self.direct_mode.load(Ordering::Relaxed) {
+            return;
+        }
+        status_bar::finish_partial_line();
+    }
+
     fn println_agent(&self, agent_name: &str, msg: &str) {
         let style = agent_style(agent_name);
         let header = style.apply_to(format!("── {} ──", agent_name));
@@ -4302,38 +4351,64 @@ fn format_tool_arguments(args_json: &str) -> String {
     }
 }
 
-/// Above this many characters with no newline in sight, the buffered text is
-/// flushed anyway instead of waiting indefinitely for one - otherwise a
-/// model that degenerates into repeating itself with no line breaks streams
-/// megabytes of content while the terminal shows nothing at all but a
-/// growing byte count.
-const MAX_STREAM_LINE_CHARS: usize = 400;
+/// One thing an incoming stream chunk implies should happen to the current
+/// line: append more text to it, terminate it because the model's own
+/// output contains a newline there, or (an empty chunk) close out whatever
+/// might still be open now that this stream is done for now.
+#[derive(Debug, PartialEq, Eq)]
+enum StreamStep {
+    Partial(String),
+    Newline,
+    Finish,
+}
 
-/// Returns a stream handler that prints `style`d text one line at a time; an
-/// empty chunk flushes the unfinished line.
+/// Splits an incoming stream chunk into the sequence of steps it implies.
+/// Text is appended to the open line as soon as it arrives - never
+/// buffered waiting for a full line - and a newline in the model's own
+/// output finishes the line so far, preserving blank lines exactly as the
+/// model produced them. An empty chunk is the end-of-stream signal: it
+/// closes whatever's left open, but (unlike a real newline) is a no-op if
+/// nothing is - it doesn't invent a newline that wasn't there.
+///
+/// Because nothing is ever held back waiting for a line to complete, a
+/// model that degenerates into repeating itself with no line breaks still
+/// streams visibly instead of leaving the terminal showing nothing but a
+/// growing byte count.
+fn stream_steps(chunk: &str) -> Vec<StreamStep> {
+    if chunk.is_empty() {
+        return vec![StreamStep::Finish];
+    }
+    let mut steps = Vec::new();
+    let mut rest = chunk;
+    while let Some(nl) = rest.find('\n') {
+        let (line, after) = rest.split_at(nl);
+        if !line.is_empty() {
+            steps.push(StreamStep::Partial(line.to_string()));
+        }
+        steps.push(StreamStep::Newline);
+        rest = &after[1..];
+    }
+    if !rest.is_empty() {
+        steps.push(StreamStep::Partial(rest.to_string()));
+    }
+    steps
+}
+
+/// Returns a stream handler that prints `style`d text as it arrives, on the
+/// current line, finalized into a real line only once the model itself
+/// emits a newline (or the stream ends).
 fn line_streamer(
     printer: ChatPrinter,
     style: Style,
 ) -> impl Fn(&str) -> Result<(), Box<dyn Error>> {
-    let buffer = Mutex::new(String::new());
     move |chunk: &str| {
-        if let Ok(mut buffer) = buffer.lock() {
-            buffer.push_str(chunk);
-            if chunk.is_empty() {
-                if !buffer.is_empty() {
-                    printer.println(&style.apply_to(&*buffer).to_string());
-                    buffer.clear();
+        for step in stream_steps(chunk) {
+            match step {
+                StreamStep::Partial(text) => {
+                    printer.print_partial(&style.apply_to(text).to_string())
                 }
-            } else if buffer.contains('\n') {
-                let mut lines: Vec<&str> = buffer.split('\n').collect();
-                let remaining = lines.pop().unwrap_or("").to_string();
-                for line in lines {
-                    printer.println(&style.apply_to(line).to_string());
-                }
-                *buffer = remaining;
-            } else if buffer.chars().count() >= MAX_STREAM_LINE_CHARS {
-                printer.println(&style.apply_to(&*buffer).to_string());
-                buffer.clear();
+                StreamStep::Newline => printer.write_newline(),
+                StreamStep::Finish => printer.finish_partial_line(),
             }
         }
         Ok(())
@@ -5880,88 +5955,160 @@ mod tests {
         assert!(matches!(parse_chat_command("\\help"), ChatCommand::Help));
     }
 
+    #[test]
+    fn test_stream_steps_no_newline_is_one_partial_step() {
+        assert_eq!(
+            stream_steps("hello"),
+            vec![StreamStep::Partial("hello".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_stream_steps_empty_chunk_finishes() {
+        // The end-of-stream signal: finish whatever's open (a no-op if
+        // nothing is, but the caller doesn't need to know that).
+        assert_eq!(stream_steps(""), vec![StreamStep::Finish]);
+    }
+
+    #[test]
+    fn test_stream_steps_trailing_newline_after_the_text() {
+        assert_eq!(
+            stream_steps("hello\n"),
+            vec![
+                StreamStep::Partial("hello".to_string()),
+                StreamStep::Newline
+            ]
+        );
+    }
+
+    #[test]
+    fn test_stream_steps_bare_newline_with_no_partial() {
+        // A lone newline (e.g. the blank line between two paragraphs)
+        // must not synthesize an empty Partial step, but must still be a
+        // real Newline (not the safe-no-op Finish) so the blank line is
+        // actually preserved.
+        assert_eq!(stream_steps("\n"), vec![StreamStep::Newline]);
+    }
+
+    #[test]
+    fn test_stream_steps_multiple_lines_in_one_chunk() {
+        assert_eq!(
+            stream_steps("a\nb\nc"),
+            vec![
+                StreamStep::Partial("a".to_string()),
+                StreamStep::Newline,
+                StreamStep::Partial("b".to_string()),
+                StreamStep::Newline,
+                StreamStep::Partial("c".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_stream_steps_blank_line_between_two_lines() {
+        assert_eq!(
+            stream_steps("a\n\nb"),
+            vec![
+                StreamStep::Partial("a".to_string()),
+                StreamStep::Newline,
+                StreamStep::Newline,
+                StreamStep::Partial("b".to_string()),
+            ]
+        );
+    }
+
     struct CapturingPrinter {
-        lines: Arc<Mutex<Vec<String>>>,
+        chunks: Arc<Mutex<Vec<String>>>,
     }
 
     impl rustyline::ExternalPrinter for CapturingPrinter {
         fn print(&mut self, msg: String) -> rustyline::Result<()> {
-            self.lines.lock().unwrap().push(msg);
+            self.chunks.lock().unwrap().push(msg);
             Ok(())
         }
     }
 
     fn capturing_chat_printer() -> (ChatPrinter, Arc<Mutex<Vec<String>>>) {
-        let lines = Arc::new(Mutex::new(Vec::new()));
+        let chunks = Arc::new(Mutex::new(Vec::new()));
         let printer = ChatPrinter::new();
         printer.set_printer(Box::new(CapturingPrinter {
-            lines: lines.clone(),
+            chunks: chunks.clone(),
         }));
         printer.set_direct_mode(false);
-        (printer, lines)
+        (printer, chunks)
     }
 
-    fn plain_lines(lines: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
-        lines
+    /// What would actually appear on screen: every captured write,
+    /// ANSI-stripped, concatenated in order - never mind how many separate
+    /// writes it took to get there, since a terminal just concatenates
+    /// whatever bytes it receives.
+    fn captured_text(chunks: &Arc<Mutex<Vec<String>>>) -> String {
+        chunks
             .lock()
             .unwrap()
             .iter()
-            .map(|l| {
-                console::strip_ansi_codes(l)
-                    .trim_end_matches('\n')
-                    .to_string()
-            })
+            .map(|c| console::strip_ansi_codes(c).to_string())
             .collect()
     }
 
     #[test]
-    fn test_line_streamer_prints_on_newline() {
-        let (printer, lines) = capturing_chat_printer();
+    fn test_line_streamer_end_of_stream_with_nothing_open_prints_nothing() {
+        // The end-of-stream flush (an empty chunk) must not print a
+        // spurious blank line when the stream had already closed out
+        // cleanly (e.g. its last chunk ended in a real newline) - or, as
+        // here, never printed anything at all.
+        let (printer, chunks) = capturing_chat_printer();
         let stream = line_streamer(printer, Style::new());
-        stream("hello ").unwrap();
-        stream("world\n").unwrap();
-        assert_eq!(plain_lines(&lines), vec!["hello world"]);
+        stream("").unwrap();
+        assert_eq!(captured_text(&chunks), "");
     }
 
     #[test]
-    fn test_line_streamer_flushes_at_end_of_stream() {
-        let (printer, lines) = capturing_chat_printer();
+    fn test_line_streamer_is_visible_before_a_newline_arrives() {
+        // The whole point: text must appear as soon as it arrives, not
+        // once buffered up to some threshold or a full line.
+        let (printer, chunks) = capturing_chat_printer();
         let stream = line_streamer(printer, Style::new());
-        stream("no newline yet").unwrap();
-        assert!(plain_lines(&lines).is_empty());
-        stream("").unwrap(); // end-of-stream flush
-        assert_eq!(plain_lines(&lines), vec!["no newline yet"]);
+        stream("partial, no newline yet").unwrap();
+        assert_eq!(captured_text(&chunks), "partial, no newline yet");
     }
 
     #[test]
-    fn test_line_streamer_force_flushes_when_no_newline_arrives() {
-        // A model stuck repeating itself with no line breaks must not make
-        // the streamed text invisible until (if ever) it finally emits a
-        // newline or the whole response ends.
-        let (printer, lines) = capturing_chat_printer();
+    fn test_line_streamer_across_chunk_boundaries() {
+        // Text arriving in arbitrarily small pieces must still concatenate
+        // correctly, and a real newline mid-chunk must be preserved.
+        // (Whether the end-of-stream flush then closes the still-open
+        // "second line" is a `finish_partial_line` concern tested directly
+        // at the status_bar::apply() level - indirect mode, used here only
+        // for capturability, has no concept of an open partial line to
+        // close.)
+        let (printer, chunks) = capturing_chat_printer();
+        let stream = line_streamer(printer, Style::new());
+        stream("hel").unwrap();
+        stream("lo ").unwrap();
+        stream("world\nsecond line").unwrap();
+        assert_eq!(captured_text(&chunks), "hello world\nsecond line");
+    }
+
+    #[test]
+    fn test_line_streamer_never_loses_content_with_no_newlines() {
+        // A model stuck repeating itself with no line breaks: every
+        // character sent in must show up, with nothing held back
+        // invisibly regardless of how long the response runs.
+        let (printer, chunks) = capturing_chat_printer();
         let stream = line_streamer(printer, Style::new());
         for _ in 0..10 {
             stream(&"x".repeat(100)).unwrap();
         }
-        // Force-flushes happen well before the stream ends (at 400 chars),
-        // so output must already be visible at this point.
-        let printed_mid_stream = plain_lines(&lines);
-        assert!(
-            !printed_mid_stream.is_empty(),
-            "1000 chars with no newline produced no output before the stream even ended"
-        );
-        for line in &printed_mid_stream {
-            assert!(
-                line.chars().count() <= MAX_STREAM_LINE_CHARS,
-                "line exceeded the force-flush threshold: {} chars",
-                line.chars().count()
-            );
-        }
+        assert_eq!(captured_text(&chunks), "x".repeat(1000));
+    }
 
-        stream("").unwrap(); // end-of-stream flush for whatever's left
-        let printed = plain_lines(&lines);
-        let total: usize = printed.iter().map(|l| l.chars().count()).sum();
-        assert_eq!(total, 1000);
+    #[test]
+    fn test_line_streamer_preserves_blank_lines() {
+        let (printer, chunks) = capturing_chat_printer();
+        let stream = line_streamer(printer, Style::new());
+        stream("first\n\nsecond\n").unwrap();
+        assert_eq!(captured_text(&chunks), "first\n\nsecond\n");
     }
 
     #[test]

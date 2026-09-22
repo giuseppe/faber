@@ -12,20 +12,37 @@ struct AgentEntry {
     color: u8,
 }
 
-/// Coordinates the status spinner with normal output on the same terminal.
+/// Coordinates the status spinner with normal output - including output
+/// streamed in as it arrives, with no trailing newline yet - on the same
+/// terminal.
 ///
-/// The spinner lives on the current, not-yet-terminated line: each tick
-/// erases the previous frame with `\r\x1b[2K` and redraws it, and any real
-/// output line erases it the same way before printing.  Real output stays in
-/// the terminal's normal scrollback, so this makes no assumptions about
-/// terminal size, scroll regions or cursor save/restore, none of which are
-/// implemented consistently enough across terminals to rely on: an earlier
-/// version reserved a fixed bottom row via a scroll region, which could fall
-/// out of sync with the terminal (e.g. across a resize) and let real output
-/// and the spinner land on the same row, corrupting both.
-static SPINNER_SHOWN: Mutex<bool> = Mutex::new(false);
+/// Whatever is on the current, not-yet-terminated line is tracked here.
+/// Real output stays in the terminal's normal scrollback and the spinner
+/// lives on the current line, redrawn in place each tick with
+/// `\r\x1b[2K`; this makes no assumptions about terminal size, scroll
+/// regions or cursor save/restore, none of which are implemented
+/// consistently enough across terminals to rely on (an earlier version
+/// reserved a fixed bottom row via a scroll region, which could fall out
+/// of sync with the terminal - e.g. across a resize - and let real output
+/// and the spinner land on the same row, corrupting both).
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum LineState {
+    /// Nothing is on the current line.
+    Empty,
+    /// The ticker's own spinner frame is on the current line.
+    Spinner,
+    /// Streamed output with no trailing newline yet is on the current line
+    /// (e.g. a model's answer, printed as it arrives rather than only once
+    /// a full line has accumulated).
+    Partial,
+}
+
+static LINE_STATE: Mutex<LineState> = Mutex::new(LineState::Empty);
 
 fn raw_write(s: &str) {
+    if s.is_empty() {
+        return;
+    }
     let bytes = s.as_bytes();
     unsafe {
         libc::write(
@@ -33,6 +50,83 @@ fn raw_write(s: &str) {
             bytes.as_ptr() as *const libc::c_void,
             bytes.len(),
         );
+    }
+}
+
+/// One thing that can happen to the current line.
+enum LineOp<'a> {
+    /// A complete, self-contained, already newline-terminated chunk of
+    /// output (e.g. a tool-completion message or an injected notification).
+    /// Never a continuation of an open partial line - that would be a
+    /// different stream's or thread's content - so whatever is on the
+    /// current line is closed out first.
+    CompleteLine(&'a str),
+    /// Appends `text` (no trailing newline) to the current line. A no-op
+    /// for empty text.
+    Partial(&'a str),
+    /// An explicit newline byte from a stream's own output: always writes
+    /// `\n` (erasing the spinner first if shown), whatever is on the
+    /// current line - open partial text, or nothing (a deliberate blank
+    /// line, which this preserves exactly as the stream produced it).
+    Newline,
+    /// "Nothing more is coming for now": closes the current line *only if*
+    /// there's an open partial line to close, otherwise a true no-op - in
+    /// particular, it never invents a newline that wasn't there, and it
+    /// leaves the spinner alone rather than erasing it. Safe to call
+    /// idempotently (e.g. once a stream ends, or before switching to
+    /// reporting a different kind of progress) without it ever printing a
+    /// spurious blank line for a partial line that was already closed, or
+    /// never opened at all.
+    Finish,
+    /// Draws one spinner frame, erasing the previous one first if it's
+    /// still shown.
+    DrawSpinner(&'a str),
+    /// Erases the spinner if that's what's currently shown.
+    ClearSpinner,
+}
+
+/// Pure decision of what bytes to actually write to the terminal for `op`
+/// given the current line state, and the resulting state - kept separate
+/// from the actual write so the (bug-prone) state transitions can be tested
+/// without touching the terminal.
+fn apply(state: LineState, op: LineOp) -> (String, LineState) {
+    let erase_spinner = if state == LineState::Spinner {
+        "\r\x1b[2K"
+    } else {
+        ""
+    };
+    match op {
+        LineOp::CompleteLine(s) => {
+            let prefix = match state {
+                LineState::Spinner => "\r\x1b[2K",
+                LineState::Partial => "\n",
+                LineState::Empty => "",
+            };
+            (format!("{}{}", prefix, s), LineState::Empty)
+        }
+        LineOp::Partial(s) => {
+            if s.is_empty() {
+                (String::new(), state)
+            } else {
+                (format!("{}{}", erase_spinner, s), LineState::Partial)
+            }
+        }
+        LineOp::Newline => (format!("{}\n", erase_spinner), LineState::Empty),
+        LineOp::Finish => {
+            if state == LineState::Partial {
+                ("\n".to_string(), LineState::Empty)
+            } else {
+                (String::new(), state)
+            }
+        }
+        LineOp::DrawSpinner(text) => (format!("{}{}", erase_spinner, text), LineState::Spinner),
+        LineOp::ClearSpinner => {
+            if state == LineState::Spinner {
+                ("\r\x1b[2K".to_string(), LineState::Empty)
+            } else {
+                (String::new(), state)
+            }
+        }
     }
 }
 
@@ -74,30 +168,39 @@ fn build_status_line(
     }
 }
 
-/// Erases the spinner frame if one is currently shown.
-fn clear_spinner_locked(shown: &mut bool) {
-    if *shown {
-        raw_write("\r\x1b[2K");
-        *shown = false;
-    }
+fn run(op: LineOp) {
+    let mut state = LINE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let (bytes, new_state) = apply(*state, op);
+    raw_write(&bytes);
+    *state = new_state;
 }
 
-/// Writes a complete, self-contained chunk of output (normally a line ending
-/// in "\n"), erasing the spinner first if one is on the current line.
+/// Writes a complete, self-contained chunk of output (normally a line
+/// ending in "\n"), closing out whatever is on the current line first.
 pub(crate) fn write_stderr(s: &str) {
-    let mut shown = SPINNER_SHOWN.lock().unwrap_or_else(|e| e.into_inner());
-    clear_spinner_locked(&mut shown);
-    raw_write(s);
+    run(LineOp::CompleteLine(s));
 }
 
-/// Draws one spinner frame (no trailing newline), erasing the previous frame
-/// first if one is still on screen.
-fn draw_spinner_locked(shown: &mut bool, text: &str) {
-    if *shown {
-        raw_write("\r\x1b[2K");
-    }
-    raw_write(text);
-    *shown = true;
+/// Appends `text` (no trailing newline) to the current line, so it's
+/// visible immediately instead of waiting for a full line to accumulate.
+pub(crate) fn write_partial(text: &str) {
+    run(LineOp::Partial(text));
+}
+
+/// Writes an explicit newline byte from a stream's own output - always,
+/// even to reproduce a deliberate blank line exactly as the stream wrote
+/// it.
+pub(crate) fn write_newline() {
+    run(LineOp::Newline);
+}
+
+/// Closes the current line if (and only if) there's an open partial line
+/// to close; a safe no-op otherwise. Call this whenever a stream is done
+/// contributing to the current line for now (it ended, or it's handing off
+/// to something else, like tool-call argument accumulation) without
+/// knowing - or needing to know - whether anything was actually left open.
+pub(crate) fn finish_partial_line() {
+    run(LineOp::Finish);
 }
 
 pub struct StatusBar {
@@ -164,20 +267,31 @@ impl StatusBar {
                         None
                     };
 
-                    let mut shown = SPINNER_SHOWN.lock().unwrap_or_else(|e| e.into_inner());
-                    match &text {
-                        Some(text) => draw_spinner_locked(&mut shown, text),
-                        None if was_active => clear_spinner_locked(&mut shown),
-                        None => {}
+                    // While streamed output is on the current line, leave
+                    // it alone: it isn't safe to erase-and-redraw a line
+                    // that holds something other than the spinner's own
+                    // last frame, and the streamed text itself is now the
+                    // "it's alive" signal.
+                    let mut state = LINE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                    if *state != LineState::Partial {
+                        let op = match &text {
+                            Some(text) => Some(LineOp::DrawSpinner(text)),
+                            None if was_active => Some(LineOp::ClearSpinner),
+                            None => None,
+                        };
+                        if let Some(op) = op {
+                            let (bytes, new_state) = apply(*state, op);
+                            raw_write(&bytes);
+                            *state = new_state;
+                        }
                     }
-                    drop(shown);
+                    drop(state);
 
                     was_active = text.is_some();
                     tick += 1;
                     std::thread::sleep(Duration::from_millis(TICK_INTERVAL_MS));
                 }
-                let mut shown = SPINNER_SHOWN.lock().unwrap_or_else(|e| e.into_inner());
-                clear_spinner_locked(&mut shown);
+                run(LineOp::ClearSpinner);
             })
         };
 
@@ -287,6 +401,141 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn test_apply_complete_line_from_empty_has_no_prefix() {
+        let (bytes, state) = apply(LineState::Empty, LineOp::CompleteLine("done\n"));
+        assert_eq!(bytes, "done\n");
+        assert_eq!(state, LineState::Empty);
+    }
+
+    #[test]
+    fn test_apply_complete_line_erases_spinner() {
+        let (bytes, state) = apply(LineState::Spinner, LineOp::CompleteLine("done\n"));
+        assert_eq!(bytes, "\r\x1b[2Kdone\n");
+        assert_eq!(state, LineState::Empty);
+    }
+
+    #[test]
+    fn test_apply_complete_line_closes_open_partial_with_newline() {
+        // A complete line is never a continuation of an open partial line
+        // (that's a different stream's or thread's content, e.g. a
+        // sub-agent's message arriving while the main agent is mid-answer);
+        // it must not be visually run onto the same line.
+        let (bytes, state) = apply(LineState::Partial, LineOp::CompleteLine("done\n"));
+        assert_eq!(bytes, "\ndone\n");
+        assert_eq!(state, LineState::Empty);
+    }
+
+    #[test]
+    fn test_apply_partial_empty_text_is_a_no_op() {
+        for state in [LineState::Empty, LineState::Spinner, LineState::Partial] {
+            let (bytes, new_state) = apply(state, LineOp::Partial(""));
+            assert_eq!(bytes, "");
+            assert_eq!(new_state, state);
+        }
+    }
+
+    #[test]
+    fn test_apply_partial_from_empty_just_writes_the_text() {
+        let (bytes, state) = apply(LineState::Empty, LineOp::Partial("hi"));
+        assert_eq!(bytes, "hi");
+        assert_eq!(state, LineState::Partial);
+    }
+
+    #[test]
+    fn test_apply_partial_erases_spinner_first() {
+        let (bytes, state) = apply(LineState::Spinner, LineOp::Partial("hi"));
+        assert_eq!(bytes, "\r\x1b[2Khi");
+        assert_eq!(state, LineState::Partial);
+    }
+
+    #[test]
+    fn test_apply_partial_continuing_an_open_line_just_appends() {
+        // Continuing its own open line must never insert a newline or
+        // erase anything - that would corrupt streamed text mid-word.
+        let (bytes, state) = apply(LineState::Partial, LineOp::Partial("hi"));
+        assert_eq!(bytes, "hi");
+        assert_eq!(state, LineState::Partial);
+    }
+
+    #[test]
+    fn test_apply_newline_from_empty_writes_a_bare_newline() {
+        // A deliberate blank line (two consecutive newlines in the
+        // model's own output) must still produce a newline.
+        let (bytes, state) = apply(LineState::Empty, LineOp::Newline);
+        assert_eq!(bytes, "\n");
+        assert_eq!(state, LineState::Empty);
+    }
+
+    #[test]
+    fn test_apply_newline_from_partial_appends_newline() {
+        let (bytes, state) = apply(LineState::Partial, LineOp::Newline);
+        assert_eq!(bytes, "\n");
+        assert_eq!(state, LineState::Empty);
+    }
+
+    #[test]
+    fn test_apply_newline_from_spinner_erases_then_writes_newline() {
+        let (bytes, state) = apply(LineState::Spinner, LineOp::Newline);
+        assert_eq!(bytes, "\r\x1b[2K\n");
+        assert_eq!(state, LineState::Empty);
+    }
+
+    #[test]
+    fn test_apply_finish_from_empty_is_a_no_op() {
+        // Unlike Newline, Finish never invents a newline that wasn't
+        // there - it's an idempotent "close if open" cleanup signal (end
+        // of stream, or handing off to a different kind of progress
+        // report), and must not print a spurious blank line when nothing
+        // was actually open.
+        let (bytes, state) = apply(LineState::Empty, LineOp::Finish);
+        assert_eq!(bytes, "");
+        assert_eq!(state, LineState::Empty);
+    }
+
+    #[test]
+    fn test_apply_finish_from_partial_closes_it() {
+        let (bytes, state) = apply(LineState::Partial, LineOp::Finish);
+        assert_eq!(bytes, "\n");
+        assert_eq!(state, LineState::Empty);
+    }
+
+    #[test]
+    fn test_apply_finish_from_spinner_is_a_no_op() {
+        // Finish isn't the right operation to be touching the spinner:
+        // leave it alone rather than erasing it.
+        let (bytes, state) = apply(LineState::Spinner, LineOp::Finish);
+        assert_eq!(bytes, "");
+        assert_eq!(state, LineState::Spinner);
+    }
+
+    #[test]
+    fn test_apply_draw_spinner_from_empty() {
+        let (bytes, state) = apply(LineState::Empty, LineOp::DrawSpinner("[spin]"));
+        assert_eq!(bytes, "[spin]");
+        assert_eq!(state, LineState::Spinner);
+    }
+
+    #[test]
+    fn test_apply_draw_spinner_erases_previous_frame() {
+        let (bytes, state) = apply(LineState::Spinner, LineOp::DrawSpinner("[spin2]"));
+        assert_eq!(bytes, "\r\x1b[2K[spin2]");
+        assert_eq!(state, LineState::Spinner);
+    }
+
+    #[test]
+    fn test_apply_clear_spinner_erases_only_when_shown() {
+        let (bytes, state) = apply(LineState::Spinner, LineOp::ClearSpinner);
+        assert_eq!(bytes, "\r\x1b[2K");
+        assert_eq!(state, LineState::Empty);
+
+        for state_in in [LineState::Empty, LineState::Partial] {
+            let (bytes, state_out) = apply(state_in, LineOp::ClearSpinner);
+            assert_eq!(bytes, "");
+            assert_eq!(state_out, state_in);
+        }
     }
 
     #[test]
