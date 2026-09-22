@@ -130,6 +130,13 @@ fn apply(state: LineState, op: LineOp) -> (String, LineState) {
     }
 }
 
+/// Fixed color for the spinner and status message text, distinct from every
+/// per-agent identity color (`AGENT_ANSI_CODES`, all in the 30s) and from
+/// the fixed colors used for actual streamed content (cyan answers, grey
+/// reasoning) - so the "something's in progress" signal always looks the
+/// same regardless of which agent or model text happens to be nearby.
+const STATUS_COLOR: u8 = 93;
+
 /// Builds one spinner frame, truncating it (with a flat color instead of the
 /// usual two-tone split) if it would be too long for `cols` columns.
 ///
@@ -158,13 +165,19 @@ fn build_status_line(
     let width = cols.saturating_sub(1).max(1);
     if plain.chars().count() <= width {
         format!(
-            "\x1b[{}m {} {}: {} \x1b[0m\x1b[90m│ {:.1}s{}\x1b[0m",
-            color, spinner, agent, message, secs, suffix
+            "\x1b[{sc}m {sp} \x1b[0m\x1b[{ac}m{agent}\x1b[0m\x1b[{sc}m: {msg} \x1b[0m\x1b[90m│ {secs:.1}s{suffix}\x1b[0m",
+            sc = STATUS_COLOR,
+            sp = spinner,
+            ac = color,
+            agent = agent,
+            msg = message,
+            secs = secs,
+            suffix = suffix
         )
     } else {
         let budget = width.saturating_sub(1); // room for the ellipsis
         let truncated: String = plain.chars().take(budget).collect();
-        format!("\x1b[{}m{}…\x1b[0m", color, truncated)
+        format!("\x1b[{}m{}…\x1b[0m", STATUS_COLOR, truncated)
     }
 }
 
@@ -543,6 +556,31 @@ mod tests {
         let line = build_status_line(36, "⣾", "default", "Thinking", 1.2, "", 80);
         assert!(line.contains("\x1b[36m"));
         assert!(line.contains("\x1b[90m"));
+        assert_eq!(visible(&line), " ⣾ default: Thinking │ 1.2s");
+    }
+
+    #[test]
+    fn test_build_status_line_status_text_uses_role_color_not_agent_color() {
+        // The spinner and message are "in progress" chrome and should always
+        // render in the same fixed color, regardless of which agent's color
+        // (here 35, magenta) is used for the agent's own name - so the two
+        // roles (status vs. identity) stay visually distinct.
+        let line = build_status_line(35, "⣾", "default", "Thinking", 1.2, "", 80);
+        assert!(
+            line.contains("\x1b[93m"),
+            "missing fixed status color: {line:?}"
+        );
+        assert!(
+            line.contains("\x1b[35m"),
+            "missing agent identity color: {line:?}"
+        );
+        // The agent name itself should be wrapped in the agent color, sitting
+        // between two status-colored segments.
+        let agent_start = line.find("\x1b[35mdefault\x1b[0m");
+        assert!(
+            agent_start.is_some(),
+            "agent name isn't cleanly wrapped in its own color: {line:?}"
+        );
         assert_eq!(visible(&line), " ⣾ default: Thinking │ 1.2s");
     }
 

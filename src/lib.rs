@@ -19,6 +19,7 @@
 
 use std::any::Any;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 pub mod db;
 pub mod db_backend;
@@ -36,6 +37,11 @@ pub struct ToolContext {
     pub agent_name: Option<String>,
     pub extra: Option<Arc<dyn Any + Send + Sync>>,
     pub mcp_manager: Option<Arc<mcp::McpManager>>,
+    /// Set around a tool's own execution (see `openai::tool_call`'s caller)
+    /// so a `println` closure that wants to visually box a tool's output
+    /// can tell "this line came from inside a running tool" apart from any
+    /// other use of the same closure. Ignored by callers that don't care.
+    pub boxed: Arc<AtomicBool>,
 }
 
 impl ToolContext {
@@ -49,6 +55,7 @@ impl ToolContext {
             agent_name: None,
             extra: None,
             mcp_manager: None,
+            boxed: Arc::new(AtomicBool::new(false)),
         }
     }
 
