@@ -80,13 +80,21 @@ use up the context window on later requests.  If the model stops because it hit
 its token limit, the chat prints a warning instead of showing a silently
 truncated answer.
 
-The status bar reports `Waiting for response` while a request is in flight,
-`Thinking` once the model starts responding, and `Streaming (N bytes, M
-chunks)` while tokens keep arriving — including during a long reasoning
-phase, so a model that "thinks out loud" for a while doesn't leave the
-status looking frozen. Tool calls show `Preparing <tool>` while their
-arguments are still streaming in, then `Running <tool>(<args>)` once
+The status bar reports `Waiting for response (N sent)` while a request is in
+flight — showing the request's size, so a long wait on a large prompt (e.g.
+after reading a large file) reads as "processing a lot of input", not a
+hang — `Thinking` once the model starts responding, and `Streaming (N
+bytes, M chunks)` while tokens keep arriving, including during a long
+reasoning phase, so a model that "thinks out loud" for a while doesn't
+leave the status looking frozen. Tool calls show `Preparing <tool>` while
+their arguments are still streaming in, then `Running <tool>(<args>)` once
 they're complete.
+
+Reading a large file in full sends its entire content to the model as
+context, which both grows every later request and can turn the next one
+into the kind of slow prompt above; `read_file` accepts `start_line`/
+`end_line` to read just a range, and reports `total_lines` plus a note
+suggesting that range when a full read of a large file is requested.
 
 When a request fails because the conversation no longer fits in the model's
 context window, the chat summarizes the history automatically and retries the

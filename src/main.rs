@@ -617,6 +617,12 @@ fn tool_delete_path(params_str: &String, _ctx: &ToolContext) -> Result<String, B
 }
 
 /// entrypoint for the read_file tool
+/// Above this many lines, a full (non-ranged) read_file result carries a
+/// `note` suggesting start_line/end_line instead. Reading a large file in
+/// full sends its entire content to the model as a tool result, which can
+/// turn the next request into a very large, slow-to-process prompt.
+const LARGE_FILE_LINE_WARNING_THRESHOLD: usize = 1000;
+
 fn tool_read_file(params_str: &String, _ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     use serde::Serialize;
 
@@ -639,6 +645,8 @@ fn tool_read_file(params_str: &String, _ctx: &ToolContext) -> Result<String, Box
         start_line: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         end_line: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     }
 
     fn error(message: String) -> ReadFileResult {
@@ -648,6 +656,7 @@ fn tool_read_file(params_str: &String, _ctx: &ToolContext) -> Result<String, Box
             total_lines: None,
             start_line: None,
             end_line: None,
+            note: None,
         }
     }
 
@@ -702,6 +711,7 @@ fn tool_read_file(params_str: &String, _ctx: &ToolContext) -> Result<String, Box
                                     total_lines: Some(total_lines),
                                     start_line: Some(start),
                                     end_line: Some(end),
+                                    note: None,
                                 }
                             }
                         }
@@ -711,6 +721,14 @@ fn tool_read_file(params_str: &String, _ctx: &ToolContext) -> Result<String, Box
                             total_lines: Some(total_lines),
                             start_line: None,
                             end_line: None,
+                            note: (total_lines > LARGE_FILE_LINE_WARNING_THRESHOLD).then(|| {
+                                format!(
+                                    "This file has {} lines. If you only need part of it, \
+                                     pass start_line/end_line next time to avoid reading \
+                                     it all and growing the conversation's context.",
+                                    total_lines
+                                )
+                            }),
                         },
                     }
                 }
@@ -4243,6 +4261,22 @@ fn preview_partial_tool_arguments(args_json: &str) -> Option<String> {
     }
 }
 
+/// Formats a byte count for display, e.g. `512 B`, `238.2 KB`, `1.4 MB`.
+fn format_bytes(bytes: usize) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{:.1} {}", value, UNITS[unit])
+    }
+}
+
 fn format_tool_arguments(args_json: &str) -> String {
     let clean_args = args_json
         .replace('\n', " ")
@@ -4368,11 +4402,16 @@ fn create_response_mode(
                         false,
                     );
                 }
-                StatusUpdate::Continuing => {
-                    // Same wait as the initial request (blocked on the
-                    // network for the model's next turn); keep the wording
-                    // consistent instead of using a less descriptive label.
-                    status_bar.set_agent_status(&agent_name, "Waiting for response", true);
+                StatusUpdate::SendingRequest { bytes } => {
+                    // Reported once per turn, right before the request is
+                    // sent. A long wait here means a large prompt is still
+                    // being processed server-side, not a hang - show its
+                    // size so that's clear instead of just a ticking clock.
+                    status_bar.set_agent_status(
+                        &agent_name,
+                        &format!("Waiting for response ({} sent)", format_bytes(*bytes)),
+                        true,
+                    );
                 }
                 StatusUpdate::Complete { usage } => {
                     completed_for_progress.store(true, Ordering::Relaxed);
@@ -6773,6 +6812,50 @@ mod tests {
         assert!(res["error"].as_str().unwrap().contains("together"));
 
         cleanup(path);
+    }
+
+    #[test]
+    fn test_read_file_large_file_gets_a_note_suggesting_a_range() {
+        let path = "_test_rf_large.tmp";
+        let content = "line\n".repeat(LARGE_FILE_LINE_WARNING_THRESHOLD + 1);
+        write_test_file(path, &content);
+
+        let res = read(serde_json::json!({"path": path})).unwrap();
+        assert_eq!(res["total_lines"], LARGE_FILE_LINE_WARNING_THRESHOLD + 1);
+        assert!(res["note"].as_str().unwrap().contains("start_line"));
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_read_file_small_file_gets_no_note() {
+        let path = "_test_rf_small.tmp";
+        write_test_file(path, "one\ntwo\nthree\n");
+        let res = read(serde_json::json!({"path": path})).unwrap();
+        assert!(res.get("note").is_none());
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_read_file_partial_range_of_large_file_gets_no_note() {
+        // The note only makes sense for a full read; a caller already using
+        // a range doesn't need to be told to use one.
+        let path = "_test_rf_large_ranged.tmp";
+        let content = "line\n".repeat(LARGE_FILE_LINE_WARNING_THRESHOLD + 1);
+        write_test_file(path, &content);
+        let res = read(serde_json::json!({"path": path, "start_line": 1, "end_line": 2})).unwrap();
+        assert!(res.get("note").is_none());
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_format_bytes() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(238_218), "232.6 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
     }
 
     #[test]
