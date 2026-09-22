@@ -36,6 +36,44 @@ fn raw_write(s: &str) {
     }
 }
 
+/// Builds one spinner frame, truncating it (with a flat color instead of the
+/// usual two-tone split) if it would be too long for `cols` columns.
+///
+/// A status line longer than the terminal is wrapped by the terminal itself
+/// onto a second row, which breaks the single-line erase-and-redraw scheme
+/// above: the next tick's `\r\x1b[2K` only clears the row the cursor is
+/// actually on (the wrapped second row), permanently leaving the first
+/// row's text behind as stray scrollback. Measured by character count, not
+/// true display width, so a message full of wide (e.g. CJK) characters
+/// could still wrap; that's an accepted approximation, consistent with the
+/// rest of this codebase, rather than pulling in a unicode-width crate for
+/// what a truncated ellipsis mostly papers over anyway.
+fn build_status_line(
+    color: u8,
+    spinner: &str,
+    agent: &str,
+    message: &str,
+    secs: f64,
+    suffix: &str,
+    cols: usize,
+) -> String {
+    let plain = format!(
+        " {} {}: {} │ {:.1}s{}",
+        spinner, agent, message, secs, suffix
+    );
+    let width = cols.saturating_sub(1).max(1);
+    if plain.chars().count() <= width {
+        format!(
+            "\x1b[{}m {} {}: {} \x1b[0m\x1b[90m│ {:.1}s{}\x1b[0m",
+            color, spinner, agent, message, secs, suffix
+        )
+    } else {
+        let budget = width.saturating_sub(1); // room for the ellipsis
+        let truncated: String = plain.chars().take(budget).collect();
+        format!("\x1b[{}m{}…\x1b[0m", color, truncated)
+    }
+}
+
 /// Erases the spinner frame if one is currently shown.
 fn clear_spinner_locked(shown: &mut bool) {
     if *shown {
@@ -107,13 +145,19 @@ impl StatusBar {
                             let secs = entry.start_time.elapsed().as_secs_f64();
                             let count = guard.len();
                             let suffix = if count > 1 {
-                                format!(" \x1b[90m(+{} more)\x1b[0m", count - 1)
+                                format!(" (+{} more)", count - 1)
                             } else {
                                 String::new()
                             };
-                            Some(format!(
-                                "\x1b[{}m {} {}: {} \x1b[0m\x1b[90m│ {:.1}s\x1b[0m{}",
-                                entry.color, spinner, agent, entry.message, secs, suffix
+                            let (_, cols) = console::Term::stderr().size();
+                            Some(build_status_line(
+                                entry.color,
+                                spinner,
+                                agent,
+                                &entry.message,
+                                secs,
+                                &suffix,
+                                cols as usize,
                             ))
                         }
                     } else {
@@ -216,6 +260,99 @@ impl Drop for StatusBar {
         self.stop_ticker.store(true, Ordering::Relaxed);
         if let Some(handle) = self.ticker_handle.take() {
             let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Strips `\x1b[...m` SGR sequences, leaving only what would actually
+    /// occupy columns on screen - used to measure the *visible* width of a
+    /// built status line, which is the thing that must never exceed the
+    /// terminal's column count.
+    fn visible(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_build_status_line_fits_keeps_two_tone_style() {
+        let line = build_status_line(36, "⣾", "default", "Thinking", 1.2, "", 80);
+        assert!(line.contains("\x1b[36m"));
+        assert!(line.contains("\x1b[90m"));
+        assert_eq!(visible(&line), " ⣾ default: Thinking │ 1.2s");
+    }
+
+    #[test]
+    fn test_build_status_line_includes_suffix_when_it_fits() {
+        let line = build_status_line(36, "⣾", "default", "Thinking", 1.2, " (+2 more)", 80);
+        assert_eq!(visible(&line), " ⣾ default: Thinking │ 1.2s (+2 more)");
+    }
+
+    #[test]
+    fn test_build_status_line_truncates_instead_of_wrapping() {
+        // The message alone is far longer than the terminal is wide - this
+        // is exactly the case that used to wrap onto a second row and leave
+        // stray text behind once the next tick redrew a shorter frame.
+        let long_message = "Streaming (128829 bytes, 450 chunks)".repeat(3);
+        let line = build_status_line(36, "⣾", "default", &long_message, 12.3, "", 40);
+        let shown = visible(&line);
+        assert!(
+            shown.chars().count() <= 39,
+            "visible line is {} chars, wider than the 40-column terminal: {:?}",
+            shown.chars().count(),
+            shown
+        );
+        assert!(shown.ends_with('…'));
+        assert!(!shown.contains('\n'));
+    }
+
+    #[test]
+    fn test_build_status_line_never_exceeds_terminal_width() {
+        let long_message = "x".repeat(500);
+        for cols in [0usize, 1, 2, 10, 20, 40, 80, 200] {
+            let line = build_status_line(
+                36,
+                "⣾",
+                "agent-name",
+                &long_message,
+                999.9,
+                " (+9 more)",
+                cols,
+            );
+            let width = visible(&line).chars().count();
+            let budget = cols.saturating_sub(1).max(1);
+            assert!(
+                width <= budget,
+                "cols={} allowed budget={} but produced a {}-char visible line: {:?}",
+                cols,
+                budget,
+                width,
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_status_line_short_terminal_does_not_panic() {
+        // Degenerate widths must degrade gracefully, not panic (e.g. via
+        // subtraction overflow or an out-of-bounds char take).
+        for cols in [0, 1, 2, 3] {
+            let _ = build_status_line(36, "⣾", "default", "Thinking", 0.0, "", cols);
         }
     }
 }
