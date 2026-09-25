@@ -92,7 +92,55 @@ const CHAT_COMMANDS: &[&str] = &[
     "/delete-agent",
     "/mcp-refresh",
     "/tools",
+    "/chdir",
+    "/pwd",
 ];
+
+/// Directory-completion candidates for `/chdir`'s in-progress path argument.
+///
+/// Splits off the last path component (the part still being typed) from any
+/// leading directory portion, lists that directory, and returns one full
+/// replacement path per matching entry - each suffixed with "/" so
+/// completion can be chained deeper with another Tab, matching common shell
+/// `cd` completion conventions:
+/// - only directories are offered (including symlinks that resolve to one -
+///   `std::fs::metadata` follows symlinks, unlike `DirEntry::file_type()`),
+///   since `/chdir` can't do anything useful with a file;
+/// - dotfiles/dot-directories are hidden unless the in-progress component
+///   itself already starts with `.`;
+/// - no leading `/` in `partial` at all means "scan the current directory",
+///   same as a bare `cd` completion would.
+fn complete_chdir_path(partial: &str) -> Vec<String> {
+    let (dir_part, name_prefix) = match partial.rfind('/') {
+        Some(idx) => (&partial[..=idx], &partial[idx + 1..]),
+        None => ("", partial),
+    };
+    let scan_dir = if dir_part.is_empty() { "." } else { dir_part };
+    let show_hidden = name_prefix.starts_with('.');
+
+    let mut candidates = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(scan_dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+            if !name.starts_with(name_prefix) {
+                continue;
+            }
+            let is_dir = std::fs::metadata(entry.path())
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            if !is_dir {
+                continue;
+            }
+            candidates.push(format!("{}{}/", dir_part, name));
+        }
+    }
+    candidates.sort();
+    candidates
+}
 
 struct ChatHelper {
     agent_names: Arc<Mutex<Vec<String>>>,
@@ -127,6 +175,19 @@ impl Completer for ChatHelper {
                     }
                 }
             }
+            return Ok((prefix_end, candidates));
+        }
+
+        if input.starts_with("/chdir ") {
+            let prefix_end = input.find(' ').unwrap() + 1;
+            let path_prefix = &input[prefix_end..];
+            let candidates = complete_chdir_path(path_prefix)
+                .into_iter()
+                .map(|p| Pair {
+                    display: p.clone(),
+                    replacement: p,
+                })
+                .collect();
             return Ok((prefix_end, candidates));
         }
 
@@ -3948,6 +4009,8 @@ enum ChatCommand {
     DeleteAgent(String),
     McpRefresh,
     Tools,
+    Chdir(String),
+    Pwd,
     Message(String),
     Empty,
     Invalid(String),
@@ -4050,6 +4113,20 @@ fn parse_chat_command(line: &str) -> ChatCommand {
     if normalized == "/tools" {
         return ChatCommand::Tools;
     }
+    if normalized.starts_with("/chdir ") {
+        let path = normalized
+            .strip_prefix("/chdir ")
+            .unwrap()
+            .trim()
+            .to_string();
+        if path.is_empty() {
+            return ChatCommand::Invalid("Usage: /chdir <path>".to_string());
+        }
+        return ChatCommand::Chdir(path);
+    }
+    if normalized == "/pwd" {
+        return ChatCommand::Pwd;
+    }
 
     if normalized.starts_with('/') {
         return ChatCommand::Invalid(format!("Unknown command: {}", normalized));
@@ -4129,6 +4206,8 @@ fn handle_chat_command(
             chat_pb.println("  /delete-agent <name>   Delete an agent");
             chat_pb.println("  /mcp-refresh           Refresh MCP tool definitions");
             chat_pb.println("  /tools                 List all available tools");
+            chat_pb.println("  /chdir <path>          Change the current working directory");
+            chat_pb.println("  /pwd                   Show the current working directory");
             Ok(true)
         }
         ChatCommand::Quit => Ok(false),
@@ -4415,6 +4494,37 @@ fn handle_chat_command(
                     .map_or(true, |m| m.get_tool_schemas().is_empty())
             {
                 chat_pb.println("No tools available.");
+            }
+            Ok(true)
+        }
+        ChatCommand::Chdir(path) => {
+            // A user-typed, explicit directory change - unlike a model tool
+            // call, there's no confinement to preserve here, and every tool
+            // that resolves paths (read_file/write_file/patch_file/glob/
+            // run_command's sandbox bind/...) re-resolves "." at call time,
+            // so they all pick this up automatically with no further wiring.
+            match std::env::set_current_dir(&path) {
+                Ok(()) => match std::env::current_dir() {
+                    Ok(cwd) => {
+                        chat_pb.println(&format!("Changed directory to {}", cwd.display()));
+                    }
+                    Err(e) => {
+                        chat_pb.println(&format!(
+                            "Changed directory, but couldn't read it back: {}",
+                            e
+                        ));
+                    }
+                },
+                Err(e) => {
+                    chat_pb.println(&format!("Failed to change directory to '{}': {}", path, e));
+                }
+            }
+            Ok(true)
+        }
+        ChatCommand::Pwd => {
+            match std::env::current_dir() {
+                Ok(cwd) => chat_pb.println(&cwd.display().to_string()),
+                Err(e) => chat_pb.println(&format!("Failed to get current directory: {}", e)),
             }
             Ok(true)
         }
@@ -6342,6 +6452,39 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_chat_command_chdir() {
+        match parse_chat_command("/chdir ../other-project") {
+            ChatCommand::Chdir(path) => assert_eq!(path, "../other-project"),
+            _ => panic!("expected Chdir"),
+        }
+    }
+
+    #[test]
+    fn test_parse_chat_command_chdir_trims_whitespace() {
+        match parse_chat_command("/chdir   src/main  ") {
+            ChatCommand::Chdir(path) => assert_eq!(path, "src/main"),
+            _ => panic!("expected Chdir"),
+        }
+    }
+
+    #[test]
+    fn test_parse_chat_command_chdir_requires_a_path() {
+        assert!(matches!(
+            parse_chat_command("/chdir"),
+            ChatCommand::Invalid(_)
+        ));
+        assert!(matches!(
+            parse_chat_command("/chdir "),
+            ChatCommand::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn test_parse_chat_command_pwd() {
+        assert!(matches!(parse_chat_command("/pwd"), ChatCommand::Pwd));
+    }
+
+    #[test]
     fn test_parse_chat_command_message() {
         match parse_chat_command("hello world") {
             ChatCommand::Message(msg) => assert_eq!(msg, "hello world"),
@@ -7580,6 +7723,113 @@ mod tests {
 
     fn cleanup(name: &str) {
         let _ = std::fs::remove_file(name);
+    }
+
+    /// A fresh, uniquely-named temp directory for a single test, so parallel
+    /// tests (which all share one process, and so one working directory)
+    /// never see each other's fixtures.
+    struct TempTestDir(std::path::PathBuf);
+
+    impl TempTestDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "faber_test_{}_{}_{}",
+                label,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self, rel: &str) -> String {
+            self.0.join(rel).to_string_lossy().to_string()
+        }
+    }
+
+    impl Drop for TempTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn test_complete_chdir_path_lists_only_matching_directories() {
+        let dir = TempTestDir::new("chdir_match");
+        std::fs::create_dir_all(dir.path("project_alpha")).unwrap();
+        std::fs::create_dir_all(dir.path("project_beta")).unwrap();
+        std::fs::create_dir_all(dir.path("other")).unwrap();
+        std::fs::write(dir.path("project_file.txt"), "not a directory").unwrap();
+
+        let prefix = format!("{}/proj", dir.0.display());
+        let candidates = complete_chdir_path(&prefix);
+
+        assert_eq!(
+            candidates,
+            vec![
+                format!("{}/project_alpha/", dir.0.display()),
+                format!("{}/project_beta/", dir.0.display()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_complete_chdir_path_hides_dotdirs_unless_asked_for() {
+        let dir = TempTestDir::new("chdir_dotdirs");
+        std::fs::create_dir_all(dir.path(".git")).unwrap();
+        std::fs::create_dir_all(dir.path("visible")).unwrap();
+
+        let all = complete_chdir_path(&format!("{}/", dir.0.display()));
+        assert_eq!(all, vec![format!("{}/visible/", dir.0.display())]);
+
+        let dotted = complete_chdir_path(&format!("{}/.g", dir.0.display()));
+        assert_eq!(dotted, vec![format!("{}/.git/", dir.0.display())]);
+    }
+
+    #[test]
+    fn test_complete_chdir_path_follows_directory_symlinks_but_not_file_ones() {
+        let dir = TempTestDir::new("chdir_symlinks");
+        std::fs::create_dir_all(dir.path("real_dir")).unwrap();
+        std::fs::write(dir.path("real_file.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(dir.path("real_dir"), dir.path("dir_link")).unwrap();
+        std::os::unix::fs::symlink(dir.path("real_file.txt"), dir.path("file_link")).unwrap();
+        std::os::unix::fs::symlink(dir.path("does_not_exist"), dir.path("broken_link")).unwrap();
+
+        let mut candidates = complete_chdir_path(&format!("{}/", dir.0.display()));
+        candidates.sort();
+
+        assert_eq!(
+            candidates,
+            vec![
+                format!("{}/dir_link/", dir.0.display()),
+                format!("{}/real_dir/", dir.0.display()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_complete_chdir_path_scans_current_directory_when_no_slash() {
+        // A bare name with no "/" at all (e.g. the very first Tab after
+        // "/chdir ") must scan "." rather than erroring or scanning nothing.
+        let name = format!("zzz_faber_test_chdir_cwd_marker_{}", std::process::id());
+        std::fs::create_dir_all(&name).unwrap();
+
+        // Prefix match on part of the name, same as a real in-progress Tab.
+        let partial = &name[..name.len() - 3];
+        let candidates = complete_chdir_path(partial);
+
+        assert!(
+            candidates.contains(&format!("{}/", name)),
+            "expected {:?} to contain {}/",
+            candidates,
+            name
+        );
+
+        let _ = std::fs::remove_dir_all(&name);
     }
 
     fn read(params: serde_json::Value) -> Result<serde_json::Value, Box<dyn Error>> {
