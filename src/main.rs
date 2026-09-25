@@ -46,7 +46,7 @@ use std::fs::Permissions;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1464,41 +1464,148 @@ fn tool_fetch_web_content(
     Ok(json_result)
 }
 
-/// entrypoint for the run_command tool
-fn tool_run_command(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
-    use serde::Serialize;
+#[derive(Deserialize)]
+struct RunCommandParams {
+    command: String,
+    args: Option<Vec<String>>,
+}
 
-    #[derive(Deserialize)]
-    struct Params {
-        command: String,
-        args: Option<Vec<String>>,
-    }
+#[derive(Serialize)]
+struct CommandResult {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    success: bool,
+}
 
-    #[derive(Serialize)]
-    struct CommandResult {
-        stdout: String,
-        stderr: String,
-        exit_code: Option<i32>,
-        success: bool,
-    }
+/// Builds the argument list bwrap needs to sandbox `run_command` when
+/// --unsafe-tools isn't set: all capabilities dropped, no network, a
+/// cleared environment, and a fresh empty root with only `/usr`, `/lib` and
+/// `/lib64` (read-only, whichever exist) and `cwd` (read-write) visible -
+/// so a command can't reach the network or touch anything outside the
+/// current directory. Pure and
+/// independent of actually spawning bwrap, so it's testable without it
+/// installed.
+///
+/// Also isolates every other namespace that doesn't need to be shared:
+///
+/// - `--unshare-pid`: without it the sandboxed process shares the *host's*
+///   PID namespace, so it can see every other process via `/proc`
+///   (including reading their `/proc/<pid>/environ`, potentially leaking
+///   secrets from unrelated processes owned by the same user) and signal
+///   any of them. `/proc` (mounted below) then only shows the sandbox's own
+///   process tree.
+/// - `--unshare-ipc` / `--unshare-uts`: no access to the host's System V/
+///   POSIX IPC objects or its hostname.
+/// - `--unshare-cgroup-try`: isolates the cgroup namespace when the kernel
+///   supports it; `-try` so an older/restricted kernel degrades instead of
+///   refusing to run at all (unlike pid/ipc/uts/net, which are old enough
+///   to assume are always available).
+/// - `--die-with-parent`: the sandboxed process (and anything it spawns) is
+///   killed if faber itself dies, instead of potentially lingering,
+///   detached, after the tool call that started it is gone.
+/// - `--new-session`: detaches from the controlling terminal (`setsid`),
+///   closing off `ioctl(fd, TIOCSTI, ...)`-style terminal injection - a
+///   sandboxed command could otherwise push fake keystrokes into the same
+///   terminal faber's own prompt reads from, effectively escaping into the
+///   outer, unsandboxed session without ever touching the filesystem or
+///   network restrictions above.
+///
+/// Mirrors `run_command`'s own command/args-vs-shell-string convention: an
+/// explicit `args` list (or a single word with none) runs that program
+/// directly inside the sandbox; a multi-word `command` with no `args` runs
+/// as a `bash -c` shell string instead, same as the unsandboxed path.
+///
+/// `command`/`args` come straight from the model's tool call and aren't
+/// validated to be an actual executable path, so a `--` separator is
+/// inserted before them: without it, a `command` crafted to look like a
+/// bwrap flag (e.g. "--ro-bind" with args ["/", "/", ...]) would be parsed
+/// by bwrap as one of *its own* options rather than as the target program -
+/// e.g. re-binding the whole host root back over the `--tmpfs /` above and
+/// defeating the sandbox's own filesystem restriction. `--` tells bwrap
+/// unambiguously that everything after it is the command to run, not more
+/// of its own arguments.
+fn bwrap_args(cwd: &str, command: &str, args: Option<&[String]>) -> Vec<String> {
+    let mut a: Vec<String> = [
+        "--cap-drop",
+        "ALL",
+        "--clearenv",
+        "--unshare-net",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup-try",
+        "--die-with-parent",
+        "--new-session",
+        "--dev",
+        "/dev/",
+        "--proc",
+        "/proc",
+        "--tmpfs",
+        "/",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        // -try for both: which of /lib, /lib64 exist (as real directories or
+        // as merged-/usr symlinks into /usr/lib*) varies by architecture and
+        // distro - e.g. a non-multilib system may only have one of them, or
+        // neither if everything already lives under /usr/lib. Bind whichever
+        // are actually present instead of failing to launch the sandbox at
+        // all over one that isn't.
+        "--ro-bind-try",
+        "/lib",
+        "/lib",
+        "--ro-bind-try",
+        "/lib64",
+        "/lib64",
+        "--bind",
+        cwd,
+        cwd,
+        "--",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
 
-    debug!("run_command received params: {}", params_str);
-
-    // Try normal parsing first, fallback to manual parsing if it fails
-    let params: Params = serde_json::from_str::<Params>(&params_str)?;
-
-    let mut cmd = if params.args.is_some() || !params.command.contains(' ') {
-        let mut c = Command::new(&params.command);
-        if let Some(ref args) = params.args {
-            c.args(args);
+    if args.is_some() || !command.contains(' ') {
+        a.push(command.to_string());
+        if let Some(args) = args {
+            a.extend(args.iter().cloned());
         }
-        c
     } else {
-        let mut c = Command::new("sh");
-        c.arg("-c").arg(&params.command);
-        c
-    };
+        a.push("/usr/bin/bash".to_string());
+        a.push("-c".to_string());
+        a.push(command.to_string());
+    }
+    a
+}
 
+/// Formats the message for when `cmd` itself couldn't be spawned at all
+/// (as opposed to running and exiting non-zero). In sandboxed mode `cmd`'s
+/// own program is always "bwrap", so a spawn failure here means bwrap
+/// itself couldn't be launched (most likely not installed), not that the
+/// requested command is missing - that would instead show up as a normal
+/// (if unsuccessful) exit from bwrap itself, with its own stderr.
+fn command_spawn_error_message(sandboxed: bool, err: &std::io::Error) -> String {
+    if sandboxed {
+        format!(
+            "Failed to launch the sandbox (bwrap): {} - is bubblewrap installed?",
+            err
+        )
+    } else {
+        format!("Failed to execute command: {}", err)
+    }
+}
+
+/// Runs `cmd`, reports its output through `ctx.println`, and returns the
+/// JSON result shared by the sandboxed and unsandboxed `run_command`
+/// variants.
+fn run_command_and_report(
+    mut cmd: Command,
+    ctx: &ToolContext,
+    command_label: &str,
+    sandboxed: bool,
+) -> Result<String, Box<dyn Error>> {
     trace!("Executing command: {:?}", cmd);
 
     let result = match cmd.output() {
@@ -1511,20 +1618,24 @@ fn tool_run_command(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
             let success = output.status.success();
 
             if success {
-                debug!("Successfully run command {}", params.command);
+                debug!("Successfully run command {}", command_label);
             } else {
                 debug!(
                     "Command {} failed with exit code {:?}",
-                    params.command, exit_code
+                    command_label, exit_code
                 );
             }
 
-            // Display output directly using context callback
+            let sandbox_note = if sandboxed { " (sandboxed)" } else { "" };
             if success {
-                ctx.println("✅ Command executed successfully:");
+                ctx.println(&format!(
+                    "✅ Command executed successfully{}:",
+                    sandbox_note
+                ));
             } else {
                 ctx.println(&format!(
-                    "❌ Command failed (exit code: {}):",
+                    "❌ Command failed{} (exit code: {}):",
+                    sandbox_note,
                     exit_code.unwrap_or(-1)
                 ));
             }
@@ -1551,21 +1662,88 @@ fn tool_run_command(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
             }
         }
         Err(e) => {
-            debug!("Failed to execute command {}: {}", params.command, e);
-            ctx.println(&format!("ERROR: Failed to execute command: {}", e));
+            debug!("Failed to execute command {}: {}", command_label, e);
+            let message = command_spawn_error_message(sandboxed, &e);
+            ctx.println(&format!("ERROR: {}", message));
             CommandResult {
                 stdout: String::new(),
-                stderr: format!("Failed to execute command: {}", e),
+                stderr: message,
                 exit_code: None,
                 success: false,
             }
         }
     };
 
-    // Output is now displayed directly above during command execution
-
     let json_result = serde_json::to_string(&result)?;
     Ok(json_result)
+}
+
+/// entrypoint for the run_command tool with --unsafe-tools: runs the
+/// command directly, with the same access as the faber process itself.
+fn tool_run_command(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    debug!("run_command received params: {}", params_str);
+    let params: RunCommandParams = serde_json::from_str(params_str)?;
+
+    let cmd = if params.args.is_some() || !params.command.contains(' ') {
+        let mut c = Command::new(&params.command);
+        if let Some(ref args) = params.args {
+            c.args(args);
+        }
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(&params.command);
+        c
+    };
+
+    run_command_and_report(cmd, ctx, &params.command, false)
+}
+
+/// entrypoint for the run_command tool without --unsafe-tools: runs the
+/// command wrapped in a bubblewrap sandbox (see `bwrap_args`) instead of
+/// refusing it outright, so basic scripting is still available by default.
+fn tool_run_command_sandboxed(
+    params_str: &String,
+    ctx: &ToolContext,
+) -> Result<String, Box<dyn Error>> {
+    debug!("run_command (sandboxed) received params: {}", params_str);
+    let params: RunCommandParams = serde_json::from_str(params_str)?;
+
+    // Defense in depth on top of the "--" separator in bwrap_args(): command
+    // and args come straight from the model's tool call, unvalidated, so
+    // reject anything that isn't the absolute executable path the schema
+    // already documents. This is what stands between the sandbox and a
+    // command crafted to look like a bwrap flag (e.g. "--ro-bind" with args
+    // ["/", "/", ...]) reaching bwrap's argv as one of its own options.
+    let direct_exec = params.args.is_some() || !params.command.contains(' ');
+    if direct_exec && !params.command.starts_with('/') {
+        let message = format!(
+            "Invalid command '{}': must be an absolute path to an executable, e.g. /usr/bin/ls",
+            params.command
+        );
+        ctx.println(&format!("ERROR: {}", message));
+        let result = CommandResult {
+            stdout: String::new(),
+            stderr: message,
+            exit_code: None,
+            success: false,
+        };
+        return Ok(serde_json::to_string(&result)?);
+    }
+
+    let cwd = std::env::current_dir()?;
+    let cwd = cwd.to_str().ok_or("current directory is not valid UTF-8")?;
+
+    let mut cmd = Command::new("bwrap");
+    cmd.args(bwrap_args(cwd, &params.command, params.args.as_deref()));
+    // run_command is a one-shot exec-and-capture-output tool, never
+    // interactive, so it never needs stdin - and not inheriting it means
+    // there's no open file descriptor to faber's own controlling terminal
+    // for a sandboxed command to target with TIOCSTI-style injection in the
+    // first place, on top of --new-session in bwrap_args() above.
+    cmd.stdin(Stdio::null());
+
+    run_command_and_report(cmd, ctx, &params.command, true)
 }
 
 /// entrypoint for the grep_in_current_directory tool
@@ -3497,6 +3675,83 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
         .to_string(),
     );
 
+    // run_command is always available: sandboxed via bubblewrap (no network,
+    // read-only system, only the current directory writable) unless
+    // --unsafe-tools grants it full, unrestricted access.
+    if unsafe_tools {
+        append_tool(
+            &mut tools,
+            "run_command".to_string(),
+            tool_run_command,
+            r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "run_command",
+                "description": "Run a command and return results in JSON format. Returns {\"stdout\": string, \"stderr\": string, \"exit_code\": number|null, \"success\": boolean}. Commands do not fail on non-zero exit codes.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Command to execute, it must be the name of the executable only, e.g. /usr/bin/ls"
+                        },
+                        "args": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Additional arguments to pass to the command after the executable path, e.g. [\"-l\", \"-a\"]"
+                        }
+                    },
+                    "required": [
+                        "command"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+            .to_string(),
+        );
+    } else {
+        append_tool(
+            &mut tools,
+            "run_command".to_string(),
+            tool_run_command_sandboxed,
+            r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "run_command",
+                "description": "Run a command inside a restricted sandbox (bubblewrap): no network access, the system is read-only, and only the current directory is writable - commands needing network access or writing elsewhere will fail. Returns results in JSON format: {\"stdout\": string, \"stderr\": string, \"exit_code\": number|null, \"success\": boolean}. Commands do not fail on non-zero exit codes.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Command to execute, it must be the name of the executable only, e.g. /usr/bin/ls"
+                        },
+                        "args": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            },
+                            "description": "Additional arguments to pass to the command after the executable path, e.g. [\"-l\", \"-a\"]"
+                        }
+                    },
+                    "required": [
+                        "command"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+            .to_string(),
+        );
+    }
+
     if !unsafe_tools {
         if let Some(allowed_list) = allowed {
             tools.retain(|name, _| allowed_list.iter().any(|a| a == name));
@@ -3536,42 +3791,6 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                     },
                     "required": [
                         "url"
-                    ],
-                    "additionalProperties": false
-                }
-            }
-        }
-"#
-        .to_string(),
-    );
-
-    append_tool(
-        &mut tools,
-        "run_command".to_string(),
-        tool_run_command,
-        r#"
-        {
-            "type": "function",
-            "function": {
-                "name": "run_command",
-                "description": "Run a command and return results in JSON format. Returns {\"stdout\": string, \"stderr\": string, \"exit_code\": number|null, \"success\": boolean}. Commands do not fail on non-zero exit codes.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "Command to execute, it must be the name of the executable only, e.g. /usr/bin/ls"
-                        },
-                        "args": {
-                            "type": "array",
-                            "items": {
-                                "type": "string"
-                            },
-                            "description": "Additional arguments to pass to the command after the executable path, e.g. [\"-l\", \"-a\"]"
-                        }
-                    },
-                    "required": [
-                        "command"
                     ],
                     "additionalProperties": false
                 }
@@ -6659,11 +6878,197 @@ mod tests {
     }
 
     #[test]
+    fn test_bwrap_args_direct_command_with_explicit_args() {
+        let args = bwrap_args(
+            "/home/user/project",
+            "/usr/bin/ls",
+            Some(&["-l".to_string(), "-a".to_string()]),
+        );
+        // Same sandboxing flags every time, ending with the command run
+        // directly (no shell) - matching the given bwrap invocation, with
+        // $(pwd) substituted for the actual working directory.
+        assert_eq!(
+            args,
+            vec![
+                "--cap-drop",
+                "ALL",
+                "--clearenv",
+                "--unshare-net",
+                "--unshare-pid",
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--unshare-cgroup-try",
+                "--die-with-parent",
+                "--new-session",
+                "--dev",
+                "/dev/",
+                "--proc",
+                "/proc",
+                "--tmpfs",
+                "/",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--ro-bind-try",
+                "/lib",
+                "/lib",
+                "--ro-bind-try",
+                "/lib64",
+                "/lib64",
+                "--bind",
+                "/home/user/project",
+                "/home/user/project",
+                "--",
+                "/usr/bin/ls",
+                "-l",
+                "-a",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_bwrap_args_single_word_command_with_no_args_runs_directly() {
+        let args = bwrap_args("/cwd", "/usr/bin/ls", None);
+        assert_eq!(args.last(), Some(&"/usr/bin/ls".to_string()));
+        assert!(!args.contains(&"/usr/bin/bash".to_string()));
+    }
+
+    #[test]
+    fn test_bwrap_args_multiword_command_with_no_args_uses_bash_c() {
+        // Same fallback convention as the unsandboxed path: a multi-word
+        // command string with no explicit args runs as a shell command,
+        // using the sandbox's own /usr/bin/bash rather than relying on a
+        // possibly-absent /bin/sh or an unset $PATH (--clearenv wipes it).
+        let args = bwrap_args("/cwd", "ls -la /tmp", None);
+        let tail = &args[args.len() - 3..];
+        assert_eq!(
+            tail,
+            &[
+                "/usr/bin/bash".to_string(),
+                "-c".to_string(),
+                "ls -la /tmp".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_bwrap_args_separates_sandbox_flags_from_the_command_with_dashdash() {
+        // command/args come straight from the model's tool call, unvalidated
+        // at this layer - without "--", a command crafted to look like a
+        // bwrap flag (e.g. "--ro-bind" with args ["/", "/", ...]) would be
+        // parsed by bwrap as one of ITS OWN options rather than the command
+        // to run, e.g. re-binding the whole host root back over the
+        // "--tmpfs /" above and defeating the sandbox entirely.
+        let args = bwrap_args(
+            "/cwd",
+            "--ro-bind",
+            Some(&["/".to_string(), "/".to_string(), "/bin/sh".to_string()]),
+        );
+        let dashdash = args.iter().position(|a| a == "--").expect("no -- found");
+        // Everything from "--" onward is opaque command/args to bwrap, no
+        // matter what it looks like.
+        assert_eq!(&args[dashdash + 1], "--ro-bind");
+        assert_eq!(&args[dashdash + 2..], ["/", "/", "/bin/sh"]);
+        // And "--" must come strictly after every fixed sandbox flag, not
+        // interleaved with them.
+        let bind_pos = args.iter().position(|a| a == "--bind").unwrap();
+        assert!(dashdash > bind_pos + 2);
+    }
+
+    #[test]
+    fn test_run_command_sandboxed_rejects_non_absolute_command() {
+        // A command that doesn't start with "/" can never legitimately be
+        // the tool's documented "absolute path to an executable" - reject
+        // it outright rather than letting something that looks like a
+        // bwrap flag (e.g. "--ro-bind") anywhere near bwrap's argv.
+        let params = serde_json::json!({
+            "command": "--ro-bind",
+            "args": ["/", "/", "/bin/sh"]
+        });
+        let result = tool_run_command_sandboxed(&params.to_string(), &test_ctx()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["success"], false);
+        assert!(parsed["stderr"].as_str().unwrap().contains("absolute path"));
+    }
+
+    #[test]
+    fn test_command_spawn_error_message_mentions_bwrap_when_sandboxed() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let msg = command_spawn_error_message(true, &err);
+        assert!(msg.contains("bwrap"), "{msg:?}");
+        assert!(msg.contains("bubblewrap"), "{msg:?}");
+    }
+
+    #[test]
+    fn test_command_spawn_error_message_plain_when_not_sandboxed() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let msg = command_spawn_error_message(false, &err);
+        assert!(!msg.contains("bwrap"), "{msg:?}");
+        assert_eq!(msg, "Failed to execute command: No such file or directory");
+    }
+
+    #[test]
+    fn test_bwrap_args_binds_cwd_read_write_and_system_dirs_read_only() {
+        let args = bwrap_args("/some/dir", "/usr/bin/true", None);
+        let bind_pos = args.iter().position(|a| a == "--bind").unwrap();
+        assert_eq!(args[bind_pos + 1], "/some/dir");
+        assert_eq!(args[bind_pos + 2], "/some/dir");
+        assert!(args.contains(&"--ro-bind".to_string()));
+        assert!(args.contains(&"--unshare-net".to_string()));
+        assert!(args.contains(&"--clearenv".to_string()));
+    }
+
+    #[test]
+    fn test_bwrap_args_binds_lib_and_lib64_only_if_they_exist() {
+        // /usr is a hard requirement (--ro-bind: fail loudly if missing,
+        // which would be a very unusual system anyway); /lib and /lib64
+        // don't exist on every system (which one, if either, varies by
+        // architecture and distro), so both are bound with -try instead -
+        // skipped silently by bwrap rather than refusing to launch the
+        // sandbox at all over one that isn't there.
+        let args = bwrap_args("/some/dir", "/usr/bin/true", None);
+        for lib_dir in ["/lib", "/lib64"] {
+            let pos = args
+                .iter()
+                .position(|a| a == lib_dir)
+                .unwrap_or_else(|| panic!("{lib_dir} not found in {args:?}"));
+            assert_eq!(args[pos - 1], "--ro-bind-try");
+        }
+
+        let usr_pos = args.iter().position(|a| a == "/usr").unwrap();
+        assert_eq!(args[usr_pos - 1], "--ro-bind");
+    }
+
+    #[test]
+    fn test_bwrap_args_isolates_every_other_namespace_and_hardens_the_process() {
+        let args = bwrap_args("/some/dir", "/usr/bin/true", None);
+        for flag in [
+            "--unshare-pid", // no visibility into (or signaling of) host processes via /proc
+            "--unshare-ipc", // no access to the host's System V/POSIX IPC objects
+            "--unshare-uts", // no access to the host's hostname/domainname
+            "--unshare-cgroup-try", // isolates the cgroup namespace where the kernel supports it
+            "--die-with-parent", // killed if faber itself dies, instead of lingering
+            "--new-session", // detached from the controlling terminal (blocks TIOCSTI injection)
+        ] {
+            assert!(args.contains(&flag.to_string()), "missing {flag}: {args:?}");
+        }
+        // All isolation flags must come before "--", i.e. be bwrap's own
+        // options, never mistaken for (or overridden by) the command/args.
+        let dashdash = args.iter().position(|a| a == "--").unwrap();
+        assert!(args[..dashdash].contains(&"--unshare-pid".to_string()));
+    }
+
+    #[test]
     fn test_initialize_tools_safe() {
         let tools = initialize_tools(false, None);
         assert!(tools.contains_key("read_file"));
         assert!(tools.contains_key("write_file"));
-        assert!(!tools.contains_key("run_command"));
+        // run_command is still available without --unsafe-tools, but
+        // sandboxed - and the model is told so, via the schema description
+        // it's given (checked here rather than comparing the callback
+        // function pointer directly, which isn't a reliable equality check).
+        assert!(tools.contains_key("run_command"));
+        assert!(tools["run_command"].schema.contains("sandbox"));
         assert!(!tools.contains_key("fetch_web_content"));
     }
 
@@ -6672,6 +7077,7 @@ mod tests {
         let tools = initialize_tools(true, None);
         assert!(tools.contains_key("read_file"));
         assert!(tools.contains_key("run_command"));
+        assert!(!tools["run_command"].schema.contains("sandbox"));
         assert!(tools.contains_key("fetch_web_content"));
     }
 
