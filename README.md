@@ -71,8 +71,17 @@ faber --db-path state.db --agent mybot chat  # start as a specific agent
 | `/delete-agent <name>` | Delete an agent and its data |
 | `/mcp-refresh` | Refresh tool definitions from MCP servers |
 | `/tools` | List all available tools (built-in + MCP) |
+| `/chdir <path>` | Change the current working directory (Tab-completes directory names) |
+| `/pwd` | Show the current working directory |
 
 Commands can also use `\` as the prefix (e.g. `\quit`).
+
+`/chdir` is explicit and user-typed, so unlike `run_command` it isn't
+sandboxed - it changes the real process directory. Every path-resolving
+tool (`read_file`, `write_file`, `patch_file`, `glob`,
+`grep_in_current_directory`, `run_command`'s sandbox bind, ...) re-resolves
+the current directory on each call, so they immediately follow a `/chdir`
+with no extra step.
 
 Reasoning ("thinking") tokens from models that stream them separately are shown
 in grey italics.  They are not kept in the conversation history, so they do not
