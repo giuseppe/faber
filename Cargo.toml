@@ -23,6 +23,10 @@ libc = "0.2"
 glob = "0.3"
 rusqlite = { version = "0.31", features = ["bundled"] }
 cron = "0.15"
+base64 = "0.22"
+terminal-trx = "0.2.6"
+xterm-color = "1.0.2"
+pulldown-cmark = { version = "0.13.4", default-features = false }
 
 [lib]
 crate-type = ["rlib"]

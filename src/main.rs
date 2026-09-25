@@ -19,6 +19,7 @@
 
 mod dummy_llm;
 mod github;
+mod latex_kitty;
 mod openai;
 mod remote_db;
 mod server;
@@ -1539,17 +1540,18 @@ struct CommandResult {
     success: bool,
 }
 
-/// Builds the argument list bwrap needs to sandbox `run_command` when
-/// --unsafe-tools isn't set: all capabilities dropped, no network, a
-/// cleared environment, and a fresh empty root with only `/usr`, `/lib` and
-/// `/lib64` (read-only, whichever exist) and `cwd` (read-write) visible -
-/// so a command can't reach the network or touch anything outside the
-/// current directory. Pure and
-/// independent of actually spawning bwrap, so it's testable without it
-/// installed.
+/// The namespace/capability isolation every bwrap sandbox this app builds
+/// shares, independent of whatever filesystem strategy a particular caller
+/// layers on top (a fresh empty root with a few binds, for `run_command`;
+/// the whole real root read-only, for `--display-graphics`'s LaTeX
+/// toolchain - see `latex_kitty::whole_root_ro_bwrap_args`):
 ///
-/// Also isolates every other namespace that doesn't need to be shared:
-///
+/// - `--cap-drop ALL`: no Linux capabilities at all.
+/// - `--clearenv`, when `clearenv` is true: no inherited environment
+///   variables. Some callers need the real environment instead (LaTeX's
+///   own file-finding library relies on it), hence this being a parameter
+///   rather than always on.
+/// - `--unshare-net`: no network access.
 /// - `--unshare-pid`: without it the sandboxed process shares the *host's*
 ///   PID namespace, so it can see every other process via `/proc`
 ///   (including reading their `/proc/<pid>/environ`, potentially leaking
@@ -1571,63 +1573,49 @@ struct CommandResult {
 ///   terminal faber's own prompt reads from, effectively escaping into the
 ///   outer, unsandboxed session without ever touching the filesystem or
 ///   network restrictions above.
-///
-/// Mirrors `run_command`'s own command/args-vs-shell-string convention: an
-/// explicit `args` list (or a single word with none) runs that program
-/// directly inside the sandbox; a multi-word `command` with no `args` runs
-/// as a `bash -c` shell string instead, same as the unsandboxed path.
+fn bwrap_isolation_flags(clearenv: bool) -> Vec<String> {
+    let mut a: Vec<String> = ["--cap-drop", "ALL"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    if clearenv {
+        a.push("--clearenv".to_string());
+    }
+    a.extend(
+        [
+            "--unshare-net",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-cgroup-try",
+            "--die-with-parent",
+            "--new-session",
+            "--dev",
+            "/dev/",
+            "--proc",
+            "/proc",
+        ]
+        .into_iter()
+        .map(String::from),
+    );
+    a
+}
+
+/// The trailing `-- <command> [args...]` (or, for a multi-word `command`
+/// with no explicit `args`, `-- /usr/bin/bash -c <command>`) shared by
+/// every bwrap sandbox this app builds.
 ///
 /// `command`/`args` come straight from the model's tool call and aren't
-/// validated to be an actual executable path, so a `--` separator is
-/// inserted before them: without it, a `command` crafted to look like a
-/// bwrap flag (e.g. "--ro-bind" with args ["/", "/", ...]) would be parsed
-/// by bwrap as one of *its own* options rather than as the target program -
-/// e.g. re-binding the whole host root back over the `--tmpfs /` above and
-/// defeating the sandbox's own filesystem restriction. `--` tells bwrap
-/// unambiguously that everything after it is the command to run, not more
-/// of its own arguments.
-fn bwrap_args(cwd: &str, command: &str, args: Option<&[String]>) -> Vec<String> {
-    let mut a: Vec<String> = [
-        "--cap-drop",
-        "ALL",
-        "--clearenv",
-        "--unshare-net",
-        "--unshare-pid",
-        "--unshare-ipc",
-        "--unshare-uts",
-        "--unshare-cgroup-try",
-        "--die-with-parent",
-        "--new-session",
-        "--dev",
-        "/dev/",
-        "--proc",
-        "/proc",
-        "--tmpfs",
-        "/",
-        "--ro-bind",
-        "/usr",
-        "/usr",
-        // -try for both: which of /lib, /lib64 exist (as real directories or
-        // as merged-/usr symlinks into /usr/lib*) varies by architecture and
-        // distro - e.g. a non-multilib system may only have one of them, or
-        // neither if everything already lives under /usr/lib. Bind whichever
-        // are actually present instead of failing to launch the sandbox at
-        // all over one that isn't.
-        "--ro-bind-try",
-        "/lib",
-        "/lib",
-        "--ro-bind-try",
-        "/lib64",
-        "/lib64",
-        "--bind",
-        cwd,
-        cwd,
-        "--",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
-
+/// validated to be an actual executable path, so the leading `--` matters:
+/// without it, a `command` crafted to look like a bwrap flag (e.g.
+/// "--ro-bind" with args ["/", "/", ...]) would be parsed by bwrap as one
+/// of *its own* options rather than as the target program - e.g.
+/// re-binding the whole host root back over a sandbox's own `--tmpfs /`
+/// and defeating its filesystem restriction. `--` tells bwrap unambiguously
+/// that everything after it is the command to run, not more of its own
+/// arguments.
+fn bwrap_command_tail(command: &str, args: Option<&[String]>) -> Vec<String> {
+    let mut a = vec!["--".to_string()];
     if args.is_some() || !command.contains(' ') {
         a.push(command.to_string());
         if let Some(args) = args {
@@ -1638,6 +1626,46 @@ fn bwrap_args(cwd: &str, command: &str, args: Option<&[String]>) -> Vec<String> 
         a.push("-c".to_string());
         a.push(command.to_string());
     }
+    a
+}
+
+/// Builds the argument list bwrap needs to sandbox `run_command` when
+/// --unsafe-tools isn't set: `bwrap_isolation_flags` (with a cleared
+/// environment), plus a fresh empty root with only `/usr`, `/lib` and
+/// `/lib64` (read-only, whichever exist) and `cwd` (read-write) visible -
+/// so a command can't reach the network or touch anything outside the
+/// current directory. Pure and independent of actually spawning bwrap, so
+/// it's testable without it installed.
+fn bwrap_args(cwd: &str, command: &str, args: Option<&[String]>) -> Vec<String> {
+    let mut a = bwrap_isolation_flags(true);
+    a.extend(
+        [
+            "--tmpfs",
+            "/",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            // -try for both: which of /lib, /lib64 exist (as real
+            // directories or as merged-/usr symlinks into /usr/lib*)
+            // varies by architecture and distro - e.g. a non-multilib
+            // system may only have one of them, or neither if everything
+            // already lives under /usr/lib. Bind whichever are actually
+            // present instead of failing to launch the sandbox at all over
+            // one that isn't.
+            "--ro-bind-try",
+            "/lib",
+            "/lib",
+            "--ro-bind-try",
+            "/lib64",
+            "/lib64",
+        ]
+        .into_iter()
+        .map(String::from),
+    );
+    a.push("--bind".to_string());
+    a.push(cwd.to_string());
+    a.push(cwd.to_string());
+    a.extend(bwrap_command_tail(command, args));
     a
 }
 
@@ -4760,20 +4788,137 @@ fn line_streamer(
     }
 }
 
+/// Wraps `line_streamer` with a filter that, when `enabled`, holds back
+/// complete `\[...\]`/`\(...\)`/`$$...$$` LaTeX blocks as they finish
+/// streaming in, renders each one to an image and displays it in place of
+/// the raw text - the moment the block finishes, not batched up until the
+/// whole response is done and already printed (which, confirmed against a
+/// real report of blocks not looking "converted", just means every image
+/// ends up in one pile at the end, disconnected from the text it came
+/// from). Falls back to printing the raw block if rendering fails, so
+/// nothing the model wrote is ever silently dropped.
+///
+/// When `enabled` is false, behaves exactly like `line_streamer` itself -
+/// no buffering, no extra work - so every user not using
+/// --display-graphics sees no change at all.
+fn latex_aware_line_streamer(
+    printer: ChatPrinter,
+    style: Style,
+    render_color: fn() -> (u8, u8, u8),
+    status_bar: Arc<status_bar::StatusBar>,
+    agent_name: String,
+    enabled: bool,
+) -> impl Fn(&str) -> Result<(), Box<dyn Error>> {
+    let plain = line_streamer(printer, style);
+    let splitter = Arc::new(Mutex::new(latex_kitty::LatexSplitter::new()));
+    move |chunk: &str| {
+        if !enabled {
+            return plain(chunk);
+        }
+        let events = {
+            let mut s = splitter.lock().unwrap_or_else(|e| e.into_inner());
+            if chunk.is_empty() {
+                s.finish()
+            } else {
+                s.push(chunk)
+            }
+        };
+        for event in events {
+            match event {
+                latex_kitty::StreamSegment::Text(text) => plain(&text)?,
+                latex_kitty::StreamSegment::Latex(block) => {
+                    status_bar.set_agent_status(&agent_name, "Rendering LaTeX", true);
+                    // Queried lazily, right here - not once up front when
+                    // this streamer is built - since building one happens
+                    // on every turn regardless of whether any LaTeX block
+                    // ever actually shows up, and a terminal round-trip
+                    // query isn't worth paying for on turns that never need
+                    // it at all.
+                    let result = latex_kitty::render_latex_to_png(&block, render_color());
+                    status_bar.clear_agent_status(&agent_name);
+                    match result {
+                        Ok(png) => latex_kitty::display_png(&png),
+                        Err(e) => {
+                            log::warn!("couldn't render LaTeX block {:?}: {}", block, e);
+                            plain(&block)?;
+                        }
+                    }
+                }
+            }
+        }
+        // Let line_streamer's own Finish step run too, closing any partial
+        // line the flushed text above may have left open - same as it
+        // would for any other end-of-stream chunk.
+        if chunk.is_empty() {
+            plain("")?;
+        }
+        Ok(())
+    }
+}
+
 fn create_response_mode(
     printer: ChatPrinter,
     status_bar: Arc<status_bar::StatusBar>,
     agent_name: String,
+    pending_complete_message: Arc<Mutex<Option<String>>>,
+    graphics_mode: Option<DisplayGraphicsMode>,
+    reasoning_accumulator: Arc<Mutex<String>>,
 ) -> ResponseMode {
     let tool_active = Arc::new(AtomicBool::new(false));
     let completed = Arc::new(AtomicBool::new(false));
+    let partial_inline = graphics_mode == Some(DisplayGraphicsMode::Partial);
 
-    let answer = line_streamer(printer.clone(), Style::new().cyan());
+    // "full" never prints live text at all, for either stream: there's no
+    // way to know in advance whether the whole response will even end up
+    // rendering successfully as one document once it's done (see
+    // render_full_or_fallback), and printing it live *and* possibly also
+    // showing a rendered image afterward would defeat the point - anything
+    // already on screen (and copy-pasteable) as raw text can never be
+    // un-printed. The existing "Streaming (N bytes)" status update still
+    // gives some sense of progress in the meantime.
+    let answer: Box<dyn Fn(&str) -> Result<(), Box<dyn Error>>> =
+        if graphics_mode == Some(DisplayGraphicsMode::Full) {
+            Box::new(|_: &str| Ok(()))
+        } else {
+            Box::new(latex_aware_line_streamer(
+                printer.clone(),
+                Style::new().cyan(),
+                latex_kitty::answer_text_color,
+                status_bar.clone(),
+                agent_name.clone(),
+                partial_inline,
+            ))
+        };
     let tool_active_for_stream = tool_active.clone();
 
     let printer_for_progress = printer.clone();
     let tool_active_for_progress = tool_active;
     let completed_for_progress = completed;
+
+    // Reasoning is streamed live but - unlike the final answer, which ends
+    // up in response.choices - it's never kept anywhere once the response
+    // completes (see the README: "not kept in the conversation history").
+    // "full" mode needs the whole thing anyway (to render it too, once the
+    // response is done), so it's accumulated here specifically for that;
+    // "partial" and off don't touch the accumulator at all.
+    let reasoning: Box<dyn Fn(&str) -> Result<(), Box<dyn Error>>> =
+        if graphics_mode == Some(DisplayGraphicsMode::Full) {
+            Box::new(move |chunk: &str| {
+                if let Ok(mut accumulated) = reasoning_accumulator.lock() {
+                    accumulated.push_str(chunk);
+                }
+                Ok(())
+            })
+        } else {
+            Box::new(latex_aware_line_streamer(
+                printer,
+                Style::new().color256(244).italic(),
+                latex_kitty::reasoning_text_color,
+                status_bar.clone(),
+                agent_name.clone(),
+                partial_inline,
+            ))
+        };
 
     ResponseMode::Streaming {
         stream_handler: Box::new(move |chunk: &str| {
@@ -4782,7 +4927,7 @@ fn create_response_mode(
             }
             answer(chunk)
         }),
-        reasoning_handler: Box::new(line_streamer(printer, Style::new().color256(244).italic())),
+        reasoning_handler: Box::new(move |chunk: &str| reasoning(chunk)),
         progress_handler: Box::new(move |progress_info: &ProgressInfo| {
             if completed_for_progress.load(Ordering::Relaxed) {
                 return Ok(());
@@ -4850,7 +4995,7 @@ fn create_response_mode(
                     let elapsed_secs = progress_info.elapsed_ms as f64 / 1000.0;
                     status_bar.clear_agent_status(&agent_name);
 
-                    if let Some(usage) = usage {
+                    let message = if let Some(usage) = usage {
                         let mut parts = Vec::new();
                         if let Some(input_tokens) = usage.prompt_tokens {
                             parts.push(format!("Input: {}", input_tokens));
@@ -4862,17 +5007,22 @@ fn create_response_mode(
                             parts.push(format!("Total: {}", total_tokens));
                         }
                         if !parts.is_empty() {
-                            printer_for_progress.println(&format!(
-                                "Complete | {} | {:.1}s",
-                                parts.join(" > "),
-                                elapsed_secs
-                            ));
+                            format!("Complete | {} | {:.1}s", parts.join(" > "), elapsed_secs)
                         } else {
-                            printer_for_progress
-                                .println(&format!("Complete | {:.1}s", elapsed_secs));
+                            format!("Complete | {:.1}s", elapsed_secs)
                         }
                     } else {
-                        printer_for_progress.println(&format!("Complete | {:.1}s", elapsed_secs));
+                        format!("Complete | {:.1}s", elapsed_secs)
+                    };
+                    // Deferred rather than printed here directly: the
+                    // caller still has --display-graphics rendering left to
+                    // do once the response itself is done, and printing
+                    // "Complete" before that finishes would make it look
+                    // like the turn ended while more of it is still coming.
+                    if let Ok(mut pending) = pending_complete_message.lock() {
+                        *pending = Some(message);
+                    } else {
+                        printer_for_progress.println(&message);
                     }
                 }
             }
@@ -4945,6 +5095,145 @@ fn warn_if_truncated(response: &OpenAIResponse, chat_pb: &ChatPrinter) {
              the context window was reached; try /summarize, /clear or fewer tools.",
         );
     }
+}
+
+/// Prints a one-time, actionable warning at chat startup for each thing
+/// that would make `--display-graphics` silently do nothing all session -
+/// an unsupported terminal, or a missing LaTeX toolchain - rather than
+/// leaving the person to wonder why nothing ever renders. Checked once
+/// here instead of only surfacing this the first time a response actually
+/// contains a LaTeX block.
+fn warn_about_display_graphics_setup(chat_pb: &ChatPrinter) {
+    if !latex_kitty::is_kitty_terminal() {
+        chat_pb.println(&format!(
+            "Note: --display-graphics is set, but this doesn't look like a supported \
+             terminal (currently: Kitty's graphics protocol; detected TERM={:?}, \
+             KITTY_WINDOW_ID={:?}) - LaTeX blocks won't be rendered. If you're inside \
+             tmux/screen, Kitty's terminal identification often doesn't pass through \
+             into it.",
+            std::env::var("TERM").ok(),
+            std::env::var("KITTY_WINDOW_ID").ok()
+        ));
+        return;
+    }
+    let missing = latex_kitty::missing_toolchain_tools();
+    if !missing.is_empty() {
+        chat_pb.println(&format!(
+            "Note: --display-graphics is set, but {} not found on PATH - install a \
+             LaTeX distribution (for pdflatex) and poppler-utils (for pdftocairo) to \
+             render LaTeX blocks.",
+            missing.join(" and ")
+        ));
+    }
+}
+
+/// The effective `--display-graphics` mode: `None` if the flag wasn't
+/// given, or if it was but the terminal isn't recognized as supporting
+/// inline graphics - there'd be nowhere to show an image either way, so
+/// every caller can treat this the same as the flag being off at all.
+fn display_graphics_mode(opts: &Opts) -> Option<DisplayGraphicsMode> {
+    opts.display_graphics
+        .filter(|_| latex_kitty::is_kitty_terminal())
+}
+
+/// `--display-graphics=partial`'s non-streaming counterpart to
+/// `latex_aware_line_streamer`: renders any LaTeX blocks in `msg` as images
+/// in place of their raw text, for a message that arrives as a single
+/// already-complete string (an injected/background notification) rather
+/// than incrementally.
+///
+/// Doesn't reproduce `ChatPrinter::println_agent`'s own two-space indent:
+/// doing so correctly while also replacing arbitrary *inline* (same-line)
+/// LaTeX blocks with images - without forcing surrounding text before/
+/// after the image onto its own separate line - needs the same "current
+/// open line" tracking `latex_aware_line_streamer` already does via
+/// `line_streamer`, which knows nothing about indentation. Reusing it
+/// as-is (unindented, like the live streaming path already looks) was
+/// judged the better trade-off over duplicating that logic just to keep
+/// the indent.
+fn println_agent_with_latex(
+    chat_pb: &ChatPrinter,
+    agent_name: &str,
+    msg: &str,
+    status_bar: &Arc<status_bar::StatusBar>,
+) {
+    let header = agent_style(agent_name).apply_to(format!("── {} ──", agent_name));
+    chat_pb.println(&header.to_string());
+    let stream = latex_aware_line_streamer(
+        chat_pb.clone(),
+        Style::new(),
+        latex_kitty::answer_text_color,
+        status_bar.clone(),
+        agent_name.to_string(),
+        true,
+    );
+    let _ = stream(msg);
+    let _ = stream("");
+    chat_pb.println("");
+}
+
+/// `--display-graphics=full`'s core: tries to render `text` (the whole
+/// response, or its reasoning) as one properly typeset LaTeX document and
+/// display it, falling back to printing `text` itself - styled as `style`,
+/// matching how it would have looked streamed live - only if rendering
+/// fails. `label` names what's being rendered, for the status bar text and
+/// a failure's log message (e.g. "response" or "reasoning").
+///
+/// This is the *only* place `text` is guaranteed to end up on screen at
+/// all: full mode never prints live text while a response is still
+/// streaming in (see `create_response_mode`), since there'd be no way to
+/// know in advance whether the eventual document will even compile -
+/// printing it live regardless would leave it in the terminal (and
+/// copy-pasteable from it) even after a successful render made that raw
+/// text redundant.
+fn render_full_or_fallback(
+    chat_pb: &ChatPrinter,
+    status_bar: &Arc<status_bar::StatusBar>,
+    agent_name: &str,
+    label: &str,
+    text: &str,
+    style: Style,
+    render_color: fn() -> (u8, u8, u8),
+) {
+    status_bar.set_agent_status(agent_name, &format!("Rendering {label} as LaTeX"), true);
+    let result = latex_kitty::render_full_response_to_png(text, render_color());
+    status_bar.clear_agent_status(agent_name);
+    match result {
+        Ok(png) => latex_kitty::display_png(&png),
+        Err(e) => {
+            log::warn!("couldn't render the {label} as LaTeX: {}", e);
+            let stream = line_streamer(chat_pb.clone(), style);
+            let _ = stream(text);
+            let _ = stream("");
+        }
+    }
+}
+
+/// `--display-graphics=full`'s counterpart for the non-streaming
+/// (injected/background) path: prints the agent header, then tries to
+/// render `msg` as one properly typeset document (`render_full_or_fallback`
+/// - printing `msg` itself only if that fails, not unconditionally, so a
+/// successful render doesn't leave the raw text sitting in the terminal
+/// too). There's no reasoning stream on this path, so only the answer's
+/// own color applies.
+fn println_agent_full_latex(
+    chat_pb: &ChatPrinter,
+    agent_name: &str,
+    msg: &str,
+    status_bar: &Arc<status_bar::StatusBar>,
+) {
+    let header = agent_style(agent_name).apply_to(format!("── {} ──", agent_name));
+    chat_pb.println(&header.to_string());
+    render_full_or_fallback(
+        chat_pb,
+        status_bar,
+        agent_name,
+        "response",
+        msg,
+        Style::new(),
+        latex_kitty::answer_text_color,
+    );
+    chat_pb.println("");
 }
 
 fn save_agent_history(db: &Option<Arc<dyn DbBackend>>, agent: &AgentState) {
@@ -5268,6 +5557,10 @@ fn chat_command(
     };
     status_bar.set_color(agent_ansi_code(&active_agent.name));
 
+    if opts.display_graphics.is_some() {
+        warn_about_display_graphics_setup(&chat_pb);
+    }
+
     let mut openai_opts = build_openai_opts(opts, &agent_config);
     debug!("Using model: {}", openai_opts.model);
 
@@ -5533,14 +5826,34 @@ fn chat_command(
                         ) {
                             Ok(response) => {
                                 warn_if_truncated(&response, &chat_pb);
-                                active_agent.messages = response.history;
                                 if let Some(ref choices) = response.choices {
                                     if let Some(content) =
                                         choices.first().and_then(|c| c.message.content.as_ref())
                                     {
-                                        chat_pb.println_agent(&active_agent.name, content);
+                                        match display_graphics_mode(opts) {
+                                            Some(DisplayGraphicsMode::Partial) => {
+                                                println_agent_with_latex(
+                                                    &chat_pb,
+                                                    &active_agent.name,
+                                                    content,
+                                                    &status_bar,
+                                                );
+                                            }
+                                            Some(DisplayGraphicsMode::Full) => {
+                                                println_agent_full_latex(
+                                                    &chat_pb,
+                                                    &active_agent.name,
+                                                    content,
+                                                    &status_bar,
+                                                );
+                                            }
+                                            None => {
+                                                chat_pb.println_agent(&active_agent.name, content);
+                                            }
+                                        }
                                     }
                                 }
+                                active_agent.messages = response.history;
                                 save_agent_history(&db, &active_agent);
                             }
                             Err(e) => {
@@ -5562,6 +5875,18 @@ fn chat_command(
                         });
 
                         let agent_name = active_agent.name.clone();
+                        // Holds the "Complete | Ns" line's text once the
+                        // response itself finishes, printed further below
+                        // instead of immediately - if --display-graphics=full
+                        // still has rendering to do, printing "Complete"
+                        // before that finished would make the turn look
+                        // done while more of it is still coming.
+                        let pending_complete_message = Arc::new(Mutex::new(None));
+                        let graphics_mode = display_graphics_mode(opts);
+                        // Only meaningfully used ("full" needs the whole
+                        // reasoning text once the response is done, to
+                        // render it too) - see create_response_mode.
+                        let reasoning_accumulator = Arc::new(Mutex::new(String::new()));
                         match request_with_summary_fallback(
                             &mut active_agent,
                             &openai_opts,
@@ -5575,6 +5900,9 @@ fn chat_command(
                                     chat_pb.clone(),
                                     status_bar.clone(),
                                     agent_name.clone(),
+                                    pending_complete_message.clone(),
+                                    graphics_mode,
+                                    reasoning_accumulator.clone(),
                                 );
                                 status_bar.set_agent_status(
                                     &agent_name,
@@ -5597,6 +5925,54 @@ fn chat_command(
                         ) {
                             Ok(response) => {
                                 warn_if_truncated(&response, &chat_pb);
+                                // "partial" already rendered any LaTeX
+                                // blocks inline as the response streamed -
+                                // nothing left to do here for it. "full"
+                                // never printed anything live at all (see
+                                // create_response_mode); this is the first
+                                // and only point its reasoning and answer
+                                // actually reach the screen, as a rendered
+                                // document or, failing that, as plain text.
+                                if graphics_mode == Some(DisplayGraphicsMode::Full) {
+                                    let reasoning_text = reasoning_accumulator
+                                        .lock()
+                                        .map(|guard| guard.clone())
+                                        .unwrap_or_default();
+                                    if !reasoning_text.trim().is_empty() {
+                                        render_full_or_fallback(
+                                            &chat_pb,
+                                            &status_bar,
+                                            &agent_name,
+                                            "reasoning",
+                                            &reasoning_text,
+                                            Style::new().color256(244).italic(),
+                                            latex_kitty::reasoning_text_color,
+                                        );
+                                    }
+                                    if let Some(content) = response
+                                        .choices
+                                        .as_ref()
+                                        .and_then(|c| c.first())
+                                        .and_then(|c| c.message.content.as_deref())
+                                    {
+                                        render_full_or_fallback(
+                                            &chat_pb,
+                                            &status_bar,
+                                            &agent_name,
+                                            "response",
+                                            content,
+                                            Style::new().cyan(),
+                                            latex_kitty::answer_text_color,
+                                        );
+                                    }
+                                }
+                                if let Some(message) = pending_complete_message
+                                    .lock()
+                                    .ok()
+                                    .and_then(|mut guard| guard.take())
+                                {
+                                    chat_pb.println(&message);
+                                }
                                 active_agent.messages = response.history;
                                 save_agent_history(&db, &active_agent);
                             }
@@ -5773,6 +6149,26 @@ fn list_models_command(opts: &Opts) -> Result<(), Box<dyn Error>> {
     }
 }
 
+/// How `--display-graphics` renders LaTeX in a response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DisplayGraphicsMode {
+    /// Each `\[...\]`/`\(...\)`/`$$...$$` block is rendered and shown in
+    /// place of its own raw text, as soon as it finishes streaming in - see
+    /// `latex_aware_line_streamer` and `latex_kitty::render_latex_to_png`.
+    Partial,
+    /// The live text streams normally, untouched (no per-block
+    /// substitution while it's still in progress - there's no way to
+    /// re-typeset a whole document incrementally as it arrives). Once the
+    /// response is done, the whole thing - the surrounding Markdown text
+    /// too, not just the isolated math - is *additionally* rendered as one
+    /// properly typeset document, via
+    /// `latex_kitty::render_full_response_to_png`: real paragraph flow,
+    /// headings, lists, and inline math that reads as part of its
+    /// sentence, not a disconnected image dropped into plain text.
+    Full,
+}
+
 #[derive(Parser, Debug, Serialize, Deserialize)]
 #[clap(version = env!("CARGO_PKG_VERSION"))]
 #[serde(default)]
@@ -5826,6 +6222,24 @@ struct Opts {
     #[clap(long)]
     /// Start chat session with this agent instead of 'default'
     agent: Option<String>,
+    #[clap(long, value_enum)]
+    /// Render \[...\], \(...\), and $$...$$ LaTeX blocks in responses as
+    /// images, on terminals where inline graphics display is supported (a
+    /// no-op elsewhere). Requires a local LaTeX toolchain (pdflatex +
+    /// pdftocairo). Off by default since it shells out to that toolchain for
+    /// every response - pass "partial" for the common case (each math
+    /// block rendered in place of its own raw text as it streams in), or
+    /// "full" to additionally render the whole response - the surrounding
+    /// text too, not just the math - as one properly typeset document once
+    /// it's done.
+    ///
+    /// Always takes an explicit value (--display-graphics=partial or
+    /// =full, or "partial"/"full" as a separate following argument) -
+    /// never a bare --display-graphics: since this flag has to come before
+    /// the subcommand (e.g. `chat`), a bare, value-less form would make
+    /// clap try to consume the subcommand's own name as this flag's value
+    /// instead, and fail.
+    display_graphics: Option<DisplayGraphicsMode>,
     #[clap(long)]
     /// Connect to a remote faber server instead of using a local database
     server: Option<String>,
@@ -5872,6 +6286,7 @@ impl Default for Opts {
             parameter: Vec::new(),
             db_path: None,
             agent: None,
+            display_graphics: None,
             server: None,
             server_key: None,
             server_key_file: None,
@@ -5921,6 +6336,10 @@ impl Opts {
 
         if !self.unsafe_tools && config.unsafe_tools {
             self.unsafe_tools = true;
+        }
+
+        if self.display_graphics.is_none() {
+            self.display_graphics = config.display_graphics;
         }
 
         if self.tool_choice.is_none() {
@@ -6054,7 +6473,11 @@ enum CliCommand {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let env = Env::new()
-        .filter_or("RUST_LOG", "warning")
+        // warn!()-level messages (e.g. a single LaTeX block failing to
+        // render) are routine enough, and can be frequent enough in one
+        // response, that showing them by default is its own kind of
+        // spam - only error!() shows without an explicit RUST_LOG.
+        .filter_or("RUST_LOG", "error")
         .write_style_or("LOG_STYLE", "always");
     env_logger::Builder::from_env(env).init();
 
