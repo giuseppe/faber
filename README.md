@@ -249,12 +249,13 @@ scheduler thread checks for pending tasks every second.
 | `task_pending` | List tasks that are due to run |
 | `send_message` | Send a message to another agent |
 | `spawn_agent` | Spawn a sub-agent for parallel work |
+| `run_command` | Execute a command, sandboxed with [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`): no network access, no capabilities, a cleared environment, a read-only root with only the current directory writable, its own PID/IPC/UTS/cgroup namespaces (no visibility into other processes or the host's hostname), killed if faber itself dies, and detached from the controlling terminal. Requires `bwrap` to be installed; use `--unsafe-tools` for unrestricted execution instead |
 
 ### Unsafe tools (require `--unsafe-tools`)
 
 | Tool | Description |
 |---|---|
-| `run_command` | Execute a shell command |
+| `run_command` | Execute a command directly, with the same access as the faber process itself - no sandboxing |
 | `fetch_web_content` | Fetch content from a URL |
 
 ### Tool filtering
@@ -377,7 +378,7 @@ faber --server 127.0.0.1:9090 --server-key mysecret chat
     --model <MODEL>          AI model to use
     --endpoint <URL>         API endpoint URL
     --no-tools               Disable all tools
-    --unsafe-tools           Enable unsafe tools (run_command, fetch_web_content)
+    --unsafe-tools           Run commands unsandboxed and enable fetch_web_content
     --tools <LIST>           Comma-separated list of tools to enable
     --tool-choice <MODE>     Tool usage mode: auto, none, required
     --api-key <PATH>         File containing the API key
