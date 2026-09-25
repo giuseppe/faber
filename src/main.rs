@@ -5531,6 +5531,14 @@ struct Opts {
     #[serde(default)]
     mcp_servers: HashMap<String, faber::mcp::McpServerConfig>,
 
+    #[clap(long = "mcp-server")]
+    #[serde(skip)]
+    /// Add a remote MCP server: NAME=URL for HTTP transport, or
+    /// NAME=sse:URL for SSE transport (can be repeated). Merged with any
+    /// servers already defined in the config file's "mcp_servers", and
+    /// takes precedence over a config file entry with the same name.
+    mcp_server: Vec<String>,
+
     #[clap(subcommand)]
     #[serde(skip)]
     command: CliCommand,
@@ -5559,6 +5567,7 @@ impl Default for Opts {
             server_key: None,
             server_key_file: None,
             mcp_servers: HashMap::new(),
+            mcp_server: Vec::new(),
             command: CliCommand::Chat {},
             args: Vec::new(),
         }
@@ -5642,6 +5651,60 @@ impl Opts {
 
         debug!("Configuration merge completed");
     }
+
+    /// Parses `--mcp-server` flags (NAME=URL or NAME=sse:URL) and inserts
+    /// them into `mcp_servers`, overwriting any config file entry with the
+    /// same name - consistent with CLI arguments overriding config file
+    /// values elsewhere in `Opts`.
+    fn apply_mcp_server_flags(&mut self) -> Result<(), Box<dyn Error>> {
+        for spec in &self.mcp_server {
+            let (name, config) = parse_mcp_server_flag(spec)?;
+            self.mcp_servers.insert(name, config);
+        }
+        Ok(())
+    }
+}
+
+/// Parses one `--mcp-server` value into a server name and config. Accepts
+/// `NAME=URL` for an HTTP-transport remote server, or `NAME=sse:URL` for an
+/// SSE-transport one - the two remote transports `McpServerConfig` supports,
+/// mirroring the config file's `url`/`sse` fields.
+fn parse_mcp_server_flag(
+    spec: &str,
+) -> Result<(String, faber::mcp::McpServerConfig), Box<dyn Error>> {
+    let (name, value) = spec.split_once('=').ok_or_else(|| {
+        format!(
+            "invalid --mcp-server '{}': expected NAME=URL or NAME=sse:URL",
+            spec
+        )
+    })?;
+    if name.is_empty() {
+        return Err(format!("invalid --mcp-server '{}': server name is empty", spec).into());
+    }
+    if value.is_empty() {
+        return Err(format!("invalid --mcp-server '{}': URL is empty", spec).into());
+    }
+
+    let config = if let Some(sse_url) = value.strip_prefix("sse:") {
+        faber::mcp::McpServerConfig {
+            command: None,
+            args: None,
+            env: None,
+            url: None,
+            sse: Some(sse_url.to_string()),
+            headers: None,
+        }
+    } else {
+        faber::mcp::McpServerConfig {
+            command: None,
+            args: None,
+            env: None,
+            url: Some(value.to_string()),
+            sse: None,
+            headers: None,
+        }
+    };
+    Ok((name.to_string(), config))
 }
 
 #[derive(Debug, Subcommand)]
@@ -5716,6 +5779,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+
+    opts.apply_mcp_server_flags()?;
 
     // Reset the model to use if an endpoint was provided
     if opts.model.is_none() && opts.endpoint.is_some() {
@@ -5811,6 +5876,100 @@ fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use rustyline::history::{History, SearchDirection};
+
+    #[test]
+    fn test_parse_mcp_server_flag_http() {
+        let (name, config) = parse_mcp_server_flag("search=http://localhost:3000/mcp").unwrap();
+        assert_eq!(name, "search");
+        assert_eq!(config.url.as_deref(), Some("http://localhost:3000/mcp"));
+        assert_eq!(config.sse, None);
+        assert_eq!(config.command, None);
+    }
+
+    #[test]
+    fn test_parse_mcp_server_flag_sse() {
+        let (name, config) = parse_mcp_server_flag("search=sse:http://localhost:3000/sse").unwrap();
+        assert_eq!(name, "search");
+        assert_eq!(config.sse.as_deref(), Some("http://localhost:3000/sse"));
+        assert_eq!(config.url, None);
+    }
+
+    #[test]
+    fn test_parse_mcp_server_flag_url_may_contain_equals_signs() {
+        // split_once must only split on the FIRST '=', so a query string in
+        // the URL doesn't get truncated or misparsed.
+        let (name, config) =
+            parse_mcp_server_flag("search=http://localhost:3000/mcp?token=abc=def").unwrap();
+        assert_eq!(name, "search");
+        assert_eq!(
+            config.url.as_deref(),
+            Some("http://localhost:3000/mcp?token=abc=def")
+        );
+    }
+
+    #[test]
+    fn test_parse_mcp_server_flag_missing_equals_is_an_error() {
+        assert!(parse_mcp_server_flag("no-equals-sign-here").is_err());
+    }
+
+    #[test]
+    fn test_parse_mcp_server_flag_empty_name_is_an_error() {
+        assert!(parse_mcp_server_flag("=http://localhost:3000/mcp").is_err());
+    }
+
+    #[test]
+    fn test_parse_mcp_server_flag_empty_url_is_an_error() {
+        assert!(parse_mcp_server_flag("search=").is_err());
+    }
+
+    #[test]
+    fn test_apply_mcp_server_flags_merges_with_config_and_overrides_by_name() {
+        let mut opts = Opts::default();
+        opts.mcp_servers.insert(
+            "fromconfig".to_string(),
+            faber::mcp::McpServerConfig {
+                command: None,
+                args: None,
+                env: None,
+                url: Some("http://config-only.example/mcp".to_string()),
+                sse: None,
+                headers: None,
+            },
+        );
+        opts.mcp_servers.insert(
+            "shared".to_string(),
+            faber::mcp::McpServerConfig {
+                command: None,
+                args: None,
+                env: None,
+                url: Some("http://old.example/mcp".to_string()),
+                sse: None,
+                headers: None,
+            },
+        );
+        opts.mcp_server = vec![
+            "fromcli=http://cli.example/mcp".to_string(),
+            "shared=sse:http://new.example/sse".to_string(),
+        ];
+
+        opts.apply_mcp_server_flags().unwrap();
+
+        assert_eq!(opts.mcp_servers.len(), 3);
+        assert_eq!(
+            opts.mcp_servers["fromconfig"].url.as_deref(),
+            Some("http://config-only.example/mcp")
+        );
+        assert_eq!(
+            opts.mcp_servers["fromcli"].url.as_deref(),
+            Some("http://cli.example/mcp")
+        );
+        // The CLI flag overrides the config file entry of the same name.
+        assert_eq!(opts.mcp_servers["shared"].url, None);
+        assert_eq!(
+            opts.mcp_servers["shared"].sse.as_deref(),
+            Some("http://new.example/sse")
+        );
+    }
 
     #[test]
     fn test_parse_parameters_number() {

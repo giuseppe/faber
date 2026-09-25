@@ -310,6 +310,23 @@ Three transports are supported:
 }
 ```
 
+### Adding a remote server from the command line
+
+`--mcp-server` is a shortcut for adding an HTTP or SSE server without
+editing the config file - useful for a one-off server or for overriding a
+config file entry:
+
+```bash
+faber --mcp-server search=http://localhost:3000/mcp chat        # HTTP
+faber --mcp-server search=sse:http://localhost:3000/sse chat    # SSE
+```
+
+The format is `NAME=URL` for HTTP, or `NAME=sse:URL` for SSE. Can be
+repeated for multiple servers, and adds to (rather than replaces) any
+`mcp_servers` from the config file; a name that matches a config file entry
+overrides it. There's no CLI shortcut for stdio servers or per-server
+headers - use the config file for those.
+
 MCP tools are prefixed with `mcp_<server>_<tool>` to avoid name collisions.
 Use `/mcp-refresh` in chat to reload tool definitions.
 
@@ -365,6 +382,7 @@ faber --server 127.0.0.1:9090 --server-key mysecret chat
     --tool-choice <MODE>     Tool usage mode: auto, none, required
     --api-key <PATH>         File containing the API key
     --parameter <K=V>        Model parameter (can be repeated)
+    --mcp-server <N=URL>     Add a remote MCP server (can be repeated); see MCP section
     --db-path <PATH>         SQLite database for persistent storage
     --agent <NAME>           Start chat as this agent instead of 'default'
     --server <ADDR>          Connect to a remote faber server
