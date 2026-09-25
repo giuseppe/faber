@@ -395,10 +395,103 @@ faber --server 127.0.0.1:9090 --server-key mysecret chat
     --mcp-server <N=URL>     Add a remote MCP server (can be repeated); see MCP section
     --db-path <PATH>         SQLite database for persistent storage
     --agent <NAME>           Start chat as this agent instead of 'default'
+    --display-graphics       Render LaTeX blocks as images on terminals that support it; see below
     --server <ADDR>          Connect to a remote faber server
     --server-key <KEY>       Pre-shared key for server authentication
     --server-key-file <PATH> Read server key from file
 ```
+
+### Displaying LaTeX as images
+
+```bash
+faber --display-graphics=partial chat
+faber --display-graphics=full chat
+```
+
+Off by default; an explicit `partial` or `full` value is required (there's
+no bare `--display-graphics` - since this flag has to come before the
+subcommand, e.g. `chat`, a value-less form would make the CLI parser try
+to consume the subcommand's own name as this flag's value instead, and
+fail). Both modes need a supported terminal - currently Kitty's graphics
+protocol, a no-op elsewhere - and a local LaTeX toolchain (see below).
+
+**`partial`** watches each response - and, since it isn't otherwise kept
+anywhere, any reasoning text the model streams separately - for `\[...\]`,
+`\(...\)`, and `$$...$$` LaTeX blocks, and renders each one as an image.
+The image replaces the block's raw text *in place*, the moment that block
+finishes streaming in, rather than appearing separately after the whole
+response is already printed - so it reads as part of the answer instead of
+a disconnected pile of images at the end. If a particular block fails to
+render (e.g. it doesn't actually compile), its raw text is printed instead,
+right where the image would have gone, so nothing is ever silently
+dropped. Status bar text reads `Rendering LaTeX` while a block is
+compiling, since each one is a separate, non-instant render.
+
+**`full`** prints nothing live while the response streams in (just the
+usual `Streaming (N bytes)` status text, so it's clear something's still
+happening) - there's no way to know in advance whether the response will
+even end up rendering successfully once it's done, and printing it live
+regardless would leave that raw text in the terminal - and copy-pasteable
+from it - even after a successful render made it redundant. Once the
+response (and separately, its reasoning, which isn't otherwise kept
+anywhere - see below) is done, each is rendered as one properly typeset
+document and shown: real Markdown (headings, bold/italic, lists, block
+quotes, tables, code blocks/spans, links, images, task lists) converted to
+LaTeX, with the math blocks preserved exactly as written and reading as
+part of their surrounding sentence, rather than a small isolated image
+dropped into plain text. Markdown conversion is deliberately not
+exhaustive: links/images render as their text/alt-text alone (a static
+image can't be clickable, and downloading a linked image is out of scope),
+and tables get a plain left/center/right-aligned `tabular`, no fancier
+styling. If a document fails to render, its raw text is printed instead -
+this is the only case `full` ever shows raw text at all, so nothing the
+model wrote is silently lost.
+
+Rendering shells out to a local LaTeX toolchain (`pdflatex` and
+`pdftocairo`, from a LaTeX distribution and poppler-utils respectively -
+neither is bundled with faber). The LaTeX being rendered comes from the
+model, so it's treated as untrusted input like any other and run under
+bwrap: no network, no capabilities, only a scratch directory writable. Its
+filesystem sandboxing differs from `run_command`'s own, though - rather
+than a fresh empty root with a curated list of read-only binds, it's the
+whole real filesystem bound read-only, with only the scratch directory
+re-bound read-write on top, and the real environment passed through rather
+than cleared. LaTeX's own file-finding library looks for its files
+(most prominently pdflatex's own precompiled format file) in places that
+vary by distro and install with no reliable way to enumerate them all
+upfront, so rather than guessing which ones to bind, the whole read-only
+filesystem is exposed instead - an acceptable tradeoff here since
+pdflatex/pdftocairo are two fixed, known binaries being fed data, not an
+arbitrary command chosen by the model. If the terminal isn't recognized as
+supported or the toolchain isn't found, faber
+says so once at chat startup rather than staying silent about why nothing
+is being rendered; a per-block rendering failure is also logged (not just
+shown as the raw-text fallback above), but quietly - by default nothing
+shows even then (faber's own default log level is `error`), so set
+`RUST_LOG=warn` to see the real error for a block that failed to render.
+
+The rendered image has a transparent background, so it blends into the
+terminal instead of standing out as its own rectangle, and its text color
+is queried from the terminal itself (the same ANSI palette slot the answer
+text renders in), so it matches that terminal's theme instead of a
+hardcoded guess.
+
+`pdflatex` needs these LaTeX packages installed - a "not found" compile
+error for one of them (visible with `RUST_LOG=warn`) means it's missing
+from the local install, not a bug in what faber generated:
+
+- Both modes: `standalone` (and the `preview` package it builds on),
+  `amsmath`, `amssymb`, `xcolor`.
+- `full` only: `inputenc`, `ulem`, `varwidth` (used via `standalone`'s own
+  `varwidth=` option), and the base `article` class (used via
+  `standalone`'s `class=article` option - almost certainly already present
+  in any real install, since it's one of LaTeX's own standard classes).
+
+On TeX Live (e.g. Fedora's `texlive-*` packages), a `texlive-scheme-basic`
+install typically needs at least `texlive-standalone`,
+`texlive-preview`, `texlive-varwidth`, and `texlive-ulem` added
+individually; `texlive-scheme-full` (or Debian/Ubuntu's
+`texlive-latex-extra`) already includes all of the above.
 
 ### Model parameters
 
