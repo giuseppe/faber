@@ -3869,31 +3869,12 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
     tools
 }
 
-fn add_tools_prompt(messages: &mut Vec<Message>, use_tools: bool) {
-    let prompts = if use_tools {
-        vec![
-            "Use the available tools as much as possible to find a solution.  Iterate until the problem is solved.  Terminate only when you are sure to have found the solution, if a tool fails, analyze the failure, fix the issue and call again the tool.  Never ask to run commands manually or ask for permissions, just run the tool.",
-            "When you've completed the task, you must terminate immediately the execution, do not explain your choices multiple times.",
-        ]
-    } else {
-        vec![
-            "You have access to various tools for file operations and code analysis.  Only use these tools when the user explicitly asks for file operations, code analysis, or repository interactions.  For simple questions, conversations, or general requests, respond directly without using tools.",
-        ]
-    };
-
-    for prompt in prompts {
-        messages.push(make_message("system", prompt.to_string()));
-    }
-}
-
-fn initialize_chat_messages(tools: &ToolsCollection, _opts: &Opts) -> Vec<Message> {
-    let mut messages: Vec<Message> = vec![];
-
-    let use_tools = !tools.is_empty();
-    add_tools_prompt(&mut messages, use_tools);
-
-    debug!("Initialized chat with {} system messages", messages.len());
-    messages
+/// Starting messages for a new chat/agent: intentionally empty. Only what
+/// the user explicitly adds - via `/system`, a per-agent `system_prompt`
+/// config, or system-context files passed to `prompt` - becomes a system
+/// message; nothing is injected by default.
+fn initialize_chat_messages(_tools: &ToolsCollection, _opts: &Opts) -> Vec<Message> {
+    vec![]
 }
 
 /// Sends a prompt to the OpenAI API and prints the AI's response to standard output.
@@ -4193,8 +4174,7 @@ fn handle_chat_command(
             chat_pb.println("Available commands:");
             chat_pb.println("  /help                  Show this help message");
             chat_pb.println("  /quit                  Exit the chat session");
-            chat_pb
-                .println("  /clear                 Clear chat history and restore system prompts");
+            chat_pb.println("  /clear                 Clear chat history");
             chat_pb.println("  /show                  Show current chat history");
             chat_pb.println("  /limit <n>             Keep only the last n messages");
             chat_pb.println("  /backtrace <n>         Remove the last n messages");
@@ -4216,7 +4196,7 @@ fn handle_chat_command(
             if let Some(db) = db {
                 db.clear_agent_messages(&active_agent.name)?;
             }
-            chat_pb.println("Chat history cleared and system prompts restored.");
+            chat_pb.println("Chat history cleared.");
             Ok(true)
         }
         ChatCommand::Show => {
@@ -7199,6 +7179,26 @@ mod tests {
         // options, never mistaken for (or overridden by) the command/args.
         let dashdash = args.iter().position(|a| a == "--").unwrap();
         assert!(args[..dashdash].contains(&"--unshare-pid".to_string()));
+    }
+
+    #[test]
+    fn test_initialize_chat_messages_has_no_default_system_prompts() {
+        // No hardcoded system message should be injected into a new chat,
+        // with or without tools available - only what the user explicitly
+        // adds (via /system, a per-agent config, or files passed to
+        // `prompt`) should ever show up as a system message.
+        let opts = Opts::default();
+        assert!(initialize_chat_messages(&ToolsCollection::new(), &opts).is_empty());
+
+        let mut tools = ToolsCollection::new();
+        tools.insert(
+            "read_file".to_string(),
+            ToolItem {
+                callback: tool_read_file,
+                schema: "{}".to_string(),
+            },
+        );
+        assert!(initialize_chat_messages(&tools, &opts).is_empty());
     }
 
     #[test]

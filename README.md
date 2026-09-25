@@ -59,7 +59,7 @@ faber --db-path state.db --agent mybot chat  # start as a specific agent
 |---|---|
 | `/help` | Show available commands |
 | `/quit` | Exit the chat session |
-| `/clear` | Clear chat history and restore system prompts |
+| `/clear` | Clear chat history |
 | `/show` | Display current chat history |
 | `/limit N` | Keep only the last N messages (0 clears) |
 | `/backtrace N` | Remove the last N messages |
