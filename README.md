@@ -268,7 +268,7 @@ scheduler thread checks for pending tasks every second.
 | `agent_data_get` | Retrieve a value for an agent |
 | `agent_data_delete` | Delete a key-value pair |
 | `agent_data_list` | List all key-value pairs for an agent |
-| `plan_update` | Set the agent's plan for the current multi-step task (full list of items, each `pending`/`in_progress`/`completed`). Stored per agent in the DB under the `state:plan` key, shown in the status bar as progress, and cleared once every item is completed or on `/clear`. Not available to sub-agents |
+| `plan_update` | Set the agent's plan for the current multi-step task (full list of items, each `pending`/`in_progress`/`completed`). Stored per agent in the DB under the `state:plan` key, shown in the status bar as progress, and cleared once every item is completed, on `/clear`, or when the agent is deleted (including a sub-agent when it finishes) |
 | `plan_get` | Get the agent's current plan |
 | `task_create_cron` | Create a recurring scheduled task |
 | `task_create_oneshot` | Create a one-shot scheduled task |

@@ -2398,13 +2398,13 @@ fn refresh_plan_status(status_bar: &status_bar::StatusBar, db: &dyn DbBackend, a
     status_bar.set_agent_plan(agent, summary.as_deref());
 }
 
-/// The plan tools act on the calling agent's own plan. Sub-agents run
-/// without an agent identity in their context, so they can't use them -
-/// better than silently writing to some other agent's plan.
+/// The plan tools act on the calling agent's own plan (sub-agents
+/// included). A context without an agent identity is refused rather than
+/// falling back to some other agent's plan.
 fn plan_agent(ctx: &ToolContext) -> Result<&str, Box<dyn Error>> {
     ctx.agent_name
         .as_deref()
-        .ok_or_else(|| "plan tools are only available to the main chat agent".into())
+        .ok_or_else(|| "plan tools require an agent identity".into())
 }
 
 fn tool_plan_update(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
@@ -2709,6 +2709,7 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
 
     let session_id_for_sub = sa_ctx.session_id.clone();
     let mcp_for_sub = ctx.mcp_manager.clone();
+    let agent_name_for_ctx = agent_name.clone();
     std::thread::spawn(move || {
         struct SubAgentGuard {
             status_bar: Arc<status_bar::StatusBar>,
@@ -2735,6 +2736,7 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
 
         let mut sub_ctx = ToolContext::new(|_: &str| {});
         sub_ctx.db = Some(db.clone());
+        sub_ctx.agent_name = Some(agent_name_for_ctx);
         sub_ctx.mcp_manager = mcp_for_sub;
         let result = post_request_with_mode(
             messages,
@@ -4807,6 +4809,9 @@ fn handle_chat_command(
             }
             if let Some(db) = db {
                 if db.delete_agent(&name)? {
+                    // The stored plan goes with the agent (agent_data
+                    // cascades); drop the status bar's copy too.
+                    status_bar.set_agent_plan(&name, None);
                     if let Ok(mut names) = agent_names.lock() {
                         names.retain(|n| n != &name);
                     }
@@ -6282,6 +6287,7 @@ fn chat_command(
                         if obj.get("type").and_then(|v| v.as_str()) == Some("subagent_result") {
                             if let Some(agent) = obj.get("agent").and_then(|v| v.as_str()) {
                                 status_bar.clear_agent_status(agent);
+                                status_bar.set_agent_plan(agent, None);
                                 let _ = db.delete_agent(agent);
                                 if let Ok(mut names) = agent_names.lock() {
                                     names.retain(|n| n != agent);
@@ -8159,6 +8165,20 @@ mod tests {
         ]}"#;
         assert!(tool_plan_update(&bad.to_string(), &ctx).is_err());
         assert!(load_plan(ctx.db().unwrap(), "default").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_deleting_agent_deletes_its_plan() {
+        let mut ctx = plan_test_ctx();
+        let db = ctx.db.clone().unwrap();
+        db.create_agent("sub", "Sub-agent: sub").unwrap();
+        ctx.agent_name = Some("sub".to_string());
+        let update = r#"{"items": [{"content": "a", "status": "pending"}]}"#;
+        tool_plan_update(&update.to_string(), &ctx).unwrap();
+        assert_eq!(load_plan(db.as_ref(), "sub").unwrap().len(), 1);
+
+        assert!(db.delete_agent("sub").unwrap());
+        assert_eq!(db.get_agent_data("sub", PLAN_DATA_KEY).unwrap(), None);
     }
 
     #[test]
