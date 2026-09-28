@@ -68,6 +68,14 @@ use std::collections::HashMap;
 struct AgentState {
     name: String,
     messages: Vec<Message>,
+    /// The most recent `prompt_tokens` this agent's conversation reported,
+    /// if any request has reported one yet - used to decide whether to
+    /// proactively summarize before the *next* request, rather than only
+    /// reactively after an actual context-length-exceeded failure. Only
+    /// ever updated when a response actually reports a number (never
+    /// reset to `None` by one that doesn't), so a provider that
+    /// occasionally omits `usage` doesn't disable the check either.
+    last_prompt_tokens: Option<u32>,
 }
 
 struct SubAgentContext {
@@ -4292,6 +4300,7 @@ fn handle_chat_command(
         ChatCommand::Quit => Ok(false),
         ChatCommand::Clear => {
             *messages = initialize_chat_messages(tools, opts);
+            active_agent.last_prompt_tokens = None;
             if let Some(db) = db {
                 db.clear_agent_messages(&active_agent.name)?;
             }
@@ -4336,11 +4345,13 @@ fn handle_chat_command(
             if n == 0 {
                 chat_pb.println("Limit cannot be zero. Clearing history instead.");
                 *messages = initialize_chat_messages(tools, opts);
+                active_agent.last_prompt_tokens = None;
                 if let Some(db) = db {
                     db.clear_agent_messages(&active_agent.name)?;
                 }
             } else if messages.len() > n {
                 *messages = messages.split_off(messages.len() - n);
+                active_agent.last_prompt_tokens = None;
                 chat_pb.println(&format!("Chat history limited to the last {} messages.", n));
             } else {
                 chat_pb.println(&format!(
@@ -4360,11 +4371,13 @@ fn handle_chat_command(
                     messages.len()
                 ));
                 *messages = initialize_chat_messages(tools, opts);
+                active_agent.last_prompt_tokens = None;
                 if let Some(db) = db {
                     db.clear_agent_messages(&active_agent.name)?;
                 }
             } else {
                 messages.truncate(messages.len() - n);
+                active_agent.last_prompt_tokens = None;
                 chat_pb.println(&format!("Went back {} steps in chat history.", n));
             }
             Ok(true)
@@ -4489,6 +4502,11 @@ fn handle_chat_command(
                 } else {
                     active_agent.messages = loaded;
                 }
+                // A different agent (possibly a different model/endpoint,
+                // via the config reload just above) - whatever was last
+                // known about the previous agent's context size doesn't
+                // apply here.
+                active_agent.last_prompt_tokens = None;
 
                 *prompt_text.lock().map_err(|e| format!("lock: {}", e))? =
                     format!("{}", agent_style(&name).apply_to(format!("{}> ", name)));
@@ -5360,8 +5378,113 @@ fn summarize_agent_history(
         chat_pb.println(summary.content.as_deref().unwrap_or(""));
     }
     agent.messages = summarized;
+    // Whatever context size was last known no longer applies - the
+    // history it described has just been replaced with a much smaller
+    // summary.
+    agent.last_prompt_tokens = None;
     save_agent_history(db, agent);
     Ok(())
+}
+
+/// How close to the model's context window `last_prompt_tokens` has to get
+/// before `maybe_summarize_proactively` summarizes ahead of the next
+/// request, rather than waiting for it to actually fail. Well short of
+/// 1.0: `last_prompt_tokens` is one turn behind (it's the size the
+/// conversation *was* at the last request, not including whatever's been
+/// added since - the current turn's own message, any tool calls it
+/// makes), and there's no cost to summarizing a little earlier than
+/// strictly necessary, unlike the cost of guessing wrong and hitting the
+/// same failure this is meant to avoid.
+const PROACTIVE_SUMMARIZE_MARGIN: f64 = 0.8;
+
+/// Decides whether to proactively summarize now, before sending another
+/// request, rather than waiting for an actual context-length-exceeded
+/// failure - true only once both pieces of information needed to decide
+/// are actually known (see `AgentState::last_prompt_tokens` and
+/// `spawn_context_window_lookup` for how each becomes available, or stays
+/// `None` indefinitely if it can't be determined).
+fn should_summarize_proactively(
+    last_prompt_tokens: Option<u32>,
+    context_window: Option<u32>,
+) -> bool {
+    match (last_prompt_tokens, context_window) {
+        (Some(tokens), Some(window)) if window > 0 => {
+            f64::from(tokens) >= f64::from(window) * PROACTIVE_SUMMARIZE_MARGIN
+        }
+        _ => false,
+    }
+}
+
+/// If `should_summarize_proactively` says it's time, summarizes `agent`'s
+/// conversation right now, before the caller goes on to send its next
+/// request - the proactive counterpart to `request_with_summary_fallback`,
+/// which only ever summarizes reactively, after a request has already
+/// failed. Best-effort: summarization failing here is only printed, not
+/// propagated, since the request that follows might still succeed without
+/// it - the same way a failure to render a LaTeX block falls back to
+/// showing the raw text rather than losing the turn entirely.
+fn maybe_summarize_proactively(
+    agent: &mut AgentState,
+    context_window: &Arc<Mutex<Option<u32>>>,
+    openai_opts: &openai::Opts,
+    db: &Option<Arc<dyn DbBackend>>,
+    ctrl_c_rx: &Arc<Mutex<mpsc::Receiver<()>>>,
+    signal_handler_active: &Arc<AtomicBool>,
+    status_bar: &Arc<status_bar::StatusBar>,
+    chat_pb: &ChatPrinter,
+) {
+    let window = *context_window.lock().unwrap_or_else(|e| e.into_inner());
+    if !should_summarize_proactively(agent.last_prompt_tokens, window) {
+        return;
+    }
+    chat_pb.println("Context is getting large, summarizing proactively before continuing...");
+    let current_messages = agent.messages.clone();
+    if let Err(e) = summarize_agent_history(
+        agent,
+        &current_messages,
+        true,
+        openai_opts,
+        db,
+        ctrl_c_rx,
+        signal_handler_active,
+        status_bar,
+        chat_pb,
+    ) {
+        if e.downcast_ref::<InterruptedError>().is_none() {
+            chat_pb.println(&format!(
+                "Proactive summarization failed, continuing without it: {}",
+                e
+            ));
+        }
+    }
+}
+
+/// Looks up `model`'s context window size from `endpoint`'s `/models`
+/// listing (`models_endpoint_from`) in a background thread, storing the
+/// result in `context_window` if found. Used to populate
+/// `--context-window` automatically when it wasn't given explicitly -
+/// spawned once at chat startup rather than called inline, since it's a
+/// network request that would otherwise delay the first prompt for a
+/// purely best-effort convenience; if it fails, times out, or the model
+/// isn't in the list, `context_window` is simply left as `None` and
+/// proactive summarization never triggers, same as if this were never
+/// called at all.
+fn spawn_context_window_lookup(
+    context_window: Arc<Mutex<Option<u32>>>,
+    endpoint: String,
+    api_key: Option<String>,
+    model: String,
+) {
+    std::thread::spawn(move || {
+        let models_endpoint = models_endpoint_from(&endpoint);
+        let found = list_models_from_endpoint(&models_endpoint, api_key.as_ref())
+            .ok()
+            .and_then(|models| models.into_iter().find(|m| m.id == model))
+            .and_then(|m| m.context_length);
+        if let Some(found) = found {
+            *context_window.lock().unwrap_or_else(|e| e.into_inner()) = Some(found);
+        }
+    });
 }
 
 /// Runs `request` on a copy of the agent's history.  If the request fails
@@ -5671,6 +5794,7 @@ fn chat_command(
     let mut active_agent = AgentState {
         name: initial_agent_name.clone(),
         messages: initial_messages,
+        last_prompt_tokens: None,
     };
     status_bar.set_color(agent_ansi_code(&active_agent.name));
 
@@ -5680,6 +5804,26 @@ fn chat_command(
 
     let mut openai_opts = build_openai_opts(opts, &agent_config);
     debug!("Using model: {}", openai_opts.model);
+
+    // Populated from --context-window directly, or (if that wasn't given)
+    // filled in later, in the background, by spawn_context_window_lookup -
+    // see maybe_summarize_proactively for what it's used for. Note: if
+    // /select-agent later switches to a different agent with a different
+    // model/endpoint, this keeps whatever it already had rather than
+    // re-looking it up - a known, accepted limitation (proactive
+    // summarization may fire a little early or late for the new agent
+    // until the cache would naturally be right again), not a correctness
+    // issue: the existing reactive fallback in request_with_summary_fallback
+    // still fully covers an actual overflow regardless.
+    let context_window: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(opts.context_window));
+    if opts.context_window.is_none() {
+        spawn_context_window_lookup(
+            context_window.clone(),
+            openai_opts.endpoint.clone(),
+            openai_opts.api_key.clone(),
+            openai_opts.model.clone(),
+        );
+    }
 
     let prompt_text = Arc::new(Mutex::new(format!(
         "{}",
@@ -5922,6 +6066,16 @@ fn chat_command(
                     }));
 
                     if is_injected {
+                        maybe_summarize_proactively(
+                            &mut active_agent,
+                            &context_window,
+                            &openai_opts,
+                            &db,
+                            &ctrl_c_rx,
+                            &signal_handler_active,
+                            &status_bar,
+                            &chat_pb,
+                        );
                         match request_with_summary_fallback(
                             &mut active_agent,
                             &openai_opts,
@@ -5943,6 +6097,11 @@ fn chat_command(
                         ) {
                             Ok(response) => {
                                 warn_if_truncated(&response, &chat_pb);
+                                if let Some(prompt_tokens) =
+                                    response.usage.as_ref().and_then(|u| u.prompt_tokens)
+                                {
+                                    active_agent.last_prompt_tokens = Some(prompt_tokens);
+                                }
                                 if let Some(ref choices) = response.choices {
                                     if let Some(content) =
                                         choices.first().and_then(|c| c.message.content.as_ref())
@@ -6004,6 +6163,16 @@ fn chat_command(
                         // reasoning text once the response is done, to
                         // render it too) - see create_response_mode.
                         let reasoning_accumulator = Arc::new(Mutex::new(String::new()));
+                        maybe_summarize_proactively(
+                            &mut active_agent,
+                            &context_window,
+                            &openai_opts,
+                            &db,
+                            &ctrl_c_rx,
+                            &signal_handler_active,
+                            &status_bar,
+                            &chat_pb,
+                        );
                         match request_with_summary_fallback(
                             &mut active_agent,
                             &openai_opts,
@@ -6042,6 +6211,11 @@ fn chat_command(
                         ) {
                             Ok(response) => {
                                 warn_if_truncated(&response, &chat_pb);
+                                if let Some(prompt_tokens) =
+                                    response.usage.as_ref().and_then(|u| u.prompt_tokens)
+                                {
+                                    active_agent.last_prompt_tokens = Some(prompt_tokens);
+                                }
                                 // "partial" already rendered any LaTeX
                                 // blocks inline as the response streamed -
                                 // nothing left to do here for it. "full"
@@ -6188,19 +6362,27 @@ fn list_tools_command(
     Ok(())
 }
 
+/// Derives a `/models` endpoint URL from a chat-completions endpoint,
+/// however it's spelled - shared by `list_models_command` and the
+/// best-effort automatic context-window lookup for proactive
+/// summarization (see `spawn_context_window_lookup`).
+fn models_endpoint_from(base_endpoint: &str) -> String {
+    if base_endpoint.ends_with("/chat/completions") {
+        base_endpoint.replace("/chat/completions", "/models")
+    } else if base_endpoint.ends_with('/') {
+        format!("{}models", base_endpoint)
+    } else {
+        format!("{}/models", base_endpoint)
+    }
+}
+
 fn list_models_command(opts: &Opts) -> Result<(), Box<dyn Error>> {
     let base_endpoint = opts
         .endpoint
         .clone()
         .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
 
-    let models_endpoint = if base_endpoint.ends_with("/chat/completions") {
-        base_endpoint.replace("/chat/completions", "/models")
-    } else if base_endpoint.ends_with("/") {
-        format!("{}models", base_endpoint)
-    } else {
-        format!("{}/models", base_endpoint)
-    };
+    let models_endpoint = models_endpoint_from(&base_endpoint);
 
     match list_models_from_endpoint(&models_endpoint, opts.api_key.as_ref()) {
         Ok(models) => {
@@ -6339,6 +6521,15 @@ struct Opts {
     #[clap(long)]
     /// Start chat session with this agent instead of 'default'
     agent: Option<String>,
+    #[clap(long)]
+    /// The model's context window size, in tokens - used to proactively
+    /// summarize the conversation before it gets too large, rather than
+    /// only reactively after an actual "context length exceeded" failure.
+    /// If not given, faber tries to look this up automatically from the
+    /// endpoint's `/models` listing at chat startup (best-effort, in the
+    /// background - if that fails or the model isn't listed, proactive
+    /// summarization simply never triggers, same as leaving this unset).
+    context_window: Option<u32>,
     #[clap(long, value_enum)]
     /// Render \[...\], \(...\), and $$...$$ LaTeX blocks in responses as
     /// images, on terminals where inline graphics display is supported (a
@@ -6403,6 +6594,7 @@ impl Default for Opts {
             parameter: Vec::new(),
             db_path: None,
             agent: None,
+            context_window: None,
             display_graphics: None,
             server: None,
             server_key: None,
@@ -6457,6 +6649,10 @@ impl Opts {
 
         if self.display_graphics.is_none() {
             self.display_graphics = config.display_graphics;
+        }
+
+        if self.context_window.is_none() {
+            self.context_window = config.context_window;
         }
 
         if self.tool_choice.is_none() {
@@ -6725,6 +6921,61 @@ fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use rustyline::history::{History, SearchDirection};
+
+    #[test]
+    fn test_models_endpoint_from_chat_completions_suffix() {
+        assert_eq!(
+            models_endpoint_from("http://localhost:8080/v1/chat/completions"),
+            "http://localhost:8080/v1/models"
+        );
+    }
+
+    #[test]
+    fn test_models_endpoint_from_trailing_slash() {
+        assert_eq!(
+            models_endpoint_from("http://localhost:8080/v1/"),
+            "http://localhost:8080/v1/models"
+        );
+    }
+
+    #[test]
+    fn test_models_endpoint_from_no_trailing_slash() {
+        assert_eq!(
+            models_endpoint_from("http://localhost:8080/v1"),
+            "http://localhost:8080/v1/models"
+        );
+    }
+
+    #[test]
+    fn test_should_summarize_proactively_below_margin_is_false() {
+        // 79% of a 1000-token window - just under the 80% margin.
+        assert!(!should_summarize_proactively(Some(790), Some(1000)));
+    }
+
+    #[test]
+    fn test_should_summarize_proactively_at_or_above_margin_is_true() {
+        assert!(should_summarize_proactively(Some(800), Some(1000)));
+        assert!(should_summarize_proactively(Some(950), Some(1000)));
+    }
+
+    #[test]
+    fn test_should_summarize_proactively_unknown_inputs_are_false() {
+        // Neither piece of information available yet (or ever, if the
+        // model isn't in a /models listing and --context-window wasn't
+        // given) - never fire blindly.
+        assert!(!should_summarize_proactively(None, None));
+        assert!(!should_summarize_proactively(Some(999_999), None));
+        assert!(!should_summarize_proactively(None, Some(1000)));
+    }
+
+    #[test]
+    fn test_should_summarize_proactively_zero_window_is_false() {
+        // Guards the division: a reported context_length of 0 (unusual,
+        // but not something to trust blindly) must not be treated as
+        // "always exceeded" via a 0/0 or divide-by-zero artifact.
+        assert!(!should_summarize_proactively(Some(0), Some(0)));
+        assert!(!should_summarize_proactively(Some(5), Some(0)));
+    }
 
     #[test]
     fn test_parse_mcp_server_flag_http() {
