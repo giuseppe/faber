@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::{BufRead, BufReader};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -331,6 +332,12 @@ pub enum StatusUpdate {
         name: String,
         duration_ms: u64,
     },
+    /// About to run several tool calls concurrently (see `run_tool_calls`).
+    /// Their output is buffered and each is then reported through the
+    /// usual `ToolStart`/`ToolComplete` pair, in order, once all finish.
+    ToolBatchStart {
+        names: Vec<String>,
+    },
     /// About to send a request and wait for the response - reported once
     /// per turn (the first request and every one that follows a tool call),
     /// with the size of the outgoing request body, so a long wait on a
@@ -564,6 +571,294 @@ pub fn tool_call(
 }
 
 /// Create a Message from the specified role and content.
+/// How a tool call touches shared state, used by `plan_tool_call_groups`
+/// to decide which calls from one turn can safely run at the same time.
+#[derive(Debug, Clone, PartialEq)]
+enum ToolAccess {
+    /// Touches nothing another call in the same turn could change (network
+    /// fetches, GitHub API and DB reads).
+    Independent,
+    /// Reads one file.
+    ReadPath(PathBuf),
+    /// Reads across the whole working tree (`glob`, `grep`).
+    ReadTree,
+    /// Writes one file.
+    WritePath(PathBuf),
+    /// Anything else - arbitrary commands, deletions, DB/agent/task
+    /// writes, sub-agents, MCP tools, unknown tools - always runs alone.
+    Exclusive,
+}
+
+impl ToolAccess {
+    fn conflicts_with(&self, other: &ToolAccess) -> bool {
+        use ToolAccess::*;
+        match (self, other) {
+            (Exclusive, _) | (_, Exclusive) => true,
+            (WritePath(a), WritePath(b) | ReadPath(b)) | (ReadPath(b), WritePath(a)) => a == b,
+            (WritePath(_), ReadTree) | (ReadTree, WritePath(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Resolves `path` against the current directory and folds away `.`/`..`
+/// lexically, so different spellings of the same file compare equal.
+/// Symlinks aren't resolved - the file may not exist yet.
+fn normalize_tool_path(path: &str) -> PathBuf {
+    let path = Path::new(path);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            c => normalized.push(c),
+        }
+    }
+    normalized
+}
+
+/// Classifies a built-in tool call by name and arguments. A call whose
+/// `path` can't be parsed is treated as `Exclusive` rather than guessed at.
+fn tool_access(name: &str, arguments: &str) -> ToolAccess {
+    let path = || {
+        serde_json::from_str::<serde_json::Value>(arguments)
+            .ok()
+            .and_then(|v| v.get("path")?.as_str().map(normalize_tool_path))
+    };
+    match name {
+        "read_file" => path().map_or(ToolAccess::Exclusive, ToolAccess::ReadPath),
+        "write_file" | "patch_file" => path().map_or(ToolAccess::Exclusive, ToolAccess::WritePath),
+        "glob" | "grep_in_current_directory" => ToolAccess::ReadTree,
+        "fetch_web_content"
+        | "github_pull_request"
+        | "github_pull_request_patch"
+        | "github_issue"
+        | "github_issue_comments"
+        | "github_issues"
+        | "github_pull_requests"
+        | "agent_list"
+        | "agent_get"
+        | "agent_data_get"
+        | "agent_data_list"
+        | "task_list"
+        | "task_get"
+        | "task_pending" => ToolAccess::Independent,
+        _ => ToolAccess::Exclusive,
+    }
+}
+
+/// Splits a turn's tool calls (given by their `accesses`, in order) into
+/// consecutive groups whose members don't conflict with each other. Groups
+/// run one after another and the calls within a group run concurrently,
+/// so every conflicting pair still runs in the order the model asked for.
+fn plan_tool_call_groups(accesses: &[ToolAccess]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (i, access) in accesses.iter().enumerate() {
+        match groups.last_mut() {
+            Some(group) if !group.iter().any(|&j| accesses[j].conflicts_with(access)) => {
+                group.push(i)
+            }
+            _ => groups.push(vec![i]),
+        }
+    }
+    groups
+}
+
+fn report_progress(
+    mode: &ResponseMode,
+    status: StatusUpdate,
+    start_time: Instant,
+) -> Result<(), Box<dyn Error>> {
+    if let ResponseMode::Streaming {
+        progress_handler, ..
+    } = mode
+    {
+        progress_handler(&ProgressInfo {
+            status,
+            elapsed_ms: start_time.elapsed().as_millis() as u64,
+        })?;
+    }
+    Ok(())
+}
+
+/// Runs one tool call with its output going straight to `ctx.println`.
+fn run_tool_call_live(
+    tools_collection: &ToolsCollection,
+    req: &ToolCall,
+    ctx: &crate::ToolContext,
+    mode: &ResponseMode,
+    start_time: Instant,
+) -> Result<Message, Box<dyn Error>> {
+    report_progress(
+        mode,
+        StatusUpdate::ToolStart {
+            name: req.function.name.clone(),
+            arguments: req.function.arguments.clone(),
+        },
+        start_time,
+    )?;
+    debug!(
+        "Executing tool call '{}' with complete arguments (length: {})",
+        req.function.name,
+        req.function.arguments.len()
+    );
+    let tool_start_time = Instant::now();
+    // Mark the tool's own output as "boxed" for the duration of the call
+    // only, so a println closure that wants to frame it can tell it apart
+    // from unrelated output - reset unconditionally (even on error) so the
+    // flag never gets stuck on for later, unrelated println calls.
+    ctx.boxed.store(true, Ordering::Relaxed);
+    let result = tool_call(tools_collection, req, ctx);
+    ctx.boxed.store(false, Ordering::Relaxed);
+    let msg = result?;
+    report_progress(
+        mode,
+        StatusUpdate::ToolComplete {
+            name: req.function.name.clone(),
+            duration_ms: tool_start_time.elapsed().as_millis() as u64,
+        },
+        start_time,
+    )?;
+    Ok(msg)
+}
+
+/// Runs `calls` concurrently, one thread each. Each tool's output is
+/// buffered and replayed through `ctx.println` afterwards, in call order,
+/// framed by its own `ToolStart`/`ToolComplete`, so concurrent output never
+/// interleaves.
+fn run_tool_call_group(
+    tools_collection: &ToolsCollection,
+    calls: &[&ToolCall],
+    ctx: &crate::ToolContext,
+    mode: &ResponseMode,
+    start_time: Instant,
+) -> Result<Vec<Message>, Box<dyn Error>> {
+    report_progress(
+        mode,
+        StatusUpdate::ToolBatchStart {
+            names: calls.iter().map(|c| c.function.name.clone()).collect(),
+        },
+        start_time,
+    )?;
+    let outcomes: Vec<(Result<Message, String>, Vec<String>, Duration)> = thread::scope(|scope| {
+        let handles: Vec<_> = calls
+            .iter()
+            .map(|&req| {
+                scope.spawn(move || {
+                    let output = Arc::new(Mutex::new(Vec::new()));
+                    let sink = output.clone();
+                    let mut buffered = crate::ToolContext::new(move |msg: &str| {
+                        sink.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(msg.to_string())
+                    });
+                    buffered.db = ctx.db.clone();
+                    buffered.agent_name = ctx.agent_name.clone();
+                    buffered.extra = ctx.extra.clone();
+                    buffered.mcp_manager = ctx.mcp_manager.clone();
+                    let tool_start_time = Instant::now();
+                    let result =
+                        tool_call(tools_collection, req, &buffered).map_err(|e| e.to_string());
+                    let lines =
+                        std::mem::take(&mut *output.lock().unwrap_or_else(|e| e.into_inner()));
+                    (result, lines, tool_start_time.elapsed())
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+            .collect()
+    });
+
+    let mut messages = Vec::with_capacity(calls.len());
+    for (req, (result, lines, duration)) in calls.iter().zip(outcomes) {
+        report_progress(
+            mode,
+            StatusUpdate::ToolStart {
+                name: req.function.name.clone(),
+                arguments: req.function.arguments.clone(),
+            },
+            start_time,
+        )?;
+        ctx.boxed.store(true, Ordering::Relaxed);
+        for line in &lines {
+            ctx.println(line);
+        }
+        ctx.boxed.store(false, Ordering::Relaxed);
+        let msg = result.map_err(|e| -> Box<dyn Error> { e.into() })?;
+        report_progress(
+            mode,
+            StatusUpdate::ToolComplete {
+                name: req.function.name.clone(),
+                duration_ms: duration.as_millis() as u64,
+            },
+            start_time,
+        )?;
+        messages.push(msg);
+    }
+    Ok(messages)
+}
+
+/// Runs a turn's tool calls, returning their result messages in call
+/// order. Calls that can't interfere with each other (see `ToolAccess`)
+/// run concurrently; everything else runs one at a time, in order.
+pub fn run_tool_calls(
+    tools_collection: &ToolsCollection,
+    tool_calls: &[ToolCall],
+    ctx: &crate::ToolContext,
+    mode: &ResponseMode,
+    start_time: Instant,
+) -> Result<Vec<Message>, Box<dyn Error>> {
+    let accesses: Vec<ToolAccess> = tool_calls
+        .iter()
+        .map(|tc| {
+            // tool_call dispatches to MCP first, even for a name that
+            // shadows a built-in, and MCP tools are opaque.
+            let is_mcp = ctx
+                .mcp_manager
+                .as_ref()
+                .is_some_and(|m| m.has_tool(&tc.function.name));
+            if is_mcp {
+                ToolAccess::Exclusive
+            } else {
+                tool_access(&tc.function.name, &tc.function.arguments)
+            }
+        })
+        .collect();
+
+    let mut messages = Vec::with_capacity(tool_calls.len());
+    for group in plan_tool_call_groups(&accesses) {
+        if let [i] = group[..] {
+            messages.push(run_tool_call_live(
+                tools_collection,
+                &tool_calls[i],
+                ctx,
+                mode,
+                start_time,
+            )?);
+        } else {
+            let calls: Vec<&ToolCall> = group.iter().map(|&i| &tool_calls[i]).collect();
+            debug!("Running {} tool calls concurrently", calls.len());
+            messages.extend(run_tool_call_group(
+                tools_collection,
+                &calls,
+                ctx,
+                mode,
+                start_time,
+            )?);
+        }
+    }
+    Ok(messages)
+}
+
 pub fn make_message(role: &str, content: String) -> Message {
     Message {
         role: role.to_string(),
@@ -847,61 +1142,13 @@ fn post_request_with_mode_and_recursion(
                         .as_ref()
                         .ok_or("Invalid response")?;
 
-                    for tool_call_request in tool_calls {
-                        // Show progress for tool start
-                        if let ResponseMode::Streaming {
-                            progress_handler, ..
-                        } = &mode
-                        {
-                            let progress_info = ProgressInfo {
-                                status: StatusUpdate::ToolStart {
-                                    name: tool_call_request.function.name.clone(),
-                                    arguments: tool_call_request.function.arguments.clone(),
-                                },
-                                elapsed_ms: start_time.elapsed().as_millis() as u64,
-                            };
-                            progress_handler(&progress_info)?;
-                        }
-
-                        debug!(
-                            "Executing tool call '{}' with complete arguments (length: {})",
-                            tool_call_request.function.name,
-                            tool_call_request.function.arguments.len()
-                        );
-                        let tool_start_time = start_time.elapsed();
-                        // Mark the tool's own output as "boxed" for the
-                        // duration of the call only, so a println closure
-                        // that wants to frame it can tell it apart from
-                        // unrelated output - reset unconditionally (even on
-                        // error) so the flag never gets stuck on for later,
-                        // unrelated println calls.
-                        ctx.boxed.store(true, Ordering::Relaxed);
-                        let result = tool_call(&tools_collection, tool_call_request, ctx);
-                        ctx.boxed.store(false, Ordering::Relaxed);
-                        let msg = result?;
-                        let tool_duration = start_time.elapsed() - tool_start_time;
-
-                        // Show progress for tool execution completion
-                        if let ResponseMode::Streaming {
-                            progress_handler, ..
-                        } = &mode
-                        {
-                            let progress_info = ProgressInfo {
-                                status: StatusUpdate::ToolComplete {
-                                    name: tool_call_request.function.name.clone(),
-                                    duration_ms: tool_duration.as_millis() as u64,
-                                },
-                                elapsed_ms: start_time.elapsed().as_millis() as u64,
-                            };
-                            progress_handler(&progress_info)?;
-                        }
-
-                        debug!(
-                            "Adding tool response message for tool: {}",
-                            tool_call_request.function.name
-                        );
-                        messages.push(msg);
-                    }
+                    messages.extend(run_tool_calls(
+                        tools_collection,
+                        tool_calls,
+                        ctx,
+                        &mode,
+                        start_time,
+                    )?);
                 }
             }
         }
@@ -1321,6 +1568,167 @@ fn handle_streaming_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read(p: &str) -> ToolAccess {
+        ToolAccess::ReadPath(PathBuf::from(p))
+    }
+
+    fn write(p: &str) -> ToolAccess {
+        ToolAccess::WritePath(PathBuf::from(p))
+    }
+
+    #[test]
+    fn test_plan_tool_call_groups_independent_reads_share_a_group() {
+        let accesses = [
+            read("/a"),
+            read("/b"),
+            ToolAccess::ReadTree,
+            ToolAccess::Independent,
+        ];
+        assert_eq!(plan_tool_call_groups(&accesses), vec![vec![0, 1, 2, 3]]);
+    }
+
+    #[test]
+    fn test_plan_tool_call_groups_same_path_write_splits_in_order() {
+        let accesses = [read("/a"), write("/a"), read("/a")];
+        assert_eq!(
+            plan_tool_call_groups(&accesses),
+            vec![vec![0], vec![1], vec![2]]
+        );
+    }
+
+    #[test]
+    fn test_plan_tool_call_groups_writes_to_different_paths_share_a_group() {
+        let accesses = [write("/a"), write("/b"), read("/c")];
+        assert_eq!(plan_tool_call_groups(&accesses), vec![vec![0, 1, 2]]);
+    }
+
+    #[test]
+    fn test_plan_tool_call_groups_write_conflicts_with_tree_read() {
+        let accesses = [ToolAccess::ReadTree, write("/a")];
+        assert_eq!(plan_tool_call_groups(&accesses), vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn test_plan_tool_call_groups_exclusive_runs_alone() {
+        let accesses = [
+            read("/a"),
+            ToolAccess::Exclusive,
+            ToolAccess::Independent,
+            ToolAccess::Independent,
+        ];
+        assert_eq!(
+            plan_tool_call_groups(&accesses),
+            vec![vec![0], vec![1], vec![2, 3]]
+        );
+    }
+
+    #[test]
+    fn test_tool_access_normalizes_path_spellings() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            tool_access("read_file", r#"{"path": "./src/../x.txt"}"#),
+            ToolAccess::ReadPath(cwd.join("x.txt"))
+        );
+        assert_eq!(
+            tool_access("patch_file", r#"{"path": "x.txt", "edits": []}"#),
+            ToolAccess::WritePath(cwd.join("x.txt"))
+        );
+    }
+
+    #[test]
+    fn test_tool_access_unknown_or_unparseable_is_exclusive() {
+        assert_eq!(tool_access("run_command", "{}"), ToolAccess::Exclusive);
+        assert_eq!(tool_access("some_new_tool", "{}"), ToolAccess::Exclusive);
+        assert_eq!(tool_access("read_file", "not json"), ToolAccess::Exclusive);
+    }
+
+    fn sleepy_tool(args: &String, ctx: &crate::ToolContext) -> Result<String, Box<dyn Error>> {
+        ctx.println(&format!("start {}", args));
+        thread::sleep(Duration::from_millis(300));
+        ctx.println(&format!("end {}", args));
+        Ok(format!("done {}", args))
+    }
+
+    fn make_call(id: &str, name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            index: None,
+            id: id.to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_run_tool_calls_runs_independent_calls_concurrently_in_order() {
+        let mut tools = ToolsCollection::new();
+        // Registered under read-only built-in names so they classify as
+        // parallel-safe.
+        for name in ["github_issue", "fetch_web_content", "task_list"] {
+            tools.insert(
+                name.to_string(),
+                ToolItem {
+                    callback: sleepy_tool,
+                    schema: String::new(),
+                },
+            );
+        }
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let sink = output.clone();
+        let ctx = crate::ToolContext::new(move |msg: &str| {
+            sink.lock().unwrap().push(msg.to_string());
+        });
+        let calls = [
+            make_call("1", "github_issue", "a"),
+            make_call("2", "fetch_web_content", "b"),
+            make_call("3", "task_list", "c"),
+        ];
+
+        let started = Instant::now();
+        let messages =
+            run_tool_calls(&tools, &calls, &ctx, &ResponseMode::Complete, started).unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "three 300ms tools took {:?}, so they didn't run concurrently",
+            elapsed
+        );
+        let ids: Vec<_> = messages
+            .iter()
+            .map(|m| m.tool_call_id.clone().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["1", "2", "3"]);
+        assert_eq!(messages[1].content.as_deref(), Some("done b"));
+        // Each tool's output is replayed as one uninterrupted block.
+        assert_eq!(
+            *output.lock().unwrap(),
+            vec!["start a", "end a", "start b", "end b", "start c", "end c"]
+        );
+    }
+
+    #[test]
+    fn test_run_tool_calls_runs_exclusive_calls_one_at_a_time() {
+        let mut tools = ToolsCollection::new();
+        tools.insert(
+            "run_command".to_string(),
+            ToolItem {
+                callback: sleepy_tool,
+                schema: String::new(),
+            },
+        );
+        let ctx = crate::ToolContext::new(|_: &str| {});
+        let calls = [
+            make_call("1", "run_command", "a"),
+            make_call("2", "run_command", "b"),
+        ];
+        let started = Instant::now();
+        run_tool_calls(&tools, &calls, &ctx, &ResponseMode::Complete, started).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(600));
+    }
 
     #[test]
     fn test_accumulate_usage_sums_across_round_trips() {

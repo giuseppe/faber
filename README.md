@@ -293,6 +293,17 @@ faber --no-tools chat                           # disable all tools
 faber --tool-choice required chat               # force tool usage
 ```
 
+### Parallel tool calls
+
+When the model asks for several tool calls in one turn, calls that can't
+interfere with each other run concurrently: file reads, `glob`/`grep`,
+GitHub and DB reads, `fetch_web_content`, and `write_file`/`patch_file` on
+different paths. A write conflicts with reads or writes of the same path and
+with `glob`/`grep`. Everything else (`run_command`, `delete_path`,
+sub-agents, DB/task writes, MCP tools) runs alone. Conflicting calls always
+run in the order the model gave them. Output from calls that ran
+concurrently is buffered and shown one tool at a time once they all finish.
+
 ## MCP (Model Context Protocol)
 
 faber can connect to external tool servers using the MCP protocol.

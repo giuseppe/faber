@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::openai::{
     Choice, ContextLengthError, FunctionCall, InterruptedError, Message, OpenAIResponse,
-    ProgressInfo, ResponseMode, StatusUpdate, ToolCall, Usage, accumulate_usage, tool_call,
+    ProgressInfo, ResponseMode, StatusUpdate, ToolCall, Usage, accumulate_usage, run_tool_calls,
 };
 
 static TURN_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -368,41 +368,13 @@ pub fn post_request_dummy(
         if has_tool_calls {
             let tool_calls = assistant_msg.tool_calls.as_ref().unwrap();
 
-            for tc in tool_calls {
-                if let ResponseMode::Streaming {
-                    ref progress_handler,
-                    ..
-                } = mode
-                {
-                    progress_handler(&ProgressInfo {
-                        status: StatusUpdate::ToolStart {
-                            name: tc.function.name.clone(),
-                            arguments: tc.function.arguments.clone(),
-                        },
-                        elapsed_ms: start_time.elapsed().as_millis() as u64,
-                    })?;
-                }
-
-                let tool_start = start_time.elapsed();
-                let msg = tool_call(tools_collection, tc, ctx)?;
-                let tool_duration = start_time.elapsed() - tool_start;
-
-                if let ResponseMode::Streaming {
-                    ref progress_handler,
-                    ..
-                } = mode
-                {
-                    progress_handler(&ProgressInfo {
-                        status: StatusUpdate::ToolComplete {
-                            name: tc.function.name.clone(),
-                            duration_ms: tool_duration.as_millis() as u64,
-                        },
-                        elapsed_ms: start_time.elapsed().as_millis() as u64,
-                    })?;
-                }
-
-                messages.push(msg);
-            }
+            messages.extend(run_tool_calls(
+                tools_collection,
+                tool_calls,
+                ctx,
+                &mode,
+                start_time,
+            )?);
 
             continue;
         }
