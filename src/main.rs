@@ -5121,6 +5121,17 @@ fn create_response_mode(
                     );
                     printer_for_progress.println(&tool_box_open(name, &formatted_args));
                 }
+                StatusUpdate::ToolBatchStart { names } => {
+                    status_bar.set_agent_status(
+                        &agent_name,
+                        &format!(
+                            "Running {} tools in parallel: {}",
+                            names.len(),
+                            names.join(", ")
+                        ),
+                        true,
+                    );
+                }
                 StatusUpdate::ToolComplete { name, duration_ms } => {
                     let duration_secs = *duration_ms as f64 / 1000.0;
                     tool_active_for_progress.store(false, Ordering::Relaxed);
