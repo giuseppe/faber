@@ -126,6 +126,17 @@ context window, the chat summarizes the history automatically and retries the
 request once.  Work done by tool calls earlier in the failed turn is included
 in the summary, and your last message is kept verbatim after it.
 
+The chat also summarizes *proactively*, before that ever happens: once the
+last request's reported prompt-token count reaches about 80% of the model's
+context window, the next request summarizes the conversation first instead of
+risking the same failure. This needs to know the context window size, which
+faber tries to look up automatically (in the background, so it doesn't delay
+your first message) from the endpoint's `/models` listing; if the endpoint
+doesn't expose that, or the lookup fails, proactive summarization simply
+never triggers - only the reactive fallback above still applies. Use
+`--context-window <N>` to set it explicitly (in tokens) instead of relying on
+the automatic lookup.
+
 ### Prompt (one-shot)
 
 Send a single prompt and print the response:
