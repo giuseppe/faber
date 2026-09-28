@@ -73,6 +73,7 @@ faber --db-path state.db --agent mybot chat  # start as a specific agent
 | `/tools` | List all available tools (built-in + MCP) |
 | `/chdir <path>` | Change the current working directory (Tab-completes directory names) |
 | `/pwd` | Show the current working directory |
+| `/cost` | Show session token usage and estimated cost |
 
 Commands can also use `\` as the prefix (e.g. `\quit`).
 
@@ -136,6 +137,12 @@ doesn't expose that, or the lookup fails, proactive summarization simply
 never triggers - only the reactive fallback above still applies. Use
 `--context-window <N>` to set it explicitly (in tokens) instead of relying on
 the automatic lookup.
+
+`/cost` shows accumulated token usage for the whole session (every agent, not
+just the current one) - prompt/completion/total tokens across every request
+so far, including each intermediate tool-call round trip - plus an estimated dollar cost, using the same background `/models`
+lookup's pricing if the endpoint provides it; otherwise just the token
+counts, with no guessed price shown.
 
 ### Prompt (one-shot)
 

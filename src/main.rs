@@ -78,6 +78,45 @@ struct AgentState {
     last_prompt_tokens: Option<u32>,
 }
 
+/// Accumulated token usage across every chat turn in the current session
+/// (every agent, not just the active one - switching agents doesn't reset
+/// this, unlike `AgentState::last_prompt_tokens`), shown by the `/cost`
+/// command. Each turn is recorded from `OpenAIResponse::turn_usage`, so
+/// every tool-call round trip within it counts, not just the final
+/// request. A turn whose requests didn't report `usage` at all simply
+/// doesn't add anything - not treated as zero tokens used, just unknown.
+#[derive(Debug, Default, Clone, Copy)]
+struct SessionUsage {
+    turns: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+}
+
+impl SessionUsage {
+    fn record(&mut self, usage: &openai::Usage) {
+        self.turns += 1;
+        self.prompt_tokens += u64::from(usage.prompt_tokens.unwrap_or(0));
+        self.completion_tokens += u64::from(usage.completion_tokens.unwrap_or(0));
+        self.total_tokens += u64::from(usage.total_tokens.unwrap_or(0));
+    }
+}
+
+/// Estimates the dollar cost of `usage` given `pricing`'s per-token prompt/
+/// completion rates (as OpenRouter's `/models` API reports them - the
+/// documented convention this parses `pricing.prompt`/`pricing.completion`
+/// against). `None` if either rate isn't a valid number - a `Pricing`
+/// that's present at all but has a genuinely unparseable rate is rare
+/// enough (and not worth guessing at) that falling back to "unknown, don't
+/// show a cost" is preferable to a silently wrong number.
+fn estimate_cost_usd(usage: &SessionUsage, pricing: &openai::Pricing) -> Option<f64> {
+    let prompt_rate: f64 = pricing.prompt.parse().ok()?;
+    let completion_rate: f64 = pricing.completion.parse().ok()?;
+    Some(
+        usage.prompt_tokens as f64 * prompt_rate + usage.completion_tokens as f64 * completion_rate,
+    )
+}
+
 struct SubAgentContext {
     tools: Arc<ToolsCollection>,
     opts: openai::Opts,
@@ -4099,6 +4138,7 @@ enum ChatCommand {
     Tools,
     Chdir(String),
     Pwd,
+    Cost,
     Message(String),
     Empty,
     Invalid(String),
@@ -4215,6 +4255,9 @@ fn parse_chat_command(line: &str) -> ChatCommand {
     if normalized == "/pwd" {
         return ChatCommand::Pwd;
     }
+    if normalized == "/cost" {
+        return ChatCommand::Cost;
+    }
 
     if normalized.starts_with('/') {
         return ChatCommand::Invalid(format!("Unknown command: {}", normalized));
@@ -4274,6 +4317,8 @@ fn handle_chat_command(
     session_id: &str,
     mcp_manager: &Option<Arc<faber::mcp::McpManager>>,
     status_bar: &status_bar::StatusBar,
+    session_usage: &Arc<Mutex<SessionUsage>>,
+    model_pricing: &Arc<Mutex<Option<openai::Pricing>>>,
 ) -> Result<bool, Box<dyn Error>> {
     let messages = &mut active_agent.messages;
     match command {
@@ -4295,6 +4340,7 @@ fn handle_chat_command(
             chat_pb.println("  /tools                 List all available tools");
             chat_pb.println("  /chdir <path>          Change the current working directory");
             chat_pb.println("  /pwd                   Show the current working directory");
+            chat_pb.println("  /cost                  Show session token usage and estimated cost");
             Ok(true)
         }
         ChatCommand::Quit => Ok(false),
@@ -4622,6 +4668,31 @@ fn handle_chat_command(
             match std::env::current_dir() {
                 Ok(cwd) => chat_pb.println(&cwd.display().to_string()),
                 Err(e) => chat_pb.println(&format!("Failed to get current directory: {}", e)),
+            }
+            Ok(true)
+        }
+        ChatCommand::Cost => {
+            let usage = *session_usage.lock().unwrap_or_else(|e| e.into_inner());
+            chat_pb.println(&format!(
+                "Session usage ({} turn{}):",
+                usage.turns,
+                if usage.turns == 1 { "" } else { "s" }
+            ));
+            chat_pb.println(&format!("  Prompt tokens:     {}", usage.prompt_tokens));
+            chat_pb.println(&format!("  Completion tokens: {}", usage.completion_tokens));
+            chat_pb.println(&format!("  Total tokens:      {}", usage.total_tokens));
+            let pricing = model_pricing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            match pricing.as_ref().and_then(|p| estimate_cost_usd(&usage, p)) {
+                Some(cost) => chat_pb.println(&format!(
+                    "  Estimated cost:    ${:.4} ({})",
+                    cost, openai_opts.model
+                )),
+                None => chat_pb.println(
+                    "  Estimated cost:    unknown (couldn't fetch pricing for this model/endpoint)",
+                ),
             }
             Ok(true)
         }
@@ -5459,30 +5530,45 @@ fn maybe_summarize_proactively(
     }
 }
 
-/// Looks up `model`'s context window size from `endpoint`'s `/models`
-/// listing (`models_endpoint_from`) in a background thread, storing the
-/// result in `context_window` if found. Used to populate
-/// `--context-window` automatically when it wasn't given explicitly -
-/// spawned once at chat startup rather than called inline, since it's a
-/// network request that would otherwise delay the first prompt for a
-/// purely best-effort convenience; if it fails, times out, or the model
-/// isn't in the list, `context_window` is simply left as `None` and
-/// proactive summarization never triggers, same as if this were never
-/// called at all.
-fn spawn_context_window_lookup(
+/// Looks up `model`'s context window size and pricing from `endpoint`'s
+/// `/models` listing (`models_endpoint_from`) in a background thread,
+/// storing whichever it finds into `context_window`/`pricing`. Used to
+/// populate `--context-window` automatically when it wasn't given
+/// explicitly, and to make `/cost` able to show an estimated dollar
+/// amount rather than only raw token counts - spawned once at chat
+/// startup rather than called inline, since it's a network request that
+/// would otherwise delay the first prompt for what's a purely best-effort
+/// convenience either way; if it fails, times out, or the model isn't in
+/// the list, both are simply left as `None` (proactive summarization never
+/// triggers, `/cost` shows tokens only), same as if this were never called
+/// at all.
+fn spawn_model_metadata_lookup(
     context_window: Arc<Mutex<Option<u32>>>,
+    context_window_is_explicit: bool,
+    pricing: Arc<Mutex<Option<openai::Pricing>>>,
     endpoint: String,
     api_key: Option<String>,
     model: String,
 ) {
     std::thread::spawn(move || {
         let models_endpoint = models_endpoint_from(&endpoint);
-        let found = list_models_from_endpoint(&models_endpoint, api_key.as_ref())
+        let Some(found) = list_models_from_endpoint(&models_endpoint, api_key.as_ref())
             .ok()
             .and_then(|models| models.into_iter().find(|m| m.id == model))
-            .and_then(|m| m.context_length);
-        if let Some(found) = found {
-            *context_window.lock().unwrap_or_else(|e| e.into_inner()) = Some(found);
+        else {
+            return;
+        };
+        // Never overwrite an explicit --context-window with whatever the
+        // lookup finds, even if it finds something different - the CLI
+        // flag is a deliberate override, not just a fallback default that
+        // happens to run first.
+        if !context_window_is_explicit {
+            if let Some(context_length) = found.context_length {
+                *context_window.lock().unwrap_or_else(|e| e.into_inner()) = Some(context_length);
+            }
+        }
+        if let Some(model_pricing) = found.pricing {
+            *pricing.lock().unwrap_or_else(|e| e.into_inner()) = Some(model_pricing);
         }
     });
 }
@@ -5806,24 +5892,32 @@ fn chat_command(
     debug!("Using model: {}", openai_opts.model);
 
     // Populated from --context-window directly, or (if that wasn't given)
-    // filled in later, in the background, by spawn_context_window_lookup -
-    // see maybe_summarize_proactively for what it's used for. Note: if
-    // /select-agent later switches to a different agent with a different
-    // model/endpoint, this keeps whatever it already had rather than
-    // re-looking it up - a known, accepted limitation (proactive
-    // summarization may fire a little early or late for the new agent
-    // until the cache would naturally be right again), not a correctness
-    // issue: the existing reactive fallback in request_with_summary_fallback
-    // still fully covers an actual overflow regardless.
+    // filled in later, in the background, by spawn_model_metadata_lookup -
+    // see maybe_summarize_proactively for what it's used for. `pricing` has
+    // no CLI override (a hardcoded price wouldn't make much sense) - always
+    // whatever the background lookup finds, if anything, used by /cost to
+    // show an estimated dollar amount. Note: if /select-agent later
+    // switches to a different agent with a different model/endpoint,
+    // both keep whatever they already had rather than re-looking up - a
+    // known, accepted limitation (proactive summarization may fire a
+    // little early or late for the new agent until the cache would
+    // naturally be right again, and /cost's estimate may reflect the
+    // wrong model's price for tokens used under a previous one), not a
+    // correctness issue: the existing reactive fallback in
+    // request_with_summary_fallback still fully covers an actual context
+    // overflow regardless, and /cost's raw token counts are always
+    // accurate even if the price estimate briefly isn't.
     let context_window: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(opts.context_window));
-    if opts.context_window.is_none() {
-        spawn_context_window_lookup(
-            context_window.clone(),
-            openai_opts.endpoint.clone(),
-            openai_opts.api_key.clone(),
-            openai_opts.model.clone(),
-        );
-    }
+    let model_pricing: Arc<Mutex<Option<openai::Pricing>>> = Arc::new(Mutex::new(None));
+    spawn_model_metadata_lookup(
+        context_window.clone(),
+        opts.context_window.is_some(),
+        model_pricing.clone(),
+        openai_opts.endpoint.clone(),
+        openai_opts.api_key.clone(),
+        openai_opts.model.clone(),
+    );
+    let session_usage: Arc<Mutex<SessionUsage>> = Arc::new(Mutex::new(SessionUsage::default()));
 
     let prompt_text = Arc::new(Mutex::new(format!(
         "{}",
@@ -6026,6 +6120,8 @@ fn chat_command(
             &session_id,
             &mcp_manager,
             &status_bar,
+            &session_usage,
+            &model_pricing,
         ) {
             Ok(handled) => handled,
             Err(e) => {
@@ -6101,6 +6197,12 @@ fn chat_command(
                                     response.usage.as_ref().and_then(|u| u.prompt_tokens)
                                 {
                                     active_agent.last_prompt_tokens = Some(prompt_tokens);
+                                }
+                                if let Some(usage) = response.turn_usage.as_ref() {
+                                    session_usage
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .record(usage);
                                 }
                                 if let Some(ref choices) = response.choices {
                                     if let Some(content) =
@@ -6215,6 +6317,12 @@ fn chat_command(
                                     response.usage.as_ref().and_then(|u| u.prompt_tokens)
                                 {
                                     active_agent.last_prompt_tokens = Some(prompt_tokens);
+                                }
+                                if let Some(usage) = response.turn_usage.as_ref() {
+                                    session_usage
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .record(usage);
                                 }
                                 // "partial" already rendered any LaTeX
                                 // blocks inline as the response streamed -
@@ -7253,6 +7361,86 @@ mod tests {
     #[test]
     fn test_parse_chat_command_pwd() {
         assert!(matches!(parse_chat_command("/pwd"), ChatCommand::Pwd));
+    }
+
+    #[test]
+    fn test_parse_chat_command_cost() {
+        assert!(matches!(parse_chat_command("/cost"), ChatCommand::Cost));
+    }
+
+    #[test]
+    fn test_session_usage_record_accumulates_across_calls() {
+        let mut usage = SessionUsage::default();
+        usage.record(&openai::Usage {
+            prompt_tokens: Some(100),
+            completion_tokens: Some(20),
+            total_tokens: Some(120),
+        });
+        usage.record(&openai::Usage {
+            prompt_tokens: Some(50),
+            completion_tokens: Some(10),
+            total_tokens: Some(60),
+        });
+        assert_eq!(usage.turns, 2);
+        assert_eq!(usage.prompt_tokens, 150);
+        assert_eq!(usage.completion_tokens, 30);
+        assert_eq!(usage.total_tokens, 180);
+    }
+
+    #[test]
+    fn test_session_usage_record_missing_fields_count_as_zero_not_skipped() {
+        // A response reporting *no* usage at all is never passed to
+        // record() in the first place (see the call sites) - but one that
+        // reports a Usage struct with some fields missing still counts as
+        // a turn, just contributing 0 for whichever fields are absent.
+        let mut usage = SessionUsage::default();
+        usage.record(&openai::Usage {
+            prompt_tokens: Some(100),
+            completion_tokens: None,
+            total_tokens: None,
+        });
+        assert_eq!(usage.turns, 1);
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 0);
+        assert_eq!(usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn test_estimate_cost_usd_multiplies_tokens_by_per_token_rate() {
+        let usage = SessionUsage {
+            turns: 1,
+            prompt_tokens: 1_000_000,
+            completion_tokens: 500_000,
+            total_tokens: 1_500_000,
+        };
+        let pricing = openai::Pricing {
+            prompt: "0.000003".to_string(),
+            completion: "0.000015".to_string(),
+            request: None,
+            image: None,
+            web_search: None,
+            internal_reasoning: None,
+            input_cache_read: None,
+            input_cache_write: None,
+        };
+        // 1_000_000 * 0.000003 + 500_000 * 0.000015 = 3.0 + 7.5 = 10.5
+        assert_eq!(estimate_cost_usd(&usage, &pricing), Some(10.5));
+    }
+
+    #[test]
+    fn test_estimate_cost_usd_unparseable_rate_is_none() {
+        let usage = SessionUsage::default();
+        let pricing = openai::Pricing {
+            prompt: "not a number".to_string(),
+            completion: "0.000015".to_string(),
+            request: None,
+            image: None,
+            web_search: None,
+            internal_reasoning: None,
+            input_cache_read: None,
+            input_cache_write: None,
+        };
+        assert_eq!(estimate_cost_usd(&usage, &pricing), None);
     }
 
     #[test]
