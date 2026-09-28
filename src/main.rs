@@ -1788,6 +1788,72 @@ fn tool_run_command(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     run_command_and_report(cmd, ctx, &params.command, false)
 }
 
+/// Host directories `bwrap_args` makes visible inside the sandbox, besides
+/// the current directory.
+const SANDBOX_SYSTEM_DIRS: &[&str] = &["/usr", "/lib", "/lib64"];
+
+/// Resolves `command` to an absolute path bwrap can exec directly: an
+/// absolute path is kept, a relative one (`./build.sh`,
+/// `target/debug/foo`) is joined to `cwd`, and a bare name is looked up on
+/// the host's `path_dirs`. bwrap can't do this itself - the sandbox's
+/// environment is cleared and its root only has `SANDBOX_SYSTEM_DIRS` and
+/// `cwd`. For a PATH hit only the directory is canonicalized (so e.g.
+/// `/bin/ls` becomes `/usr/bin/ls` on merged-/usr systems, where `/bin`
+/// doesn't exist in the sandbox), never the file itself, which may be a
+/// symlink whose name matters (`clang++` -> `clang`).
+///
+/// The result always starts with `/`, so it can never be mistaken for a
+/// bwrap option.
+fn resolve_sandboxed_command(
+    command: &str,
+    cwd: &std::path::Path,
+    path_dirs: Option<&std::ffi::OsStr>,
+) -> Result<String, String> {
+    let resolved = if command.starts_with('/') {
+        PathBuf::from(command)
+    } else if command.contains('/') {
+        // Fold away `.`/`..` so the visibility check below can't be fooled
+        // by e.g. `../elsewhere/x`, which only looks like it's under cwd.
+        let mut path = PathBuf::new();
+        for component in cwd.join(command).components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    path.pop();
+                }
+                c => path.push(c),
+            }
+        }
+        path
+    } else {
+        let found = path_dirs
+            .and_then(|dirs| latex_kitty::resolve_in_path_dirs(command, dirs))
+            .ok_or_else(|| format!("Command '{}' not found on PATH", command))?;
+        match (found.parent(), found.file_name()) {
+            (Some(dir), Some(name)) => fs::canonicalize(dir)
+                .map(|dir| dir.join(name))
+                .unwrap_or(found),
+            _ => found,
+        }
+    };
+    let visible = resolved.starts_with(cwd)
+        || SANDBOX_SYSTEM_DIRS
+            .iter()
+            .any(|dir| resolved.starts_with(dir));
+    if !visible {
+        return Err(format!(
+            "Command '{}' resolves to {}, which isn't visible inside the sandbox (only {} and the current directory are)",
+            command,
+            resolved.display(),
+            SANDBOX_SYSTEM_DIRS.join(", ")
+        ));
+    }
+    resolved
+        .into_os_string()
+        .into_string()
+        .map_err(|_| format!("Command '{}' resolves to a non-UTF-8 path", command))
+}
+
 /// entrypoint for the run_command tool without --unsafe-tools: runs the
 /// command wrapped in a bubblewrap sandbox (see `bwrap_args`) instead of
 /// refusing it outright, so basic scripting is still available by default.
@@ -1798,33 +1864,38 @@ fn tool_run_command_sandboxed(
     debug!("run_command (sandboxed) received params: {}", params_str);
     let params: RunCommandParams = serde_json::from_str(params_str)?;
 
-    // Defense in depth on top of the "--" separator in bwrap_args(): command
-    // and args come straight from the model's tool call, unvalidated, so
-    // reject anything that isn't the absolute executable path the schema
-    // already documents. This is what stands between the sandbox and a
-    // command crafted to look like a bwrap flag (e.g. "--ro-bind" with args
-    // ["/", "/", ...]) reaching bwrap's argv as one of its own options.
-    let direct_exec = params.args.is_some() || !params.command.contains(' ');
-    if direct_exec && !params.command.starts_with('/') {
-        let message = format!(
-            "Invalid command '{}': must be an absolute path to an executable, e.g. /usr/bin/ls",
-            params.command
-        );
-        ctx.println(&format!("ERROR: {}", message));
-        let result = CommandResult {
-            stdout: String::new(),
-            stderr: message,
-            exit_code: None,
-            success: false,
-        };
-        return Ok(serde_json::to_string(&result)?);
-    }
-
     let cwd = std::env::current_dir()?;
+
+    // Defense in depth on top of the "--" separator in bwrap_args(): command
+    // and args come straight from the model's tool call, unvalidated, so a
+    // directly-executed command is always resolved to an absolute path
+    // first - what stands between the sandbox and a command crafted to
+    // look like a bwrap flag (e.g. "--ro-bind" with args ["/", "/", ...])
+    // reaching bwrap's argv as one of its own options.
+    let direct_exec = params.args.is_some() || !params.command.contains(' ');
+    let command = if direct_exec {
+        match resolve_sandboxed_command(&params.command, &cwd, std::env::var_os("PATH").as_deref())
+        {
+            Ok(command) => command,
+            Err(message) => {
+                ctx.println(&format!("ERROR: {}", message));
+                let result = CommandResult {
+                    stdout: String::new(),
+                    stderr: message,
+                    exit_code: None,
+                    success: false,
+                };
+                return Ok(serde_json::to_string(&result)?);
+            }
+        }
+    } else {
+        params.command.clone()
+    };
+
     let cwd = cwd.to_str().ok_or("current directory is not valid UTF-8")?;
 
     let mut cmd = Command::new("bwrap");
-    cmd.args(bwrap_args(cwd, &params.command, params.args.as_deref()));
+    cmd.args(bwrap_args(cwd, &command, params.args.as_deref()));
     // run_command is a one-shot exec-and-capture-output tool, never
     // interactive, so it never needs stdin - and not inheriting it means
     // there's no open file descriptor to faber's own controlling terminal
@@ -3819,7 +3890,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                     "properties": {
                         "command": {
                             "type": "string",
-                            "description": "Command to execute, it must be the name of the executable only, e.g. /usr/bin/ls"
+                            "description": "Command to execute: an absolute path (e.g. /usr/bin/ls), a path relative to the current directory (e.g. ./build.sh), or a program name looked up on PATH (e.g. ls). It must be inside /usr, /lib, /lib64 or the current directory to be runnable in the sandbox"
                         },
                         "args": {
                             "type": "array",
@@ -7522,11 +7593,10 @@ mod tests {
     }
 
     #[test]
-    fn test_run_command_sandboxed_rejects_non_absolute_command() {
-        // A command that doesn't start with "/" can never legitimately be
-        // the tool's documented "absolute path to an executable" - reject
-        // it outright rather than letting something that looks like a
-        // bwrap flag (e.g. "--ro-bind") anywhere near bwrap's argv.
+    fn test_run_command_sandboxed_rejects_flag_like_command() {
+        // A bare name is looked up on PATH and only ever passed on as the
+        // resulting absolute path - something that looks like a bwrap flag
+        // (e.g. "--ro-bind") isn't found and never gets near bwrap's argv.
         let params = serde_json::json!({
             "command": "--ro-bind",
             "args": ["/", "/", "/bin/sh"]
@@ -7534,7 +7604,72 @@ mod tests {
         let result = tool_run_command_sandboxed(&params.to_string(), &test_ctx()).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], false);
-        assert!(parsed["stderr"].as_str().unwrap().contains("absolute path"));
+        assert!(
+            parsed["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("not found on PATH")
+        );
+    }
+
+    #[test]
+    fn test_resolve_sandboxed_command_keeps_absolute_path() {
+        let cwd = std::path::Path::new("/work");
+        assert_eq!(
+            resolve_sandboxed_command("/usr/bin/ls", cwd, None).unwrap(),
+            "/usr/bin/ls"
+        );
+    }
+
+    #[test]
+    fn test_resolve_sandboxed_command_joins_relative_path_to_cwd() {
+        let cwd = std::path::Path::new("/work");
+        assert_eq!(
+            resolve_sandboxed_command("./build.sh", cwd, None).unwrap(),
+            "/work/build.sh"
+        );
+        assert_eq!(
+            resolve_sandboxed_command("target/debug/../release/app", cwd, None).unwrap(),
+            "/work/target/release/app"
+        );
+    }
+
+    #[test]
+    fn test_resolve_sandboxed_command_rejects_relative_path_escaping_cwd() {
+        let cwd = std::path::Path::new("/work/project");
+        let err = resolve_sandboxed_command("../other/script.sh", cwd, None).unwrap_err();
+        assert!(err.contains("isn't visible inside the sandbox"), "{err}");
+    }
+
+    #[test]
+    fn test_resolve_sandboxed_command_looks_up_bare_name_on_path() {
+        let dir = std::env::temp_dir().join(format!("faber_test_path_{}", std::process::id()));
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("mytool"), "").unwrap();
+        let path_dirs = std::ffi::OsString::from(format!("/nonexistent:{}", bin.display()));
+
+        // Found on PATH and under cwd, so visible in the sandbox.
+        let resolved = resolve_sandboxed_command("mytool", &dir, Some(&path_dirs)).unwrap();
+        assert_eq!(
+            resolved,
+            fs::canonicalize(&bin)
+                .unwrap()
+                .join("mytool")
+                .to_str()
+                .unwrap()
+        );
+
+        // Found on PATH but outside every directory the sandbox can see.
+        let err =
+            resolve_sandboxed_command("mytool", std::path::Path::new("/work"), Some(&path_dirs))
+                .unwrap_err();
+        assert!(err.contains("isn't visible inside the sandbox"), "{err}");
+
+        let err = resolve_sandboxed_command("nosuchtool", &dir, Some(&path_dirs)).unwrap_err();
+        assert!(err.contains("not found on PATH"), "{err}");
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

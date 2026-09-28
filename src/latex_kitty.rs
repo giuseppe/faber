@@ -801,7 +801,10 @@ fn resolve_on_path(program: &str) -> Option<std::path::PathBuf> {
 /// reading the real environment variable, so it's testable without
 /// mutating process-wide state (risky - Rust tests run in parallel within
 /// one process).
-fn resolve_in_path_dirs(program: &str, path_dirs: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+pub(crate) fn resolve_in_path_dirs(
+    program: &str,
+    path_dirs: &std::ffi::OsStr,
+) -> Option<std::path::PathBuf> {
     std::env::split_paths(path_dirs)
         .map(|dir| dir.join(program))
         .find(|candidate| candidate.is_file())
