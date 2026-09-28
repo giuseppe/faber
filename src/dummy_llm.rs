@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::openai::{
     Choice, ContextLengthError, FunctionCall, InterruptedError, Message, OpenAIResponse,
-    ProgressInfo, ResponseMode, StatusUpdate, ToolCall, Usage, tool_call,
+    ProgressInfo, ResponseMode, StatusUpdate, ToolCall, Usage, accumulate_usage, tool_call,
 };
 
 static TURN_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -232,6 +232,7 @@ fn make_text_response(turn: usize, messages: Vec<Message>) -> OpenAIResponse {
             completion_tokens: Some(20),
             total_tokens: Some(30),
         }),
+        turn_usage: None,
         history: messages,
     }
 }
@@ -267,6 +268,7 @@ fn make_tool_call_response(turn: usize, messages: Vec<Message>) -> OpenAIRespons
             completion_tokens: Some(5),
             total_tokens: Some(15),
         }),
+        turn_usage: None,
         history: messages,
     }
 }
@@ -284,6 +286,7 @@ pub fn post_request_dummy(
 ) -> Result<OpenAIResponse, Box<dyn std::error::Error>> {
     let start_time = Instant::now();
     let mut messages = messages;
+    let mut turn_usage: Option<Usage> = None;
 
     loop {
         check_interrupted(&ctrl_c_rx)?;
@@ -314,6 +317,7 @@ pub fn post_request_dummy(
         } else {
             make_text_response(turn, messages.clone())
         };
+        accumulate_usage(&mut turn_usage, response.usage.as_ref());
 
         let choice = response
             .choices
@@ -420,6 +424,7 @@ pub fn post_request_dummy(
             error: None,
             choices: response.choices,
             usage: response.usage,
+            turn_usage,
             history: messages,
         });
     }

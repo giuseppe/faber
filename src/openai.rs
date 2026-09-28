@@ -229,11 +229,40 @@ pub struct Usage {
     pub total_tokens: Option<u32>,
 }
 
+/// Adds `usage` into `total`, treating a missing field on either side as
+/// 0. `None` stays `None` only while nothing has reported usage at all, so
+/// "no request reported usage" stays distinguishable from "zero tokens".
+pub fn accumulate_usage(total: &mut Option<Usage>, usage: Option<&Usage>) {
+    let Some(usage) = usage else {
+        return;
+    };
+    let sum = |a: Option<u32>, b: Option<u32>| match (a, b) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+    };
+    *total = Some(match total.take() {
+        None => usage.clone(),
+        Some(t) => Usage {
+            prompt_tokens: sum(t.prompt_tokens, usage.prompt_tokens),
+            completion_tokens: sum(t.completion_tokens, usage.completion_tokens),
+            total_tokens: sum(t.total_tokens, usage.total_tokens),
+        },
+    });
+}
+
 #[derive(Deserialize, Debug)]
 pub struct OpenAIResponse {
     pub error: Option<OpenAIError>,
     pub choices: Option<Vec<Choice>>,
+    /// Usage of the final request only - its `prompt_tokens` reflects the
+    /// current size of the conversation.
     pub usage: Option<Usage>,
+
+    /// Usage summed over every request made to produce this response,
+    /// including each intermediate tool-call round trip - what was
+    /// actually billed for the turn.
+    #[serde(skip_deserializing)]
+    pub turn_usage: Option<Usage>,
 
     #[serde(skip_deserializing)]
     pub history: Vec<Message>,
@@ -593,6 +622,7 @@ fn post_request_with_mode_and_recursion(
 ) -> Result<OpenAIResponse, Box<dyn Error>> {
     let start_time = Instant::now();
     let mut messages = messages;
+    let mut turn_usage: Option<Usage> = None;
 
     loop {
         let mut headers = HeaderMap::new();
@@ -753,6 +783,7 @@ fn post_request_with_mode_and_recursion(
             trace!("Got response {:?}", response_text);
             serde_json::from_str(&response_text)?
         };
+        accumulate_usage(&mut turn_usage, openai_response.usage.as_ref());
 
         if let Some(mut err) = openai_response.error {
             if err.metadata.is_some() {
@@ -904,6 +935,7 @@ fn post_request_with_mode_and_recursion(
 
         debug!("Final response: messages in history = {}", messages.len());
         openai_response.history = messages;
+        openai_response.turn_usage = turn_usage;
         return Ok(openai_response);
     }
 }
@@ -1281,6 +1313,7 @@ fn handle_streaming_response(
         error: None,
         choices: Some(vec![choice]),
         usage,
+        turn_usage: None,
         history: vec![],
     })
 }
@@ -1288,6 +1321,41 @@ fn handle_streaming_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_accumulate_usage_sums_across_round_trips() {
+        let mut total = None;
+        let round = |p, c, t| Usage {
+            prompt_tokens: Some(p),
+            completion_tokens: Some(c),
+            total_tokens: Some(t),
+        };
+        accumulate_usage(&mut total, Some(&round(100, 10, 110)));
+        accumulate_usage(&mut total, Some(&round(150, 20, 170)));
+        let total = total.unwrap();
+        assert_eq!(total.prompt_tokens, Some(250));
+        assert_eq!(total.completion_tokens, Some(30));
+        assert_eq!(total.total_tokens, Some(280));
+    }
+
+    #[test]
+    fn test_accumulate_usage_none_stays_none_until_something_reports() {
+        let mut total = None;
+        accumulate_usage(&mut total, None);
+        assert!(total.is_none());
+        accumulate_usage(
+            &mut total,
+            Some(&Usage {
+                prompt_tokens: Some(5),
+                completion_tokens: None,
+                total_tokens: None,
+            }),
+        );
+        accumulate_usage(&mut total, None);
+        let total = total.unwrap();
+        assert_eq!(total.prompt_tokens, Some(5));
+        assert_eq!(total.completion_tokens, None);
+    }
 
     #[test]
     fn test_normalize_endpoint_already_complete() {
