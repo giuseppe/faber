@@ -649,7 +649,8 @@ fn tool_access(name: &str, arguments: &str) -> ToolAccess {
         | "agent_data_list"
         | "task_list"
         | "task_get"
-        | "task_pending" => ToolAccess::Independent,
+        | "task_pending"
+        | "plan_get" => ToolAccess::Independent,
         _ => ToolAccess::Exclusive,
     }
 }

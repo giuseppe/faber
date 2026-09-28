@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -216,9 +217,22 @@ pub(crate) fn finish_partial_line() {
     run(LineOp::Finish);
 }
 
+/// Prefixes an agent's current status with its plan progress, if it has
+/// a plan, so the plan stays visible while the status keeps changing.
+fn compose_message(plan: Option<&String>, message: &str) -> String {
+    match plan {
+        Some(plan) => format!("{} · {}", plan, message),
+        None => message.to_string(),
+    }
+}
+
 pub struct StatusBar {
     enabled: bool,
     entries: Arc<Mutex<Vec<(String, AgentEntry)>>>,
+    /// Per-agent plan progress summary, kept apart from `entries` because
+    /// it outlives any single status message (and the entry itself, which
+    /// is removed whenever the agent goes idle).
+    plans: Arc<Mutex<HashMap<String, String>>>,
     stop_ticker: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     default_color: Arc<AtomicU8>,
@@ -232,12 +246,14 @@ impl StatusBar {
         }
 
         let entries: Arc<Mutex<Vec<(String, AgentEntry)>>> = Arc::new(Mutex::new(Vec::new()));
+        let plans: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
         let stop_ticker = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
         let default_color = Arc::new(AtomicU8::new(36));
 
         let ticker_handle = {
             let entries = entries.clone();
+            let plans = plans.clone();
             let stop = stop_ticker.clone();
             let paused = paused.clone();
 
@@ -266,11 +282,15 @@ impl StatusBar {
                                 String::new()
                             };
                             let (_, cols) = console::Term::stderr().size();
+                            let message = compose_message(
+                                plans.lock().unwrap_or_else(|e| e.into_inner()).get(agent),
+                                &entry.message,
+                            );
                             Some(build_status_line(
                                 entry.color,
                                 spinner,
                                 agent,
-                                &entry.message,
+                                &message,
                                 secs,
                                 &suffix,
                                 cols as usize,
@@ -311,6 +331,7 @@ impl StatusBar {
         Self {
             enabled: true,
             entries,
+            plans,
             stop_ticker,
             paused,
             default_color,
@@ -322,6 +343,7 @@ impl StatusBar {
         Self {
             enabled: false,
             entries: Arc::new(Mutex::new(Vec::new())),
+            plans: Arc::new(Mutex::new(HashMap::new())),
             stop_ticker: Arc::new(AtomicBool::new(true)),
             paused: Arc::new(AtomicBool::new(true)),
             default_color: Arc::new(AtomicU8::new(36)),
@@ -372,6 +394,20 @@ impl StatusBar {
         }
     }
 
+    /// Sets (or with `None`, clears) the plan progress summary shown
+    /// alongside `agent`'s status whenever it's active.
+    pub fn set_agent_plan(&self, agent: &str, summary: Option<&str>) {
+        let mut plans = self.plans.lock().unwrap_or_else(|e| e.into_inner());
+        match summary {
+            Some(summary) => {
+                plans.insert(agent.to_string(), summary.to_string());
+            }
+            None => {
+                plans.remove(agent);
+            }
+        }
+    }
+
     pub fn clear_agent_status(&self, agent: &str) {
         if !self.enabled {
             return;
@@ -394,6 +430,16 @@ impl Drop for StatusBar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_compose_message_prefixes_plan() {
+        let plan = "Plan 2/5: write tests".to_string();
+        assert_eq!(
+            compose_message(Some(&plan), "Thinking"),
+            "Plan 2/5: write tests · Thinking"
+        );
+        assert_eq!(compose_message(None, "Thinking"), "Thinking");
+    }
 
     /// Strips `\x1b[...m` SGR sequences, leaving only what would actually
     /// occupy columns on screen - used to measure the *visible* width of a
