@@ -5497,12 +5497,58 @@ fn execute_scheduled_command(
     Some((assistant_msg, tool_msg))
 }
 
+/// Runs one due scheduled task to completion: `execute_scheduled_command`,
+/// forwarding its result (if any) over `tx`, then marking the task
+/// executed either way. Split out of `scheduler_loop` so each due task can
+/// run on its own thread instead of blocking every other one - see that
+/// function's own doc comment for why.
+fn run_scheduled_task(
+    task: db::TaskRow,
+    db: Arc<dyn DbBackend>,
+    tools: Arc<ToolsCollection>,
+    tx: mpsc::Sender<(Option<String>, String, Message, Message)>,
+) {
+    let command = if task.command.is_empty() {
+        task.description.clone()
+    } else {
+        task.command.clone()
+    };
+
+    let db_opt: Option<Arc<dyn DbBackend>> = Some(db.clone());
+    if let Some((assistant_msg, tool_msg)) = execute_scheduled_command(&command, &tools, &db_opt) {
+        let _ = tx.send((task.agent_name.clone(), command, assistant_msg, tool_msg));
+    }
+
+    let _ = db.mark_task_executed(
+        task.id,
+        &task.task_type,
+        task.cron_expression.as_deref(),
+        task.max_runs,
+    );
+}
+
+/// Polls for due scheduled tasks once a second and runs each one.
+///
+/// Each due task runs on its own thread (`run_scheduled_task`) rather than
+/// blocking this loop: a task that invokes a slow tool (e.g.
+/// `fetch_web_content` with a long timeout, or a `run_command` build) used
+/// to delay every other due task, including ones due on a completely
+/// unrelated schedule, until it finished. `db`/`tools`/`tx` are all
+/// already `Arc`/`Sender` - cheap to clone per task, same pattern
+/// `tool_spawn_agent` already uses for its own background sub-agents.
 fn scheduler_loop(
     db: Arc<dyn DbBackend>,
     tools: Arc<ToolsCollection>,
     tx: mpsc::Sender<(Option<String>, String, Message, Message)>,
 ) {
-    let db_opt: Option<Arc<dyn DbBackend>> = Some(db.clone());
+    // Tracks task IDs a background thread is already executing. A task
+    // that takes longer than one polling interval to finish hasn't called
+    // `mark_task_executed` yet by the next poll, so `get_pending_tasks`
+    // would return it again - without this, that means a second thread
+    // running the very same task concurrently with the first, rather than
+    // just other, unrelated due tasks running in parallel as intended.
+    let running: Arc<Mutex<std::collections::HashSet<i64>>> =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
     loop {
         std::thread::sleep(Duration::from_secs(1));
         let tasks = match db.get_pending_tasks() {
@@ -5511,24 +5557,24 @@ fn scheduler_loop(
         };
 
         for task in tasks {
-            let command = if task.command.is_empty() {
-                task.description.clone()
-            } else {
-                task.command.clone()
+            let task_id = task.id;
+            let newly_claimed = {
+                let mut set = running.lock().unwrap_or_else(|e| e.into_inner());
+                set.insert(task_id)
             };
-
-            if let Some((assistant_msg, tool_msg)) =
-                execute_scheduled_command(&command, &tools, &db_opt)
-            {
-                let _ = tx.send((task.agent_name.clone(), command, assistant_msg, tool_msg));
+            if !newly_claimed {
+                continue; // already running from a still-in-flight earlier poll
             }
 
-            let _ = db.mark_task_executed(
-                task.id,
-                &task.task_type,
-                task.cron_expression.as_deref(),
-                task.max_runs,
-            );
+            let db = db.clone();
+            let tools = tools.clone();
+            let tx = tx.clone();
+            let running = running.clone();
+            std::thread::spawn(move || {
+                run_scheduled_task(task, db, tools, tx);
+                let mut set = running.lock().unwrap_or_else(|e| e.into_inner());
+                set.remove(&task_id);
+            });
         }
     }
 }
