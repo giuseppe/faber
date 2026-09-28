@@ -2293,6 +2293,162 @@ fn tool_agent_data_list(params_str: &String, ctx: &ToolContext) -> Result<String
     Ok(serde_json::to_string(&entries)?)
 }
 
+/// `agent_data` key holding an agent's current plan (a JSON list of
+/// `PlanItem`), alongside the existing `config:*` keys.
+const PLAN_DATA_KEY: &str = "state:plan";
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum PlanStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+struct PlanItem {
+    content: String,
+    status: PlanStatus,
+}
+
+fn validate_plan(items: &[PlanItem]) -> Result<(), String> {
+    if items.iter().any(|i| i.content.trim().is_empty()) {
+        return Err("plan items must have non-empty content".to_string());
+    }
+    let in_progress = items
+        .iter()
+        .filter(|i| i.status == PlanStatus::InProgress)
+        .count();
+    if in_progress > 1 {
+        return Err(format!(
+            "at most one plan item can be in_progress at a time, got {}",
+            in_progress
+        ));
+    }
+    Ok(())
+}
+
+/// A plan with nothing left to do is as good as no plan - it's cleared
+/// rather than kept around to clutter the status bar.
+fn plan_is_finished(items: &[PlanItem]) -> bool {
+    items.iter().all(|i| i.status == PlanStatus::Completed)
+}
+
+/// One-line progress summary for the status bar: completed/total and the
+/// item being worked on (or the next pending one). `None` if there's no
+/// active plan.
+fn plan_summary(items: &[PlanItem]) -> Option<String> {
+    if plan_is_finished(items) {
+        return None;
+    }
+    let completed = items
+        .iter()
+        .filter(|i| i.status == PlanStatus::Completed)
+        .count();
+    let current = items
+        .iter()
+        .find(|i| i.status == PlanStatus::InProgress)
+        .or_else(|| items.iter().find(|i| i.status == PlanStatus::Pending))?;
+    Some(format!(
+        "Plan {}/{}: {}",
+        completed,
+        items.len(),
+        current.content
+    ))
+}
+
+fn format_plan(items: &[PlanItem]) -> Vec<String> {
+    items
+        .iter()
+        .map(|i| {
+            let mark = match i.status {
+                PlanStatus::Pending => "[ ]",
+                PlanStatus::InProgress => "[>]",
+                PlanStatus::Completed => "[x]",
+            };
+            format!("{} {}", mark, i.content)
+        })
+        .collect()
+}
+
+fn load_plan(db: &dyn DbBackend, agent: &str) -> Result<Vec<PlanItem>, Box<dyn Error>> {
+    match db.get_agent_data(agent, PLAN_DATA_KEY)? {
+        Some(value) => Ok(serde_json::from_str(&value)?),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Stores `items` as `agent`'s plan, or removes the plan entirely if it's
+/// empty or finished.
+fn save_plan(db: &dyn DbBackend, agent: &str, items: &[PlanItem]) -> Result<(), Box<dyn Error>> {
+    if plan_is_finished(items) {
+        db.delete_agent_data(agent, PLAN_DATA_KEY)?;
+    } else {
+        db.set_agent_data(agent, PLAN_DATA_KEY, &serde_json::to_string(items)?)?;
+    }
+    Ok(())
+}
+
+/// Shows `agent`'s stored plan (if any) in the status bar. Best-effort: a
+/// failed lookup just leaves no plan shown.
+fn refresh_plan_status(status_bar: &status_bar::StatusBar, db: &dyn DbBackend, agent: &str) {
+    let summary = load_plan(db, agent)
+        .ok()
+        .and_then(|items| plan_summary(&items));
+    status_bar.set_agent_plan(agent, summary.as_deref());
+}
+
+/// The plan tools act on the calling agent's own plan. Sub-agents run
+/// without an agent identity in their context, so they can't use them -
+/// better than silently writing to some other agent's plan.
+fn plan_agent(ctx: &ToolContext) -> Result<&str, Box<dyn Error>> {
+    ctx.agent_name
+        .as_deref()
+        .ok_or_else(|| "plan tools are only available to the main chat agent".into())
+}
+
+fn tool_plan_update(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        items: Vec<PlanItem>,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    validate_plan(&params.items)?;
+    let agent = plan_agent(ctx)?;
+    let db = ctx.db()?;
+    save_plan(db, agent, &params.items)?;
+
+    let summary = plan_summary(&params.items);
+    if let Some(sa_ctx) = ctx
+        .extra
+        .as_ref()
+        .and_then(|e| e.downcast_ref::<SubAgentContext>())
+    {
+        sa_ctx.status_bar.set_agent_plan(agent, summary.as_deref());
+    }
+    for line in format_plan(&params.items) {
+        ctx.println(&line);
+    }
+    let result = if summary.is_some() {
+        serde_json::json!({"status": "ok", "items": params.items.len()})
+    } else {
+        serde_json::json!({"status": "ok", "cleared": true, "message": "Plan finished or empty; cleared."})
+    };
+    Ok(result.to_string())
+}
+
+fn tool_plan_get(_params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    let agent = plan_agent(ctx)?;
+    let items = load_plan(ctx.db()?, agent)?;
+    if items.is_empty() {
+        ctx.println("(no active plan)");
+    }
+    for line in format_plan(&items) {
+        ctx.println(&line);
+    }
+    Ok(serde_json::json!({ "items": items }).to_string())
+}
+
 fn tool_task_create_cron(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     #[derive(Deserialize)]
     struct Params {
@@ -3574,6 +3730,72 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
 
     append_tool(
         &mut tools,
+        "plan_update".to_string(),
+        tool_plan_update,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "plan_update",
+                "description": "Create or update your plan for the current multi-step task. Always pass the complete list - it replaces the previous plan. Use it for tasks with three or more distinct steps: write the steps out before starting, mark one item in_progress while working on it, and mark it completed as soon as it's done. The plan is shown to the user as progress. It is cleared automatically once every item is completed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "description": "The full plan, in order",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "content": {
+                                        "type": "string",
+                                        "description": "What this step does, in a few words"
+                                    },
+                                    "status": {
+                                        "type": "string",
+                                        "enum": ["pending", "in_progress", "completed"],
+                                        "description": "At most one item may be in_progress"
+                                    }
+                                },
+                                "required": ["content", "status"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": [
+                        "items"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "plan_get".to_string(),
+        tool_plan_get,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "plan_get",
+                "description": "Get your current plan (see plan_update), e.g. to pick up where you left off after the conversation was summarized.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
         "task_create_cron".to_string(),
         tool_task_create_cron,
         r#"
@@ -4139,6 +4361,7 @@ enum ChatCommand {
     Chdir(String),
     Pwd,
     Cost,
+    Plan,
     Message(String),
     Empty,
     Invalid(String),
@@ -4258,6 +4481,9 @@ fn parse_chat_command(line: &str) -> ChatCommand {
     if normalized == "/cost" {
         return ChatCommand::Cost;
     }
+    if normalized == "/plan" {
+        return ChatCommand::Plan;
+    }
 
     if normalized.starts_with('/') {
         return ChatCommand::Invalid(format!("Unknown command: {}", normalized));
@@ -4341,6 +4567,7 @@ fn handle_chat_command(
             chat_pb.println("  /chdir <path>          Change the current working directory");
             chat_pb.println("  /pwd                   Show the current working directory");
             chat_pb.println("  /cost                  Show session token usage and estimated cost");
+            chat_pb.println("  /plan                  Show the current agent's plan");
             Ok(true)
         }
         ChatCommand::Quit => Ok(false),
@@ -4349,7 +4576,9 @@ fn handle_chat_command(
             active_agent.last_prompt_tokens = None;
             if let Some(db) = db {
                 db.clear_agent_messages(&active_agent.name)?;
+                db.delete_agent_data(&active_agent.name, PLAN_DATA_KEY)?;
             }
+            status_bar.set_agent_plan(&active_agent.name, None);
             chat_pb.println("Chat history cleared.");
             Ok(true)
         }
@@ -4533,6 +4762,8 @@ fn handle_chat_command(
                     .collect();
                 db.save_agent_messages(&active_agent.name, &msgs)?;
                 db.release_agent(&active_agent.name, session_id)?;
+                status_bar.set_agent_plan(&active_agent.name, None);
+                refresh_plan_status(status_bar, db.as_ref(), &name);
 
                 let agent_config = db.get_agent_config(&name)?;
                 *openai_opts = build_openai_opts(opts, &agent_config);
@@ -4693,6 +4924,25 @@ fn handle_chat_command(
                 None => chat_pb.println(
                     "  Estimated cost:    unknown (couldn't fetch pricing for this model/endpoint)",
                 ),
+            }
+            Ok(true)
+        }
+        ChatCommand::Plan => {
+            let Some(db) = db else {
+                chat_pb.println("Database not configured.");
+                return Ok(true);
+            };
+            let items = load_plan(db.as_ref(), &active_agent.name)?;
+            if items.is_empty() {
+                chat_pb.println(&format!(
+                    "Agent '{}' has no active plan.",
+                    active_agent.name
+                ));
+            } else {
+                chat_pb.println(&format!("Plan for agent '{}':", active_agent.name));
+                for line in format_plan(&items) {
+                    chat_pb.println(&format!("  {}", line));
+                }
             }
             Ok(true)
         }
@@ -5894,6 +6144,9 @@ fn chat_command(
         last_prompt_tokens: None,
     };
     status_bar.set_color(agent_ansi_code(&active_agent.name));
+    if let Some(ref db) = db {
+        refresh_plan_status(&status_bar, db.as_ref(), &active_agent.name);
+    }
 
     if opts.display_graphics.is_some() {
         warn_about_display_graphics_setup(&chat_pb);
@@ -7375,6 +7628,80 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_chat_command_plan() {
+        assert!(matches!(parse_chat_command("/plan"), ChatCommand::Plan));
+    }
+
+    fn plan_item(content: &str, status: PlanStatus) -> PlanItem {
+        PlanItem {
+            content: content.to_string(),
+            status,
+        }
+    }
+
+    #[test]
+    fn test_plan_item_json_uses_snake_case_status() {
+        let items: Vec<PlanItem> =
+            serde_json::from_str(r#"[{"content": "a", "status": "in_progress"}]"#).unwrap();
+        assert_eq!(items, vec![plan_item("a", PlanStatus::InProgress)]);
+    }
+
+    #[test]
+    fn test_validate_plan_rejects_two_in_progress_and_empty_content() {
+        assert!(
+            validate_plan(&[
+                plan_item("a", PlanStatus::InProgress),
+                plan_item("b", PlanStatus::InProgress),
+            ])
+            .is_err()
+        );
+        assert!(validate_plan(&[plan_item("  ", PlanStatus::Pending)]).is_err());
+        assert!(
+            validate_plan(&[
+                plan_item("a", PlanStatus::Completed),
+                plan_item("b", PlanStatus::InProgress),
+                plan_item("c", PlanStatus::Pending),
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_plan_summary_shows_progress_and_current_item() {
+        let items = [
+            plan_item("a", PlanStatus::Completed),
+            plan_item("b", PlanStatus::InProgress),
+            plan_item("c", PlanStatus::Pending),
+        ];
+        assert_eq!(plan_summary(&items).as_deref(), Some("Plan 1/3: b"));
+    }
+
+    #[test]
+    fn test_plan_summary_falls_back_to_next_pending() {
+        let items = [
+            plan_item("a", PlanStatus::Completed),
+            plan_item("b", PlanStatus::Pending),
+        ];
+        assert_eq!(plan_summary(&items).as_deref(), Some("Plan 1/2: b"));
+    }
+
+    #[test]
+    fn test_plan_summary_none_when_empty_or_finished() {
+        assert_eq!(plan_summary(&[]), None);
+        assert_eq!(plan_summary(&[plan_item("a", PlanStatus::Completed)]), None);
+    }
+
+    #[test]
+    fn test_format_plan_marks_each_status() {
+        let items = [
+            plan_item("a", PlanStatus::Completed),
+            plan_item("b", PlanStatus::InProgress),
+            plan_item("c", PlanStatus::Pending),
+        ];
+        assert_eq!(format_plan(&items), vec!["[x] a", "[>] b", "[ ] c"]);
+    }
+
+    #[test]
     fn test_parse_chat_command_cost() {
         assert!(matches!(parse_chat_command("/cost"), ChatCommand::Cost));
     }
@@ -7786,6 +8113,59 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         db::initialize_db(&conn).unwrap();
         Arc::new(Mutex::new(conn))
+    }
+
+    fn plan_test_ctx() -> ToolContext {
+        let db = LocalDb::new(test_db_conn());
+        db.ensure_default_agent().unwrap();
+        let mut ctx = ToolContext::new(|_: &str| {});
+        ctx.db = Some(Arc::new(db));
+        ctx.agent_name = Some("default".to_string());
+        ctx
+    }
+
+    #[test]
+    fn test_plan_tools_round_trip_through_db() {
+        let ctx = plan_test_ctx();
+        let update = r#"{"items": [
+            {"content": "read code", "status": "completed"},
+            {"content": "write fix", "status": "in_progress"}
+        ]}"#;
+        tool_plan_update(&update.to_string(), &ctx).unwrap();
+
+        let got: serde_json::Value =
+            serde_json::from_str(&tool_plan_get(&"{}".to_string(), &ctx).unwrap()).unwrap();
+        assert_eq!(got["items"][1]["content"], "write fix");
+        assert_eq!(got["items"][1]["status"], "in_progress");
+    }
+
+    #[test]
+    fn test_plan_update_clears_finished_plan() {
+        let ctx = plan_test_ctx();
+        let update = r#"{"items": [{"content": "a", "status": "pending"}]}"#;
+        tool_plan_update(&update.to_string(), &ctx).unwrap();
+        let done = r#"{"items": [{"content": "a", "status": "completed"}]}"#;
+        tool_plan_update(&done.to_string(), &ctx).unwrap();
+        let db = ctx.db().unwrap();
+        assert_eq!(db.get_agent_data("default", PLAN_DATA_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn test_plan_update_rejects_invalid_plan_without_saving() {
+        let ctx = plan_test_ctx();
+        let bad = r#"{"items": [
+            {"content": "a", "status": "in_progress"},
+            {"content": "b", "status": "in_progress"}
+        ]}"#;
+        assert!(tool_plan_update(&bad.to_string(), &ctx).is_err());
+        assert!(load_plan(ctx.db().unwrap(), "default").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_plan_tools_require_agent_identity() {
+        let mut ctx = plan_test_ctx();
+        ctx.agent_name = None;
+        assert!(tool_plan_get(&"{}".to_string(), &ctx).is_err());
     }
 
     #[test]
