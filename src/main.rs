@@ -2160,11 +2160,73 @@ fn tool_lsp_unsandboxed(params_str: &String, ctx: &ToolContext) -> Result<String
     lsp::run(params_str, ctx, false)
 }
 
-/// entrypoint for the grep_in_current_directory tool: searches with
-/// ripgrep when it's installed, plain grep otherwise.
+/// Builds the bubblewrap argument list for a search: `run_command`'s
+/// isolation (cleared environment, no network) and the same empty root
+/// with only `/usr` and `/lib*`, but with `cwd` bound *read-only* - a search
+/// never needs to write - plus `program` itself if it lives elsewhere (e.g.
+/// a ripgrep installed under `~/.cargo/bin`). Symlinks under `cwd` can't
+/// lead the search anywhere outside it.
+fn bwrap_search_args(cwd: &str, program: &str, args: &[String]) -> Vec<String> {
+    let mut a = bwrap_isolation_flags(true);
+    a.extend(
+        [
+            "--tmpfs",
+            "/",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--ro-bind-try",
+            "/lib",
+            "/lib",
+            "--ro-bind-try",
+            "/lib64",
+            "/lib64",
+            "--ro-bind",
+            cwd,
+            cwd,
+        ]
+        .into_iter()
+        .map(String::from),
+    );
+    let program_path = std::path::Path::new(program);
+    if !SANDBOX_SYSTEM_DIRS
+        .iter()
+        .any(|dir| program_path.starts_with(dir))
+    {
+        a.extend([
+            "--ro-bind".to_string(),
+            program.to_string(),
+            program.to_string(),
+        ]);
+    }
+    a.extend(["--chdir".to_string(), cwd.to_string()]);
+    a.extend(bwrap_command_tail(program, Some(args)));
+    a
+}
+
+/// entrypoint for the grep_in_current_directory tool without
+/// --unsafe-tools: the search runs sandboxed (see `bwrap_search_args`).
 fn tool_grep_in_current_directory(
     params_str: &String,
     ctx: &ToolContext,
+) -> Result<String, Box<dyn Error>> {
+    search_in_current_directory(params_str, ctx, true)
+}
+
+/// entrypoint for the grep_in_current_directory tool with --unsafe-tools:
+/// the search runs directly on the host.
+fn tool_grep_in_current_directory_unsandboxed(
+    params_str: &String,
+    ctx: &ToolContext,
+) -> Result<String, Box<dyn Error>> {
+    search_in_current_directory(params_str, ctx, false)
+}
+
+/// Searches with ripgrep when it's installed, plain grep otherwise.
+fn search_in_current_directory(
+    params_str: &String,
+    ctx: &ToolContext,
+    sandboxed: bool,
 ) -> Result<String, Box<dyn Error>> {
     let params: SearchParams = serde_json::from_str(params_str)?;
     let path = search_path(params.path.as_deref())?;
@@ -2175,13 +2237,37 @@ fn tool_grep_in_current_directory(
 
     let (program, args) = match latex_kitty::resolve_on_path("rg") {
         Some(rg) => (rg, rg_search_args(&params, &path)),
-        None => (PathBuf::from("grep"), grep_search_args(&params, &path)),
+        None => (
+            latex_kitty::resolve_on_path("grep").ok_or("neither rg nor grep is installed")?,
+            grep_search_args(&params, &path),
+        ),
     };
-    let mut cmd = Command::new(&program);
-    cmd.args(&args);
+    let mut cmd = if sandboxed {
+        let cwd = std::env::current_dir()?;
+        let cwd = cwd.to_str().ok_or("current directory is not valid UTF-8")?;
+        let program = program
+            .to_str()
+            .ok_or("search program path is not valid UTF-8")?;
+        let mut cmd = Command::new("bwrap");
+        cmd.args(bwrap_search_args(cwd, program, &args));
+        cmd
+    } else {
+        let mut cmd = Command::new(&program);
+        cmd.args(&args);
+        cmd
+    };
     cmd.stdin(Stdio::null());
     trace!("Executing search command: {:?}", cmd);
-    let output = cmd.output()?;
+    let output = cmd.output().map_err(|e| {
+        if sandboxed {
+            format!(
+                "Failed to launch the sandbox (bwrap): {} - is bubblewrap installed?",
+                e
+            )
+        } else {
+            format!("Failed to run {}: {}", program.display(), e)
+        }
+    })?;
 
     // Both exit with 1 for "no matches", which isn't an error here. 2 is
     // an error - but rg also returns 2 when it matched and merely couldn't
@@ -3527,7 +3613,11 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
     append_tool(
         &mut tools,
         "grep_in_current_directory".to_string(),
-        tool_grep_in_current_directory,
+        if unsafe_tools {
+            tool_grep_in_current_directory_unsandboxed
+        } else {
+            tool_grep_in_current_directory
+        },
         r#"
         {
             "type": "function",
@@ -9353,6 +9443,37 @@ mod tests {
     }
 
     #[test]
+    fn test_bwrap_search_args_bind_cwd_read_only() {
+        let args = bwrap_search_args("/proj", "/usr/bin/rg", &["-e".to_string(), "x".to_string()]);
+        assert!(
+            !args.contains(&"--bind".to_string()),
+            "nothing writable: {args:?}"
+        );
+        let ro: Vec<_> = args
+            .windows(3)
+            .filter(|w| w[0] == "--ro-bind")
+            .map(|w| w[1].clone())
+            .collect();
+        assert_eq!(ro, vec!["/usr", "/proj"]);
+        assert!(args.contains(&"--unshare-net".to_string()));
+        assert!(args.contains(&"--clearenv".to_string()));
+        let chdir = args.iter().position(|a| a == "--chdir").unwrap();
+        assert_eq!(args[chdir + 1], "/proj");
+        assert_eq!(&args[args.len() - 4..], ["--", "/usr/bin/rg", "-e", "x"]);
+    }
+
+    #[test]
+    fn test_bwrap_search_args_bind_a_program_outside_the_system_dirs() {
+        let args = bwrap_search_args("/proj", "/home/me/.cargo/bin/rg", &[]);
+        let ro: Vec<_> = args
+            .windows(3)
+            .filter(|w| w[0] == "--ro-bind")
+            .map(|w| w[1].clone())
+            .collect();
+        assert_eq!(ro, vec!["/usr", "/proj", "/home/me/.cargo/bin/rg"]);
+    }
+
+    #[test]
     fn test_limit_lines_reports_what_was_left_out() {
         assert_eq!(limit_lines("a\nb\nc\n", 5), ("a\nb\nc\n".to_string(), 0));
         assert_eq!(limit_lines("a\nb\nc\n", 2), ("a\nb\n".to_string(), 1));
@@ -9367,8 +9488,10 @@ mod tests {
         std::fs::write(format!("{dir}/sub/b.rs"), "fn tool_two() {}\n").unwrap();
         std::fs::write(format!("{dir}/notes.md"), "tool_three\n").unwrap();
 
+        // Sandboxed as in production when bubblewrap is installed.
+        let sandboxed = latex_kitty::resolve_on_path("bwrap").is_some();
         let run = |params: serde_json::Value| {
-            tool_grep_in_current_directory(&params.to_string(), &test_ctx()).unwrap()
+            search_in_current_directory(&params.to_string(), &test_ctx(), sandboxed).unwrap()
         };
         let out = run(serde_json::json!({"pattern": "fn tool_\\w+", "path": dir}));
         assert_eq!(out.lines().count(), 2, "{out}");

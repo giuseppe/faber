@@ -264,7 +264,7 @@ scheduler thread checks for pending tasks every second.
 | `patch_file` | Apply a batch of search-and-replace edits to a file, all-or-nothing, rewriting only the changed bytes; the result includes a numbered-context preview of where each edit landed, so a follow-up `read_file` usually isn't needed to confirm it |
 | `delete_path` | Delete a file or directory |
 | `glob` | Find files matching a glob pattern |
-| `grep_in_current_directory` | Search file contents with a regex, using [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) if installed and `grep` otherwise. Skips `.gitignore`d, hidden and binary files (the `grep` fallback skips `.git`, `target` and `node_modules` instead); optional `path`, `glob`, `case_insensitive`, `fixed_strings`, `context_lines`, `files_only`, `include_ignored`; output sorted by path and cut off after `max_results` lines (default 200) with a note |
+| `grep_in_current_directory` | Search file contents with a regex, using [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) if installed and `grep` otherwise. Skips `.gitignore`d, hidden and binary files (the `grep` fallback skips `.git`, `target` and `node_modules` instead); optional `path`, `glob`, `case_insensitive`, `fixed_strings`, `context_lines`, `files_only`, `include_ignored`; output sorted by path and cut off after `max_results` lines (default 200) with a note. Unless `--unsafe-tools` is set, the search runs in a bubblewrap sandbox like `run_command`'s, but with the current directory mounted read-only |
 | `github_issue` | Get a GitHub issue |
 | `github_issue_comments` | Get comments on a GitHub issue |
 | `github_issues` | List recent issues in a repository |
