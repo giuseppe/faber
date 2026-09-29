@@ -844,7 +844,11 @@ pub(crate) fn resolve_in_path_dirs(
 ///   through costs nothing here - there's no untrusted code running that
 ///   could read it back out, just the LaTeX toolchain locating its own
 ///   files.
-fn whole_root_ro_bwrap_args(cwd: &str, command: &str, args: Option<&[String]>) -> Vec<String> {
+pub(crate) fn whole_root_ro_bwrap_args(
+    cwd: &str,
+    command: &str,
+    args: Option<&[String]>,
+) -> Vec<String> {
     let mut a = crate::bwrap_isolation_flags(false);
     a.push("--ro-bind".to_string());
     a.push("/".to_string());

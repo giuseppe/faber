@@ -279,6 +279,7 @@ scheduler thread checks for pending tasks every second.
 | `agent_data_get` | Retrieve a value for an agent |
 | `agent_data_delete` | Delete a key-value pair |
 | `agent_data_list` | List all key-value pairs for an agent |
+| `lsp` | Ask a language server about code: `definition`, `references`, `hover`, `symbols` (a file's outline), `workspace_symbols` or `diagnostics`. The server is picked by file extension - rust-analyzer (`.rs`), clangd (C/C++), pyright-langserver or pylsp (`.py`), gopls (`.go`), typescript-language-server (JS/TS) - whichever is installed, started on first use and kept running. A symbol is given by `line` plus its text on that line (`symbol`). Files are re-synced on every call, so edits are picked up. Language servers can run project code (e.g. rust-analyzer builds `build.rs` and proc macros), so unless `--unsafe-tools` is set they run sandboxed with [bubblewrap](https://github.com/containers/bubblewrap): the whole filesystem read-only (so toolchains under `$HOME` still work), only the current directory writable, and no network |
 | `plan_update` | Set the agent's plan for the current multi-step task (full list of items, each `pending`/`in_progress`/`completed`). Stored per agent in the DB under the `state:plan` key, shown in the status bar as progress, and cleared once every item is completed, on `/clear`, or when the agent is deleted (including a sub-agent when it finishes) |
 | `plan_get` | Get the agent's current plan |
 | `task_create_cron` | Create a recurring scheduled task |

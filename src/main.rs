@@ -20,6 +20,7 @@
 mod dummy_llm;
 mod github;
 mod latex_kitty;
+mod lsp;
 mod openai;
 mod remote_db;
 mod server;
@@ -2147,6 +2148,18 @@ fn limit_lines(output: &str, max_lines: usize) -> (String, usize) {
     (kept.join("\n") + "\n", total - max_lines)
 }
 
+/// entrypoint for the lsp tool without --unsafe-tools: the language
+/// server runs sandboxed (see `lsp`).
+fn tool_lsp(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    lsp::run(params_str, ctx, true)
+}
+
+/// entrypoint for the lsp tool with --unsafe-tools: the language server
+/// runs directly on the host.
+fn tool_lsp_unsandboxed(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    lsp::run(params_str, ctx, false)
+}
+
 /// entrypoint for the grep_in_current_directory tool: searches with
 /// ripgrep when it's installed, plain grep otherwise.
 fn tool_grep_in_current_directory(
@@ -3949,6 +3962,57 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                     "required": [
                         "agent"
                     ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "lsp".to_string(),
+        if unsafe_tools {
+            tool_lsp_unsandboxed
+        } else {
+            tool_lsp
+        },
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "lsp",
+                "description": "Ask the language server for the file's language (rust-analyzer, clangd, pyright/pylsp, gopls or typescript-language-server, whichever is installed) about code in the current directory's project. Actions: definition (where a symbol is defined), references (every use of a symbol), hover (its type and documentation), symbols (outline of a file: its functions, types, etc. with line ranges - cheaper than reading the file), workspace_symbols (find symbols by name across the project), diagnostics (compiler errors and warnings for a file). Point at a symbol with its line and the symbol's text on that line.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["definition", "references", "hover", "symbols", "workspace_symbols", "diagnostics"]
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "The file, relative to the current directory. For workspace_symbols, any file in the language to search."
+                        },
+                        "line": {
+                            "type": "integer",
+                            "description": "1-based line of the symbol (definition, references, hover)."
+                        },
+                        "symbol": {
+                            "type": "string",
+                            "description": "The symbol's text as it appears on that line, e.g. a function name (definition, references, hover)."
+                        },
+                        "column": {
+                            "type": "integer",
+                            "description": "1-based column, only if the symbol text is ambiguous on the line."
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Symbol name or part of it (workspace_symbols)."
+                        }
+                    },
+                    "required": ["action", "path"],
                     "additionalProperties": false
                 }
             }
