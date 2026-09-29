@@ -61,33 +61,139 @@ const MAX_RESULTS: usize = 200;
 /// A language server faber knows how to start, and which files it handles.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ServerSpec {
-    /// Alternatives in order of preference; the first found on PATH is used.
-    commands: &'static [&'static [&'static str]],
-    extensions: &'static [&'static str],
+    /// The name it's configured under in `lsp_servers`.
+    name: String,
+    /// Alternatives in order of preference; the first installed is used.
+    commands: Vec<Vec<String>>,
+    extensions: Vec<String>,
+    /// The LSP `languageId` for its files, if not the built-in default.
+    language_id: Option<String>,
+    /// Sent as `initializationOptions` and as the answer to the server's
+    /// `workspace/configuration` requests.
+    settings: Value,
 }
 
-const SERVERS: &[ServerSpec] = &[
+/// A server as written in the config file's `lsp_servers`:
+///
+/// ```json
+/// "lsp_servers": {
+///   "zig": {"command": ["zls"], "extensions": ["zig"]},
+///   "python": {"command": ["pylsp"], "extensions": ["py"]},
+///   "go": null
+/// }
+/// ```
+///
+/// An entry named like a built-in server (`rust`, `c`, `python`, `go`,
+/// `typescript`) replaces it, `null` removes it, and any other name adds a
+/// server.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerConfig {
+    /// The server's executable (a name looked up on PATH, or a path) and
+    /// its arguments.
+    pub command: Vec<String>,
+    /// File extensions it handles, without the dot.
+    pub extensions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub settings: Value,
+}
+
+fn builtin(name: &str, commands: &[&[&str]], extensions: &[&str]) -> ServerSpec {
     ServerSpec {
-        commands: &[&["rust-analyzer"]],
-        extensions: &["rs"],
-    },
-    ServerSpec {
-        commands: &[&["clangd"]],
-        extensions: &["c", "h", "cc", "cpp", "cxx", "hh", "hpp", "hxx"],
-    },
-    ServerSpec {
-        commands: &[&["pyright-langserver", "--stdio"], &["pylsp"]],
-        extensions: &["py"],
-    },
-    ServerSpec {
-        commands: &[&["gopls"]],
-        extensions: &["go"],
-    },
-    ServerSpec {
-        commands: &[&["typescript-language-server", "--stdio"]],
-        extensions: &["ts", "tsx", "js", "jsx", "mjs", "cjs"],
-    },
-];
+        name: name.to_string(),
+        commands: commands
+            .iter()
+            .map(|c| c.iter().map(|a| a.to_string()).collect())
+            .collect(),
+        extensions: extensions.iter().map(|e| e.to_string()).collect(),
+        language_id: None,
+        settings: Value::Null,
+    }
+}
+
+fn builtin_servers() -> Vec<ServerSpec> {
+    vec![
+        builtin("rust", &[&["rust-analyzer"]], &["rs"]),
+        builtin(
+            "c",
+            &[&["clangd"]],
+            &["c", "h", "cc", "cpp", "cxx", "hh", "hpp", "hxx"],
+        ),
+        builtin(
+            "python",
+            &[&["pyright-langserver", "--stdio"], &["pylsp"]],
+            &["py"],
+        ),
+        builtin("go", &[&["gopls"]], &["go"]),
+        builtin(
+            "typescript",
+            &[&["typescript-language-server", "--stdio"]],
+            &["ts", "tsx", "js", "jsx", "mjs", "cjs"],
+        ),
+    ]
+}
+
+/// Applies the config file's `lsp_servers` to `servers` (see
+/// `ServerConfig`), checking that every entry makes sense and that no two
+/// servers claim the same extension.
+pub(crate) fn merge_servers(
+    mut servers: Vec<ServerSpec>,
+    overrides: &HashMap<String, Option<ServerConfig>>,
+) -> Result<Vec<ServerSpec>, String> {
+    let mut names: Vec<&String> = overrides.keys().collect();
+    names.sort();
+    for name in names {
+        servers.retain(|s| &s.name != name);
+        let Some(config) = &overrides[name] else {
+            continue;
+        };
+        if config.command.first().is_none_or(|c| c.is_empty()) {
+            return Err(format!("lsp_servers.{}: \"command\" is empty", name));
+        }
+        if config.extensions.is_empty() {
+            return Err(format!("lsp_servers.{}: \"extensions\" is empty", name));
+        }
+        servers.push(ServerSpec {
+            name: name.clone(),
+            commands: vec![config.command.clone()],
+            extensions: config
+                .extensions
+                .iter()
+                .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
+                .collect(),
+            language_id: config.language_id.clone(),
+            settings: config.settings.clone(),
+        });
+    }
+    let mut owner: HashMap<&str, &str> = HashMap::new();
+    for server in &servers {
+        for ext in &server.extensions {
+            if let Some(other) = owner.insert(ext, &server.name) {
+                return Err(format!(
+                    "lsp_servers: both \"{}\" and \"{}\" handle .{} files",
+                    other, server.name, ext
+                ));
+            }
+        }
+    }
+    Ok(servers)
+}
+
+static SERVERS: OnceLock<Vec<ServerSpec>> = OnceLock::new();
+
+/// Installs the config file's `lsp_servers`; called once at startup,
+/// before any tool runs. Without it, the built-in servers are used.
+pub(crate) fn configure(overrides: &HashMap<String, Option<ServerConfig>>) -> Result<(), String> {
+    let servers = merge_servers(builtin_servers(), overrides)?;
+    let _ = SERVERS.set(servers);
+    Ok(())
+}
+
+fn servers() -> &'static [ServerSpec] {
+    SERVERS.get_or_init(builtin_servers)
+}
 
 fn extension(path: &Path) -> Option<String> {
     path.extension()
@@ -95,43 +201,52 @@ fn extension(path: &Path) -> Option<String> {
         .map(|e| e.to_ascii_lowercase())
 }
 
-pub(crate) fn server_for_path(path: &Path) -> Option<&'static ServerSpec> {
+fn find_server<'a>(servers: &'a [ServerSpec], path: &Path) -> Option<&'a ServerSpec> {
     let ext = extension(path)?;
-    SERVERS
-        .iter()
-        .find(|s| s.extensions.contains(&ext.as_str()))
+    servers.iter().find(|s| s.extensions.contains(&ext))
 }
 
-/// The LSP `languageId` for a file.
-fn language_id(path: &Path) -> &'static str {
-    match extension(path).as_deref() {
-        Some("rs") => "rust",
-        Some("c") | Some("h") => "c",
-        Some("cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx") => "cpp",
-        Some("py") => "python",
-        Some("go") => "go",
-        Some("ts") => "typescript",
-        Some("tsx") => "typescriptreact",
-        Some("jsx") => "javascriptreact",
-        Some("js" | "mjs" | "cjs") => "javascript",
-        _ => "plaintext",
+/// The LSP `languageId` for a file: the server's configured one, or the
+/// standard one for well-known extensions, or else the extension itself.
+fn language_id(spec: &ServerSpec, path: &Path) -> String {
+    if let Some(id) = &spec.language_id {
+        return id.clone();
     }
+    let ext = extension(path).unwrap_or_default();
+    match ext.as_str() {
+        "rs" => "rust",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx" => "cpp",
+        "py" => "python",
+        "go" => "go",
+        "ts" => "typescript",
+        "tsx" => "typescriptreact",
+        "jsx" => "javascriptreact",
+        "js" | "mjs" | "cjs" => "javascript",
+        other => other,
+    }
+    .to_string()
 }
 
-/// Resolves the first of `spec`'s commands that's installed.
+/// Resolves the first of `spec`'s commands that's installed: a name is
+/// looked up on PATH, a path is taken as is if it exists.
 fn resolve_server_command(spec: &ServerSpec) -> Result<(PathBuf, Vec<String>), String> {
-    for command in spec.commands {
-        if let Some(program) = crate::latex_kitty::resolve_on_path(command[0]) {
-            let args = command[1..].iter().map(|a| a.to_string()).collect();
-            return Ok((program, args));
+    for command in &spec.commands {
+        let program = if command[0].contains('/') {
+            Some(PathBuf::from(&command[0])).filter(|p| p.is_file())
+        } else {
+            crate::latex_kitty::resolve_on_path(&command[0])
+        };
+        if let Some(program) = program {
+            return Ok((program, command[1..].to_vec()));
         }
     }
     Err(format!(
-        "no language server installed for .{} files (tried: {})",
-        spec.extensions[0],
+        "the \"{}\" language server isn't installed (tried: {})",
+        spec.name,
         spec.commands
             .iter()
-            .map(|c| c[0])
+            .map(|c| c[0].as_str())
             .collect::<Vec<_>>()
             .join(", ")
     ))
@@ -236,6 +351,7 @@ struct OpenDocument {
 
 pub(crate) struct Client {
     name: String,
+    spec: ServerSpec,
     root: PathBuf,
     child: Mutex<Child>,
     stdin: Arc<Mutex<ChildStdin>>,
@@ -429,7 +545,7 @@ impl Client {
             diagnostics_changed: Condvar::new(),
             progress: Mutex::new(HashSet::new()),
             progress_changed: Condvar::new(),
-            settings: Value::Null,
+            settings: spec.settings.clone(),
         });
         {
             let stdin = stdin.clone();
@@ -439,6 +555,7 @@ impl Client {
         }
         let client = Client {
             name,
+            spec: spec.clone(),
             root: root.to_path_buf(),
             child: Mutex::new(child),
             stdin,
@@ -452,7 +569,7 @@ impl Client {
 
     fn initialize(&self) -> Result<(), Box<dyn Error>> {
         let root_uri = path_to_uri(&self.root);
-        let params = json!({
+        let mut params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
             "workspaceFolders": [{
@@ -473,6 +590,9 @@ impl Client {
                 },
             },
         });
+        if !self.spec.settings.is_null() {
+            params["initializationOptions"] = self.spec.settings.clone();
+        }
         self.request_once("initialize", params)
             .map_err(|e| format!("{} failed to initialize: {}", self.name, e))?;
         self.notify("initialized", json!({}))?;
@@ -585,7 +705,7 @@ impl Client {
                     "textDocument/didOpen",
                     json!({"textDocument": {
                         "uri": uri,
-                        "languageId": language_id(path),
+                        "languageId": language_id(&self.spec, path),
                         "version": 1,
                         "text": text,
                     }}),
@@ -672,11 +792,11 @@ fn clients() -> &'static Mutex<HashMap<(String, PathBuf), Arc<Client>>> {
 /// The running client for `path`'s language in the current directory's
 /// project, started if needed (or restarted if it died).
 fn client_for(path: &Path, sandboxed: bool) -> Result<Arc<Client>, Box<dyn Error>> {
-    let spec = server_for_path(path).ok_or_else(|| {
+    let spec = find_server(servers(), path).ok_or_else(|| {
         format!(
-            "no language server is configured for {} (supported extensions: {})",
+            "no language server is configured for {} (supported extensions: {}; more can be added with \"lsp_servers\" in the config file)",
             path.display(),
-            SERVERS
+            servers()
                 .iter()
                 .flat_map(|s| s.extensions.iter())
                 .map(|e| format!(".{}", e))
@@ -685,7 +805,7 @@ fn client_for(path: &Path, sandboxed: bool) -> Result<Arc<Client>, Box<dyn Error
         )
     })?;
     let root = std::env::current_dir()?;
-    let key = (spec.commands[0][0].to_string(), root.clone());
+    let key = (spec.name.clone(), root.clone());
     let mut clients = clients().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(client) = clients.get(&key) {
         if client.is_alive() {
@@ -1111,13 +1231,84 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_server_for_path_by_extension() {
-        let rs = server_for_path(Path::new("src/main.rs")).unwrap();
+    fn test_find_server_by_extension() {
+        let servers = builtin_servers();
+        let rs = find_server(&servers, Path::new("src/main.rs")).unwrap();
         assert_eq!(rs.commands[0][0], "rust-analyzer");
-        let cpp = server_for_path(Path::new("a/B.HPP")).unwrap();
+        let cpp = find_server(&servers, Path::new("a/B.HPP")).unwrap();
         assert_eq!(cpp.commands[0][0], "clangd");
-        assert!(server_for_path(Path::new("README.md")).is_none());
-        assert!(server_for_path(Path::new("Makefile")).is_none());
+        assert!(find_server(&servers, Path::new("README.md")).is_none());
+        assert!(find_server(&servers, Path::new("Makefile")).is_none());
+    }
+
+    fn overrides(json: Value) -> HashMap<String, Option<ServerConfig>> {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn test_merge_servers_adds_replaces_and_removes() {
+        let servers = merge_servers(
+            builtin_servers(),
+            &overrides(json!({
+                "zig": {"command": ["zls"], "extensions": [".ZIG"]},
+                "python": {"command": ["/opt/bin/pylsp", "-v"], "extensions": ["py", "pyi"],
+                           "settings": {"pylsp": {"plugins": {}}}},
+                "go": null,
+            })),
+        )
+        .unwrap();
+
+        let zig = find_server(&servers, Path::new("a.zig")).unwrap();
+        assert_eq!(zig.commands, vec![vec!["zls".to_string()]]);
+        assert_eq!(language_id(zig, Path::new("a.zig")), "zig");
+
+        let py = find_server(&servers, Path::new("x.pyi")).unwrap();
+        assert_eq!(py.name, "python");
+        assert_eq!(
+            py.commands,
+            vec![vec!["/opt/bin/pylsp".to_string(), "-v".to_string()]]
+        );
+        assert_eq!(py.settings, json!({"pylsp": {"plugins": {}}}));
+        assert_eq!(language_id(py, Path::new("x.py")), "python");
+
+        assert!(find_server(&servers, Path::new("main.go")).is_none());
+        // Untouched built-ins stay.
+        assert!(find_server(&servers, Path::new("main.rs")).is_some());
+    }
+
+    #[test]
+    fn test_merge_servers_rejects_conflicts_and_empty_entries() {
+        let err = merge_servers(
+            builtin_servers(),
+            &overrides(json!({"ccls": {"command": ["ccls"], "extensions": ["cpp"]}})),
+        )
+        .unwrap_err();
+        assert!(err.contains("\"c\" and \"ccls\" handle .cpp"), "{err}");
+        // Replacing the built-in instead of adding a second server is fine.
+        assert!(
+            merge_servers(
+                builtin_servers(),
+                &overrides(json!({
+                    "c": null,
+                    "ccls": {"command": ["ccls"], "extensions": ["c", "cpp"]},
+                })),
+            )
+            .is_ok()
+        );
+        let err = merge_servers(
+            builtin_servers(),
+            &overrides(json!({"x": {"command": [], "extensions": ["x"]}})),
+        )
+        .unwrap_err();
+        assert!(err.contains("\"command\" is empty"), "{err}");
+    }
+
+    #[test]
+    fn test_server_config_rejects_unknown_fields() {
+        let result: Result<HashMap<String, Option<ServerConfig>>, _> = serde_json::from_value(
+            json!({"x": {"command": ["x"], "extensions": ["x"], "extension": ["y"]}}),
+        );
+        assert!(result.is_err());
     }
 
     #[test]

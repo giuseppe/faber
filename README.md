@@ -308,6 +308,37 @@ faber --no-tools chat                           # disable all tools
 faber --tool-choice required chat               # force tool usage
 ```
 
+### Language servers
+
+The `lsp` tool picks a server by file extension from a built-in table -
+`rust` (rust-analyzer), `c` (clangd), `python` (pyright-langserver, else
+pylsp), `go` (gopls), `typescript` (typescript-language-server). The config
+file's `lsp_servers` changes it: an entry named like a built-in replaces
+it, `null` removes it, and any other name adds a server:
+
+```json
+{
+  "lsp_servers": {
+    "zig": { "command": ["zls"], "extensions": ["zig"] },
+    "python": { "command": ["pylsp"], "extensions": ["py", "pyi"] },
+    "rust": {
+      "command": ["rust-analyzer"],
+      "extensions": ["rs"],
+      "settings": { "cargo": { "features": "all" } }
+    },
+    "go": null
+  }
+}
+```
+
+`command` is the executable (looked up on `PATH`, or a path) and its
+arguments. `language_id` sets the LSP language identifier, if the
+extension isn't a well-known one - it defaults to the extension itself.
+`settings` is passed to the server as its `initializationOptions` and as
+the answer to its `workspace/configuration` requests. faber refuses to
+start if two servers claim the same extension. Configured servers are
+sandboxed exactly like the built-in ones.
+
 ### Parallel tool calls
 
 When the model asks for several tool calls in one turn, calls that can't
