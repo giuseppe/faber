@@ -7393,6 +7393,12 @@ struct Opts {
     #[serde(default)]
     mcp_servers: HashMap<String, faber::mcp::McpServerConfig>,
 
+    /// Language servers for the lsp tool, added to or replacing the
+    /// built-in ones (`null` removes one) - see `lsp::ServerConfig`.
+    #[clap(skip)]
+    #[serde(default)]
+    lsp_servers: HashMap<String, Option<lsp::ServerConfig>>,
+
     #[clap(long = "mcp-server")]
     #[serde(skip)]
     /// Add a remote MCP server: NAME=URL for HTTP transport, or
@@ -7431,6 +7437,7 @@ impl Default for Opts {
             server_key: None,
             server_key_file: None,
             mcp_servers: HashMap::new(),
+            lsp_servers: HashMap::new(),
             mcp_server: Vec::new(),
             command: CliCommand::Chat {},
             args: Vec::new(),
@@ -7519,6 +7526,10 @@ impl Opts {
 
         if self.mcp_servers.is_empty() {
             self.mcp_servers = config.mcp_servers;
+        }
+
+        if self.lsp_servers.is_empty() {
+            self.lsp_servers = config.lsp_servers;
         }
 
         debug!("Configuration merge completed");
@@ -7657,6 +7668,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     opts.apply_mcp_server_flags()?;
+    lsp::configure(&opts.lsp_servers)?;
 
     // Reset the model to use if an endpoint was provided
     if opts.model.is_none() && opts.endpoint.is_some() {
