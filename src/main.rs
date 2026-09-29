@@ -2012,69 +2012,205 @@ fn tool_run_command_sandboxed(
     run_command_and_report(cmd, ctx, &params.command, true)
 }
 
-/// entrypoint for the grep_in_current_directory tool
+#[derive(Deserialize, Debug, Default)]
+struct SearchParams {
+    pattern: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    glob: Option<String>,
+    #[serde(default)]
+    case_insensitive: bool,
+    #[serde(default)]
+    fixed_strings: bool,
+    #[serde(default)]
+    context_lines: Option<u32>,
+    #[serde(default)]
+    files_only: bool,
+    #[serde(default)]
+    include_ignored: bool,
+    #[serde(default)]
+    max_results: Option<usize>,
+}
+
+const DEFAULT_SEARCH_MAX_RESULTS: usize = 200;
+const MAX_SEARCH_MAX_RESULTS: usize = 2000;
+const MAX_SEARCH_CONTEXT_LINES: u32 = 10;
+
+/// Directories the plain-grep fallback skips unless `include_ignored` is
+/// set - the usual big, generated ones that ripgrep would skip through
+/// `.gitignore`.
+const GREP_EXCLUDED_DIRS: &[&str] = &[".git", "target", "node_modules"];
+
+/// Checks that a search `path` stays inside the current directory: relative
+/// and without `..`. Defaults to `.`.
+fn search_path(path: Option<&str>) -> Result<String, String> {
+    let path = path.unwrap_or(".");
+    let p = std::path::Path::new(path);
+    if p.is_absolute() || p.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err(format!(
+            "path '{}' must be relative to the current directory, without '..'",
+            path
+        ));
+    }
+    Ok(path.to_string())
+}
+
+/// Arguments for ripgrep. `--sort path` keeps results (and so where they
+/// get cut off) the same from one call to the next; `--max-columns` keeps
+/// one minified line from swallowing the whole result.
+fn rg_search_args(params: &SearchParams, path: &str) -> Vec<String> {
+    let mut a: Vec<String> = [
+        "--no-config",
+        "--color",
+        "never",
+        "--no-heading",
+        "--with-filename",
+        "--line-number",
+        "--sort",
+        "path",
+        "--max-columns",
+        "500",
+        "--max-columns-preview",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    if params.case_insensitive {
+        a.push("-i".to_string());
+    }
+    if params.fixed_strings {
+        a.push("-F".to_string());
+    }
+    if params.files_only {
+        a.push("-l".to_string());
+    } else if let Some(n) = params.context_lines.filter(|n| *n > 0) {
+        a.push("-C".to_string());
+        a.push(n.min(MAX_SEARCH_CONTEXT_LINES).to_string());
+    }
+    if let Some(glob) = &params.glob {
+        a.push("-g".to_string());
+        a.push(glob.clone());
+    }
+    if params.include_ignored {
+        a.push("--no-ignore".to_string());
+        a.push("--hidden".to_string());
+    }
+    a.push("-e".to_string());
+    a.push(params.pattern.clone());
+    a.push("--".to_string());
+    a.push(path.to_string());
+    a
+}
+
+/// Arguments for the plain `grep` fallback, as close to `rg_search_args` as
+/// grep allows: extended regexes, binary files skipped, and the usual
+/// generated directories excluded instead of honoring `.gitignore`.
+fn grep_search_args(params: &SearchParams, path: &str) -> Vec<String> {
+    let mut a: Vec<String> = ["-r", "-n", "-I", "-H"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    a.push(if params.fixed_strings { "-F" } else { "-E" }.to_string());
+    if params.case_insensitive {
+        a.push("-i".to_string());
+    }
+    if params.files_only {
+        a.push("-l".to_string());
+    } else if let Some(n) = params.context_lines.filter(|n| *n > 0) {
+        a.push("-C".to_string());
+        a.push(n.min(MAX_SEARCH_CONTEXT_LINES).to_string());
+    }
+    if let Some(glob) = &params.glob {
+        a.push(format!("--include={}", glob));
+    }
+    if !params.include_ignored {
+        for dir in GREP_EXCLUDED_DIRS {
+            a.push(format!("--exclude-dir={}", dir));
+        }
+    }
+    a.push("-e".to_string());
+    a.push(params.pattern.clone());
+    a.push("--".to_string());
+    a.push(path.to_string());
+    a
+}
+
+/// Keeps the first `max_lines` lines of `output`, returning them and how
+/// many were left out.
+fn limit_lines(output: &str, max_lines: usize) -> (String, usize) {
+    let total = output.lines().count();
+    if total <= max_lines {
+        return (output.to_string(), 0);
+    }
+    let kept: Vec<&str> = output.lines().take(max_lines).collect();
+    (kept.join("\n") + "\n", total - max_lines)
+}
+
+/// entrypoint for the grep_in_current_directory tool: searches with
+/// ripgrep when it's installed, plain grep otherwise.
 fn tool_grep_in_current_directory(
     params_str: &String,
     ctx: &ToolContext,
 ) -> Result<String, Box<dyn Error>> {
-    #[derive(Deserialize)]
-    struct Params {
-        pattern: String,
-    }
+    let params: SearchParams = serde_json::from_str(params_str)?;
+    let path = search_path(params.path.as_deref())?;
+    let max_results = params
+        .max_results
+        .unwrap_or(DEFAULT_SEARCH_MAX_RESULTS)
+        .clamp(1, MAX_SEARCH_MAX_RESULTS);
 
-    let params: Params = serde_json::from_str::<Params>(&params_str)?;
-
-    let mut cmd = Command::new("grep");
-    cmd.arg("-r");
-    cmd.arg("-n");
-    cmd.arg("-e").arg(&params.pattern);
-
-    debug!(
-        "Grepping for pattern '{}' in current directory",
-        params.pattern
-    );
-
-    trace!("Executing grep command: {:?}", cmd);
+    let (program, args) = match latex_kitty::resolve_on_path("rg") {
+        Some(rg) => (rg, rg_search_args(&params, &path)),
+        None => (PathBuf::from("grep"), grep_search_args(&params, &path)),
+    };
+    let mut cmd = Command::new(&program);
+    cmd.args(&args);
+    cmd.stdin(Stdio::null());
+    trace!("Executing search command: {:?}", cmd);
     let output = cmd.output()?;
-    // Grep returns 1 if no lines were selected, 0 if lines were selected, >1 for errors.
-    // We consider no lines selected as a valid, empty result, not an error for the tool.
-    if !output.status.success() && output.status.code() != Some(1) {
-        let stderr = String::from_utf8(output.stderr)?;
-        let err_msg = format!(
-            "grep command failed with status {:?}. Stderr: {}",
-            output.status, stderr
-        );
-        let err: Box<dyn Error> = err_msg.into();
-        return Err(err);
+
+    // Both exit with 1 for "no matches", which isn't an error here. 2 is
+    // an error - but rg also returns 2 when it matched and merely couldn't
+    // read some files, so only fail if there's nothing to show.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() && output.status.code() != Some(1) && stdout.is_empty() {
+        return Err(format!(
+            "{} failed ({}): {}",
+            program.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
     }
 
-    let r = String::from_utf8(output.stdout)?;
-    debug!(
-        "Grep command successfully executed for pattern '{}'",
-        params.pattern
-    );
-
-    // Display grep results directly using context callback
+    let (shown, omitted) = limit_lines(&stdout, max_results);
     ctx.println(&format!(
-        "🔍 Grep results for pattern '{}':",
+        "🔍 Search results for pattern '{}':",
         params.pattern
     ));
-
-    if r.is_empty() {
+    if shown.is_empty() {
         ctx.println("(no matches found)");
-    } else {
-        let line_count = r.lines().count();
-        ctx.println(&format!("Found {} matches:", line_count));
-        for line in r.lines().take(10) {
-            // Show first 10 matches
-            ctx.println(&format!("  {}", line));
-        }
-        if line_count > 10 {
-            ctx.println(&format!("  ... and {} more matches", line_count - 10));
-        }
+        return Ok("No matches.".to_string());
+    }
+    let shown_count = shown.lines().count();
+    ctx.println(&format!("{} lines:", shown_count + omitted));
+    for line in shown.lines().take(10) {
+        ctx.println(&format!("  {}", line));
+    }
+    if shown_count + omitted > 10 {
+        ctx.println(&format!("  ... and {} more", shown_count + omitted - 10));
     }
 
-    Ok(r)
+    let mut result = shown;
+    if omitted > 0 {
+        result.push_str(&format!(
+            "[{} more lines not shown. Narrow the search with `path`, `glob` or a more \
+             specific pattern, use `files_only` to list matching files, or raise `max_results`.]\n",
+            omitted
+        ));
+    }
+    Ok(result)
 }
 
 /// entrypoint for the github_issue tool
@@ -3384,13 +3520,45 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "grep_in_current_directory",
-                "description": "Grep for a pattern in the current directory.",
+                "description": "Search file contents under the current directory with a regular expression (ripgrep syntax, e.g. `fn \\w+_tool|tool_\\w+`). Files ignored by .gitignore, hidden files and binary files are skipped. Returns matching lines as `path:line:text`, sorted by path; results beyond max_results are cut off with a note.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "pattern": {
                             "type": "string",
-                            "description": "The pattern to search for."
+                            "description": "The regular expression to search for (a literal string if fixed_strings is true)."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "File or directory to search, relative to the current directory. Defaults to the whole current directory."
+                        },
+                        "glob": {
+                            "type": "string",
+                            "description": "Only search files whose name matches this glob, e.g. \"*.rs\"."
+                        },
+                        "case_insensitive": {
+                            "type": "boolean",
+                            "description": "Match regardless of case."
+                        },
+                        "fixed_strings": {
+                            "type": "boolean",
+                            "description": "Treat pattern as a literal string, not a regular expression."
+                        },
+                        "context_lines": {
+                            "type": "integer",
+                            "description": "Also show this many lines before and after each match (at most 10)."
+                        },
+                        "files_only": {
+                            "type": "boolean",
+                            "description": "Only list the paths of files that contain a match."
+                        },
+                        "include_ignored": {
+                            "type": "boolean",
+                            "description": "Also search hidden and .gitignore'd files (e.g. build output)."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum number of output lines to return (default 200, at most 2000)."
                         }
                     },
                     "required": [
@@ -9055,6 +9223,105 @@ mod tests {
         assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside\n");
         assert!(res.is_err());
         let _ = std::fs::remove_file(outside);
+    }
+
+    #[test]
+    fn test_every_tool_schema_is_valid_json_naming_its_tool() {
+        for unsafe_tools in [false, true] {
+            for (name, tool) in initialize_tools(unsafe_tools, None) {
+                let schema: serde_json::Value = serde_json::from_str(&tool.schema)
+                    .unwrap_or_else(|e| panic!("schema of {name} is invalid JSON: {e}"));
+                assert_eq!(schema["function"]["name"], name.as_str());
+            }
+        }
+    }
+
+    fn search_params(json: serde_json::Value) -> SearchParams {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn test_search_path_stays_inside_current_directory() {
+        assert_eq!(search_path(None).unwrap(), ".");
+        assert_eq!(search_path(Some("src")).unwrap(), "src");
+        assert!(search_path(Some("/etc")).is_err());
+        assert!(search_path(Some("src/../../x")).is_err());
+    }
+
+    #[test]
+    fn test_rg_search_args_maps_every_option() {
+        let params = search_params(serde_json::json!({
+            "pattern": "fn tool_",
+            "glob": "*.rs",
+            "case_insensitive": true,
+            "fixed_strings": true,
+            "context_lines": 50,
+            "include_ignored": true
+        }));
+        let args = rg_search_args(&params, "src");
+        for expected in ["-i", "-F", "--no-ignore", "--hidden", "--no-config"] {
+            assert!(
+                args.contains(&expected.to_string()),
+                "{expected} missing: {args:?}"
+            );
+        }
+        let c = args.iter().position(|a| a == "-C").unwrap();
+        assert_eq!(args[c + 1], "10", "context is capped");
+        let g = args.iter().position(|a| a == "-g").unwrap();
+        assert_eq!(args[g + 1], "*.rs");
+        // The pattern can never be taken for an option, and the path comes
+        // after "--".
+        assert_eq!(&args[args.len() - 4..], ["-e", "fn tool_", "--", "src"]);
+    }
+
+    #[test]
+    fn test_grep_search_args_excludes_generated_dirs_unless_asked() {
+        let params = search_params(serde_json::json!({"pattern": "-v", "files_only": true}));
+        let args = grep_search_args(&params, ".");
+        assert!(args.contains(&"-E".to_string()));
+        assert!(args.contains(&"-l".to_string()));
+        assert!(args.contains(&"--exclude-dir=target".to_string()));
+        assert_eq!(&args[args.len() - 4..], ["-e", "-v", "--", "."]);
+
+        let params = search_params(serde_json::json!({"pattern": "x", "include_ignored": true}));
+        let args = grep_search_args(&params, ".");
+        assert!(!args.iter().any(|a| a.starts_with("--exclude-dir")));
+    }
+
+    #[test]
+    fn test_limit_lines_reports_what_was_left_out() {
+        assert_eq!(limit_lines("a\nb\nc\n", 5), ("a\nb\nc\n".to_string(), 0));
+        assert_eq!(limit_lines("a\nb\nc\n", 2), ("a\nb\n".to_string(), 1));
+    }
+
+    #[test]
+    fn test_grep_tool_searches_a_directory_and_caps_results() {
+        let dir = "_test_search_dir";
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(format!("{dir}/sub")).unwrap();
+        std::fs::write(format!("{dir}/a.rs"), "fn tool_one() {}\nfn other() {}\n").unwrap();
+        std::fs::write(format!("{dir}/sub/b.rs"), "fn tool_two() {}\n").unwrap();
+        std::fs::write(format!("{dir}/notes.md"), "tool_three\n").unwrap();
+
+        let run = |params: serde_json::Value| {
+            tool_grep_in_current_directory(&params.to_string(), &test_ctx()).unwrap()
+        };
+        let out = run(serde_json::json!({"pattern": "fn tool_\\w+", "path": dir}));
+        assert_eq!(out.lines().count(), 2, "{out}");
+        assert!(out.contains("a.rs:1:fn tool_one() {}"), "{out}");
+        assert!(out.contains("b.rs:1:fn tool_two() {}"), "{out}");
+
+        let out = run(serde_json::json!({"pattern": "tool_", "path": dir, "glob": "*.md"}));
+        assert!(out.contains("notes.md:1:tool_three"), "{out}");
+        assert!(!out.contains("a.rs"), "{out}");
+
+        let out = run(serde_json::json!({"pattern": "tool_", "path": dir, "max_results": 1}));
+        assert!(out.contains("[2 more lines not shown"), "{out}");
+
+        let out = run(serde_json::json!({"pattern": "nothing_matches_this", "path": dir}));
+        assert_eq!(out, "No matches.");
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

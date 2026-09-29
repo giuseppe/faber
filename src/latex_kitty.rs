@@ -792,7 +792,7 @@ fn full_latex_document(markdown_text: &str, color: (u8, u8, u8)) -> String {
 /// name to look up itself - the same way `run_command`'s own schema
 /// requires an absolute path from the model, for a consistent, predictable
 /// executable regardless of what PATH looks like inside a given sandbox.
-fn resolve_on_path(program: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn resolve_on_path(program: &str) -> Option<std::path::PathBuf> {
     let dirs = std::env::var_os("PATH")?;
     resolve_in_path_dirs(program, &dirs)
 }
