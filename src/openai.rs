@@ -195,6 +195,11 @@ pub struct OpenAIRequest {
     pub tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    /// Asks for `usage` in the final chunk of a streamed response: OpenAI
+    /// and llama.cpp leave it out of streams otherwise, and without it
+    /// there's no way to tell how full the context is getting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<serde_json::Value>,
     #[serde(flatten)]
     pub parameters: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -384,6 +389,35 @@ pub struct ModelInfo {
     pub pricing: Option<Pricing>,
     pub top_provider: Option<TopProvider>,
     pub supported_parameters: Option<Vec<String>>,
+    /// llama.cpp's server reports model details here instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<ModelMeta>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ModelMeta {
+    /// The context size the server was started with (`--ctx-size`), which
+    /// is what actually limits requests - not the model's training length.
+    pub n_ctx: Option<u32>,
+}
+
+impl ModelInfo {
+    /// The model's context window, from whichever field the endpoint
+    /// reports it in.
+    pub fn context_window(&self) -> Option<u32> {
+        self.context_length
+            .or_else(|| self.meta.as_ref().and_then(|m| m.n_ctx))
+    }
+}
+
+/// Picks `model` out of an endpoint's model list. A server that lists a
+/// single model (e.g. llama.cpp's) serves it whatever name the request
+/// uses, so that one is taken when nothing matches by name.
+pub fn find_model(models: Vec<ModelInfo>, model: &str) -> Option<ModelInfo> {
+    if models.len() == 1 {
+        return models.into_iter().next();
+    }
+    models.into_iter().find(|m| m.id == model)
 }
 
 /// Represents the architecture details of a model.
@@ -484,6 +518,166 @@ pub fn describe_error(e: &(dyn Error + 'static)) -> String {
 }
 
 /// Perform a tool call and return the message to send back.
+/// Shortens a tool result to at most about `max_chars` characters, keeping
+/// the beginning and the end (where a command's errors or a summary line
+/// usually are) and saying in the middle what was left out and how to get
+/// it. Returns `content` unchanged if it already fits.
+pub fn truncate_tool_output(content: &str, max_chars: usize) -> String {
+    let total = content.chars().count();
+    if total <= max_chars {
+        return content.to_string();
+    }
+    let head_chars = max_chars * 2 / 3;
+    let tail_chars = max_chars - head_chars;
+    let head_end = content
+        .char_indices()
+        .nth(head_chars)
+        .map_or(content.len(), |(i, _)| i);
+    let tail_start = content
+        .char_indices()
+        .nth(total - tail_chars)
+        .map_or(content.len(), |(i, _)| i);
+    format!(
+        "{}\n\n[... {} characters omitted: this tool result was too large to show in full. \
+         Ask for less (e.g. read_file with start_line/end_line, a more specific search \
+         pattern, or a command with less output) to see the rest ...]\n\n{}",
+        &content[..head_end],
+        total - head_chars - tail_chars,
+        &content[tail_start..]
+    )
+}
+
+/// A tool result is never shrunk below this many characters by
+/// `shrink_tool_results`, so it stays useful to the model.
+const MIN_SHRUNK_TOOL_RESULT_CHARS: usize = 2000;
+
+/// Reads the first run of digits right after `marker` in `text`.
+fn number_after(text: &str, marker: &str) -> Option<u64> {
+    let rest = &text[text.find(marker)? + marker.len()..];
+    let rest = rest.trim_start_matches([' ', ':']);
+    let digits: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == ',')
+        .filter(|c| *c != ',')
+        .collect();
+    digits.parse().ok()
+}
+
+/// `(prompt_tokens, context_tokens)` from a context-overflow error, when
+/// the provider reports them: llama.cpp's `n_prompt_tokens`/`n_ctx`
+/// fields, OpenAI's "maximum context length is N tokens. However, your
+/// messages resulted in M tokens", or Anthropic's "prompt is too long: M
+/// tokens > N maximum".
+pub fn context_overflow_sizes(error_text: &str) -> Option<(u64, u64)> {
+    let pairs = [
+        ("\"n_prompt_tokens\":", "\"n_ctx\":"),
+        ("resulted in", "maximum context length is"),
+        ("prompt is too long:", "tokens >"),
+    ];
+    pairs.iter().find_map(|(prompt_marker, context_marker)| {
+        let prompt = number_after(error_text, prompt_marker)?;
+        let context = number_after(error_text, context_marker)?;
+        (prompt > context && context > 0).then_some((prompt, context))
+    })
+}
+
+fn content_chars(msg: &Message) -> usize {
+    msg.content.as_deref().map_or(0, |c| c.chars().count())
+}
+
+/// Cheaper recovery from a context overflow than summarizing: shortens the
+/// largest tool results in `messages` (keeping the head and tail of each)
+/// until the history should fit. Everything else, including what the model
+/// did so far in the current turn, is kept, so the turn can simply carry on.
+///
+/// How much to cut comes from the sizes in `error_text` when the provider
+/// reports them (aiming at 80% of the context, to leave room for the
+/// reply), otherwise half. Returns `None` if shrinking tool results can't
+/// get there, so the caller should summarize instead.
+pub fn shrink_tool_results(messages: &[Message], error_text: &str) -> Option<Vec<Message>> {
+    let ratio = match context_overflow_sizes(error_text) {
+        Some((prompt, context)) => context as f64 * 0.8 / prompt as f64,
+        None => 0.5,
+    };
+    shrink_tool_results_to(messages, ratio)
+}
+
+/// Shortens the largest tool results in `messages` until the history's
+/// total size is about `ratio` of what it is now (see
+/// `shrink_tool_results`). `None` if tool results alone can't get there.
+pub fn shrink_tool_results_to(messages: &[Message], ratio: f64) -> Option<Vec<Message>> {
+    let ratio = ratio.clamp(0.05, 0.9);
+    let total: usize = messages.iter().map(content_chars).sum();
+    let mut to_cut = total - (total as f64 * ratio) as usize;
+
+    let mut tool_results: Vec<(usize, usize)> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "tool")
+        .map(|(i, m)| (i, content_chars(m)))
+        .filter(|(_, len)| *len > MIN_SHRUNK_TOOL_RESULT_CHARS)
+        .collect();
+    let can_cut: usize = tool_results
+        .iter()
+        .map(|(_, len)| len - MIN_SHRUNK_TOOL_RESULT_CHARS)
+        .sum();
+    if can_cut < to_cut {
+        return None;
+    }
+
+    tool_results.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut shrunk = messages.to_vec();
+    for (i, len) in tool_results {
+        if to_cut == 0 {
+            break;
+        }
+        let keep = len.saturating_sub(to_cut).max(MIN_SHRUNK_TOOL_RESULT_CHARS);
+        to_cut = to_cut.saturating_sub(len - keep);
+        let content = shrunk[i].content.as_deref().unwrap_or("");
+        shrunk[i].content = Some(truncate_tool_output(content, keep));
+    }
+    Some(shrunk)
+}
+
+/// Above this fraction of the context window, the tool loop shortens old
+/// tool results before sending the next request.
+const CONTEXT_TRIM_THRESHOLD: f64 = 0.75;
+
+/// What the tool loop shortens the history to when it goes over
+/// `CONTEXT_TRIM_THRESHOLD`, leaving room for several more tool results
+/// and a long reply.
+const CONTEXT_TRIM_TARGET: f64 = 0.5;
+
+/// Proactive counterpart to `shrink_tool_results`, run in the tool loop
+/// before each follow-up request: estimates the next request's size from
+/// the last response's `usage` plus the `new_chars` of tool results added
+/// since (or, if the server reported no usage, from the size of the whole
+/// history), and if that's over `CONTEXT_TRIM_THRESHOLD` of `context_window`,
+/// returns the history with old tool results shortened to about
+/// `CONTEXT_TRIM_TARGET`. Without this the context can fill up with no
+/// error at all - the server just cuts the reply short once the prompt
+/// leaves no room for it.
+fn trim_for_next_request(
+    messages: &[Message],
+    usage: Option<&Usage>,
+    new_chars: usize,
+    context_window: Option<u32>,
+) -> Option<Vec<Message>> {
+    let window = context_window? as f64;
+    // ~4 characters per token for whatever the server hasn't counted.
+    let estimated = match usage.and_then(|u| u.prompt_tokens) {
+        Some(prompt) => {
+            let completion = usage.and_then(|u| u.completion_tokens).unwrap_or(0);
+            (prompt + completion) as f64 + new_chars as f64 / 4.0
+        }
+        None => messages.iter().map(content_chars).sum::<usize>() as f64 / 4.0,
+    };
+    if estimated <= window * CONTEXT_TRIM_THRESHOLD {
+        return None;
+    }
+    shrink_tool_results_to(messages, window * CONTEXT_TRIM_TARGET / estimated)
+}
+
 pub fn tool_call(
     tools_collection: &ToolsCollection,
     req: &ToolCall,
@@ -519,6 +713,7 @@ pub fn tool_call(
                     error_msg
                 }
             };
+            let content = truncate_tool_output(&content, ctx.max_tool_output_chars());
             let msg = Message {
                 role: "tool".to_string(),
                 content: Some(content),
@@ -559,6 +754,7 @@ pub fn tool_call(
     };
 
     trace!("Tool {} gave output {:?}", tool_name, content);
+    let content = truncate_tool_output(&content, ctx.max_tool_output_chars());
 
     let msg = Message {
         role: "tool".to_string(),
@@ -764,6 +960,7 @@ fn run_tool_call_group(
                     buffered.agent_name = ctx.agent_name.clone();
                     buffered.extra = ctx.extra.clone();
                     buffered.mcp_manager = ctx.mcp_manager.clone();
+                    buffered.max_tool_output_chars = ctx.max_tool_output_chars;
                     let tool_start_time = Instant::now();
                     let result =
                         tool_call(tools_collection, req, &buffered).map_err(|e| e.to_string());
@@ -959,6 +1156,7 @@ fn post_request_with_mode_and_recursion(
             tools: if tools.len() > 0 { Some(tools) } else { None },
             tool_choice: tool_choice,
             stream: if use_streaming { Some(true) } else { None },
+            stream_options: use_streaming.then(|| serde_json::json!({"include_usage": true})),
             parameters: opts.parameters.clone(),
         };
 
@@ -1143,13 +1341,21 @@ fn post_request_with_mode_and_recursion(
                         .as_ref()
                         .ok_or("Invalid response")?;
 
-                    messages.extend(run_tool_calls(
-                        tools_collection,
-                        tool_calls,
-                        ctx,
-                        &mode,
-                        start_time,
-                    )?);
+                    let results =
+                        run_tool_calls(tools_collection, tool_calls, ctx, &mode, start_time)?;
+                    let new_chars: usize = results.iter().map(content_chars).sum();
+                    messages.extend(results);
+                    if let Some(trimmed) = trim_for_next_request(
+                        &messages,
+                        openai_response.usage.as_ref(),
+                        new_chars,
+                        ctx.context_window,
+                    ) {
+                        ctx.println(
+                            "(Shortened older tool results to stay within the context window.)",
+                        );
+                        messages = trimmed;
+                    }
                 }
             }
         }
@@ -1569,6 +1775,135 @@ fn handle_streaming_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_truncate_tool_output_keeps_head_and_tail() {
+        let content: String = (0..1000).map(|i| format!("{:04}\n", i)).collect();
+        let out = truncate_tool_output(&content, 600);
+        assert!(out.starts_with("0000\n"));
+        assert!(out.ends_with("0999\n"));
+        assert!(out.contains("characters omitted"));
+        assert!(out.chars().count() < 600 + 300);
+        assert_eq!(truncate_tool_output("short", 600), "short");
+    }
+
+    #[test]
+    fn test_truncate_tool_output_respects_char_boundaries() {
+        let out = truncate_tool_output(&"é".repeat(100), 10);
+        assert!(out.starts_with("éééééé"));
+    }
+
+    fn model(id: &str, json_extra: serde_json::Value) -> ModelInfo {
+        let mut v = serde_json::json!({"id": id});
+        v.as_object_mut()
+            .unwrap()
+            .extend(json_extra.as_object().unwrap().clone());
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn test_context_window_reads_llama_cpp_meta() {
+        let m = model(
+            "m",
+            serde_json::json!({"meta": {"n_ctx": 66816, "n_vocab": 5}}),
+        );
+        assert_eq!(m.context_window(), Some(66816));
+        let m = model("m", serde_json::json!({"context_length": 8192}));
+        assert_eq!(m.context_window(), Some(8192));
+    }
+
+    #[test]
+    fn test_find_model_takes_the_only_model_whatever_its_name() {
+        let only = vec![model("/models/qwen.gguf", serde_json::json!({}))];
+        assert_eq!(
+            find_model(only, "google/gemini-2.5-pro").unwrap().id,
+            "/models/qwen.gguf"
+        );
+        let many = vec![
+            model("a", serde_json::json!({})),
+            model("b", serde_json::json!({})),
+        ];
+        assert_eq!(find_model(many.clone(), "b").unwrap().id, "b");
+        assert!(find_model(many, "c").is_none());
+    }
+
+    fn tool_result(len: usize) -> Message {
+        let mut msg = make_message("tool", "z".repeat(len));
+        msg.name = Some("read_file".to_string());
+        msg.tool_call_id = Some("call_1".to_string());
+        msg
+    }
+
+    #[test]
+    fn test_overflow_sizes_are_read_from_known_error_formats() {
+        let llama = r#"got error code: 400 Bad Request: {"error":{"code":400,"message":"request (96822 tokens) exceeds the available context size (66816 tokens)","type":"exceed_context_size_error","n_prompt_tokens":96822,"n_ctx":66816}}"#;
+        assert_eq!(context_overflow_sizes(llama), Some((96822, 66816)));
+        let openai = "This model's maximum context length is 128000 tokens. However, your messages resulted in 130,512 tokens.";
+        assert_eq!(context_overflow_sizes(openai), Some((130512, 128000)));
+        let anthropic = "prompt is too long: 210000 tokens > 200000 maximum";
+        assert_eq!(context_overflow_sizes(anthropic), Some((210000, 200000)));
+        assert_eq!(context_overflow_sizes("context length exceeded"), None);
+    }
+
+    #[test]
+    fn test_shrink_cuts_the_largest_tool_result_and_keeps_the_turn() {
+        let messages = vec![
+            make_message("user", "read it".to_string()),
+            Message {
+                role: "assistant".to_string(),
+                content: None,
+                tool_call_id: None,
+                name: None,
+                tool_calls: Some(vec![make_call("call_1", "read_file", "{}")]),
+            },
+            tool_result(100_000),
+        ];
+        // Needs to get down to 80% of 50/100 of the current size.
+        let error = r#"{"n_prompt_tokens":100000,"n_ctx":50000}"#;
+        let shrunk = shrink_tool_results(&messages, error).unwrap();
+        assert_eq!(shrunk.len(), 3);
+        assert!(shrunk[1].tool_calls.is_some());
+        assert_eq!(shrunk[2].tool_call_id.as_deref(), Some("call_1"));
+        let total: usize = shrunk.iter().map(content_chars).sum();
+        let before: usize = messages.iter().map(content_chars).sum();
+        assert!(total <= before * 41 / 100, "{total} of {before}");
+    }
+
+    #[test]
+    fn test_shrink_gives_up_when_tool_results_are_not_the_problem() {
+        let messages = vec![
+            make_message("user", "x".repeat(100_000)),
+            tool_result(3_000),
+        ];
+        assert!(shrink_tool_results(&messages, "context length exceeded").is_none());
+    }
+
+    fn usage(prompt: u32, completion: u32) -> Usage {
+        Usage {
+            prompt_tokens: Some(prompt),
+            completion_tokens: Some(completion),
+            total_tokens: Some(prompt + completion),
+        }
+    }
+
+    #[test]
+    fn test_trim_for_next_request_only_near_the_limit() {
+        let messages = vec![make_message("user", "go".to_string()), tool_result(200_000)];
+        // 20k of 100k tokens used: nothing to do.
+        assert!(
+            trim_for_next_request(&messages, Some(&usage(20_000, 100)), 0, Some(100_000)).is_none()
+        );
+        // Unknown window: nothing to do.
+        assert!(trim_for_next_request(&messages, Some(&usage(90_000, 100)), 0, None).is_none());
+        // No usage reported: estimated from the history (~50k tokens here).
+        assert!(trim_for_next_request(&messages, None, 0, Some(100_000)).is_none());
+        assert!(trim_for_next_request(&messages, None, 0, Some(60_000)).is_some());
+        // 60k used + 200k new chars (~50k tokens) is over 75%.
+        let trimmed =
+            trim_for_next_request(&messages, Some(&usage(60_000, 0)), 200_000, Some(100_000))
+                .unwrap();
+        assert!(content_chars(&trimmed[1]) < 200_000 / 2);
+    }
 
     fn read(p: &str) -> ToolAccess {
         ToolAccess::ReadPath(PathBuf::from(p))

@@ -215,6 +215,7 @@ pub fn summarize_conversation(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::openai::{FunctionCall, ToolCall};
 

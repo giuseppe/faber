@@ -117,15 +117,25 @@ model that degenerates into repeating itself with no line breaks at all -
 and can always be interrupted with Ctrl-C as soon as something looks
 wrong.
 
-Reading a large file in full sends its entire content to the model as
-context, which both grows every later request and can turn the next one
-into the kind of slow prompt above; `read_file` accepts `start_line`/
-`end_line` to read just a range, and reports `total_lines` plus a note
-suggesting that range when a full read of a large file is requested.
+No single tool result can fill the context: each one is capped at about a
+quarter of the model's context window (32,000 characters if the window is
+unknown), keeping its beginning and end with a note in between saying what
+was left out. `read_file` stops at a whole line instead, and its note gives
+the `start_line` to continue from; it also accepts `start_line`/`end_line` to
+read just a range.
 
-When a request fails because the conversation no longer fits in the model's
-context window, the chat summarizes the history automatically and retries the
-request once.  Work done by tool calls earlier in the failed turn is included
+Within a turn, once the conversation reaches about 75% of the context window
+between tool calls, faber shortens the oldest large tool results before
+sending the next request, so a long task (e.g. reading a big file chunk by
+chunk) doesn't fill the context and get its reply cut off. This uses the
+token counts the server reports (faber asks for them in streamed responses
+with `stream_options.include_usage`), or an estimate if it reports none.
+
+If a request still fails because the conversation doesn't fit, the chat
+first shortens large tool results and retries - keeping everything else,
+including what the model already did in the current turn - up to three
+times. Only if that's not enough does it summarize the history and retry
+the request. Work done by tool calls earlier in the failed turn is included
 in the summary, and your last message is kept verbatim after it.
 
 The chat also summarizes *proactively*, before that ever happens: once the
@@ -133,11 +143,12 @@ last request's reported prompt-token count reaches about 80% of the model's
 context window, the next request summarizes the conversation first instead of
 risking the same failure. This needs to know the context window size, which
 faber tries to look up automatically (in the background, so it doesn't delay
-your first message) from the endpoint's `/models` listing; if the endpoint
-doesn't expose that, or the lookup fails, proactive summarization simply
-never triggers - only the reactive fallback above still applies. Use
-`--context-window <N>` to set it explicitly (in tokens) instead of relying on
-the automatic lookup.
+your first message) from the endpoint's `/models` listing - OpenRouter's
+`context_length` or llama.cpp's `meta.n_ctx`; an endpoint that lists a single
+model is taken to serve that one, whatever the configured model name. If the
+lookup fails, proactive summarization and tool-result trimming never trigger
+- only the reactive fallback above still applies. Use `--context-window <N>`
+to set it explicitly (in tokens) instead of relying on the automatic lookup.
 
 `/cost` shows accumulated token usage for the whole session (every agent, not
 just the current one) - prompt/completion/total tokens across every request

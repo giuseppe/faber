@@ -817,7 +817,43 @@ fn tool_delete_path(params_str: &String, _ctx: &ToolContext) -> Result<String, B
 /// turn the next request into a very large, slow-to-process prompt.
 const LARGE_FILE_LINE_WARNING_THRESHOLD: usize = 1000;
 
-fn tool_read_file(params_str: &String, _ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+/// Tells the model a read stopped at `shown_end` instead of `requested_end`
+/// because the rest didn't fit, and how to continue.
+fn truncated_read_note(
+    start: u64,
+    shown_end: u64,
+    requested_end: u64,
+    total_lines: usize,
+) -> String {
+    format!(
+        "Only lines {}-{} of the requested {}-{} are included (the file has {} lines): \
+         the rest is too large for one read. Call read_file again with \
+         start_line={} to continue, or search for what you need instead of \
+         reading everything.",
+        start,
+        shown_end,
+        start,
+        requested_end,
+        total_lines,
+        shown_end + 1
+    )
+}
+
+/// How many of `lines` (each with its own newline), starting from the
+/// first, fit in `budget_chars` - always at least one, so a single huge line
+/// still makes progress (the generic tool-output cap then shortens it).
+fn lines_within_budget(lines: &[&str], budget_chars: usize) -> usize {
+    let mut used = 0;
+    for (i, line) in lines.iter().enumerate() {
+        used += line.chars().count();
+        if used > budget_chars {
+            return i.max(1);
+        }
+    }
+    lines.len()
+}
+
+fn tool_read_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     use serde::Serialize;
 
     #[derive(Deserialize)]
@@ -877,6 +913,9 @@ fn tool_read_file(params_str: &String, _ctx: &ToolContext) -> Result<String, Box
                     // original bytes for that range.
                     let full_lines: Vec<&str> = contents.split_inclusive('\n').collect();
                     let total_lines = full_lines.len();
+                    // Leave headroom for JSON escaping (quotes, backslashes
+                    // and newlines all grow) and the other fields.
+                    let budget = ctx.max_tool_output_chars() * 3 / 4;
 
                     match (params.start_line, params.end_line) {
                         (Some(start), Some(end)) => {
@@ -898,15 +937,35 @@ fn tool_read_file(params_str: &String, _ctx: &ToolContext) -> Result<String, Box
                                     end, total_lines
                                 ))
                             } else {
-                                let slice = full_lines[(start - 1) as usize..end as usize].concat();
+                                let requested = &full_lines[(start - 1) as usize..end as usize];
+                                let shown = lines_within_budget(requested, budget);
+                                let shown_end = start + shown as u64 - 1;
                                 ReadFileResult {
-                                    content: Some(slice),
+                                    content: Some(requested[..shown].concat()),
                                     error: None,
                                     total_lines: Some(total_lines),
                                     start_line: Some(start),
-                                    end_line: Some(end),
-                                    note: None,
+                                    end_line: Some(shown_end),
+                                    note: (shown < requested.len()).then(|| {
+                                        truncated_read_note(start, shown_end, end, total_lines)
+                                    }),
                                 }
+                            }
+                        }
+                        _ if lines_within_budget(&full_lines, budget) < total_lines => {
+                            let shown = lines_within_budget(&full_lines, budget) as u64;
+                            ReadFileResult {
+                                content: Some(full_lines[..shown as usize].concat()),
+                                error: None,
+                                total_lines: Some(total_lines),
+                                start_line: Some(1),
+                                end_line: Some(shown),
+                                note: Some(truncated_read_note(
+                                    1,
+                                    shown,
+                                    total_lines as u64,
+                                    total_lines,
+                                )),
                             }
                         }
                         _ => ReadFileResult {
@@ -5818,18 +5877,28 @@ fn spawn_model_metadata_lookup(
 ) {
     std::thread::spawn(move || {
         let models_endpoint = models_endpoint_from(&endpoint);
-        let Some(found) = list_models_from_endpoint(&models_endpoint, api_key.as_ref())
-            .ok()
-            .and_then(|models| models.into_iter().find(|m| m.id == model))
-        else {
+        let models = match list_models_from_endpoint(&models_endpoint, api_key.as_ref()) {
+            Ok(models) => models,
+            Err(e) => {
+                debug!("Model metadata lookup at {} failed: {}", models_endpoint, e);
+                return;
+            }
+        };
+        let Some(found) = openai::find_model(models, &model) else {
+            debug!("Model '{}' not listed at {}", model, models_endpoint);
             return;
         };
+        debug!(
+            "Model metadata for '{}': context window {:?}",
+            found.id,
+            found.context_window()
+        );
         // Never overwrite an explicit --context-window with whatever the
         // lookup finds, even if it finds something different - the CLI
         // flag is a deliberate override, not just a fallback default that
         // happens to run first.
         if !context_window_is_explicit {
-            if let Some(context_length) = found.context_length {
+            if let Some(context_length) = found.context_window() {
                 *context_window.lock().unwrap_or_else(|e| e.into_inner()) = Some(context_length);
             }
         }
@@ -5839,9 +5908,15 @@ fn spawn_model_metadata_lookup(
     });
 }
 
-/// Runs `request` on a copy of the agent's history.  If the request fails
-/// because the conversation no longer fits in the model's context window, the
-/// history is summarized and the request is run once more.
+/// How many times `request_with_summary_fallback` shortens tool results
+/// in one turn before falling back to summarizing the conversation.
+const MAX_TOOL_RESULT_SHRINKS: usize = 3;
+
+/// Runs `request` on a copy of the agent's history, recovering if it fails
+/// because the conversation no longer fits in the model's context window:
+/// first by shortening the largest tool results (keeping the rest of the
+/// history, including the current turn's progress), and if that isn't
+/// enough, by summarizing the conversation.
 fn request_with_summary_fallback<T>(
     agent: &mut AgentState,
     openai_opts: &openai::Opts,
@@ -5852,14 +5927,39 @@ fn request_with_summary_fallback<T>(
     chat_pb: &ChatPrinter,
     mut request: impl FnMut(Vec<Message>) -> Result<T, Box<dyn Error>>,
 ) -> Result<T, Box<dyn Error>> {
-    let err = match request(agent.messages.clone()) {
+    let mut err = match request(agent.messages.clone()) {
         Err(e) => e,
         ok => return ok,
     };
-    let history = match err.downcast_ref::<openai::ContextLengthError>() {
-        Some(overflow) => overflow.history.clone(),
-        None => return Err(err),
+    let Some(overflow) = err.downcast_ref::<openai::ContextLengthError>() else {
+        return Err(err);
     };
+    let mut history = overflow.history.clone();
+    let mut overflow_message = overflow.message.clone();
+
+    // Each round keeps whatever the turn has done since the last one, so a
+    // long turn that keeps reading can keep going, with its oldest tool
+    // results getting shorter each time.
+    for _ in 0..MAX_TOOL_RESULT_SHRINKS {
+        let Some(shrunk) = openai::shrink_tool_results(&history, &overflow_message) else {
+            break;
+        };
+        chat_pb.println("Context length exceeded, shortening large tool results and retrying...");
+        agent.messages = shrunk;
+        agent.last_prompt_tokens = None;
+        save_agent_history(db, agent);
+        err = match request(agent.messages.clone()) {
+            Err(e) => e,
+            ok => return ok,
+        };
+        match err.downcast_ref::<openai::ContextLengthError>() {
+            Some(overflow) => {
+                history = overflow.history.clone();
+                overflow_message = overflow.message.clone();
+            }
+            None => return Err(err),
+        }
+    }
 
     chat_pb.println("Context length exceeded, summarizing the conversation and retrying...");
     summarize_agent_history(
@@ -5880,7 +5980,33 @@ fn request_with_summary_fallback<T>(
             format!("{} (summarization failed: {})", err, e).into()
         }
     })?;
-    request(agent.messages.clone())
+    request(agent.messages.clone()).map_err(|e| {
+        match e.downcast_ref::<openai::ContextLengthError>() {
+            Some(overflow) => still_too_large_error(&overflow.message),
+            None => e,
+        }
+    })
+}
+
+/// The error shown when a request still overflows the context window after
+/// every recovery attempt, instead of the provider's raw error body.
+fn still_too_large_error(provider_message: &str) -> Box<dyn Error> {
+    let sizes = match openai::context_overflow_sizes(provider_message) {
+        Some((prompt, context)) => {
+            format!(
+                " (the request needs {} tokens, the model has {})",
+                prompt, context
+            )
+        }
+        None => String::new(),
+    };
+    format!(
+        "The request is still too large for the model's context window after shortening \
+         tool results and summarizing{}. Ask for less at once (e.g. a range of a file, \
+         or a narrower search), or use /clear to start over.",
+        sizes
+    )
+    .into()
 }
 
 fn format_tool_output(output: &str) -> String {
@@ -6423,6 +6549,10 @@ fn chat_command(
                     tool_context.db = db.clone();
                     tool_context.agent_name = Some(active_agent.name.clone());
                     tool_context.mcp_manager = mcp_manager.clone();
+                    // Re-read every turn: the window may only have been
+                    // found by the background /models lookup since startup.
+                    tool_context.context_window =
+                        *context_window.lock().unwrap_or_else(|e| e.into_inner());
                     tool_context.extra = Some(Arc::new(SubAgentContext {
                         tools: tools_arc.clone(),
                         opts: openai_opts.clone(),
@@ -6804,6 +6934,7 @@ fn list_models_command(opts: &Opts) -> Result<(), Box<dyn Error>> {
                         Ok(c) => format!("{:.6}", c),
                         Err(_) => completion_price_str.to_string(),
                     };
+                    let context_window = model.context_window().unwrap_or(0);
                     let supported_parameters = model
                         .supported_parameters
                         .unwrap_or_else(|| vec![])
@@ -6812,7 +6943,7 @@ fn list_models_command(opts: &Opts) -> Result<(), Box<dyn Error>> {
                     table.add_row(Row::new(vec![
                         Cell::new(&model.id),
                         Cell::new(&model.name.unwrap_or("".to_string())),
-                        Cell::new(&model.context_length.unwrap_or(0).to_string()),
+                        Cell::new(&context_window.to_string()),
                         Cell::new(&prompt_price),
                         Cell::new(&completion_price),
                         Cell::new(&supported_parameters),
@@ -9300,6 +9431,42 @@ mod tests {
         assert!(res.get("start_line").is_none());
         assert!(res.get("end_line").is_none());
         cleanup(path);
+    }
+
+    fn read_with_limit(params: serde_json::Value, max_chars: usize) -> serde_json::Value {
+        let mut ctx = test_ctx();
+        ctx.max_tool_output_chars = Some(max_chars);
+        serde_json::from_str(&tool_read_file(&params.to_string(), &ctx).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn test_read_file_too_large_stops_at_a_line_and_says_where_to_continue() {
+        let path = "_test_rf_too_large.tmp";
+        // 100 lines of 10 characters each; a 400-char budget allows 300.
+        let contents: String = (0..100).map(|i| format!("line {:04}\n", i)).collect();
+        write_test_file(path, &contents);
+        let res = read_with_limit(serde_json::json!({"path": path}), 400);
+        assert_eq!(res["start_line"], 1);
+        assert_eq!(res["end_line"], 30);
+        assert_eq!(res["total_lines"], 100);
+        assert!(res["content"].as_str().unwrap().ends_with("line 0029\n"));
+        assert!(res["note"].as_str().unwrap().contains("start_line=31"));
+
+        let res = read_with_limit(
+            serde_json::json!({"path": path, "start_line": 31, "end_line": 100}),
+            400,
+        );
+        assert_eq!(res["end_line"], 60);
+        assert!(res["content"].as_str().unwrap().starts_with("line 0030\n"));
+        assert!(res["note"].as_str().unwrap().contains("start_line=61"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_lines_within_budget_always_makes_progress() {
+        assert_eq!(lines_within_budget(&["a\n", "b\n", "c\n"], 4), 2);
+        assert_eq!(lines_within_budget(&["a\n", "b\n"], 100), 2);
+        assert_eq!(lines_within_budget(&["way too long\n", "b\n"], 3), 1);
     }
 
     #[test]
