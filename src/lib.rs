@@ -31,6 +31,21 @@ pub mod openai;
 #[allow(dead_code)]
 pub mod protocol;
 
+/// Largest tool result, in characters, handed back to the model when the
+/// context window is unknown (roughly 8k tokens).
+pub const DEFAULT_MAX_TOOL_OUTPUT_CHARS: usize = 32_000;
+
+/// Smallest cap `max_tool_output_chars_for_context` will ever pick, so a
+/// tiny context window still leaves room for a useful result.
+const MIN_MAX_TOOL_OUTPUT_CHARS: usize = 4_000;
+
+/// Tool-result cap for a model with `context_window` tokens: about a
+/// quarter of the window (at ~4 characters per token), so a single tool
+/// result can never fill the context on its own.
+pub fn max_tool_output_chars_for_context(context_window: u32) -> usize {
+    (context_window as usize).max(MIN_MAX_TOOL_OUTPUT_CHARS)
+}
+
 pub struct ToolContext {
     pub println: Box<dyn Fn(&str) + Send + Sync>,
     pub db: Option<Arc<dyn db_backend::DbBackend>>,
@@ -42,6 +57,13 @@ pub struct ToolContext {
     /// can tell "this line came from inside a running tool" apart from any
     /// other use of the same closure. Ignored by callers that don't care.
     pub boxed: Arc<AtomicBool>,
+    /// Cap on a tool result's size, in characters (see
+    /// `max_tool_output_chars`); `None` uses the default.
+    pub max_tool_output_chars: Option<usize>,
+    /// The model's context window in tokens, when known: sizes tool
+    /// results (unless `max_tool_output_chars` is set) and lets the tool
+    /// loop trim old tool results before the conversation outgrows it.
+    pub context_window: Option<u32>,
 }
 
 impl ToolContext {
@@ -56,7 +78,16 @@ impl ToolContext {
             extra: None,
             mcp_manager: None,
             boxed: Arc::new(AtomicBool::new(false)),
+            max_tool_output_chars: None,
+            context_window: None,
         }
+    }
+
+    /// Largest tool result, in characters, to hand back to the model.
+    pub fn max_tool_output_chars(&self) -> usize {
+        self.max_tool_output_chars
+            .or_else(|| self.context_window.map(max_tool_output_chars_for_context))
+            .unwrap_or(DEFAULT_MAX_TOOL_OUTPUT_CHARS)
     }
 
     pub fn println(&self, msg: &str) {
