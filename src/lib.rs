@@ -18,8 +18,8 @@
  */
 
 use std::any::Any;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, mpsc};
 
 pub mod db;
 pub mod db_backend;
@@ -64,6 +64,10 @@ pub struct ToolContext {
     /// results (unless `max_tool_output_chars` is set) and lets the tool
     /// loop trim old tool results before the conversation outgrows it.
     pub context_window: Option<u32>,
+    /// Receives Ctrl-C while a request is running, for a long-running tool
+    /// (e.g. `fan_out`) to notice it. Whoever takes the signal must stop
+    /// and return `openai::InterruptedError`.
+    pub interrupt: Option<Arc<Mutex<mpsc::Receiver<()>>>>,
 }
 
 impl ToolContext {
@@ -80,6 +84,7 @@ impl ToolContext {
             boxed: Arc::new(AtomicBool::new(false)),
             max_tool_output_chars: None,
             context_window: None,
+            interrupt: None,
         }
     }
 

@@ -740,6 +740,10 @@ pub fn tool_call(
             );
             match (t.callback)(&req.function.arguments, ctx) {
                 Ok(result) => result,
+                // The user pressed Ctrl-C while the tool ran: stop the
+                // whole turn, as anywhere else, rather than reporting it
+                // to the model as a failed tool call.
+                Err(e) if e.downcast_ref::<InterruptedError>().is_some() => return Err(e),
                 Err(e) => {
                     let error_msg = format!(
                         "error: tool '{}' failed: {}",
@@ -961,6 +965,8 @@ fn run_tool_call_group(
                     buffered.extra = ctx.extra.clone();
                     buffered.mcp_manager = ctx.mcp_manager.clone();
                     buffered.max_tool_output_chars = ctx.max_tool_output_chars;
+                    buffered.context_window = ctx.context_window;
+                    buffered.interrupt = ctx.interrupt.clone();
                     let tool_start_time = Instant::now();
                     let result =
                         tool_call(tools_collection, req, &buffered).map_err(|e| e.to_string());

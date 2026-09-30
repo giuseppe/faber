@@ -18,6 +18,7 @@
  */
 
 mod dummy_llm;
+mod fan_out;
 mod github;
 mod latex_kitty;
 mod lsp;
@@ -79,9 +80,26 @@ struct AgentState {
     last_prompt_tokens: Option<u32>,
 }
 
+/// The final answer in a sub-agent's (or fan-out worker's) response, or
+/// why there isn't one.
+fn final_response_text(result: Result<OpenAIResponse, Box<dyn Error>>) -> Result<String, String> {
+    let resp = result.map_err(|e| e.to_string())?;
+    if let Some(err) = resp.error {
+        return Err(err.message);
+    }
+    Ok(resp
+        .choices
+        .as_ref()
+        .and_then(|c| c.first())
+        .and_then(|c| c.message.content.clone())
+        .filter(|c| !c.trim().is_empty())
+        .unwrap_or_else(|| "(no response)".to_string()))
+}
+
 /// Accumulated token usage across every chat turn in the current session
 /// (every agent, not just the active one - switching agents doesn't reset
-/// this, unlike `AgentState::last_prompt_tokens`), shown by the `/cost`
+/// this, unlike `AgentState::last_prompt_tokens` - plus every sub-agent
+/// and fan-out worker run, each counted as a turn), shown by the `/cost`
 /// command. Each turn is recorded from `OpenAIResponse::turn_usage`, so
 /// every tool-call round trip within it counts, not just the final
 /// request. A turn whose requests didn't report `usage` at all simply
@@ -124,6 +142,8 @@ struct SubAgentContext {
     session_id: String,
     active_subagents: Arc<std::sync::atomic::AtomicUsize>,
     status_bar: Arc<status_bar::StatusBar>,
+    /// Sub-agents' and fan-out workers' tokens count toward `/cost` too.
+    session_usage: Arc<Mutex<SessionUsage>>,
 }
 
 const CHAT_COMMANDS: &[&str] = &[
@@ -3004,6 +3024,8 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     let session_id_for_sub = sa_ctx.session_id.clone();
     let mcp_for_sub = ctx.mcp_manager.clone();
     let agent_name_for_ctx = agent_name.clone();
+    let context_window = ctx.context_window;
+    let session_usage = sa_ctx.session_usage.clone();
     std::thread::spawn(move || {
         struct SubAgentGuard {
             status_bar: Arc<status_bar::StatusBar>,
@@ -3032,6 +3054,7 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         sub_ctx.db = Some(db.clone());
         sub_ctx.agent_name = Some(agent_name_for_ctx);
         sub_ctx.mcp_manager = mcp_for_sub;
+        sub_ctx.context_window = context_window;
         let result = post_request_with_mode(
             messages,
             &tools,
@@ -3040,21 +3063,13 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
             &sub_ctx,
             None,
         );
-        let response_text = match result {
-            Ok(resp) => {
-                if let Some(ref choices) = resp.choices {
-                    choices
-                        .first()
-                        .and_then(|c| c.message.content.clone())
-                        .unwrap_or_else(|| "(no response)".to_string())
-                } else if let Some(ref err) = resp.error {
-                    format!("Error: {}", err.message)
-                } else {
-                    "(empty response)".to_string()
-                }
-            }
-            Err(e) => format!("Error: {}", e),
-        };
+        if let Some(usage) = result.as_ref().ok().and_then(|r| r.turn_usage.as_ref()) {
+            session_usage
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record(usage);
+        }
+        let response_text = final_response_text(result).unwrap_or_else(|e| format!("Error: {}", e));
         let notification = serde_json::json!({
             "type": "subagent_result",
             "agent": agent_name,
@@ -4479,6 +4494,47 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "name",
                         "prompt"
                     ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "fan_out".to_string(),
+        fan_out::tool_fan_out,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "fan_out",
+                "description": "Run the same task for many items at once - e.g. review each of these files, answer this question for each module - each in its own worker agent, and get all their results back together, in item order, when every worker has finished. Workers see only their own item and the prompt, and by default can only use read-only tools (reading files, searching, lsp), so have them report findings and make any edits yourself afterwards.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "What to run the task for, one worker each (at most 100), e.g. file paths."
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "The task for each worker. {item} is replaced by the worker's item (otherwise the item is appended). Say exactly what the result should contain."
+                        },
+                        "max_parallel": {
+                            "type": "integer",
+                            "description": "How many workers run at the same time (default 4, at most 16)."
+                        },
+                        "tools": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Tools the workers may use, by name, instead of the default read-only ones. Workers that write files can overwrite each other's changes."
+                        }
+                    },
+                    "required": ["items", "prompt"],
                     "additionalProperties": false
                 }
             }
@@ -6881,7 +6937,9 @@ fn chat_command(
                         session_id: session_id.to_string(),
                         active_subagents: active_subagents.clone(),
                         status_bar: status_bar.clone(),
+                        session_usage: session_usage.clone(),
                     }));
+                    tool_context.interrupt = Some(ctrl_c_rx.clone());
 
                     if is_injected {
                         maybe_summarize_proactively(

@@ -151,7 +151,7 @@ lookup fails, proactive summarization and tool-result trimming never trigger
 to set it explicitly (in tokens) instead of relying on the automatic lookup.
 
 `/cost` shows accumulated token usage for the whole session (every agent, not
-just the current one) - prompt/completion/total tokens across every request
+just the current one, plus sub-agents and `fan_out` workers) - prompt/completion/total tokens across every request
 so far, including each intermediate tool-call round trip - plus an estimated dollar cost, using the same background `/models`
 lookup's pricing if the endpoint provides it; otherwise just the token
 counts, with no guessed price shown.
@@ -291,6 +291,7 @@ scheduler thread checks for pending tasks every second.
 | `task_pending` | List tasks that are due to run |
 | `send_message` | Send a message to another agent |
 | `spawn_agent` | Spawn a sub-agent for parallel work |
+| `fan_out` | Run the same task for many items (e.g. files) at once, one worker agent each, at most `max_parallel` at a time (default 4), and return all the results together, in item order, once every worker is done. `{item}` in the prompt is replaced by each worker's item. Workers only get read-only tools (`read_file`, `glob`, `grep_in_current_directory`, `lsp`, web/GitHub reads) unless `tools` names others - workers that write can overwrite each other's changes - and can't spawn agents. Ctrl-C stops every worker. Each result gets a share of the output cap |
 | `run_command` | Execute a command, sandboxed with [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`): no network access, no capabilities, a cleared environment, a read-only root with only the current directory writable, its own PID/IPC/UTS/cgroup namespaces (no visibility into other processes or the host's hostname), killed if faber itself dies, and detached from the controlling terminal. Requires `bwrap` to be installed; use `--unsafe-tools` for unrestricted execution instead |
 
 ### Unsafe tools (require `--unsafe-tools`)
