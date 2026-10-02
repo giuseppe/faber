@@ -64,6 +64,9 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "github_pull_request",
     "github_pull_request_patch",
     "github_pull_requests",
+    "kb_search",
+    "kb_read",
+    "kb_list",
 ];
 
 /// Tools a worker can never have: no nested agents, and no plan (workers

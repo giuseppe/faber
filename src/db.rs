@@ -320,7 +320,50 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
     let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN session_id TEXT DEFAULT NULL;");
     let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN heartbeat_at TEXT DEFAULT NULL;");
 
+    initialize_kb(conn)?;
     Ok(())
+}
+
+/// The knowledge base: `kb_notes`, plus `kb_fts`, an FTS5 full-text index
+/// over their title, body and tags that triggers keep in step with it.
+/// Titles are unique per scope (shared, or one agent's private notes),
+/// ignoring case, so writing a note under an existing title updates it.
+fn initialize_kb(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS kb_notes (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             title TEXT NOT NULL,
+             body TEXT NOT NULL,
+             tags TEXT NOT NULL DEFAULT '',
+             agent_name TEXT,
+             created_by TEXT,
+             created_at TEXT NOT NULL DEFAULT (datetime('now')),
+             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+             FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_kb_title
+             ON kb_notes(lower(title), COALESCE(agent_name, ''));
+         CREATE INDEX IF NOT EXISTS idx_kb_updated ON kb_notes(updated_at);
+         CREATE VIRTUAL TABLE IF NOT EXISTS kb_fts USING fts5(
+             title, body, tags,
+             content = 'kb_notes', content_rowid = 'id',
+             tokenize = 'porter unicode61'
+         );
+         CREATE TRIGGER IF NOT EXISTS kb_notes_ai AFTER INSERT ON kb_notes BEGIN
+             INSERT INTO kb_fts(rowid, title, body, tags)
+                 VALUES (new.id, new.title, new.body, new.tags);
+         END;
+         CREATE TRIGGER IF NOT EXISTS kb_notes_ad AFTER DELETE ON kb_notes BEGIN
+             INSERT INTO kb_fts(kb_fts, rowid, title, body, tags)
+                 VALUES ('delete', old.id, old.title, old.body, old.tags);
+         END;
+         CREATE TRIGGER IF NOT EXISTS kb_notes_au AFTER UPDATE ON kb_notes BEGIN
+             INSERT INTO kb_fts(kb_fts, rowid, title, body, tags)
+                 VALUES ('delete', old.id, old.title, old.body, old.tags);
+             INSERT INTO kb_fts(rowid, title, body, tags)
+                 VALUES (new.id, new.title, new.body, new.tags);
+         END;",
+    )
 }
 
 /// Opens an existing database without changing it in any way: no file is
@@ -1000,6 +1043,291 @@ pub fn finish_task(
             outcome.exit_code,
             outcome.result,
         ],
+    )?;
+    Ok(rows > 0)
+}
+
+// --- Knowledge base ---
+
+/// A knowledge base note.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct KbNote {
+    pub id: i64,
+    pub title: String,
+    pub body: String,
+    pub tags: Vec<String>,
+    /// The agent it's private to; `None` for a note every agent sees.
+    pub agent_name: Option<String>,
+    /// The agent (or user) that last wrote it.
+    pub created_by: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A `kb_search` result: the note, and a snippet of where it matched with
+/// the matching words in [brackets].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct KbHit {
+    pub note: KbNote,
+    pub snippet: String,
+}
+
+/// Tags normalized for storage: lowercase, deduplicated, and wrapped in
+/// commas (`,deploy,ci,`) so that one can be matched with a plain LIKE.
+fn tags_to_db(tags: &[String]) -> String {
+    let mut normalized: Vec<String> = tags
+        .iter()
+        .map(|t| t.trim().trim_start_matches('#').to_lowercase())
+        .filter(|t| !t.is_empty() && !t.contains(','))
+        .collect();
+    normalized.sort();
+    normalized.dedup();
+    if normalized.is_empty() {
+        String::new()
+    } else {
+        format!(",{},", normalized.join(","))
+    }
+}
+
+fn tags_from_db(tags: &str) -> Vec<String> {
+    tags.split(',')
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+const KB_COLUMNS: &str = "kb_notes.id, kb_notes.title, kb_notes.body, kb_notes.tags, \
+     kb_notes.agent_name, kb_notes.created_by, kb_notes.created_at, kb_notes.updated_at";
+
+fn row_to_kb_note(row: &rusqlite::Row) -> rusqlite::Result<KbNote> {
+    Ok(KbNote {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        body: row.get(2)?,
+        tags: tags_from_db(&row.get::<_, String>(3)?),
+        agent_name: row.get(4)?,
+        created_by: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+/// Who's looking at the knowledge base.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum KbViewer {
+    /// The user, through `faber kb`: sees every note, private ones too.
+    User,
+    /// An agent (`None`: one without an identity, e.g. a fan-out worker):
+    /// sees shared notes and its own private ones.
+    Agent(Option<String>),
+}
+
+impl KbViewer {
+    /// The SQL condition for notes this viewer sees, and the value to bind
+    /// to its `?1` (always referenced, so the parameter count is fixed).
+    fn condition(&self) -> (&'static str, Option<&str>) {
+        match self {
+            KbViewer::User => ("(?1 IS NULL OR 1)", None),
+            KbViewer::Agent(None) => ("(kb_notes.agent_name IS NULL AND ?1 IS NULL)", None),
+            KbViewer::Agent(Some(agent)) => (
+                "(kb_notes.agent_name IS NULL OR kb_notes.agent_name = ?1)",
+                Some(agent.as_str()),
+            ),
+        }
+    }
+}
+
+/// Writes a note: creates it, or - if one with the same title (ignoring
+/// case) already exists in the same scope - replaces its body and tags.
+/// `private_to` makes it visible to that agent only. Returns the note's id
+/// and whether it was newly created.
+pub fn kb_write(
+    conn: &Connection,
+    title: &str,
+    body: &str,
+    tags: &[String],
+    private_to: Option<&str>,
+    author: Option<&str>,
+) -> Result<(i64, bool), Box<dyn Error>> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("a note needs a title".into());
+    }
+    if body.trim().is_empty() {
+        return Err("a note needs a body".into());
+    }
+    if let Some(agent) = private_to {
+        if get_agent(conn, agent)?.is_none() {
+            return Err(format!("no agent named '{}'", agent).into());
+        }
+    }
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM kb_notes
+             WHERE lower(title) = lower(?1) AND COALESCE(agent_name, '') = COALESCE(?2, '')",
+            params![title, private_to],
+            |row| row.get(0),
+        )
+        .ok();
+    match existing {
+        Some(id) => {
+            conn.execute(
+                "UPDATE kb_notes SET title = ?2, body = ?3, tags = ?4, created_by = ?5,
+                     updated_at = datetime('now')
+                 WHERE id = ?1",
+                params![id, title, body, tags_to_db(tags), author],
+            )?;
+            Ok((id, false))
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO kb_notes (title, body, tags, agent_name, created_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![title, body, tags_to_db(tags), private_to, author],
+            )?;
+            Ok((conn.last_insert_rowid(), true))
+        }
+    }
+}
+
+/// The note with this id, if `viewer` may see it.
+pub fn kb_get(
+    conn: &Connection,
+    id: i64,
+    viewer: &KbViewer,
+) -> Result<Option<KbNote>, Box<dyn Error>> {
+    let (visible, who) = viewer.condition();
+    let sql = format!(
+        "SELECT {} FROM kb_notes WHERE {} AND id = ?2",
+        KB_COLUMNS, visible
+    );
+    let mut rows = conn
+        .prepare(&sql)?
+        .query_map(params![who, id], row_to_kb_note)?
+        .collect::<Vec<_>>();
+    Ok(rows.pop().transpose()?)
+}
+
+/// The note with this title (ignoring case) that `viewer` sees - a
+/// private one before a shared one.
+pub fn kb_get_by_title(
+    conn: &Connection,
+    title: &str,
+    viewer: &KbViewer,
+) -> Result<Option<KbNote>, Box<dyn Error>> {
+    let (visible, who) = viewer.condition();
+    let sql = format!(
+        "SELECT {} FROM kb_notes WHERE {} AND lower(title) = lower(?2)
+         ORDER BY agent_name IS NULL LIMIT 1",
+        KB_COLUMNS, visible
+    );
+    let mut rows = conn
+        .prepare(&sql)?
+        .query_map(params![who, title.trim()], row_to_kb_note)?
+        .collect::<Vec<_>>();
+    Ok(rows.pop().transpose()?)
+}
+
+/// Words too common to say anything about which note is meant. Left out
+/// of a search, so that "how do I deploy a release?" doesn't match every
+/// note with an "a" in it.
+const KB_STOP_WORDS: &[&str] = &[
+    "a", "about", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does", "for", "from",
+    "how", "i", "if", "in", "is", "it", "me", "my", "of", "on", "or", "our", "should", "so",
+    "that", "the", "this", "to", "us", "was", "we", "what", "when", "where", "which", "who", "why",
+    "with", "you", "your",
+];
+
+/// An FTS5 query for free text: its words, minus stop words (unless that
+/// leaves none), each quoted - so nothing in it is read as FTS5 syntax -
+/// and OR-ed, leaving it to the ranking to put notes matching more of them
+/// first. `None` if there are no words at all.
+pub fn kb_fts_query(text: &str) -> Option<String> {
+    let words: Vec<&str> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let meaningful: Vec<&str> = words
+        .iter()
+        .copied()
+        .filter(|w| !KB_STOP_WORDS.contains(&w.to_lowercase().as_str()))
+        .collect();
+    let words = if meaningful.is_empty() {
+        words
+    } else {
+        meaningful
+    };
+    (!words.is_empty()).then(|| {
+        words
+            .iter()
+            .map(|w| format!("\"{}\"", w))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    })
+}
+
+/// Ranked full-text search over the notes `viewer` sees, optionally only
+/// those tagged `tag`. Matches in the title count most, then tags, then
+/// the body.
+pub fn kb_search(
+    conn: &Connection,
+    query: &str,
+    viewer: &KbViewer,
+    tag: Option<&str>,
+    limit: usize,
+) -> Result<Vec<KbHit>, Box<dyn Error>> {
+    let (visible, who) = viewer.condition();
+    let fts = kb_fts_query(query).ok_or("the search has no words in it")?;
+    let sql = format!(
+        "SELECT {}, snippet(kb_fts, 1, '[', ']', '…', 16)
+         FROM kb_fts JOIN kb_notes ON kb_notes.id = kb_fts.rowid
+         WHERE kb_fts MATCH ?2 AND {} AND (?3 IS NULL OR kb_notes.tags LIKE '%,' || ?3 || ',%')
+         ORDER BY bm25(kb_fts, 10.0, 1.0, 5.0)
+         LIMIT ?4",
+        KB_COLUMNS, visible
+    );
+    let tag = tag.map(|t| t.trim().trim_start_matches('#').to_lowercase());
+    let hits = conn
+        .prepare(&sql)?
+        .query_map(params![who, fts, tag, limit as i64], |row| {
+            Ok(KbHit {
+                note: row_to_kb_note(row)?,
+                snippet: row.get(8)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(hits)
+}
+
+/// The notes `viewer` sees, most recently updated first, optionally only
+/// those tagged `tag`.
+pub fn kb_list(
+    conn: &Connection,
+    viewer: &KbViewer,
+    tag: Option<&str>,
+    limit: usize,
+) -> Result<Vec<KbNote>, Box<dyn Error>> {
+    let (visible, who) = viewer.condition();
+    let sql = format!(
+        "SELECT {} FROM kb_notes
+         WHERE {} AND (?2 IS NULL OR tags LIKE '%,' || ?2 || ',%')
+         ORDER BY updated_at DESC, id DESC LIMIT ?3",
+        KB_COLUMNS, visible
+    );
+    let tag = tag.map(|t| t.trim().trim_start_matches('#').to_lowercase());
+    let notes = conn
+        .prepare(&sql)?
+        .query_map(params![who, tag, limit as i64], row_to_kb_note)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(notes)
+}
+
+/// Deletes a note `viewer` may see. Returns whether one was deleted.
+pub fn kb_delete(conn: &Connection, id: i64, viewer: &KbViewer) -> Result<bool, Box<dyn Error>> {
+    let (visible, who) = viewer.condition();
+    let rows = conn.execute(
+        &format!("DELETE FROM kb_notes WHERE {} AND id = ?2", visible),
+        params![who, id],
     )?;
     Ok(rows > 0)
 }
@@ -1939,6 +2267,210 @@ mod tests {
         assert!(
             get_task(&conn, keep).unwrap().is_none(),
             "deleting an agent still deletes its tasks"
+        );
+    }
+
+    fn tags(list: &[&str]) -> Vec<String> {
+        list.iter().map(|t| t.to_string()).collect()
+    }
+
+    fn agent(name: &str) -> KbViewer {
+        KbViewer::Agent(Some(name.to_string()))
+    }
+
+    fn titles(hits: &[KbHit]) -> Vec<&str> {
+        hits.iter().map(|h| h.note.title.as_str()).collect()
+    }
+
+    #[test]
+    fn test_kb_write_creates_then_updates_by_title() {
+        let conn = test_db();
+        let (id, created) = kb_write(
+            &conn,
+            "Deploy steps",
+            "run make deploy",
+            &tags(&["Ops", "#deploy", "ops"]),
+            None,
+            Some("bob"),
+        )
+        .unwrap();
+        assert!(created);
+        let note = kb_get(&conn, id, &KbViewer::User).unwrap().unwrap();
+        assert_eq!(note.tags, ["deploy", "ops"], "normalized and deduplicated");
+        assert_eq!(note.created_by.as_deref(), Some("bob"));
+
+        let (again, created) =
+            kb_write(&conn, "deploy STEPS", "run make release", &[], None, None).unwrap();
+        assert_eq!((again, created), (id, false));
+        let note = kb_get(&conn, id, &KbViewer::User).unwrap().unwrap();
+        assert_eq!(note.body, "run make release");
+        assert!(note.tags.is_empty());
+
+        assert!(kb_write(&conn, "  ", "x", &[], None, None).is_err());
+        assert!(kb_write(&conn, "t", " ", &[], None, None).is_err());
+        assert!(kb_write(&conn, "t", "x", &[], Some("nobody"), None).is_err());
+    }
+
+    #[test]
+    fn test_kb_private_notes_are_scoped() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        create_agent(&conn, "bob", "").unwrap();
+        kb_write(&conn, "Prefs", "shared prefs", &[], None, None).unwrap();
+        let (alices, created) = kb_write(
+            &conn,
+            "Prefs",
+            "alice likes tabs",
+            &[],
+            Some("alice"),
+            Some("alice"),
+        )
+        .unwrap();
+        assert!(created, "same title, different scope: a separate note");
+
+        let seen = |viewer: &KbViewer| kb_list(&conn, viewer, None, 10).unwrap().len();
+        assert_eq!(seen(&agent("alice")), 2);
+        assert_eq!(seen(&agent("bob")), 1);
+        assert_eq!(seen(&KbViewer::Agent(None)), 1);
+        assert_eq!(seen(&KbViewer::User), 2);
+        assert_eq!(
+            kb_get_by_title(&conn, "prefs", &agent("alice"))
+                .unwrap()
+                .unwrap()
+                .body,
+            "alice likes tabs",
+            "an agent's own note comes before the shared one"
+        );
+        assert!(kb_get(&conn, alices, &agent("bob")).unwrap().is_none());
+        assert!(
+            !kb_delete(&conn, alices, &agent("bob")).unwrap(),
+            "can't delete what it can't see"
+        );
+        assert!(
+            kb_search(&conn, "tabs", &agent("bob"), None, 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        delete_agent(&conn, "alice").unwrap();
+        assert_eq!(
+            seen(&KbViewer::User),
+            1,
+            "an agent's private notes go with it"
+        );
+        assert!(
+            kb_search(&conn, "tabs", &KbViewer::User, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_kb_search_ranks_titles_first_and_stems_words() {
+        let conn = test_db();
+        kb_write(
+            &conn,
+            "Release checklist",
+            "Before deploying, bump the version.",
+            &tags(&["release"]),
+            None,
+            None,
+        )
+        .unwrap();
+        kb_write(
+            &conn,
+            "Deploying to staging",
+            "Use the staging cluster.",
+            &tags(&["ops"]),
+            None,
+            None,
+        )
+        .unwrap();
+        kb_write(&conn, "Coffee machine", "Descale monthly.", &[], None, None).unwrap();
+
+        let hits = kb_search(&conn, "how do we deploy?", &KbViewer::User, None, 10).unwrap();
+        assert_eq!(titles(&hits), ["Deploying to staging", "Release checklist"]);
+        assert!(
+            hits[1].snippet.contains("[deploying]"),
+            "{}",
+            hits[1].snippet
+        );
+
+        let hits = kb_search(&conn, "deploy", &KbViewer::User, Some("#Release"), 10).unwrap();
+        assert_eq!(titles(&hits), ["Release checklist"]);
+        assert_eq!(
+            kb_search(&conn, "deploy", &KbViewer::User, None, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_kb_search_index_follows_updates_and_deletes() {
+        let conn = test_db();
+        let (id, _) = kb_write(&conn, "Build", "uses make", &[], None, None).unwrap();
+        kb_write(&conn, "Build", "uses cargo", &[], None, None).unwrap();
+        assert!(
+            kb_search(&conn, "make", &KbViewer::User, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            kb_search(&conn, "cargo", &KbViewer::User, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(kb_delete(&conn, id, &KbViewer::User).unwrap());
+        assert!(
+            kb_search(&conn, "cargo", &KbViewer::User, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_kb_search_survives_query_syntax_in_free_text() {
+        let conn = test_db();
+        kb_write(
+            &conn,
+            "Quoting",
+            "say \"hello\" NEAR the door",
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        for query in [
+            "\"hello",
+            "hello*",
+            "NEAR(hello door)",
+            "title:hello",
+            "-hello",
+            "hello AND OR NOT",
+            "a.b/c's",
+        ] {
+            assert!(
+                kb_search(&conn, query, &KbViewer::User, None, 10).is_ok(),
+                "query {query:?} failed"
+            );
+        }
+        assert!(
+            kb_search(&conn, "?!", &KbViewer::User, None, 10).is_err(),
+            "no words"
+        );
+        assert_eq!(
+            kb_fts_query("deploy steps?").unwrap(),
+            "\"deploy\" OR \"steps\""
+        );
+        assert_eq!(
+            kb_fts_query("How do I deploy a release?").unwrap(),
+            "\"deploy\" OR \"release\""
+        );
+        assert_eq!(
+            kb_fts_query("who are we").unwrap(),
+            "\"who\" OR \"are\" OR \"we\""
         );
     }
 

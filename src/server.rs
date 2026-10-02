@@ -332,6 +332,43 @@ fn dispatch_inner(
             let v = db::prune_tasks(&conn, older_than, dry_run)?;
             Ok(serde_json::to_value(v)?)
         }
+        "kb_write" => {
+            let tags: Vec<String> = serde_json::from_value(p["tags"].clone()).unwrap_or_default();
+            let v = db::kb_write(
+                &conn,
+                str_param!("title"),
+                str_param!("body"),
+                &tags,
+                opt_str_param!("private_to"),
+                opt_str_param!("author"),
+            )?;
+            Ok(serde_json::to_value(v)?)
+        }
+        "kb_get" | "kb_get_by_title" | "kb_search" | "kb_list" | "kb_delete" => {
+            let viewer: db::KbViewer = serde_json::from_value(p["viewer"].clone())
+                .map_err(|e| format!("bad param 'viewer': {}", e))?;
+            let limit = p["limit"].as_u64().unwrap_or(10) as usize;
+            Ok(match req.method.as_str() {
+                "kb_get" => serde_json::to_value(db::kb_get(&conn, i64_param!("id"), &viewer)?)?,
+                "kb_get_by_title" => {
+                    serde_json::to_value(db::kb_get_by_title(&conn, str_param!("title"), &viewer)?)?
+                }
+                "kb_search" => serde_json::to_value(db::kb_search(
+                    &conn,
+                    str_param!("query"),
+                    &viewer,
+                    opt_str_param!("tag"),
+                    limit,
+                )?)?,
+                "kb_list" => serde_json::to_value(db::kb_list(
+                    &conn,
+                    &viewer,
+                    opt_str_param!("tag"),
+                    limit,
+                )?)?,
+                _ => serde_json::to_value(db::kb_delete(&conn, i64_param!("id"), &viewer)?)?,
+            })
+        }
         "claim_task" => {
             let v = db::claim_task(&conn, i64_param!("task_id"), str_param!("session_id"))?;
             Ok(serde_json::to_value(v)?)
@@ -405,6 +442,34 @@ mod tests {
             thread.join().unwrap();
         }
         assert_eq!(client.list_agents().unwrap().len(), 8 * 25);
+    }
+
+    #[test]
+    fn test_kb_over_a_remote_connection() {
+        let client = connected_client();
+        let (id, created) = client
+            .kb_write(
+                "Build",
+                "cargo build --release",
+                &["ci".to_string()],
+                None,
+                Some("bot"),
+            )
+            .unwrap();
+        assert!(created);
+        let viewer = db::KbViewer::Agent(None);
+        let hits = client
+            .kb_search("release build", &viewer, Some("ci"), 5)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].note.id, id);
+        assert!(client.kb_get_by_title("BUILD", &viewer).unwrap().is_some());
+        assert_eq!(
+            client.kb_list(&db::KbViewer::User, None, 10).unwrap().len(),
+            1
+        );
+        assert!(client.kb_delete(id, &viewer).unwrap());
+        assert!(client.kb_get(id, &db::KbViewer::User).unwrap().is_none());
     }
 
     #[test]

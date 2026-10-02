@@ -18,7 +18,9 @@
  */
 
 use crate::db;
-use crate::db::{AgentConfig, AgentRow, NewTask, NotificationRow, TaskOutcome, TaskRow};
+use crate::db::{
+    AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow, TaskOutcome, TaskRow,
+};
 use crate::db_backend::DbBackend;
 use std::error::Error;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -251,6 +253,58 @@ impl DbBackend for LocalDb {
     ) -> Result<bool, Box<dyn Error>> {
         let conn = self.lock()?;
         db::finish_task(&conn, task_id, session_id, outcome)
+    }
+
+    fn kb_write(
+        &self,
+        title: &str,
+        body: &str,
+        tags: &[String],
+        private_to: Option<&str>,
+        author: Option<&str>,
+    ) -> Result<(i64, bool), Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::kb_write(&conn, title, body, tags, private_to, author)
+    }
+
+    fn kb_get(&self, id: i64, viewer: &KbViewer) -> Result<Option<KbNote>, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::kb_get(&conn, id, viewer)
+    }
+
+    fn kb_get_by_title(
+        &self,
+        title: &str,
+        viewer: &KbViewer,
+    ) -> Result<Option<KbNote>, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::kb_get_by_title(&conn, title, viewer)
+    }
+
+    fn kb_search(
+        &self,
+        query: &str,
+        viewer: &KbViewer,
+        tag: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<KbHit>, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::kb_search(&conn, query, viewer, tag, limit)
+    }
+
+    fn kb_list(
+        &self,
+        viewer: &KbViewer,
+        tag: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<KbNote>, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::kb_list(&conn, viewer, tag, limit)
+    }
+
+    fn kb_delete(&self, id: i64, viewer: &KbViewer) -> Result<bool, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::kb_delete(&conn, id, viewer)
     }
 
     fn gc_agents(&self) -> Result<Vec<String>, Box<dyn Error>> {

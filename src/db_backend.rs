@@ -17,7 +17,9 @@
  *
  */
 
-use crate::db::{AgentConfig, AgentRow, NewTask, NotificationRow, TaskOutcome, TaskRow};
+use crate::db::{
+    AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow, TaskOutcome, TaskRow,
+};
 use std::error::Error;
 
 pub trait DbBackend: Send + Sync {
@@ -105,4 +107,35 @@ pub trait DbBackend: Send + Sync {
     ) -> Result<bool, Box<dyn Error>>;
 
     fn gc_agents(&self) -> Result<Vec<String>, Box<dyn Error>>;
+
+    /// See `db::kb_write`.
+    fn kb_write(
+        &self,
+        title: &str,
+        body: &str,
+        tags: &[String],
+        private_to: Option<&str>,
+        author: Option<&str>,
+    ) -> Result<(i64, bool), Box<dyn Error>>;
+    fn kb_get(&self, id: i64, viewer: &KbViewer) -> Result<Option<KbNote>, Box<dyn Error>>;
+    fn kb_get_by_title(
+        &self,
+        title: &str,
+        viewer: &KbViewer,
+    ) -> Result<Option<KbNote>, Box<dyn Error>>;
+    /// See `db::kb_search`.
+    fn kb_search(
+        &self,
+        query: &str,
+        viewer: &KbViewer,
+        tag: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<KbHit>, Box<dyn Error>>;
+    fn kb_list(
+        &self,
+        viewer: &KbViewer,
+        tag: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<KbNote>, Box<dyn Error>>;
+    fn kb_delete(&self, id: i64, viewer: &KbViewer) -> Result<bool, Box<dyn Error>>;
 }

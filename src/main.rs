@@ -2607,6 +2607,175 @@ fn tool_agent_data_list(params_str: &String, ctx: &ToolContext) -> Result<String
     Ok(serde_json::to_string(&entries)?)
 }
 
+/// Who the calling agent is, as a knowledge base viewer.
+fn kb_viewer(ctx: &ToolContext) -> db::KbViewer {
+    db::KbViewer::Agent(ctx.agent_name.clone())
+}
+
+/// A note as the model reads it: title, a line of metadata, then the body.
+fn format_kb_note(note: &db::KbNote) -> String {
+    let mut meta = vec![format!("note #{}", note.id)];
+    if !note.tags.is_empty() {
+        meta.push(format!("tags: {}", note.tags.join(", ")));
+    }
+    meta.push(format!("updated {}", note.updated_at));
+    if let Some(by) = &note.created_by {
+        meta.push(format!("by {}", by));
+    }
+    if note.agent_name.is_some() {
+        meta.push("private".to_string());
+    }
+    format!(
+        "# {}\n({})\n\n{}",
+        note.title,
+        meta.join(" · "),
+        note.body.trim()
+    )
+}
+
+fn tool_kb_write(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        title: String,
+        body: String,
+        #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default)]
+        private: bool,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let private_to = if params.private {
+        Some(
+            ctx.agent_name
+                .as_deref()
+                .ok_or("private notes need an agent identity; save it as a shared note")?,
+        )
+    } else {
+        None
+    };
+    let (id, created) = ctx.db()?.kb_write(
+        &params.title,
+        &params.body,
+        &params.tags,
+        private_to,
+        ctx.agent_name.as_deref(),
+    )?;
+    ctx.println(&format!(
+        "📒 {} note #{}: {}",
+        if created { "Saved" } else { "Updated" },
+        id,
+        params.title.trim()
+    ));
+    Ok(serde_json::json!({"id": id, "created": created}).to_string())
+}
+
+fn tool_kb_search(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        query: String,
+        #[serde(default)]
+        tag: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let limit = params.limit.unwrap_or(8).clamp(1, 50);
+    let hits = ctx
+        .db()?
+        .kb_search(&params.query, &kb_viewer(ctx), params.tag.as_deref(), limit)?;
+    ctx.println(&format!("🔎 {} note(s) for '{}'", hits.len(), params.query));
+    if hits.is_empty() {
+        return Ok("No notes match.".to_string());
+    }
+    Ok(hits
+        .iter()
+        .map(|hit| {
+            let tags = if hit.note.tags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", hit.note.tags.join(", "))
+            };
+            format!(
+                "#{} {}{}\n    {}",
+                hit.note.id,
+                hit.note.title,
+                tags,
+                hit.snippet.replace('\n', " ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn tool_kb_read(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        #[serde(default)]
+        id: Option<i64>,
+        #[serde(default)]
+        title: Option<String>,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let db = ctx.db()?;
+    let viewer = kb_viewer(ctx);
+    let note = match (params.id, &params.title) {
+        (Some(id), _) => db.kb_get(id, &viewer)?,
+        (None, Some(title)) => db.kb_get_by_title(title, &viewer)?,
+        (None, None) => return Err("give the note's id or title".into()),
+    };
+    match note {
+        Some(note) => {
+            ctx.println(&format!("📒 note #{}: {}", note.id, note.title));
+            Ok(format_kb_note(&note))
+        }
+        None => Ok("No such note.".to_string()),
+    }
+}
+
+fn tool_kb_list(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        #[serde(default)]
+        tag: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let limit = params.limit.unwrap_or(20).clamp(1, 200);
+    let notes = ctx
+        .db()?
+        .kb_list(&kb_viewer(ctx), params.tag.as_deref(), limit)?;
+    ctx.println(&format!("📒 {} note(s)", notes.len()));
+    if notes.is_empty() {
+        return Ok("The knowledge base is empty.".to_string());
+    }
+    Ok(notes
+        .iter()
+        .map(|n| {
+            let tags = if n.tags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", n.tags.join(", "))
+            };
+            format!("#{} {}{} (updated {})", n.id, n.title, tags, n.updated_at)
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn tool_kb_delete(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        id: i64,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let deleted = ctx.db()?.kb_delete(params.id, &kb_viewer(ctx))?;
+    if deleted {
+        ctx.println(&format!("🗑 Deleted note #{}", params.id));
+    }
+    Ok(serde_json::json!({"deleted": deleted, "id": params.id}).to_string())
+}
+
 /// `agent_data` key holding an agent's current plan (a JSON list of
 /// `PlanItem`), alongside the existing `config:*` keys.
 const PLAN_DATA_KEY: &str = "state:plan";
@@ -4137,6 +4306,131 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         }
                     },
                     "required": ["action", "path"],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "kb_search".to_string(),
+        tool_kb_search,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "kb_search",
+                "description": "Search the knowledge base: notes that you, other agents and the user saved about this project and how to work on it - how to build and deploy, decisions and why, conventions, gotchas, the user's preferences. Search it before asking the user something they may already have told an agent, and before re-investigating something that may already be known. Results are ranked by relevance, each with a snippet where the [matching words] are; read a note in full with kb_read.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "What to look for, in words, e.g. \"deploy staging\""},
+                        "tag": {"type": "string", "description": "Only notes with this tag"},
+                        "limit": {"type": "integer", "description": "Most results to return (default 8)"}
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "kb_read".to_string(),
+        tool_kb_read,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "kb_read",
+                "description": "Read a knowledge base note in full, by id (as kb_search and kb_list show it) or by title.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "title": {"type": "string"}
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "kb_list".to_string(),
+        tool_kb_list,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "kb_list",
+                "description": "List knowledge base notes, most recently updated first, optionally only those with a tag.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "tag": {"type": "string"},
+                        "limit": {"type": "integer", "description": "Most notes to list (default 20)"}
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "kb_write".to_string(),
+        tool_kb_write,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "kb_write",
+                "description": "Save something worth knowing beyond this conversation to the knowledge base: facts about the project, decisions and the reasons for them, how-tos, conventions, gotchas, the user's preferences. Keep one topic per note under a clear title. Writing a note whose title already exists replaces it, so search first and update an existing note (with its full new text) rather than adding a near-duplicate. Notes are shared with every agent unless private.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "A short, specific title, e.g. \"Deploying to staging\""},
+                        "body": {"type": "string", "description": "The note's full text (Markdown)"},
+                        "tags": {"type": "array", "items": {"type": "string"}, "description": "A few tags to group notes by, e.g. [\"ops\", \"deploy\"]"},
+                        "private": {"type": "boolean", "description": "Only you (this agent) will see it"}
+                    },
+                    "required": ["title", "body"],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "kb_delete".to_string(),
+        tool_kb_delete,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "kb_delete",
+                "description": "Delete a knowledge base note that's wrong or no longer relevant, by id.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer"}
+                    },
+                    "required": ["id"],
                     "additionalProperties": false
                 }
             }
@@ -7913,6 +8207,143 @@ fn describe_task(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> Stri
     out
 }
 
+/// `faber kb`: lists, searches, shows, adds or deletes knowledge base
+/// notes, as the user - who sees every note, private ones included.
+fn kb_command(
+    db: &Option<Arc<dyn DbBackend>>,
+    action: Option<&KbAction>,
+    tag: Option<&str>,
+    last: usize,
+) -> Result<(), Box<dyn Error>> {
+    let db = db.as_ref().ok_or(
+        "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
+    )?;
+    // A database from before the knowledge base, opened read-only.
+    match kb_command_inner(db.as_ref(), action, tag, last) {
+        Err(e) if e.to_string().contains("no such table: kb_") => Err(
+            "this database has no knowledge base yet: it's added the first time `faber chat` \
+             or `faber kb add` opens it"
+                .into(),
+        ),
+        other => other,
+    }
+}
+
+fn kb_command_inner(
+    db: &dyn DbBackend,
+    action: Option<&KbAction>,
+    tag: Option<&str>,
+    last: usize,
+) -> Result<(), Box<dyn Error>> {
+    let viewer = db::KbViewer::User;
+    let now = chrono::Utc::now();
+    let updated = |note: &db::KbNote| {
+        db::parse_db_time(&note.updated_at)
+            .map(|t| format_relative(t, now))
+            .unwrap_or_else(|| note.updated_at.clone())
+    };
+    let tag_list = |note: &db::KbNote| {
+        if note.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", note.tags.join(", "))
+        }
+    };
+    match action {
+        None => {
+            let notes = db.kb_list(&viewer, tag, last)?;
+            if notes.is_empty() {
+                println!("No notes.");
+                return Ok(());
+            }
+            let mut table = Table::new();
+            table.set_format(*format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
+            table.set_titles(Row::new(
+                ["ID", "Title", "Tags", "Scope", "By", "Updated"]
+                    .iter()
+                    .map(|t| Cell::new(t))
+                    .collect(),
+            ));
+            for note in &notes {
+                let scope = match &note.agent_name {
+                    Some(agent) => format!("private: {}", agent),
+                    None => "shared".to_string(),
+                };
+                table.add_row(Row::new(vec![
+                    Cell::new(&note.id.to_string()),
+                    Cell::new(&first_line(&note.title, 50)),
+                    Cell::new(&note.tags.join(", ")),
+                    Cell::new(&scope),
+                    Cell::new(note.created_by.as_deref().unwrap_or("-")),
+                    Cell::new(&updated(note)),
+                ]));
+            }
+            table.printstd();
+        }
+        Some(KbAction::Search { query, tag, limit }) => {
+            let hits = db.kb_search(query, &viewer, tag.as_deref(), *limit)?;
+            if hits.is_empty() {
+                println!("No notes match.");
+            }
+            for hit in &hits {
+                println!(
+                    "#{} {}{} ({})\n    {}",
+                    hit.note.id,
+                    hit.note.title,
+                    tag_list(&hit.note),
+                    updated(&hit.note),
+                    hit.snippet.replace('\n', " ")
+                );
+            }
+        }
+        Some(KbAction::Show { note }) => {
+            let found = match note.parse::<i64>() {
+                Ok(id) => db.kb_get(id, &viewer)?,
+                Err(_) => db.kb_get_by_title(note, &viewer)?,
+            };
+            let found = found.ok_or_else(|| format!("no note {}", note))?;
+            println!("{}", format_kb_note(&found));
+        }
+        Some(KbAction::Add {
+            title,
+            body,
+            tags,
+            agent,
+        }) => {
+            let body = match body {
+                Some(body) => body.clone(),
+                None => {
+                    let mut body = String::new();
+                    std::io::stdin().read_to_string(&mut body)?;
+                    body
+                }
+            };
+            let (id, created) = db.kb_write(title, &body, tags, agent.as_deref(), Some("user"))?;
+            println!(
+                "{} note #{}: {}",
+                if created { "Added" } else { "Updated" },
+                id,
+                title.trim()
+            );
+        }
+        Some(KbAction::Rm { ids }) => {
+            let mut missing = 0;
+            for &id in ids {
+                if db.kb_delete(id, &viewer)? {
+                    println!("Deleted note #{}.", id);
+                } else {
+                    missing += 1;
+                    eprintln!("No note #{}.", id);
+                }
+            }
+            if missing > 0 {
+                return Err(format!("{} of {} note(s) not found", missing, ids.len()).into());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `faber tasks hold` / `release`: puts tasks on hold or releases them,
 /// saying for each one that couldn't be changed why not.
 fn hold_tasks_command(
@@ -8643,6 +9074,45 @@ enum TasksAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum KbAction {
+    /// Ranked full-text search over the notes
+    Search {
+        /// What to look for, in words
+        query: String,
+        /// Only notes with this tag
+        #[clap(long)]
+        tag: Option<String>,
+        /// Most results to show
+        #[clap(long, default_value = "10")]
+        limit: usize,
+    },
+    /// Show a note in full, by id or title
+    Show {
+        /// The note's id, as `faber kb` lists it, or its title
+        note: String,
+    },
+    /// Add a note, or replace the one with the same title
+    Add {
+        /// The note's title
+        title: String,
+        /// The note's text; read from stdin if not given
+        body: Option<String>,
+        /// A tag for the note (can be repeated)
+        #[clap(long = "tag")]
+        tags: Vec<String>,
+        /// Make it private to this agent instead of shared with all
+        #[clap(long)]
+        agent: Option<String>,
+    },
+    /// Delete notes
+    Rm {
+        /// The ids of the notes, as `faber kb` lists them
+        #[clap(required = true)]
+        ids: Vec<i64>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum CliCommand {
     /// Pass a request to the AI model and print its response
     Prompt {
@@ -8663,6 +9133,19 @@ enum CliCommand {
 
     /// Remove dormant agents (no active session)
     Gc {},
+
+    /// Show the knowledge base the agents keep (kb_* tools) - or, with a
+    /// subcommand, search, show, add or delete notes
+    Kb {
+        #[clap(subcommand)]
+        action: Option<KbAction>,
+        /// Only notes with this tag
+        #[clap(long)]
+        tag: Option<String>,
+        /// Only the N most recently updated notes
+        #[clap(long, default_value = "50")]
+        last: usize,
+    },
 
     /// Show scheduled tasks: their status, schedule and how their last run
     /// went - or, with `add`, create one
@@ -8724,6 +9207,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if matches!(
         opts.command,
         CliCommand::Tasks { .. }
+            | CliCommand::Kb { .. }
             | CliCommand::Models {}
             | CliCommand::ListTools {}
             | CliCommand::Gc {}
@@ -8799,6 +9283,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             CliCommand::Tasks {
                 action: None | Some(TasksAction::Show { .. }),
                 ..
+            } | CliCommand::Kb {
+                action: None | Some(KbAction::Search { .. }) | Some(KbAction::Show { .. }),
+                ..
             }
         ) {
             // Only looks: never create or migrate a database for it.
@@ -8845,6 +9332,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Models {} => list_models_command(&opts),
         CliCommand::ListTools {} => list_tools_command(&mcp_manager),
         CliCommand::Gc {} => gc_command(&opts),
+        CliCommand::Kb { action, tag, last } => {
+            kb_command(&db_connection, action.as_ref(), tag.as_deref(), *last)
+        }
         CliCommand::Tasks {
             action:
                 Some(TasksAction::Prune {
@@ -10200,6 +10690,69 @@ mod tests {
         ctx.db = Some(Arc::new(db));
         ctx.agent_name = Some("default".to_string());
         ctx
+    }
+
+    #[test]
+    fn test_kb_tools_round_trip() {
+        let mut ctx = plan_test_ctx();
+        let call = |f: ToolCallback, ctx: &ToolContext, params: serde_json::Value| {
+            f(&params.to_string(), ctx).unwrap()
+        };
+        let saved = call(
+            tool_kb_write,
+            &ctx,
+            serde_json::json!({"title": "Deploying", "body": "Run `make deploy` from main.", "tags": ["ops"]}),
+        );
+        let id = serde_json::from_str::<serde_json::Value>(&saved).unwrap()["id"]
+            .as_i64()
+            .unwrap();
+
+        let found = call(
+            tool_kb_search,
+            &ctx,
+            serde_json::json!({"query": "how to deploy"}),
+        );
+        assert!(
+            found.starts_with(&format!("#{} Deploying [ops]", id)),
+            "{found}"
+        );
+        assert!(found.contains("[deploy]"), "{found}");
+
+        let read = call(
+            tool_kb_read,
+            &ctx,
+            serde_json::json!({"title": "deploying"}),
+        );
+        assert!(read.starts_with("# Deploying\n"), "{read}");
+        assert!(read.contains("by default"), "{read}");
+        assert!(read.ends_with("Run `make deploy` from main."), "{read}");
+
+        // A private note isn't visible to an agent-less caller.
+        call(
+            tool_kb_write,
+            &ctx,
+            serde_json::json!({"title": "Mine", "body": "secret", "private": true}),
+        );
+        ctx.agent_name = None;
+        assert_eq!(
+            call(tool_kb_search, &ctx, serde_json::json!({"query": "secret"})),
+            "No notes match."
+        );
+        assert!(
+            tool_kb_write(
+                &serde_json::json!({"title": "x", "body": "y", "private": true}).to_string(),
+                &ctx
+            )
+            .is_err()
+        );
+
+        assert!(call(tool_kb_list, &ctx, serde_json::json!({})).contains("Deploying"));
+        let deleted = call(tool_kb_delete, &ctx, serde_json::json!({"id": id}));
+        assert!(deleted.contains("\"deleted\":true"), "{deleted}");
+        assert_eq!(
+            call(tool_kb_read, &ctx, serde_json::json!({"id": id})),
+            "No such note."
+        );
     }
 
     #[test]
