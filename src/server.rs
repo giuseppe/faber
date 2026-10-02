@@ -310,6 +310,11 @@ fn dispatch_inner(
             let v = db::set_task_enabled(&conn, i64_param!("task_id"), enabled)?;
             Ok(serde_json::to_value(v)?)
         }
+        "set_task_held" => {
+            let held = p["held"].as_bool().ok_or("missing param 'held'")?;
+            let v = db::set_task_held(&conn, i64_param!("task_id"), held)?;
+            Ok(serde_json::to_value(v)?)
+        }
         "get_pending_tasks" => {
             let v = db::get_pending_tasks(&conn)?;
             Ok(serde_json::to_value(v)?)

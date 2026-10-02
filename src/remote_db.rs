@@ -359,6 +359,14 @@ impl DbBackend for RemoteDb {
         Ok(v.as_bool().unwrap_or(false))
     }
 
+    fn set_task_held(&self, task_id: i64, held: bool) -> Result<bool, Box<dyn Error>> {
+        let v = self.call(
+            "set_task_held",
+            serde_json::json!({"task_id": task_id, "held": held}),
+        )?;
+        Ok(serde_json::from_value(v)?)
+    }
+
     fn get_pending_tasks(&self) -> Result<Vec<TaskRow>, Box<dyn Error>> {
         let v = self.call("get_pending_tasks", serde_json::json!({}))?;
         Ok(serde_json::from_value(v)?)

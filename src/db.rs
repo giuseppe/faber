@@ -98,6 +98,9 @@ pub struct NewTask {
     pub command: String,
     pub agent_name: Option<String>,
     pub schedule: TaskSchedule,
+    /// Create it `held` rather than `scheduled`.
+    #[serde(default)]
+    pub held: bool,
 }
 
 /// A task's lifecycle:
@@ -108,6 +111,10 @@ pub struct NewTask {
 ///   heartbeating, the claim is abandoned and the task can be claimed again.
 /// - back to `scheduled` after a cron run (`finish_task`), or `done` after
 ///   a one-shot run or a cron task's last allowed run (`max_runs`).
+/// - `held`: scheduled, but not to be picked up by anyone until released
+///   (`set_task_held`) - e.g. created ahead of time, to start on a go
+///   signal. Released, it's `scheduled` again, and runs right away if it
+///   came due meanwhile.
 /// - `disabled`: switched off by the user; switching it back on makes it
 ///   `scheduled` again.
 ///
@@ -117,6 +124,7 @@ pub struct TaskStatus;
 
 impl TaskStatus {
     pub const SCHEDULED: &'static str = "scheduled";
+    pub const HELD: &'static str = "held";
     pub const RUNNING: &'static str = "running";
     pub const DONE: &'static str = "done";
     pub const DISABLED: &'static str = "disabled";
@@ -137,7 +145,85 @@ const CLAIM_ABANDONED: &str = "claimed_by IS NULL OR claimed_by NOT IN (
     SELECT session_id FROM agents
     WHERE session_id IS NOT NULL AND heartbeat_at >= datetime('now', '-30 seconds'))";
 
+/// The columns and constraints of `scheduled_tasks`, as created fresh and
+/// as rebuilt by `rebuild_task_table_if_needed`.
+const TASK_TABLE_DEFINITION: &str = "
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_name TEXT,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    task_type TEXT NOT NULL CHECK(task_type IN ('cron', 'oneshot')),
+    cron_expression TEXT,
+    run_at TEXT,
+    next_run_at TEXT,
+    last_run_at TEXT,
+    status TEXT NOT NULL DEFAULT 'scheduled'
+        CHECK(status IN ('scheduled', 'held', 'running', 'done', 'disabled')),
+    kind TEXT NOT NULL DEFAULT 'tool' CHECK(kind IN ('tool', 'prompt')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    command TEXT NOT NULL DEFAULT '',
+    max_runs INTEGER DEFAULT NULL,
+    run_count INTEGER NOT NULL DEFAULT 0,
+    claimed_by TEXT DEFAULT NULL,
+    started_at TEXT DEFAULT NULL,
+    last_outcome TEXT DEFAULT NULL,
+    last_exit_code INTEGER DEFAULT NULL,
+    last_result TEXT DEFAULT NULL,
+    FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE SET NULL";
+
+/// Every column of `TASK_TABLE_DEFINITION`, for copying rows across.
+const TASK_TABLE_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, kind, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result";
+
+/// Brings an existing `scheduled_tasks` table to `TASK_TABLE_DEFINITION`
+/// when its `status` constraint predates the `held` state. SQLite can't
+/// change a CHECK constraint in place, so the table is rebuilt: a new one
+/// is created, the rows copied over, and it takes the old one's place, all
+/// in one transaction. The id counter is carried over too, so ids of
+/// deleted tasks are never handed out again.
+fn rebuild_task_table_if_needed(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'scheduled_tasks'",
+        [],
+        |row| row.get(0),
+    )?;
+    if sql.contains("'held'") {
+        return Ok(());
+    }
+    let next_id: i64 = conn
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'scheduled_tasks'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    // Foreign key enforcement can't change inside a transaction, and has
+    // to be off while the table is swapped.
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let result = conn.execute_batch(&format!(
+        "BEGIN;
+         CREATE TABLE scheduled_tasks_new ({definition});
+         INSERT INTO scheduled_tasks_new ({columns}) SELECT {columns} FROM scheduled_tasks;
+         DROP TABLE scheduled_tasks;
+         ALTER TABLE scheduled_tasks_new RENAME TO scheduled_tasks;
+         UPDATE sqlite_sequence SET seq = MAX(seq, {next_id}) WHERE name = 'scheduled_tasks';
+         COMMIT;",
+        definition = TASK_TABLE_DEFINITION,
+        columns = TASK_TABLE_COLUMNS,
+        next_id = next_id,
+    ));
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    result
+}
+
 pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS scheduled_tasks ({});",
+        TASK_TABLE_DEFINITION
+    ))?;
     conn.execute_batch(
         "
         PRAGMA foreign_keys = ON;
@@ -157,22 +243,6 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
             FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
         );
 
-        CREATE TABLE IF NOT EXISTS scheduled_tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            agent_name TEXT,
-            name TEXT NOT NULL,
-            description TEXT NOT NULL DEFAULT '',
-            task_type TEXT NOT NULL CHECK(task_type IN ('cron', 'oneshot')),
-            cron_expression TEXT,
-            run_at TEXT,
-            next_run_at TEXT,
-            last_run_at TEXT,
-            status TEXT NOT NULL DEFAULT 'scheduled'
-                CHECK(status IN ('scheduled', 'running', 'done', 'disabled')),
-            kind TEXT NOT NULL DEFAULT 'tool' CHECK(kind IN ('tool', 'prompt')),
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE SET NULL
-        );
 
         CREATE TABLE IF NOT EXISTS agent_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -194,7 +264,6 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_agent_data_agent ON agent_data(agent_name);
-        CREATE INDEX IF NOT EXISTS idx_tasks_agent ON scheduled_tasks(agent_name);
         CREATE INDEX IF NOT EXISTS idx_agent_messages_agent_seq ON agent_messages(agent_name, seq);
         CREATE INDEX IF NOT EXISTS idx_notifications_to_agent ON notifications(to_agent);
 
@@ -228,6 +297,7 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
         ));
     }
     migrate_task_enabled_to_status(conn)?;
+    rebuild_task_table_if_needed(conn)?;
     // Tasks made before prompt tasks existed whose command is plain text
     // could only fail; they're instructions for an agent. Ones that already
     // ran are left as they were.
@@ -243,7 +313,8 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
                  END, '') != 'text';",
     )?;
     conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_due ON scheduled_tasks(status, next_run_at);",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_due ON scheduled_tasks(status, next_run_at);
+         CREATE INDEX IF NOT EXISTS idx_tasks_agent ON scheduled_tasks(agent_name);",
     )?;
 
     let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN session_id TEXT DEFAULT NULL;");
@@ -658,8 +729,8 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
     conn.execute(
         "INSERT INTO scheduled_tasks
              (name, description, kind, task_type, cron_expression, run_at, next_run_at,
-              agent_name, command, max_runs)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              agent_name, command, max_runs, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             task.name,
             task.description,
@@ -670,7 +741,12 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
             next_run_at,
             task.agent_name,
             task.command,
-            max_runs
+            max_runs,
+            if task.held {
+                TaskStatus::HELD
+            } else {
+                TaskStatus::SCHEDULED
+            }
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -765,10 +841,26 @@ pub fn set_task_enabled(
     } else {
         conn.execute(
             "UPDATE scheduled_tasks SET status = 'disabled'
-             WHERE id = ?1 AND status IN ('scheduled', 'running')",
+             WHERE id = ?1 AND status IN ('scheduled', 'held', 'running')",
             params![task_id],
         )?
     };
+    Ok(rows > 0)
+}
+
+/// Puts a `scheduled` task on hold (`held`), or releases a held one back
+/// to `scheduled`. Returns false if the task wasn't in the state to start
+/// from - a running task is already assigned and can't be held.
+pub fn set_task_held(conn: &Connection, task_id: i64, held: bool) -> Result<bool, Box<dyn Error>> {
+    let (from, to) = if held {
+        (TaskStatus::SCHEDULED, TaskStatus::HELD)
+    } else {
+        (TaskStatus::HELD, TaskStatus::SCHEDULED)
+    };
+    let rows = conn.execute(
+        "UPDATE scheduled_tasks SET status = ?3 WHERE id = ?1 AND status = ?2",
+        params![task_id, from, to],
+    )?;
     Ok(rows > 0)
 }
 
@@ -1595,6 +1687,7 @@ mod tests {
             command: "do it".to_string(),
             agent_name: None,
             schedule: TaskSchedule::Once { at: at.clone() },
+            held: false,
         };
         let id = create_task(&conn, &task("prompt")).unwrap();
         let row = get_task(&conn, id).unwrap().unwrap();
@@ -1725,6 +1818,128 @@ mod tests {
             .map(|t| t.name)
             .collect();
         assert_eq!(left, ["recent done", "old disabled", "old scheduled"]);
+    }
+
+    #[test]
+    fn test_held_task_is_not_picked_up_until_released() {
+        let conn = test_db();
+        live_session(&conn, "s");
+        let id = due_oneshot(&conn);
+
+        assert!(set_task_held(&conn, id, true).unwrap());
+        assert_eq!(
+            get_task(&conn, id).unwrap().unwrap().status,
+            TaskStatus::HELD
+        );
+        assert!(get_pending_tasks(&conn).unwrap().is_empty());
+        assert!(!claim_task(&conn, id, "s").unwrap());
+        assert!(!set_task_held(&conn, id, true).unwrap(), "already held");
+
+        assert!(set_task_held(&conn, id, false).unwrap());
+        assert_eq!(
+            get_task(&conn, id).unwrap().unwrap().status,
+            TaskStatus::SCHEDULED
+        );
+        assert!(
+            claim_task(&conn, id, "s").unwrap(),
+            "due, so it runs right away"
+        );
+        assert!(
+            !set_task_held(&conn, id, true).unwrap(),
+            "running tasks can't be held"
+        );
+        assert!(!set_task_held(&conn, id, false).unwrap(), "nor released");
+    }
+
+    #[test]
+    fn test_held_task_can_be_disabled_and_created_held() {
+        let conn = test_db();
+        let id = due_oneshot(&conn);
+        set_task_held(&conn, id, true).unwrap();
+        assert!(set_task_enabled(&conn, id, false).unwrap());
+        assert_eq!(
+            get_task(&conn, id).unwrap().unwrap().status,
+            TaskStatus::DISABLED
+        );
+
+        let held = create_task(
+            &conn,
+            &NewTask {
+                name: "later".to_string(),
+                description: String::new(),
+                kind: TaskKind::PROMPT.to_string(),
+                command: "go".to_string(),
+                agent_name: None,
+                schedule: TaskSchedule::Once {
+                    at: chrono::Utc::now().to_rfc3339(),
+                },
+                held: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            get_task(&conn, held).unwrap().unwrap().status,
+            TaskStatus::HELD
+        );
+    }
+
+    #[test]
+    fn test_task_table_rebuilt_to_allow_held() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_db(&conn).unwrap();
+        // Recreate the table as it was before `held`: same columns, but a
+        // status constraint without it.
+        conn.execute_batch(&format!(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE scheduled_tasks;
+             CREATE TABLE scheduled_tasks ({});
+             PRAGMA foreign_keys = ON;",
+            TASK_TABLE_DEFINITION.replace("'scheduled', 'held',", "'scheduled',")
+        ))
+        .unwrap();
+        create_agent(&conn, "bob", "").unwrap();
+        let at = chrono::Utc::now().to_rfc3339();
+        let keep = create_oneshot_task(&conn, "keep", "d", &at, "say hi", Some("bob")).unwrap();
+        let gone = create_oneshot_task(&conn, "gone", "", &at, "x", None).unwrap();
+        delete_task(&conn, gone).unwrap();
+        assert!(
+            set_task_held(&conn, keep, true).is_err(),
+            "old constraint rejects held"
+        );
+
+        initialize_db(&conn).unwrap();
+
+        let task = get_task(&conn, keep).unwrap().unwrap();
+        assert_eq!(
+            (task.name.as_str(), task.agent_name.as_deref()),
+            ("keep", Some("bob"))
+        );
+        assert_eq!(task.kind, TaskKind::PROMPT);
+        assert!(set_task_held(&conn, keep, true).unwrap());
+        // Ids of deleted tasks aren't handed out again.
+        let next = create_oneshot_task(&conn, "next", "", &at, "x", None).unwrap();
+        assert!(next > gone, "{next} <= {gone}");
+        // Indexes and the agent foreign key are back.
+        let indexes: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'scheduled_tasks'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            indexes.contains(&"idx_tasks_due".to_string()),
+            "{indexes:?}"
+        );
+        assert!(
+            indexes.contains(&"idx_tasks_agent".to_string()),
+            "{indexes:?}"
+        );
+        delete_agent(&conn, "bob").unwrap();
+        assert!(
+            get_task(&conn, keep).unwrap().is_none(),
+            "deleting an agent still deletes its tasks"
+        );
     }
 
     #[test]

@@ -217,6 +217,11 @@ impl DbBackend for LocalDb {
         db::set_task_enabled(&conn, task_id, enabled)
     }
 
+    fn set_task_held(&self, task_id: i64, held: bool) -> Result<bool, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::set_task_held(&conn, task_id, held)
+    }
+
     fn get_pending_tasks(&self) -> Result<Vec<TaskRow>, Box<dyn Error>> {
         let conn = self.lock()?;
         db::get_pending_tasks(&conn)
