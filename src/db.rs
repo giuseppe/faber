@@ -58,6 +58,46 @@ pub struct TaskRow {
     pub last_exit_code: Option<i64>,
     /// The last run's output (truncated), or why it failed.
     pub last_result: Option<String>,
+    /// `tool` or `prompt` - see `TaskKind`.
+    pub kind: String,
+}
+
+/// What a task's `command` is:
+///
+/// - `tool`: a `{"tool": ..., "arguments": ...}` call, run directly by the
+///   scheduler of any chat session, no LLM involved.
+/// - `prompt`: an instruction for an agent. It's picked up by a chat
+///   session waiting at its prompt - only one whose agent is `agent_name`,
+///   if set - and run as a turn of that agent's conversation.
+pub struct TaskKind;
+
+impl TaskKind {
+    pub const TOOL: &'static str = "tool";
+    pub const PROMPT: &'static str = "prompt";
+}
+
+/// When a new task runs.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum TaskSchedule {
+    /// Once, at this RFC 3339 time.
+    Once { at: String },
+    /// On a 7-field cron schedule, optionally at most `max_runs` times.
+    Cron {
+        expression: String,
+        max_runs: Option<i64>,
+    },
+}
+
+/// A task to create with `create_task`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct NewTask {
+    pub name: String,
+    pub description: String,
+    /// `TaskKind::TOOL` or `TaskKind::PROMPT`.
+    pub kind: String,
+    pub command: String,
+    pub agent_name: Option<String>,
+    pub schedule: TaskSchedule,
 }
 
 /// A task's lifecycle:
@@ -129,6 +169,7 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
             last_run_at TEXT,
             status TEXT NOT NULL DEFAULT 'scheduled'
                 CHECK(status IN ('scheduled', 'running', 'done', 'disabled')),
+            kind TEXT NOT NULL DEFAULT 'tool' CHECK(kind IN ('tool', 'prompt')),
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE SET NULL
         );
@@ -179,6 +220,7 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
         "last_outcome TEXT DEFAULT NULL",
         "last_exit_code INTEGER DEFAULT NULL",
         "last_result TEXT DEFAULT NULL",
+        "kind TEXT NOT NULL DEFAULT 'tool' CHECK(kind IN ('tool', 'prompt'))",
     ] {
         let _ = conn.execute_batch(&format!(
             "ALTER TABLE scheduled_tasks ADD COLUMN {};",
@@ -186,6 +228,20 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
         ));
     }
     migrate_task_enabled_to_status(conn)?;
+    // Tasks made before prompt tasks existed whose command is plain text
+    // could only fail; they're instructions for an agent. Ones that already
+    // ran are left as they were.
+    conn.execute_batch(
+        "UPDATE scheduled_tasks
+         SET kind = 'prompt',
+             command = CASE WHEN trim(command) = '' THEN description ELSE command END
+         WHERE kind = 'tool' AND status IN ('scheduled', 'disabled')
+           AND trim(CASE WHEN trim(command) = '' THEN description ELSE command END) != ''
+           AND COALESCE(
+                 CASE WHEN json_valid(CASE WHEN trim(command) = '' THEN description ELSE command END)
+                      THEN json_type(CASE WHEN trim(command) = '' THEN description ELSE command END, '$.tool')
+                 END, '') != 'text';",
+    )?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_tasks_due ON scheduled_tasks(status, next_run_at);",
     )?;
@@ -214,7 +270,9 @@ pub fn open_read_only(path: &str) -> Result<Connection, Box<dyn Error>> {
     if !table_has_column(&conn, "scheduled_tasks", "id").map_err(|_| not_faber())? {
         return Err(not_faber().into());
     }
-    if !table_has_column(&conn, "scheduled_tasks", "status")? {
+    if !table_has_column(&conn, "scheduled_tasks", "status")?
+        || !table_has_column(&conn, "scheduled_tasks", "kind")?
+    {
         return Err(format!(
             "{} is from an older version of faber: open it once with `faber chat` to upgrade it",
             shown
@@ -499,10 +557,11 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         last_outcome: row.get(16)?,
         last_exit_code: row.get(17)?,
         last_result: row.get(18)?,
+        kind: row.get(19)?,
     })
 }
 
-const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result";
+const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, kind";
 
 pub fn create_cron_task(
     conn: &Connection,
@@ -522,11 +581,98 @@ pub fn create_cron_task(
         .map(|dt| dt.to_rfc3339());
 
     conn.execute(
-        "INSERT INTO scheduled_tasks (name, description, task_type, cron_expression, next_run_at, agent_name, command, max_runs)
-         VALUES (?1, ?2, 'cron', ?3, ?4, ?5, ?6, ?7)",
-        params![name, description, cron_expr, next_run, agent_name, command, max_runs],
+        "INSERT INTO scheduled_tasks (name, description, task_type, cron_expression, next_run_at, agent_name, command, max_runs, kind)
+         VALUES (?1, ?2, 'cron', ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            name,
+            description,
+            cron_expr,
+            next_run,
+            agent_name,
+            effective_command(command, description),
+            max_runs,
+            kind_for_command(effective_command(command, description))
+        ],
     )?;
 
+    Ok(conn.last_insert_rowid())
+}
+
+/// Whether `command` is a `{"tool": "<name>", ...}` call.
+pub fn is_tool_call(command: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(command)
+        .ok()
+        .and_then(|v| v.get("tool")?.as_str().map(|t| !t.is_empty()))
+        .unwrap_or(false)
+}
+
+/// The kind of task `command` makes: a tool call runs as one, anything else
+/// is an instruction for an agent. An empty command stays a `tool` task,
+/// which fails saying so when it runs.
+fn kind_for_command(command: &str) -> &'static str {
+    if command.trim().is_empty() || is_tool_call(command) {
+        TaskKind::TOOL
+    } else {
+        TaskKind::PROMPT
+    }
+}
+
+/// What a task runs: its command, or its description if the command is
+/// empty (as the scheduler has always done).
+fn effective_command<'a>(command: &'a str, description: &'a str) -> &'a str {
+    if command.trim().is_empty() {
+        description
+    } else {
+        command
+    }
+}
+
+/// Creates a task of either kind (see `TaskKind`), returning its id.
+pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Error>> {
+    if task.kind != TaskKind::TOOL && task.kind != TaskKind::PROMPT {
+        return Err(format!("unknown task kind '{}': use tool or prompt", task.kind).into());
+    }
+    if let Some(agent) = &task.agent_name {
+        if get_agent(conn, agent)?.is_none() {
+            return Err(format!("no agent named '{}'", agent).into());
+        }
+    }
+    let (task_type, cron_expression, run_at, next_run_at, max_runs) = match &task.schedule {
+        TaskSchedule::Once { at } => {
+            chrono::DateTime::parse_from_rfc3339(at)
+                .map_err(|e| format!("Invalid RFC 3339 datetime '{}': {}", at, e))?;
+            ("oneshot", None, Some(at.clone()), Some(at.clone()), None)
+        }
+        TaskSchedule::Cron {
+            expression,
+            max_runs,
+        } => {
+            let next = Schedule::from_str(expression)
+                .map_err(|e| format!("Invalid cron expression '{}': {}", expression, e))?
+                .upcoming(chrono::Utc)
+                .next()
+                .map(|dt| dt.to_rfc3339());
+            ("cron", Some(expression.clone()), None, next, *max_runs)
+        }
+    };
+    conn.execute(
+        "INSERT INTO scheduled_tasks
+             (name, description, kind, task_type, cron_expression, run_at, next_run_at,
+              agent_name, command, max_runs)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            task.name,
+            task.description,
+            task.kind,
+            task_type,
+            cron_expression,
+            run_at,
+            next_run_at,
+            task.agent_name,
+            task.command,
+            max_runs
+        ],
+    )?;
     Ok(conn.last_insert_rowid())
 }
 
@@ -542,9 +688,16 @@ pub fn create_oneshot_task(
         .map_err(|e| format!("Invalid RFC 3339 datetime '{}': {}", run_at, e))?;
 
     conn.execute(
-        "INSERT INTO scheduled_tasks (name, description, task_type, run_at, next_run_at, agent_name, command)
-         VALUES (?1, ?2, 'oneshot', ?3, ?3, ?4, ?5)",
-        params![name, description, run_at, agent_name, command],
+        "INSERT INTO scheduled_tasks (name, description, task_type, run_at, next_run_at, agent_name, command, kind)
+         VALUES (?1, ?2, 'oneshot', ?3, ?3, ?4, ?5, ?6)",
+        params![
+            name,
+            description,
+            run_at,
+            agent_name,
+            effective_command(command, description),
+            kind_for_command(effective_command(command, description))
+        ],
     )?;
 
     Ok(conn.last_insert_rowid())
@@ -1384,6 +1537,105 @@ mod tests {
         let err = open_read_only(&path).unwrap_err().to_string();
         assert!(err.contains("isn't a faber database"), "{err}");
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_create_task_kinds_and_validation() {
+        let conn = test_db();
+        let at = chrono::Utc::now().to_rfc3339();
+        let task = |kind: &str| NewTask {
+            name: "n".to_string(),
+            description: String::new(),
+            kind: kind.to_string(),
+            command: "do it".to_string(),
+            agent_name: None,
+            schedule: TaskSchedule::Once { at: at.clone() },
+        };
+        let id = create_task(&conn, &task("prompt")).unwrap();
+        let row = get_task(&conn, id).unwrap().unwrap();
+        assert_eq!(row.kind, TaskKind::PROMPT);
+        assert_eq!(row.task_type, "oneshot");
+        assert_eq!(row.status, TaskStatus::SCHEDULED);
+        // The old creation functions still make tool tasks.
+        let id = create_oneshot_task(&conn, "t", "", &at, "", None).unwrap();
+        assert_eq!(get_task(&conn, id).unwrap().unwrap().kind, TaskKind::TOOL);
+
+        assert!(create_task(&conn, &task("shell")).is_err());
+        let mut cron = task("prompt");
+        cron.schedule = TaskSchedule::Cron {
+            expression: "not cron".to_string(),
+            max_runs: None,
+        };
+        assert!(create_task(&conn, &cron).is_err());
+    }
+
+    #[test]
+    fn test_plain_text_commands_make_prompt_tasks() {
+        let conn = test_db();
+        let at = chrono::Utc::now().to_rfc3339();
+        let kind = |id: i64| get_task(&conn, id).unwrap().unwrap().kind;
+        let joke = create_oneshot_task(&conn, "j", "", &at, "Tell the user a joke", None).unwrap();
+        assert_eq!(kind(joke), TaskKind::PROMPT);
+        let tool = create_oneshot_task(
+            &conn,
+            "t",
+            "",
+            &at,
+            r#"{"tool":"glob","arguments":{}}"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!(kind(tool), TaskKind::TOOL);
+        let cron = create_cron_task(
+            &conn,
+            "c",
+            "Summarize the news",
+            "0 0 9 * * * *",
+            "",
+            None,
+            None,
+        )
+        .unwrap();
+        let row = get_task(&conn, cron).unwrap().unwrap();
+        assert_eq!(row.kind, TaskKind::PROMPT);
+        assert_eq!(
+            row.command, "Summarize the news",
+            "the description stands in for the command"
+        );
+        assert!(!is_tool_call(r#"{"tool": ""}"#));
+        assert!(!is_tool_call("[1, 2]"));
+    }
+
+    #[test]
+    fn test_scheduled_plain_text_tool_tasks_become_prompt_tasks() {
+        let conn = test_db();
+        let at = chrono::Utc::now().to_rfc3339();
+        let insert = |name: &str, command: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO scheduled_tasks (name, description, task_type, run_at, next_run_at, command, kind, status)
+                 VALUES (?1, 'from the description', 'oneshot', ?2, ?2, ?3, 'tool', ?4)",
+                params![name, at, command, status],
+            )
+            .unwrap();
+        };
+        insert("text", "Tell a joke", "scheduled");
+        insert("empty", "", "disabled");
+        insert("call", r#"{"tool":"glob"}"#, "scheduled");
+        insert("ran", "Tell a joke", "done");
+        initialize_db(&conn).unwrap();
+        let kinds: Vec<(String, String, String)> = list_tasks(&conn, None)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.name, t.kind, t.command))
+            .collect();
+        let expected = [
+            ("text", "prompt", "Tell a joke"),
+            ("empty", "prompt", "from the description"),
+            ("call", "tool", r#"{"tool":"glob"}"#),
+            ("ran", "tool", "Tell a joke"),
+        ]
+        .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()));
+        assert_eq!(kinds, expected);
     }
 
     #[test]

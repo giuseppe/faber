@@ -17,7 +17,7 @@
  *
  */
 
-use faber::db::{AgentConfig, AgentRow, NotificationRow, TaskOutcome, TaskRow};
+use faber::db::{AgentConfig, AgentRow, NewTask, NotificationRow, TaskOutcome, TaskRow};
 use faber::db_backend::DbBackend;
 use faber::protocol::{RpcRequest, RpcResponse};
 use std::error::Error;
@@ -361,6 +361,11 @@ impl DbBackend for RemoteDb {
 
     fn get_pending_tasks(&self) -> Result<Vec<TaskRow>, Box<dyn Error>> {
         let v = self.call("get_pending_tasks", serde_json::json!({}))?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn create_task(&self, task: &NewTask) -> Result<i64, Box<dyn Error>> {
+        let v = self.call("create_task", serde_json::json!({"task": task}))?;
         Ok(serde_json::from_value(v)?)
     }
 
