@@ -24,6 +24,7 @@ mod latex_kitty;
 mod lsp;
 mod openai;
 mod remote_db;
+mod scripted_llm;
 mod server;
 mod status_bar;
 mod summarize;
@@ -10271,21 +10272,16 @@ mod tests {
     /// A tool context like a chat's, as `agent`, over `db`, with the
     /// dummy model behind sub-agents.
     fn chat_ctx(db: Arc<dyn DbBackend>, agent: &str) -> ToolContext {
+        chat_ctx_with_model(db, agent, "dummy")
+    }
+
+    fn chat_ctx_with_model(db: Arc<dyn DbBackend>, agent: &str, model: &str) -> ToolContext {
         let mut ctx = ToolContext::new(|_: &str| {});
         ctx.db = Some(db);
         ctx.agent_name = Some(agent.to_string());
         ctx.extra = Some(Arc::new(SubAgentContext {
             tools: Arc::new(initialize_tools(false, None)),
-            opts: openai::Opts {
-                max_tokens: None,
-                model: "dummy".to_string(),
-                endpoint: String::new(),
-                tool_choice: None,
-                api_key: None,
-                max_retries: None,
-                retry_base_delay_secs: None,
-                parameters: Default::default(),
-            },
+            opts: script_opts(model),
             session_id: "test-session".to_string(),
             active_subagents: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             status_bar: Arc::new(status_bar::StatusBar::new()),
@@ -10300,6 +10296,75 @@ mod tests {
             db.create_agent(agent, "").unwrap();
         }
         db
+    }
+
+    fn script_opts(model: &str) -> openai::Opts {
+        openai::Opts {
+            max_tokens: None,
+            model: model.to_string(),
+            endpoint: String::new(),
+            tool_choice: None,
+            api_key: None,
+            max_retries: None,
+            retry_base_delay_secs: None,
+            parameters: Default::default(),
+        }
+    }
+
+    /// Writes a model script (see `scripted_llm`) and returns its `--model`.
+    fn model_script(name: &str, rules: serde_json::Value) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "faber_main_script_{}_{}.json",
+            name,
+            std::process::id()
+        ));
+        std::fs::write(&path, rules.to_string()).unwrap();
+        format!("script:{}", path.display())
+    }
+
+    /// A whole turn of the agent in `ctx`, with every tool.
+    fn run_turn(ctx: &ToolContext, model: &str, prompt: &str) -> String {
+        let response = post_request_with_mode(
+            vec![make_message("user", prompt.to_string())],
+            &initialize_tools(false, None),
+            &script_opts(model),
+            ResponseMode::Complete,
+            ctx,
+            None,
+        )
+        .unwrap();
+        response.choices.unwrap()[0]
+            .message
+            .content
+            .clone()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_scripted_coordinator_fans_out_and_summarizes() {
+        let model = model_script(
+            "fanout",
+            serde_json::json!([
+                {"if": "triage", "tool": "fan_out",
+                 "arguments": {"items": ["101", "102"], "prompt": "check issue {item}"}},
+                {"if": "check issue 101", "reply": "101 is a duplicate"},
+                {"if": "check issue 102", "reply": "102 needs a fix", "delay_ms": 50},
+                {"if": "## 1. 101", "reply": "triaged both"},
+            ]),
+        );
+        let db = local_db_with_agents(&["boss"]);
+        let ctx = chat_ctx_with_model(db, "boss", &model);
+        assert_eq!(run_turn(&ctx, &model, "please triage"), "triaged both");
+        let usage = match &ctx.extra {
+            Some(extra) => *extra
+                .downcast_ref::<SubAgentContext>()
+                .unwrap()
+                .session_usage
+                .lock()
+                .unwrap(),
+            None => unreachable!(),
+        };
+        assert_eq!(usage.turns, 2, "both workers' tokens counted");
     }
 
     #[test]

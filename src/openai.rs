@@ -1120,6 +1120,16 @@ pub fn post_request_with_mode(
     ctx: &crate::ToolContext,
     ctrl_c_rx: Option<Arc<Mutex<mpsc::Receiver<()>>>>,
 ) -> Result<OpenAIResponse, Box<dyn Error>> {
+    if crate::scripted_llm::is_scripted_model(&opts.model) {
+        return crate::scripted_llm::post_request_scripted(
+            messages,
+            &opts.model,
+            tools_collection,
+            mode,
+            ctx,
+            ctrl_c_rx,
+        );
+    }
     if crate::dummy_llm::is_dummy_model(&opts.model) {
         return crate::dummy_llm::post_request_dummy(
             messages,

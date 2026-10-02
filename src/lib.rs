@@ -30,6 +30,7 @@ pub mod mcp;
 pub mod openai;
 #[allow(dead_code)]
 pub mod protocol;
+pub mod scripted_llm;
 
 /// Largest tool result, in characters, handed back to the model when the
 /// context window is unknown (roughly 8k tokens).
