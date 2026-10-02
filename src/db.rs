@@ -70,6 +70,9 @@ pub struct TaskRow {
     pub last_result: Option<String>,
     /// `tool` or `prompt` - see `TaskKind`.
     pub kind: String,
+    /// Tasks that must be done, successfully, before this one is due.
+    #[serde(default)]
+    pub depends_on: Vec<i64>,
 }
 
 /// What a task's `command` is:
@@ -111,6 +114,9 @@ pub struct NewTask {
     /// Create it `held` rather than `scheduled`.
     #[serde(default)]
     pub held: bool,
+    /// Tasks that must be done, successfully, first (see `DEPENDENCIES_MET`).
+    #[serde(default)]
+    pub depends_on: Vec<i64>,
 }
 
 /// A task's lifecycle:
@@ -148,6 +154,16 @@ pub struct TaskOutcome {
     pub result: String,
 }
 
+/// SQL condition: every task in `scheduled_tasks.depends_on` is done, and
+/// its last run succeeded. Dependencies can only be on tasks that existed
+/// when the task was created (`create_task` checks), so they never loop.
+const DEPENDENCIES_MET: &str = "NOT EXISTS (
+    SELECT 1 FROM json_each(COALESCE(scheduled_tasks.depends_on, '[]')) AS dependency
+    LEFT JOIN scheduled_tasks AS required ON required.id = dependency.value
+    WHERE required.id IS NULL
+       OR required.status != 'done'
+       OR COALESCE(required.last_outcome, '') != 'succeeded')";
+
 /// SQL condition: the task's claim belongs to a session that's no longer
 /// heartbeating (or no longer exists) - its run was abandoned. Sessions
 /// heartbeat every 5 seconds.
@@ -179,10 +195,11 @@ const TASK_TABLE_DEFINITION: &str = "
     last_outcome TEXT DEFAULT NULL,
     last_exit_code INTEGER DEFAULT NULL,
     last_result TEXT DEFAULT NULL,
+    depends_on TEXT DEFAULT NULL,
     FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE SET NULL";
 
 /// Every column of `TASK_TABLE_DEFINITION`, for copying rows across.
-const TASK_TABLE_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, kind, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result";
+const TASK_TABLE_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, kind, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, depends_on";
 
 /// Brings an existing `scheduled_tasks` table to `TASK_TABLE_DEFINITION`
 /// when its `status` constraint predates the `held` state. SQLite can't
@@ -299,6 +316,7 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
         "last_outcome TEXT DEFAULT NULL",
         "last_exit_code INTEGER DEFAULT NULL",
         "last_result TEXT DEFAULT NULL",
+        "depends_on TEXT DEFAULT NULL",
         "kind TEXT NOT NULL DEFAULT 'tool' CHECK(kind IN ('tool', 'prompt'))",
     ] {
         let _ = conn.execute_batch(&format!(
@@ -696,10 +714,14 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         last_exit_code: row.get(17)?,
         last_result: row.get(18)?,
         kind: row.get(19)?,
+        depends_on: row
+            .get::<_, Option<String>>(20)?
+            .and_then(|deps| serde_json::from_str(&deps).ok())
+            .unwrap_or_default(),
     })
 }
 
-const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, kind";
+const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, kind, depends_on";
 
 pub fn create_cron_task(
     conn: &Connection,
@@ -775,6 +797,16 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
             return Err(format!("no agent named '{}'", agent).into());
         }
     }
+    for dependency in &task.depends_on {
+        if get_task(conn, *dependency)?.is_none() {
+            return Err(format!("no task #{} to depend on", dependency).into());
+        }
+    }
+    let depends_on = if task.depends_on.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&task.depends_on)?)
+    };
     let (task_type, cron_expression, run_at, next_run_at, max_runs) = match &task.schedule {
         TaskSchedule::Once { at } => {
             chrono::DateTime::parse_from_rfc3339(at)
@@ -796,8 +828,8 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
     conn.execute(
         "INSERT INTO scheduled_tasks
              (name, description, kind, task_type, cron_expression, run_at, next_run_at,
-              agent_name, command, max_runs, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              agent_name, command, max_runs, status, depends_on)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             task.name,
             task.description,
@@ -813,7 +845,8 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
                 TaskStatus::HELD
             } else {
                 TaskStatus::SCHEDULED
-            }
+            },
+            depends_on
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -937,8 +970,9 @@ pub fn get_pending_tasks(conn: &Connection) -> Result<Vec<TaskRow>, Box<dyn Erro
         "SELECT {} FROM scheduled_tasks
          WHERE next_run_at <= ?1
            AND (status = 'scheduled' OR (status = 'running' AND ({})))
+           AND {}
          ORDER BY next_run_at",
-        TASK_COLUMNS, CLAIM_ABANDONED
+        TASK_COLUMNS, CLAIM_ABANDONED, DEPENDENCIES_MET
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![now], row_to_task)?;
@@ -994,6 +1028,44 @@ pub fn prune_tasks(
     Ok(old)
 }
 
+/// Fails every scheduled task with a dependency that failed or no longer
+/// exists - it can never become due - returning the ids it failed. Run
+/// repeatedly (the scheduler does, every poll), this fails whole chains.
+pub fn fail_tasks_with_failed_dependencies(conn: &Connection) -> Result<Vec<i64>, Box<dyn Error>> {
+    let mut stmt = conn.prepare(
+        "SELECT scheduled_tasks.id, dependency.value, required.id IS NULL
+         FROM scheduled_tasks, json_each(COALESCE(scheduled_tasks.depends_on, '[]')) AS dependency
+         LEFT JOIN scheduled_tasks AS required ON required.id = dependency.value
+         WHERE scheduled_tasks.status = 'scheduled'
+           AND (required.id IS NULL
+                OR (required.status = 'done' AND required.last_outcome = 'failed'))",
+    )?;
+    let blocked: Vec<(i64, i64, bool)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut failed = Vec::new();
+    for (task, dependency, missing) in blocked {
+        if failed.contains(&task) {
+            continue;
+        }
+        let reason = if missing {
+            format!("dependency #{} no longer exists", dependency)
+        } else {
+            format!("dependency #{} failed", dependency)
+        };
+        let rows = conn.execute(
+            "UPDATE scheduled_tasks SET status = 'done', last_outcome = 'failed',
+                 last_result = ?2, last_run_at = ?3
+             WHERE id = ?1 AND status = 'scheduled'",
+            params![task, reason, chrono::Utc::now().to_rfc3339()],
+        )?;
+        if rows > 0 {
+            failed.push(task);
+        }
+    }
+    Ok(failed)
+}
+
 /// Claims a due task for `session_id` to run. Returns false if it isn't due
 /// any more or another session got to it first - the check and the claim
 /// are one statement, so only one session can ever win. A task whose
@@ -1007,8 +1079,9 @@ pub fn claim_task(
     let sql = format!(
         "UPDATE scheduled_tasks SET status = 'running', claimed_by = ?2, started_at = ?3
          WHERE id = ?1 AND next_run_at <= ?3
-           AND (status = 'scheduled' OR (status = 'running' AND ({})))",
-        CLAIM_ABANDONED
+           AND (status = 'scheduled' OR (status = 'running' AND ({})))
+           AND {}",
+        CLAIM_ABANDONED, DEPENDENCIES_MET
     );
     let rows = conn.execute(&sql, params![task_id, session_id, now])?;
     Ok(rows > 0)
@@ -2142,6 +2215,7 @@ mod tests {
             agent_name: None,
             schedule: TaskSchedule::Once { at: at.clone() },
             held: false,
+            depends_on: Vec::new(),
         };
         let id = create_task(&conn, &task("prompt")).unwrap();
         let row = get_task(&conn, id).unwrap().unwrap();
@@ -2328,6 +2402,7 @@ mod tests {
                     at: chrono::Utc::now().to_rfc3339(),
                 },
                 held: true,
+                depends_on: Vec::new(),
             },
         )
         .unwrap();
@@ -2711,6 +2786,123 @@ mod tests {
         assert_eq!(agent_lineage(&conn, "leaf").unwrap(), ["leaf", "root"]);
         set_agent_parent(&conn, "leaf", None).unwrap();
         assert_eq!(agent_lineage(&conn, "leaf").unwrap(), ["leaf"]);
+    }
+
+    fn due_task_after(conn: &Connection, name: &str, depends_on: Vec<i64>) -> i64 {
+        create_task(
+            conn,
+            &NewTask {
+                name: name.to_string(),
+                description: String::new(),
+                kind: TaskKind::PROMPT.to_string(),
+                command: format!("do {}", name),
+                agent_name: None,
+                schedule: TaskSchedule::Once {
+                    at: (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339(),
+                },
+                held: false,
+                depends_on,
+            },
+        )
+        .unwrap()
+    }
+
+    fn pending_names(conn: &Connection) -> Vec<String> {
+        get_pending_tasks(conn)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    }
+
+    fn run_task(conn: &Connection, id: i64, succeeded: bool) {
+        assert!(
+            claim_task(conn, id, "s").unwrap(),
+            "task {id} should be claimable"
+        );
+        let outcome = TaskOutcome {
+            succeeded,
+            exit_code: None,
+            result: String::new(),
+        };
+        assert!(finish_task(conn, id, "s", &outcome).unwrap());
+    }
+
+    #[test]
+    fn test_dependent_tasks_wait_for_their_dependencies() {
+        let conn = test_db();
+        live_session(&conn, "s");
+        let a = due_task_after(&conn, "a", vec![]);
+        let b = due_task_after(&conn, "b", vec![a]);
+        let c = due_task_after(&conn, "c", vec![b]);
+        assert_eq!(get_task(&conn, c).unwrap().unwrap().depends_on, vec![b]);
+
+        assert_eq!(pending_names(&conn), ["a"]);
+        assert!(
+            !claim_task(&conn, b, "s").unwrap(),
+            "the claim checks dependencies too"
+        );
+        run_task(&conn, a, true);
+        assert_eq!(pending_names(&conn), ["b"]);
+        run_task(&conn, b, true);
+        assert_eq!(pending_names(&conn), ["c"]);
+        assert!(
+            fail_tasks_with_failed_dependencies(&conn)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_a_failed_dependency_fails_the_whole_chain() {
+        let conn = test_db();
+        live_session(&conn, "s");
+        let a = due_task_after(&conn, "a", vec![]);
+        let b = due_task_after(&conn, "b", vec![a]);
+        let c = due_task_after(&conn, "c", vec![b]);
+        run_task(&conn, a, false);
+        assert_eq!(fail_tasks_with_failed_dependencies(&conn).unwrap(), [b]);
+        assert_eq!(fail_tasks_with_failed_dependencies(&conn).unwrap(), [c]);
+        let c = get_task(&conn, c).unwrap().unwrap();
+        assert_eq!(
+            (c.status.as_str(), c.last_outcome.as_deref()),
+            ("done", Some("failed"))
+        );
+        assert_eq!(
+            c.last_result.as_deref(),
+            Some(format!("dependency #{} failed", b).as_str())
+        );
+        assert!(pending_names(&conn).is_empty());
+    }
+
+    #[test]
+    fn test_a_deleted_or_unknown_dependency() {
+        let conn = test_db();
+        let a = due_task_after(&conn, "a", vec![]);
+        let b = due_task_after(&conn, "b", vec![a]);
+        delete_task(&conn, a).unwrap();
+        assert_eq!(fail_tasks_with_failed_dependencies(&conn).unwrap(), [b]);
+        assert_eq!(
+            get_task(&conn, b).unwrap().unwrap().last_result.as_deref(),
+            Some(format!("dependency #{} no longer exists", a).as_str())
+        );
+        let err = create_task(
+            &conn,
+            &NewTask {
+                name: "x".to_string(),
+                description: String::new(),
+                kind: TaskKind::PROMPT.to_string(),
+                command: "x".to_string(),
+                agent_name: None,
+                schedule: TaskSchedule::Once {
+                    at: chrono::Utc::now().to_rfc3339(),
+                },
+                held: false,
+                depends_on: vec![999],
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no task #999"), "{err}");
     }
 
     #[test]

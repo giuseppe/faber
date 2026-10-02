@@ -2793,6 +2793,8 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         delay_seconds: Option<u64>,
         #[serde(default)]
         run_at: Option<String>,
+        #[serde(default)]
+        depends_on: Vec<i64>,
     }
     let params: Params = serde_json::from_str(params_str)?;
     if params.command.trim().is_empty() {
@@ -2838,6 +2840,7 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         agent_name: params.agent_name.or_else(|| ctx.agent_name.clone()),
         schedule,
         held: false,
+        depends_on: params.depends_on,
     };
     let id = ctx.db()?.create_task(&task)?;
     let next_run = ctx.db()?.get_task(id)?.and_then(|t| t.next_run_at);
@@ -4405,7 +4408,8 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "cron_expression": {"type": "string", "description": "7 fields: 'sec min hour day_of_month month day_of_week year', e.g. '0 30 9 * * Mon-Fri *' for 9:30 every weekday"},
                         "max_runs": {"type": "integer", "description": "With cron_expression: stop after this many runs"},
                         "delay_seconds": {"type": "integer", "description": "Run once, this many seconds from now"},
-                        "run_at": {"type": "string", "description": "Run once at this RFC 3339 time, e.g. 2026-10-03T08:00:00Z"}
+                        "run_at": {"type": "string", "description": "Run once at this RFC 3339 time, e.g. 2026-10-03T08:00:00Z"},
+                        "depends_on": {"type": "array", "items": {"type": "integer"}, "description": "Ids of tasks that must finish successfully first; it fails if one of them fails"}
                     },
                     "required": ["name", "command"],
                     "additionalProperties": false
@@ -6798,6 +6802,8 @@ fn scheduler_loop(
 ) {
     loop {
         std::thread::sleep(Duration::from_secs(1));
+        // A task whose dependency failed can never run: fail it too.
+        let _ = db.fail_tasks_with_failed_dependencies();
         let tasks = match db.get_pending_tasks() {
             Ok(t) => t,
             Err(_) => continue,
@@ -7701,7 +7707,36 @@ fn first_line(text: &str, max: usize) -> String {
 }
 
 /// One row of the `faber tasks` table.
-fn task_table_row(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> Row {
+/// Each task's dependencies that aren't done successfully yet - among
+/// `all` tasks; one that no longer exists counts as unmet.
+fn unmet_dependencies(all: &[db::TaskRow]) -> HashMap<i64, Vec<i64>> {
+    let met = |id: &i64| {
+        all.iter().any(|t| {
+            t.id == *id
+                && t.status == db::TaskStatus::DONE
+                && t.last_outcome.as_deref() == Some("succeeded")
+        })
+    };
+    all.iter()
+        .filter_map(|t| {
+            let unmet: Vec<i64> = t.depends_on.iter().copied().filter(|d| !met(d)).collect();
+            (!unmet.is_empty()).then_some((t.id, unmet))
+        })
+        .collect()
+}
+
+fn format_task_ids(ids: &[i64]) -> String {
+    ids.iter()
+        .map(|id| format!("#{}", id))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn task_table_row(
+    task: &db::TaskRow,
+    blocked: &HashMap<i64, Vec<i64>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Row {
     let when = |t: &Option<String>| {
         t.as_deref()
             .and_then(db::parse_db_time)
@@ -7734,6 +7769,8 @@ fn task_table_row(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> Row
         }
     } else if task.status != db::TaskStatus::SCHEDULED {
         "-".to_string()
+    } else if let Some(unmet) = blocked.get(&task.id) {
+        format!("after {}", format_task_ids(unmet))
     } else if due && task.kind == db::TaskKind::PROMPT {
         // Only a chat session waiting at its prompt picks these up.
         "waiting for an agent".to_string()
@@ -7775,7 +7812,11 @@ fn task_table_row(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> Row
 const BOARD_MAX_CARDS: usize = 10;
 
 /// The board column a task belongs in.
-fn board_column(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> usize {
+fn board_column(
+    task: &db::TaskRow,
+    blocked: &HashMap<i64, Vec<i64>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> usize {
     let due = task
         .next_run_at
         .as_deref()
@@ -7784,7 +7825,11 @@ fn board_column(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> usize
     match task.status.as_str() {
         db::TaskStatus::RUNNING => 2,
         db::TaskStatus::DONE => 3,
-        db::TaskStatus::SCHEDULED if due && task.kind == db::TaskKind::PROMPT => 1,
+        db::TaskStatus::SCHEDULED
+            if due && task.kind == db::TaskKind::PROMPT && !blocked.contains_key(&task.id) =>
+        {
+            1
+        }
         _ => 0,
     }
 }
@@ -7793,6 +7838,7 @@ fn board_column(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> usize
 /// `dim`/`busy` styling for the parts that carry state.
 fn board_card_lines(
     task: &db::TaskRow,
+    blocked: &HashMap<i64, Vec<i64>>,
     now: chrono::DateTime<chrono::Utc>,
     styles: &BoardStyles,
 ) -> Vec<String> {
@@ -7836,7 +7882,14 @@ fn board_card_lines(
                 lines.push(styles.dim.apply_to("⏸ disabled").to_string());
             } else if status == db::TaskStatus::HELD {
                 lines.push(styles.busy.apply_to("✋ on hold").to_string());
-            } else if board_column(task, now) == 1 {
+            } else if let Some(unmet) = blocked.get(&task.id) {
+                lines.push(
+                    styles
+                        .dim
+                        .apply_to(format!("after {}", format_task_ids(unmet)))
+                        .to_string(),
+                );
+            } else if board_column(task, blocked, now) == 1 {
                 lines.push(format!("due {} · for {}", ago(&task.next_run_at), who));
             } else {
                 lines.push(ago(&task.next_run_at));
@@ -7878,6 +7931,7 @@ fn fit(text: &str, width: usize) -> String {
 /// laid out to fit `width` screen columns.
 fn render_board(
     tasks: &[db::TaskRow],
+    blocked: &HashMap<i64, Vec<i64>>,
     now: chrono::DateTime<chrono::Utc>,
     width: usize,
     color: bool,
@@ -7892,7 +7946,7 @@ fn render_board(
     for (index, title) in titles.iter().enumerate() {
         let cards: Vec<&db::TaskRow> = tasks
             .iter()
-            .filter(|t| board_column(t, now) == index)
+            .filter(|t| board_column(t, blocked, now) == index)
             .collect();
         let mut lines = vec![
             fit(&format!("{} ({})", title, cards.len()), col_width),
@@ -7900,7 +7954,7 @@ fn render_board(
         ];
         for task in cards.iter().take(BOARD_MAX_CARDS) {
             lines.push(format!("┌{}┐", "─".repeat(col_width - 2)));
-            for line in board_card_lines(task, now, &styles) {
+            for line in board_card_lines(task, blocked, now, &styles) {
                 lines.push(format!("│ {} │", fit(&line, inner)));
             }
             lines.push(format!("└{}┘", "─".repeat(col_width - 2)));
@@ -7938,6 +7992,8 @@ fn print_tasks_table(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Box<dyn Error>> {
     let since = since.map(|s| parse_since(s, now)).transpose()?;
+    let all = db.list_tasks(None)?;
+    let blocked = unmet_dependencies(&all);
     let tasks = select_tasks(db.list_tasks(agent)?, since, last);
     if board {
         let term = console::Term::stdout();
@@ -7946,7 +8002,10 @@ fn print_tasks_table(
         } else {
             120
         };
-        print!("{}", render_board(&tasks, now, width, term.is_term()));
+        print!(
+            "{}",
+            render_board(&tasks, &blocked, now, width, term.is_term())
+        );
         return Ok(());
     }
     if tasks.is_empty() {
@@ -7973,7 +8032,7 @@ fn print_tasks_table(
         .collect(),
     ));
     for task in &tasks {
-        table.add_row(task_table_row(task, now));
+        table.add_row(task_table_row(task, &blocked, now));
     }
     table.printstd();
     Ok(())
@@ -7994,6 +8053,7 @@ fn new_task_from_cli(
         tool,
         name,
         hold,
+        depends_on,
     } = action
     else {
         return Err("not a `tasks add` command".to_string());
@@ -8059,13 +8119,18 @@ fn new_task_from_cli(
         agent_name: agent.clone(),
         schedule,
         held: *hold,
+        depends_on: depends_on.clone(),
     })
 }
 
 /// Everything about `task`, for `faber tasks show`: one labelled line per
 /// field, times both absolute (local) and relative to `now`, and the full
 /// command and last result indented below.
-fn describe_task(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> String {
+fn describe_task(
+    task: &db::TaskRow,
+    dependencies: &[String],
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
     let time = |t: &Option<String>| match t.as_deref() {
         None => "-".to_string(),
         Some(text) => match db::parse_db_time(text) {
@@ -8121,6 +8186,14 @@ fn describe_task(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> Stri
             task.claimed_by.clone().unwrap_or_else(|| "-".to_string()),
         ),
         ("Last outcome", outcome),
+        (
+            "Depends on",
+            if dependencies.is_empty() {
+                "-".to_string()
+            } else {
+                dependencies.join(", ")
+            },
+        ),
     ];
     let indent = |text: &str| {
         text.lines()
@@ -8563,7 +8636,27 @@ fn show_task_command(
     if json {
         println!("{}", serde_json::to_string_pretty(&task)?);
     } else {
-        print!("{}", describe_task(&task, chrono::Utc::now()));
+        let dependencies: Vec<String> = task
+            .depends_on
+            .iter()
+            .map(|id| match db.get_task(*id) {
+                Ok(Some(dependency)) => format!(
+                    "#{} ({}{})",
+                    id,
+                    dependency.status,
+                    match dependency.last_outcome.as_deref() {
+                        Some("succeeded") => " ✓",
+                        Some(_) => " ✗",
+                        None => "",
+                    }
+                ),
+                _ => format!("#{} (gone)", id),
+            })
+            .collect();
+        print!(
+            "{}",
+            describe_task(&task, &dependencies, chrono::Utc::now())
+        );
     }
     Ok(())
 }
@@ -9229,6 +9322,10 @@ enum TasksAction {
         /// Create it on hold: nobody picks it up until `faber tasks release`
         #[clap(long)]
         hold: bool,
+        /// Only once this task is done, successfully - it fails if that
+        /// one fails (can be repeated)
+        #[clap(long = "after", value_name = "ID")]
+        depends_on: Vec<i64>,
     },
     /// Put scheduled tasks on hold, so they aren't picked up even when due
     Hold {
@@ -10152,6 +10249,7 @@ mod tests {
             last_exit_code: None,
             last_result: None,
             kind: "tool".to_string(),
+            depends_on: Vec::new(),
         }
     }
 
@@ -10261,9 +10359,35 @@ mod tests {
     fn test_board_marks_held_tasks() {
         let now = utc("2026-10-02T12:00:00Z");
         let held = board_task(1, "held", "prompt", "2026-10-02T11:00:00Z");
-        let board = render_board(&[held], now, 120, false);
+        let board = render_board(&[held], &HashMap::new(), now, 120, false);
         assert!(board.starts_with("SCHEDULED (1)"), "{board}");
         assert!(board.contains("✋ on hold"), "{board}");
+    }
+
+    #[test]
+    fn test_tasks_add_after_and_unmet_dependencies() {
+        let now = utc("2026-10-02T12:00:00Z");
+        let task =
+            new_task_from_cli(&add_args(&["deploy", "--after", "3", "--after", "4"]), now).unwrap();
+        assert_eq!(task.depends_on, vec![3, 4]);
+
+        let mut done_ok = task_row(3, "2026-10-01 10:00:00", None);
+        done_ok.status = "done".to_string();
+        done_ok.last_outcome = Some("succeeded".to_string());
+        let mut running = task_row(4, "2026-10-01 10:00:00", None);
+        running.status = "running".to_string();
+        let mut waiting = task_row(5, "2026-10-01 10:00:00", None);
+        waiting.depends_on = vec![3, 4, 99];
+        let all = vec![done_ok, running, waiting];
+        let blocked = unmet_dependencies(&all);
+        assert_eq!(
+            blocked.get(&5),
+            Some(&vec![4, 99]),
+            "#3 is met; #99 doesn't exist"
+        );
+        assert!(!blocked.contains_key(&3));
+        let board = render_board(&all, &blocked, now, 120, false);
+        assert!(board.contains("after #4, #99"), "{board}");
     }
 
     #[test]
@@ -10319,6 +10443,7 @@ mod tests {
             agent_name: agent.map(String::from),
             schedule: db::TaskSchedule::Once { at: past.clone() },
             held: false,
+            depends_on: Vec::new(),
         };
         let for_bob = db.create_task(&prompt(Some("bob"))).unwrap();
         assert!(claim_prompt_task(db.as_ref(), "s1", "alice").is_none());
@@ -10377,7 +10502,7 @@ mod tests {
             // A due tool task isn't waiting for an agent: the scheduler runs it.
             board_task(6, "scheduled", "tool", "2026-10-02T11:59:00Z"),
         ];
-        let board = render_board(&tasks, now, 120, false);
+        let board = render_board(&tasks, &HashMap::new(), now, 120, false);
         let lines: Vec<&str> = board.lines().collect();
         assert!(lines[0].starts_with("SCHEDULED (3)"), "{board}");
         assert!(lines[0].contains("WAITING (1)") && lines[0].contains("RUNNING (1)"));
@@ -10413,7 +10538,7 @@ mod tests {
                 t
             })
             .collect();
-        let board = render_board(&tasks, now, 90, true);
+        let board = render_board(&tasks, &HashMap::new(), now, 90, true);
         assert!(board.contains("+3 more"), "{board}");
         let widths: Vec<usize> = board
             .lines()
@@ -10441,7 +10566,7 @@ mod tests {
         task.last_exit_code = Some(2);
         task.command = "Summarize the day.\nKeep it short.".to_string();
         task.last_result = Some("line one\nline two".to_string());
-        let text = describe_task(&task, now);
+        let text = describe_task(&task, &[], now);
         for expected in [
             "Task #7",
             "Name:         nightly",
