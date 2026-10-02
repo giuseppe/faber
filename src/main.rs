@@ -2884,6 +2884,10 @@ fn tool_send_message(params_str: &String, ctx: &ToolContext) -> Result<String, B
     Ok(result.to_string())
 }
 
+/// How deep sub-agents may nest: a sub-agent of a sub-agent of ... - so a
+/// task that keeps delegating ends instead of recursing forever.
+const MAX_AGENT_DEPTH: usize = 8;
+
 fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     #[derive(Deserialize)]
     struct Params {
@@ -2909,6 +2913,14 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     let agent_config = {
         if db.get_agent(&agent_name)?.is_none() {
             db.create_agent(&agent_name, &format!("Sub-agent: {}", agent_name))?;
+        }
+        let depth = db.agent_lineage(&parent_agent)?.len();
+        if depth >= MAX_AGENT_DEPTH {
+            return Err(format!(
+                "'{}' is already {} levels deep in sub-agents; can't go deeper",
+                parent_agent, depth
+            )
+            .into());
         }
         // Lets it see the knowledge base notes private to its parent (and
         // so on up), while what it saves privately stays below.
@@ -2951,6 +2963,8 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
 
     let session_id_for_sub = sa_ctx.session_id.clone();
     let mcp_for_sub = ctx.mcp_manager.clone();
+    // The sub-agent gets the same machinery, so it can spawn its own.
+    let extra_for_sub = ctx.extra.clone();
     let agent_name_for_ctx = agent_name.clone();
     let context_window = ctx.context_window;
     let session_usage = sa_ctx.session_usage.clone();
@@ -2983,6 +2997,7 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         sub_ctx.agent_name = Some(agent_name_for_ctx);
         sub_ctx.mcp_manager = mcp_for_sub;
         sub_ctx.context_window = context_window;
+        sub_ctx.extra = extra_for_sub;
         let result = post_request_with_mode(
             messages,
             &tools,
@@ -10416,6 +10431,66 @@ mod tests {
             "every worker answered"
         );
         assert!(out.contains("## 500. 499\n"));
+    }
+
+    /// Waits up to 10 seconds for `check` to hold.
+    fn eventually(mut check: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if check() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn test_sub_agents_can_spawn_their_own() {
+        let model = model_script(
+            "nested",
+            serde_json::json!([
+                // spawn_agent's own result echoes the prompt: answer it first.
+                {"if": "\"status\":\"spawned\"", "reply": "started"},
+                {"if": "start", "tool": "spawn_agent", "arguments": {"name": "lvl1", "prompt": "level one"}},
+                {"if": "level one", "tool": "spawn_agent", "arguments": {"name": "lvl2", "prompt": "level two"}},
+                {"if": "level two", "reply": "deep enough"},
+            ]),
+        );
+        let db = local_db_with_agents(&["boss"]);
+        let ctx = chat_ctx_with_model(db.clone(), "boss", &model);
+        assert_eq!(run_turn(&ctx, &model, "start"), "started");
+        assert!(
+            eventually(|| db
+                .agent_lineage("lvl2")
+                .map(|l| l == ["lvl2", "lvl1", "boss"])
+                .unwrap_or(false)),
+            "lvl1 should have spawned lvl2"
+        );
+    }
+
+    #[test]
+    fn test_sub_agent_nesting_is_limited() {
+        let names: Vec<String> = (0..MAX_AGENT_DEPTH).map(|i| format!("a{}", i)).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let db = local_db_with_agents(&refs);
+        for pair in names.windows(2) {
+            db.set_agent_parent(&pair[1], Some(&pair[0])).unwrap();
+        }
+        let deepest = names.last().unwrap();
+        let err = tool_spawn_agent(
+            &serde_json::json!({"name": "too-deep", "prompt": "x"}).to_string(),
+            &chat_ctx(db.clone(), deepest),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("levels deep"), "{err}");
+        // One level up still works.
+        tool_spawn_agent(
+            &serde_json::json!({"name": "ok", "prompt": "x"}).to_string(),
+            &chat_ctx(db, &names[MAX_AGENT_DEPTH - 2]),
+        )
+        .unwrap();
     }
 
     #[test]

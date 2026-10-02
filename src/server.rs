@@ -188,6 +188,10 @@ fn dispatch_inner(
             db::create_agent(&conn, str_param!("name"), str_param!("description"))?;
             Ok(serde_json::json!(true))
         }
+        "agent_lineage" => {
+            let v = db::agent_lineage(&conn, str_param!("agent"))?;
+            Ok(serde_json::to_value(v)?)
+        }
         "set_agent_parent" => {
             db::set_agent_parent(&conn, str_param!("agent"), opt_str_param!("parent"))?;
             Ok(serde_json::json!(true))

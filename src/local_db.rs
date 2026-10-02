@@ -77,6 +77,11 @@ impl DbBackend for LocalDb {
         db::list_agents(&conn)
     }
 
+    fn agent_lineage(&self, agent: &str) -> Result<Vec<String>, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::agent_lineage(&conn, agent)
+    }
+
     fn set_agent_parent(&self, agent: &str, parent: Option<&str>) -> Result<(), Box<dyn Error>> {
         let conn = self.lock()?;
         db::set_agent_parent(&conn, agent, parent)
