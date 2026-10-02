@@ -307,7 +307,14 @@ faber --db-path state.db tasks --last 10    # the 10 most recently active
 faber --db-path state.db tasks --since 2h   # active in the last 2 hours (also 30m, 3d, 1w)
 faber --db-path state.db tasks --since 2026-10-01 --agent mybot
 faber --db-path state.db tasks --watch      # redraw every 2s until Ctrl-C (--watch=N for N seconds)
+faber --db-path state.db tasks --board --watch   # as a board, one column per state
 ```
+
+`--board` shows the tasks as cards in four columns - **Scheduled**
+(including disabled ones, marked ⏸), **Waiting** (prompt tasks that are
+due but no agent has picked up yet), **Running** and **Done** (✓ or ✗ with
+the start of the result) - sized to the terminal, at most 10 cards per
+column. `--since`, `--last` and `--agent` work with it too.
 
 ```
  ID | Name           | Agent | Schedule        | Status    | Next run | Last run | Runs | Last result
@@ -323,6 +330,23 @@ database from an older faber once with `faber chat` first. A relative
 `db_path` in a config file is relative to the current directory.
 
 A task is "active" when it was created, started or finished a run.
+
+### Cleaning up
+
+Done tasks are kept, with their results, until deleted:
+
+```bash
+faber --db-path state.db tasks prune --older-than 7d --dry-run   # list what would go
+faber --db-path state.db tasks prune --older-than 7d             # delete them
+faber --db-path state.db tasks prune --done                      # delete every done task, however recent
+```
+
+`prune` only deletes `done` tasks (✓ and ✗ alike) whose last run is older
+than `--older-than` - `7d` by default, or no limit with `--done` alone;
+scheduled, running and disabled tasks are never touched. To do it automatically, set `"task_retention": "30d"` in the
+config file (or pass `--task-retention 30d`): while a `faber chat` runs,
+it prunes done tasks older than that every hour. Deleting an agent also
+deletes its tasks, and the model can delete one with `task_delete`.
 `--since` also takes a date or `"YYYY-MM-DD HH:MM"` in local time, or an
 RFC 3339 timestamp. It works with `--server` too.
 

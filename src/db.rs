@@ -790,6 +790,51 @@ pub fn get_pending_tasks(conn: &Connection) -> Result<Vec<TaskRow>, Box<dyn Erro
     Ok(tasks)
 }
 
+/// Reads a timestamp as stored in the database: RFC 3339 (`next_run_at`,
+/// `last_run_at`, ...) or SQLite's `datetime('now')` UTC format
+/// (`created_at`).
+pub fn parse_db_time(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Some(t.with_timezone(&chrono::Utc));
+    }
+    chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|t| t.and_utc())
+}
+
+/// Deletes `done` tasks that last ran (or, if they never did, were
+/// created) before `older_than`, returning them. With `dry_run`, only
+/// returns what would be deleted. Scheduled, running and disabled tasks
+/// are never touched.
+pub fn prune_tasks(
+    conn: &Connection,
+    older_than: chrono::DateTime<chrono::Utc>,
+    dry_run: bool,
+) -> Result<Vec<TaskRow>, Box<dyn Error>> {
+    let old: Vec<TaskRow> = list_tasks(conn, None)?
+        .into_iter()
+        .filter(|t| t.status == TaskStatus::DONE)
+        .filter(|t| {
+            t.last_run_at
+                .as_deref()
+                .or(Some(t.created_at.as_str()))
+                .and_then(parse_db_time)
+                .is_some_and(|when| when < older_than)
+        })
+        .collect();
+    if !dry_run {
+        let tx = conn.unchecked_transaction()?;
+        for task in &old {
+            tx.execute(
+                "DELETE FROM scheduled_tasks WHERE id = ?1 AND status = 'done'",
+                params![task.id],
+            )?;
+        }
+        tx.commit()?;
+    }
+    Ok(old)
+}
+
 /// Claims a due task for `session_id` to run. Returns false if it isn't due
 /// any more or another session got to it first - the check and the claim
 /// are one statement, so only one session can ever win. A task whose
@@ -1636,6 +1681,50 @@ mod tests {
         ]
         .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()));
         assert_eq!(kinds, expected);
+    }
+
+    #[test]
+    fn test_prune_tasks_removes_only_old_done_tasks() {
+        let conn = test_db();
+        let now = chrono::Utc::now();
+        let at = now.to_rfc3339();
+        let make = |name: &str, status: &str, last_run: Option<chrono::Duration>| {
+            let id = create_oneshot_task(&conn, name, "", &at, "x", None).unwrap();
+            conn.execute(
+                "UPDATE scheduled_tasks SET status = ?1, last_run_at = ?2 WHERE id = ?3",
+                params![status, last_run.map(|ago| (now - ago).to_rfc3339()), id],
+            )
+            .unwrap();
+        };
+        make("old done", "done", Some(chrono::Duration::days(10)));
+        make("recent done", "done", Some(chrono::Duration::hours(1)));
+        make("old disabled", "disabled", Some(chrono::Duration::days(10)));
+        make(
+            "old scheduled",
+            "scheduled",
+            Some(chrono::Duration::days(10)),
+        );
+
+        let cutoff = now - chrono::Duration::days(7);
+        let would = prune_tasks(&conn, cutoff, true).unwrap();
+        assert_eq!(
+            would.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            ["old done"]
+        );
+        assert_eq!(
+            list_tasks(&conn, None).unwrap().len(),
+            4,
+            "dry run deletes nothing"
+        );
+
+        let pruned = prune_tasks(&conn, cutoff, false).unwrap();
+        assert_eq!(pruned.len(), 1);
+        let left: Vec<String> = list_tasks(&conn, None)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(left, ["recent done", "old disabled", "old scheduled"]);
     }
 
     #[test]

@@ -6795,12 +6795,29 @@ fn chat_command(
         let heartbeat_db = scheduler_db.clone();
         let heartbeat_session = session_id.clone();
 
+        let scheduler_db_for_prune = scheduler_db.clone();
         let scheduler_db = scheduler_db.clone();
         let scheduler_tools = Arc::new(tools.clone());
         let scheduler_session = session_id.to_string();
         std::thread::spawn(move || {
             scheduler_loop(scheduler_db, scheduler_session, scheduler_tools, task_tx);
         });
+        if let Some(retention) = opts.task_retention.as_deref().and_then(parse_duration) {
+            let prune_db = scheduler_db_for_prune.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let cutoff = (chrono::Utc::now() - retention).to_rfc3339();
+                    match prune_db.prune_tasks(&cutoff, false) {
+                        Ok(pruned) if !pruned.is_empty() => {
+                            debug!("Pruned {} old task(s)", pruned.len())
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!("Couldn't prune old tasks: {}", e),
+                    }
+                    std::thread::sleep(Duration::from_secs(3600));
+                }
+            });
+        }
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_secs(5));
@@ -7321,18 +7338,6 @@ fn gc_command(opts: &Opts) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Reads a timestamp as stored in the database: RFC 3339 (`next_run_at`,
-/// `last_run_at`, ...) or SQLite's `datetime('now')` UTC format
-/// (`created_at`).
-fn parse_db_time(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(text) {
-        return Some(t.with_timezone(&chrono::Utc));
-    }
-    chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
-        .ok()
-        .map(|t| t.and_utc())
-}
-
 /// A duration like `45s`, `30m`, `2h`, `3d` or `1w`.
 fn parse_duration(text: &str) -> Option<chrono::Duration> {
     let text = text.trim();
@@ -7421,7 +7426,7 @@ fn task_activity(task: &db::TaskRow) -> Option<chrono::DateTime<chrono::Utc>> {
     ]
     .into_iter()
     .flatten()
-    .filter_map(|t| parse_db_time(t))
+    .filter_map(|t| db::parse_db_time(t))
     .max()
 }
 
@@ -7464,7 +7469,7 @@ fn first_line(text: &str, max: usize) -> String {
 fn task_table_row(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> Row {
     let when = |t: &Option<String>| {
         t.as_deref()
-            .and_then(parse_db_time)
+            .and_then(db::parse_db_time)
             .map(|t| format_relative(t, now))
             .unwrap_or_else(|| "-".to_string())
     };
@@ -7484,7 +7489,7 @@ fn task_table_row(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> Row
     let due = task
         .next_run_at
         .as_deref()
-        .and_then(parse_db_time)
+        .and_then(db::parse_db_time)
         .is_some_and(|t| t <= now);
     let next = if task.status != db::TaskStatus::SCHEDULED {
         "-".to_string()
@@ -7525,16 +7530,182 @@ fn task_table_row(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> Row
     ])
 }
 
+/// Most cards shown in one board column; the rest are counted.
+const BOARD_MAX_CARDS: usize = 10;
+
+/// The board column a task belongs in.
+fn board_column(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> usize {
+    let due = task
+        .next_run_at
+        .as_deref()
+        .and_then(db::parse_db_time)
+        .is_some_and(|t| t <= now);
+    match task.status.as_str() {
+        db::TaskStatus::RUNNING => 2,
+        db::TaskStatus::DONE => 3,
+        db::TaskStatus::SCHEDULED if due && task.kind == db::TaskKind::PROMPT => 1,
+        _ => 0,
+    }
+}
+
+/// The text lines of a task's card (without its frame), with `ok`/`bad`/
+/// `dim`/`busy` styling for the parts that carry state.
+fn board_card_lines(
+    task: &db::TaskRow,
+    now: chrono::DateTime<chrono::Utc>,
+    styles: &BoardStyles,
+) -> Vec<String> {
+    let ago = |t: &Option<String>| {
+        t.as_deref()
+            .and_then(db::parse_db_time)
+            .map(|t| format_relative(t, now))
+            .unwrap_or_else(|| "-".to_string())
+    };
+    let who = task.agent_name.as_deref().unwrap_or("any agent");
+    let mut lines = vec![format!("#{} {}", task.id, task.name)];
+    match task.status.as_str() {
+        db::TaskStatus::DONE => {
+            let mark = match task.last_outcome.as_deref() {
+                Some("succeeded") => styles.ok.apply_to("✓").to_string(),
+                Some(_) => styles.bad.apply_to("✗").to_string(),
+                None => "-".to_string(),
+            };
+            lines.push(format!("{} {}", mark, ago(&task.last_run_at)));
+            if let Some(result) = task.last_result.as_deref().filter(|r| !r.trim().is_empty()) {
+                lines.push(styles.dim.apply_to(first_line(result, 200)).to_string());
+            }
+        }
+        db::TaskStatus::RUNNING => {
+            lines.push(format!("{} · {}", task.kind, who));
+            let since = ago(&task.started_at);
+            lines.push(
+                styles
+                    .busy
+                    .apply_to(format!("for {}", since.trim_end_matches(" ago")))
+                    .to_string(),
+            );
+        }
+        status => {
+            let schedule = task
+                .cron_expression
+                .clone()
+                .unwrap_or_else(|| "once".to_string());
+            lines.push(format!("{} · {}", task.kind, schedule));
+            if status == db::TaskStatus::DISABLED {
+                lines.push(styles.dim.apply_to("⏸ disabled").to_string());
+            } else if board_column(task, now) == 1 {
+                lines.push(format!("due {} · for {}", ago(&task.next_run_at), who));
+            } else {
+                lines.push(ago(&task.next_run_at));
+            }
+        }
+    }
+    lines
+}
+
+/// Styling for the board; all plain when output isn't a terminal.
+struct BoardStyles {
+    ok: Style,
+    bad: Style,
+    dim: Style,
+    busy: Style,
+}
+
+impl BoardStyles {
+    fn new(color: bool) -> Self {
+        Self {
+            ok: Style::new().green().force_styling(color),
+            bad: Style::new().red().force_styling(color),
+            dim: Style::new().color256(244).force_styling(color),
+            busy: Style::new().yellow().force_styling(color),
+        }
+    }
+}
+
+/// Pads (or cuts) `text` to exactly `width` columns of the screen,
+/// whatever escape codes or wide characters it contains.
+fn fit(text: &str, width: usize) -> String {
+    let cut = console::truncate_str(text, width, "…");
+    let pad = width.saturating_sub(console::measure_text_width(&cut));
+    format!("{}{}", cut, " ".repeat(pad))
+}
+
+/// `tasks` as a board: one column per state - scheduled (including
+/// disabled), waiting for an agent, running, done - with a card per task,
+/// laid out to fit `width` screen columns.
+fn render_board(
+    tasks: &[db::TaskRow],
+    now: chrono::DateTime<chrono::Utc>,
+    width: usize,
+    color: bool,
+) -> String {
+    const GAP: usize = 2;
+    let styles = BoardStyles::new(color);
+    let col_width = (width.saturating_sub(3 * GAP) / 4).clamp(20, 48);
+    let inner = col_width - 4;
+    let titles = ["SCHEDULED", "WAITING", "RUNNING", "DONE"];
+
+    let mut columns: Vec<Vec<String>> = Vec::new();
+    for (index, title) in titles.iter().enumerate() {
+        let cards: Vec<&db::TaskRow> = tasks
+            .iter()
+            .filter(|t| board_column(t, now) == index)
+            .collect();
+        let mut lines = vec![
+            fit(&format!("{} ({})", title, cards.len()), col_width),
+            " ".repeat(col_width),
+        ];
+        for task in cards.iter().take(BOARD_MAX_CARDS) {
+            lines.push(format!("┌{}┐", "─".repeat(col_width - 2)));
+            for line in board_card_lines(task, now, &styles) {
+                lines.push(format!("│ {} │", fit(&line, inner)));
+            }
+            lines.push(format!("└{}┘", "─".repeat(col_width - 2)));
+        }
+        if cards.len() > BOARD_MAX_CARDS {
+            lines.push(fit(
+                &format!("+{} more", cards.len() - BOARD_MAX_CARDS),
+                col_width,
+            ));
+        }
+        columns.push(lines);
+    }
+
+    let rows = columns.iter().map(Vec::len).max().unwrap_or(0);
+    let blank = " ".repeat(col_width);
+    let mut out = String::new();
+    for row in 0..rows {
+        let cells: Vec<&str> = columns
+            .iter()
+            .map(|c| c.get(row).map(String::as_str).unwrap_or(&blank))
+            .collect();
+        out.push_str(cells.join(&" ".repeat(GAP)).trim_end());
+        out.push('\n');
+    }
+    out
+}
+
 /// Prints the tasks `select_tasks` picks as a table, as of `now`.
 fn print_tasks_table(
     db: &dyn DbBackend,
     since: Option<&str>,
     last: Option<usize>,
     agent: Option<&str>,
+    board: bool,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Box<dyn Error>> {
     let since = since.map(|s| parse_since(s, now)).transpose()?;
     let tasks = select_tasks(db.list_tasks(agent)?, since, last);
+    if board {
+        let term = console::Term::stdout();
+        let width = if term.is_term() {
+            term.size().1 as usize
+        } else {
+            120
+        };
+        print!("{}", render_board(&tasks, now, width, term.is_term()));
+        return Ok(());
+    }
     if tasks.is_empty() {
         println!("No tasks.");
         return Ok(());
@@ -7579,7 +7750,10 @@ fn new_task_from_cli(
         agent,
         tool,
         name,
-    } = action;
+    } = action
+    else {
+        return Err("not a `tasks add` command".to_string());
+    };
     if text.trim().is_empty() {
         return Err("the task's text is empty".to_string());
     }
@@ -7643,6 +7817,65 @@ fn new_task_from_cli(
     })
 }
 
+/// `faber tasks prune`: deletes (or with `dry_run` lists) done tasks whose
+/// last run is older than `older_than`.
+fn prune_tasks_command(
+    db: &Option<Arc<dyn DbBackend>>,
+    older_than: Option<&str>,
+    all_done: bool,
+    dry_run: bool,
+) -> Result<(), Box<dyn Error>> {
+    let db = db.as_ref().ok_or(
+        "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
+    )?;
+    // --done alone means no age limit; otherwise --older-than, or 7d.
+    let older_than = match (older_than, all_done) {
+        (Some(age), _) => Some(age),
+        (None, true) => None,
+        (None, false) => Some("7d"),
+    };
+    let age = older_than
+        .map(|text| {
+            parse_duration(text).ok_or_else(|| {
+                format!(
+                    "can't read --older-than '{}': use a duration like 12h, 7d or 2w",
+                    text
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_else(chrono::Duration::zero);
+    let which = match older_than {
+        Some(text) => format!("done task(s) older than {}", text),
+        None => "done task(s)".to_string(),
+    };
+    let now = chrono::Utc::now();
+    // A cutoff a moment in the future, for --done, so a task that
+    // finished this very second still counts.
+    let cutoff = now - age + chrono::Duration::seconds(1);
+    let pruned = db.prune_tasks(&cutoff.to_rfc3339(), dry_run)?;
+    if pruned.is_empty() {
+        println!("No {}.", which.replace("task(s)", "tasks"));
+        return Ok(());
+    }
+    println!(
+        "{} {} {}:",
+        if dry_run { "Would delete" } else { "Deleted" },
+        pruned.len(),
+        which
+    );
+    for task in &pruned {
+        let when = task
+            .last_run_at
+            .as_deref()
+            .and_then(db::parse_db_time)
+            .map(|t| format!("last run {}", format_relative(t, now)))
+            .unwrap_or_else(|| "never ran".to_string());
+        println!("  #{} {} ({})", task.id, task.name, when);
+    }
+    Ok(())
+}
+
 /// `faber tasks add`: creates a task and says when and by whom it'll run.
 fn add_task_command(
     db: &Option<Arc<dyn DbBackend>>,
@@ -7656,7 +7889,7 @@ fn add_task_command(
     let id = db.create_task(&task)?;
     let when = match &task.schedule {
         db::TaskSchedule::Cron { expression, .. } => format!("on \"{}\"", expression),
-        db::TaskSchedule::Once { at } => match parse_db_time(at) {
+        db::TaskSchedule::Once { at } => match db::parse_db_time(at) {
             Some(t) if t <= now + chrono::Duration::seconds(1) => "as soon as possible".to_string(),
             Some(t) => format!(
                 "{} ({})",
@@ -7686,12 +7919,13 @@ fn tasks_command(
     last: Option<usize>,
     agent: Option<&str>,
     watch: Option<u64>,
+    board: bool,
 ) -> Result<(), Box<dyn Error>> {
     let db = db.as_ref().ok_or(
         "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
     )?;
     let Some(interval) = watch else {
-        return print_tasks_table(db.as_ref(), since, last, agent, chrono::Utc::now());
+        return print_tasks_table(db.as_ref(), since, last, agent, board, chrono::Utc::now());
     };
     // Fail on a bad --since right away rather than on every refresh.
     if let Some(since) = since {
@@ -7709,7 +7943,7 @@ fn tasks_command(
         );
         // A failed refresh (e.g. a dropped --server connection) is shown
         // and retried, not fatal.
-        if let Err(e) = print_tasks_table(db.as_ref(), since, last, agent, now) {
+        if let Err(e) = print_tasks_table(db.as_ref(), since, last, agent, board, now) {
             println!("Error: {}", e);
         }
         std::io::stdout().flush()?;
@@ -7965,6 +8199,11 @@ struct Opts {
     #[serde(default)]
     lsp_servers: HashMap<String, Option<lsp::ServerConfig>>,
 
+    #[clap(long, value_name = "DURATION")]
+    /// While `faber chat` runs, delete done tasks whose last run is older
+    /// than this (e.g. 30d), checked hourly. Off unless set.
+    task_retention: Option<String>,
+
     #[clap(long = "mcp-server")]
     #[serde(skip)]
     /// Add a remote MCP server: NAME=URL for HTTP transport, or
@@ -8004,6 +8243,7 @@ impl Default for Opts {
             server_key_file: None,
             mcp_servers: HashMap::new(),
             lsp_servers: HashMap::new(),
+            task_retention: None,
             mcp_server: Vec::new(),
             command: CliCommand::Chat {},
             args: Vec::new(),
@@ -8098,6 +8338,10 @@ impl Opts {
             self.lsp_servers = config.lsp_servers;
         }
 
+        if self.task_retention.is_none() {
+            self.task_retention = config.task_retention;
+        }
+
         debug!("Configuration merge completed");
     }
 
@@ -8158,6 +8402,21 @@ fn parse_mcp_server_flag(
 
 #[derive(Debug, Subcommand)]
 enum TasksAction {
+    /// Delete done tasks whose last run is older than --older-than (7d by
+    /// default), or all of them with --done. Scheduled, running and
+    /// disabled tasks are never deleted
+    Prune {
+        /// How old a done task's last run must be: 30m, 12h, 7d, 2w
+        #[clap(long, value_name = "DURATION")]
+        older_than: Option<String>,
+        /// Delete every done task, however recent (unless --older-than
+        /// is also given)
+        #[clap(long)]
+        done: bool,
+        /// Only list what would be deleted
+        #[clap(long)]
+        dry_run: bool,
+    },
     /// Create a task: by default a prompt for an agent, run by the first
     /// `faber chat` waiting at its prompt (only one whose agent is --agent,
     /// if given) once it's due
@@ -8233,6 +8492,9 @@ enum CliCommand {
         /// N with --watch=N), until Ctrl-C
         #[clap(long, value_name = "N", num_args = 0..=1, require_equals = true, default_missing_value = "2")]
         watch: Option<u64>,
+        /// Show the tasks as a board, one column per state, instead of a table
+        #[clap(long)]
+        board: bool,
     },
 
     /// Start a server exposing the DB API over TCP
@@ -8263,6 +8525,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut opts = Opts::parse();
     debug!("Command line options parsed");
 
+    // Commands that just print and exit should end quietly when their
+    // output is cut short (`faber tasks | head`), like any other CLI tool,
+    // instead of panicking on the broken pipe. Only those: chat and serve
+    // write to sockets, where a peer hanging up must not kill the process.
+    if matches!(
+        opts.command,
+        CliCommand::Tasks { .. }
+            | CliCommand::Models {}
+            | CliCommand::ListTools {}
+            | CliCommand::Gc {}
+    ) {
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
+
     // Load and merge configuration file
     let config_path = match &opts.config {
         Some(path) => Some(path.clone()),
@@ -8292,6 +8570,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     opts.apply_mcp_server_flags()?;
     lsp::configure(&opts.lsp_servers)?;
+    if let Some(retention) = &opts.task_retention {
+        parse_duration(retention).ok_or_else(|| {
+            format!(
+                "can't read task_retention '{}': use a duration like 30d or 2w",
+                retention
+            )
+        })?;
+    }
 
     // Reset the model to use if an endpoint was provided
     if opts.model.is_none() && opts.endpoint.is_some() {
@@ -8362,6 +8648,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::ListTools {} => list_tools_command(&mcp_manager),
         CliCommand::Gc {} => gc_command(&opts),
         CliCommand::Tasks {
+            action:
+                Some(TasksAction::Prune {
+                    older_than,
+                    done,
+                    dry_run,
+                }),
+            ..
+        } => prune_tasks_command(&db_connection, older_than.as_deref(), *done, *dry_run),
+        CliCommand::Tasks {
             action: Some(action),
             ..
         } => add_task_command(&db_connection, action),
@@ -8371,12 +8666,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             last,
             agent,
             watch,
+            board,
         } => tasks_command(
             &db_connection,
             since.as_deref(),
             *last,
             agent.as_deref(),
             *watch,
+            *board,
         ),
         CliCommand::Serve {
             bind,
@@ -8887,13 +9184,13 @@ mod tests {
     }
 
     fn utc(text: &str) -> chrono::DateTime<chrono::Utc> {
-        parse_db_time(text).unwrap()
+        db::parse_db_time(text).unwrap()
     }
 
     #[test]
     fn test_parse_db_time_reads_both_stored_formats() {
         assert_eq!(utc("2026-10-01 12:30:00"), utc("2026-10-01T12:30:00+00:00"));
-        assert!(parse_db_time("yesterday").is_none());
+        assert!(db::parse_db_time("yesterday").is_none());
     }
 
     #[test]
@@ -9123,6 +9420,79 @@ mod tests {
         let failed = prompt_task_outcome(Err(&err));
         assert!(!failed.succeeded);
         assert_eq!(failed.result, "boom");
+    }
+
+    fn board_task(id: i64, status: &str, kind: &str, next: &str) -> db::TaskRow {
+        let mut t = task_row(id, "2026-10-01 10:00:00", None);
+        t.status = status.to_string();
+        t.kind = kind.to_string();
+        t.next_run_at = Some(next.to_string());
+        t
+    }
+
+    #[test]
+    fn test_board_puts_each_task_in_its_column() {
+        let now = utc("2026-10-02T12:00:00Z");
+        let mut done = board_task(4, "done", "tool", "2026-10-02T11:00:00Z");
+        done.last_outcome = Some("failed".to_string());
+        done.last_result = Some("exit status 2".to_string());
+        done.last_run_at = Some("2026-10-02T11:00:00Z".to_string());
+        let tasks = vec![
+            board_task(1, "scheduled", "tool", "2026-10-02T13:00:00Z"),
+            board_task(2, "scheduled", "prompt", "2026-10-02T11:59:00Z"),
+            board_task(3, "running", "prompt", "2026-10-02T11:00:00Z"),
+            done,
+            board_task(5, "disabled", "tool", "2026-10-02T13:00:00Z"),
+            // A due tool task isn't waiting for an agent: the scheduler runs it.
+            board_task(6, "scheduled", "tool", "2026-10-02T11:59:00Z"),
+        ];
+        let board = render_board(&tasks, now, 120, false);
+        let lines: Vec<&str> = board.lines().collect();
+        assert!(lines[0].starts_with("SCHEDULED (3)"), "{board}");
+        assert!(lines[0].contains("WAITING (1)") && lines[0].contains("RUNNING (1)"));
+        assert!(lines[0].contains("DONE (1)"));
+        // Every card's first line is in its column: find each "#N" offset.
+        let column_of = |id: &str| {
+            let line = lines.iter().find(|l| l.contains(id)).unwrap();
+            line.find(id).unwrap() / 30
+        };
+        assert_eq!(column_of("#1 "), 0);
+        assert_eq!(column_of("#5 "), 0);
+        assert_eq!(column_of("#6 "), 0);
+        assert_eq!(column_of("#2 "), 1);
+        assert_eq!(column_of("#3 "), 2);
+        assert_eq!(column_of("#4 "), 3);
+        assert!(board.contains("⏸ disabled"));
+        assert!(board.contains("✗ 1h ago"));
+        assert!(board.contains("exit status 2"));
+        assert!(board.contains("due 1m ago · for any"), "{board}");
+        for line in &lines {
+            assert!(console::measure_text_width(line) <= 120, "too wide: {line}");
+        }
+    }
+
+    #[test]
+    fn test_board_caps_long_columns_and_keeps_width_with_colors() {
+        let now = utc("2026-10-02T12:00:00Z");
+        let tasks: Vec<db::TaskRow> = (1..=13)
+            .map(|id| {
+                let mut t = board_task(id, "done", "tool", "2026-10-02T11:00:00Z");
+                t.last_outcome = Some("succeeded".to_string());
+                t.name = "a rather long task name that won't fit".to_string();
+                t
+            })
+            .collect();
+        let board = render_board(&tasks, now, 90, true);
+        assert!(board.contains("+3 more"), "{board}");
+        let widths: Vec<usize> = board
+            .lines()
+            .filter(|l| l.contains('│'))
+            .map(console::measure_text_width)
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "cards are ragged: {widths:?}"
+        );
     }
 
     #[test]
