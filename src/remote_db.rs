@@ -160,6 +160,14 @@ impl DbBackend for RemoteDb {
         Ok(serde_json::from_value(v)?)
     }
 
+    fn set_agent_activity(&self, agent: &str, activity: &str) -> Result<(), Box<dyn Error>> {
+        self.call(
+            "set_agent_activity",
+            serde_json::json!({"agent": agent, "activity": activity}),
+        )?;
+        Ok(())
+    }
+
     fn agent_lineage(&self, agent: &str) -> Result<Vec<String>, Box<dyn Error>> {
         let v = self.call("agent_lineage", serde_json::json!({"agent": agent}))?;
         Ok(serde_json::from_value(v)?)

@@ -32,6 +32,8 @@ pub trait DbBackend: Send + Sync {
     fn delete_agent(&self, name: &str) -> Result<bool, Box<dyn Error>>;
     fn list_agents(&self) -> Result<Vec<AgentRow>, Box<dyn Error>>;
     fn get_agent(&self, name: &str) -> Result<Option<AgentRow>, Box<dyn Error>>;
+    /// See `db::set_agent_activity`.
+    fn set_agent_activity(&self, agent: &str, activity: &str) -> Result<(), Box<dyn Error>>;
     /// See `db::agent_lineage`.
     fn agent_lineage(&self, agent: &str) -> Result<Vec<String>, Box<dyn Error>>;
     /// See `db::set_agent_parent`.
