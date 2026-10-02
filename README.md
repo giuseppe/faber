@@ -286,7 +286,9 @@ A task's `kind` says what its command is:
 - `prompt` (the default for `tasks add`): an instruction for an agent. Once
   it's due, the first `faber chat` session **waiting at its prompt** claims
   it - with `--agent NAME`, only a session whose current agent is `NAME` -
-  and runs it as a turn of that agent's conversation, shown in that chat.
+  and runs it as a turn of that agent's conversation, shown in that chat
+  (Ctrl-C interrupts it, like a turn you typed; it's then recorded as
+  failed).
   The agent's final answer becomes the task's result. Until some agent is
   waiting, `faber tasks` shows it as "waiting for an agent".
 - `tool` (`--tool`): a tool call run directly by any session's

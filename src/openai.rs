@@ -117,6 +117,33 @@ pub fn normalize_endpoint(endpoint: &str) -> String {
 }
 
 /// Check for Ctrl-C signal and return InterruptedError if found
+/// Runs a blocking call - sending a request, reading a whole response -
+/// on a helper thread, checking for Ctrl-C every 100ms meanwhile, so the
+/// user isn't stuck waiting for a slow or hung server. If interrupted, the
+/// call is abandoned: its thread finishes in the background and its result
+/// is dropped. Without a `ctrl_c_rx`, it just runs the call.
+fn interruptible<T: Send + 'static>(
+    call: impl FnOnce() -> T + Send + 'static,
+    ctrl_c_rx: &Option<Arc<Mutex<mpsc::Receiver<()>>>>,
+) -> Result<T, Box<dyn Error>> {
+    if ctrl_c_rx.is_none() {
+        return Ok(call());
+    }
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(call());
+    });
+    loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => return Ok(result),
+            Err(mpsc::RecvTimeoutError::Timeout) => check_ctrl_c_signal(ctrl_c_rx)?,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("the request thread died".into());
+            }
+        }
+    }
+}
+
 fn check_ctrl_c_signal(
     ctrl_c_rx: &Option<Arc<Mutex<mpsc::Receiver<()>>>>,
 ) -> Result<(), Box<dyn Error>> {
@@ -1195,11 +1222,11 @@ fn post_request_with_mode_and_recursion(
         let mut response = None;
 
         for attempt in 1..=max_retries {
-            let response_result = client
+            let request = client
                 .post(&opts.endpoint)
                 .headers(headers.clone())
-                .json(&request_body)
-                .send();
+                .json(&request_body);
+            let response_result = interruptible(move || request.send(), &ctrl_c_rx)?;
 
             check_ctrl_c_signal(&ctrl_c_rx)?;
 
@@ -1282,7 +1309,7 @@ fn post_request_with_mode_and_recursion(
             handle_streaming_response(response, &mode, ctrl_c_rx.clone())
                 .map_err(|e| classify_context_error(e, &messages))?
         } else {
-            let response_text = response.text()?;
+            let response_text = interruptible(move || response.text(), &ctrl_c_rx)??;
             trace!("Got response {:?}", response_text);
             serde_json::from_str(&response_text)?
         };
@@ -1784,6 +1811,27 @@ fn handle_streaming_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_interruptible_returns_the_result_or_stops_on_ctrl_c() {
+        let (tx, rx) = mpsc::channel();
+        let ctrl_c = Some(Arc::new(Mutex::new(rx)));
+        assert_eq!(interruptible(|| 42, &ctrl_c).unwrap(), 42);
+        assert_eq!(interruptible(|| 7, &None).unwrap(), 7);
+
+        let started = Instant::now();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            let _ = tx.send(());
+        });
+        let err = interruptible(|| thread::sleep(Duration::from_secs(30)), &ctrl_c).unwrap_err();
+        assert!(err.downcast_ref::<InterruptedError>().is_some(), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn test_truncate_tool_output_keeps_head_and_tail() {
