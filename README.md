@@ -203,8 +203,8 @@ config:endpoint    - Override the API endpoint
 config:system_prompt - Custom system prompt
 ```
 
-These can be set through the `agent_data_set` tool or directly in the
-database.
+The model sets or clears them with the `agent_configure` tool, and
+`agent_get` shows them.
 
 ### Sub-agents
 
@@ -237,8 +237,8 @@ a heartbeat, allowing recovery from crashes.
 
 ## Scheduled tasks
 
-Tasks can be created via the `task_create_cron` and `task_create_oneshot`
-tools.
+Tasks can be created via the `task_create` tool, or from the command line
+(`faber tasks add`, below).
 
 - **Cron tasks**: recurring, using 7-field cron expressions
   (`sec min hour day_of_month month day_of_week year`)
@@ -294,7 +294,7 @@ A task's `kind` says what its command is:
 - `tool` (`--tool`): a tool call run directly by any session's
   scheduler, with no LLM.
 
-The model's `task_create_cron`/`task_create_oneshot` tools make either
+The model's `task_create` tool makes either
 kind, depending on the command: a `{"tool": ...}` call is a `tool` task,
 plain language ("tell the user a joke") is a `prompt` task for the agent
 that created it, carried out once its chat is idle again.
@@ -411,35 +411,25 @@ agent deletes its private notes.
 | Tool | Description |
 |---|---|
 | `read_file` | Read file contents, optionally just a `start_line`..`end_line` range; reports `total_lines` |
-| `write_file` | Create/overwrite a file with specified permissions, or partially edit an existing one via byte `offset`+`length`, `start_line`..`end_line`, or exact-text `old_content` search-and-replace (one mode at a time) |
-| `patch_file` | Apply a batch of search-and-replace edits to a file, all-or-nothing, rewriting only the changed bytes; the result includes a numbered-context preview of where each edit landed, so a follow-up `read_file` usually isn't needed to confirm it |
+| `write_file` | Create a file, or replace its whole content, with optional permissions. Anything else is refused and pointed at `patch_file` |
+| `patch_file` | Change part of an existing file: a batch of edits, each replacing exact text (`old_content`) or a range of lines (`start_line`..`end_line`), applied in order, all-or-nothing, rewriting only the changed bytes; the result includes a numbered-context preview of where each edit landed, so a follow-up `read_file` usually isn't needed to confirm it |
 | `delete_path` | Delete a file or directory |
 | `glob` | Find files matching a glob pattern |
 | `grep_in_current_directory` | Search file contents with a regex, using [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) if installed and `grep` otherwise. Skips `.gitignore`d, hidden and binary files (the `grep` fallback skips `.git`, `target` and `node_modules` instead); optional `path`, `glob`, `case_insensitive`, `fixed_strings`, `context_lines`, `files_only`, `include_ignored`; output sorted by path and cut off after `max_results` lines (default 200) with a note. Unless `--unsafe-tools` is set, the search runs in a bubblewrap sandbox like `run_command`'s, but with the current directory mounted read-only |
-| `github_issue` | Get a GitHub issue |
-| `github_issue_comments` | Get comments on a GitHub issue |
-| `github_issues` | List recent issues in a repository |
-| `github_pull_request` | Get a GitHub pull request |
-| `github_pull_request_patch` | Get the raw patch for a PR |
-| `github_pull_requests` | List recent pull requests |
+| `github_issue` | One GitHub issue by number (optionally with its comments), or the issues updated in the last few days |
+| `github_pull_request` | One pull request by number (or its diff, with `patch`), or the pull requests updated in the last few days |
 | `agent_create` | Create a new agent |
 | `agent_delete` | Delete an agent |
 | `agent_list` | List all agents |
-| `agent_get` | Get agent details |
-| `agent_data_set` | Store a key-value pair for an agent |
-| `agent_data_get` | Retrieve a value for an agent |
-| `agent_data_delete` | Delete a key-value pair |
-| `agent_data_list` | List all key-value pairs for an agent |
+| `agent_get` | Get an agent's details, including its configuration |
+| `agent_configure` | Set or clear an agent's model, endpoint or system prompt |
 | `lsp` | Ask a language server about code: `definition`, `references`, `hover`, `symbols` (a file's outline), `workspace_symbols` or `diagnostics`. The server is picked by file extension - rust-analyzer (`.rs`), clangd (C/C++), pyright-langserver or pylsp (`.py`), gopls (`.go`), typescript-language-server (JS/TS) - whichever is installed, started on first use and kept running. A symbol is given by `line` plus its text on that line (`symbol`). Files are re-synced on every call, so edits are picked up. Language servers can run project code (e.g. rust-analyzer builds `build.rs` and proc macros), so unless `--unsafe-tools` is set they run sandboxed with [bubblewrap](https://github.com/containers/bubblewrap): the whole filesystem read-only (so toolchains under `$HOME` still work), only the current directory writable, and no network |
 | `plan_update` | Set the agent's plan for the current multi-step task (full list of items, each `pending`/`in_progress`/`completed`). Stored per agent in the DB under the `state:plan` key, shown in the status bar as progress, and cleared once every item is completed, on `/clear`, or when the agent is deleted (including a sub-agent when it finishes) |
 | `plan_get` | Get the agent's current plan |
-| `task_create_cron` | Create a recurring scheduled task |
-| `task_create_oneshot` | Create a one-shot scheduled task |
+| `task_create` | Create a task: on a cron schedule, once after a delay or at a time, or right away |
 | `task_delete` | Delete a scheduled task |
-| `task_list` | List scheduled tasks |
-| `task_get` | Get task details |
+| `task_list` | List tasks (all, an agent's, or only the due ones), or get one by id |
 | `task_set_enabled` | Enable or disable a task |
-| `task_pending` | List tasks that are due to run |
 | `send_message` | Send a message to another agent |
 | `spawn_agent` | Spawn a sub-agent for parallel work |
 | `fan_out` | Run the same task for many items (e.g. files) at once, one worker agent each, at most `max_parallel` at a time (default 4), and return all the results together, in item order, once every worker is done. `{item}` in the prompt is replaced by each worker's item. Workers only get read-only tools (`read_file`, `glob`, `grep_in_current_directory`, `lsp`, web/GitHub reads) unless `tools` names others - workers that write can overwrite each other's changes - and can't spawn agents. Ctrl-C stops every worker. Each result gets a share of the output cap |

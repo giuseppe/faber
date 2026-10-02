@@ -1114,23 +1114,12 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
     use serde::Serialize;
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Params {
         path: String,
         content: String,
         #[serde(default = "default_file_mode")]
         mode: String,
-        #[serde(default)]
-        offset: Option<u64>,
-        #[serde(default)]
-        length: Option<u64>,
-        #[serde(default)]
-        start_line: Option<u64>,
-        #[serde(default)]
-        end_line: Option<u64>,
-        #[serde(default)]
-        old_content: Option<String>,
-        #[serde(default)]
-        replace_all: Option<bool>,
     }
 
     #[derive(Serialize)]
@@ -1147,7 +1136,17 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
         "0644".to_string()
     }
 
-    let params: Params = serde_json::from_str::<Params>(&params_str)?;
+    let params: Params = serde_json::from_str::<Params>(&params_str).map_err(|e| {
+        if e.to_string().contains("unknown field") {
+            format!(
+                "write_file only writes a whole file (path, content, mode) - {}. \
+                 To change part of an existing file, use patch_file.",
+                e
+            )
+        } else {
+            e.to_string()
+        }
+    })?;
 
     debug!(
         "write_file received params: path='{}', content_length={}, mode='{}'",
@@ -1174,181 +1173,9 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
 
     debug!("Parsed file mode: {} (octal: {:o})", file_mode, file_mode);
 
-    let has_offset = params.offset.is_some();
-    let has_start_line = params.start_line.is_some();
-    let has_old_content = params.old_content.is_some();
-
-    if has_old_content && (has_offset || has_start_line) {
-        return Err("Cannot combine old_content with offset or start_line parameters".into());
-    }
-    if has_offset && has_start_line {
-        return Err("Cannot combine offset with start_line parameters".into());
-    }
-    if has_offset && params.length.is_none() {
-        return Err("offset requires length to be specified".into());
-    }
-    if has_start_line && params.end_line.is_none() {
-        return Err("start_line requires end_line to be specified".into());
-    }
-
-    let is_partial = has_offset || has_start_line || has_old_content;
-
     let root = Root::open(".")?;
     let path_buf = PathBuf::from(&params.path);
 
-    if is_partial {
-        let mut file = root
-            .open_subpath(&params.path, OpenFlags::O_RDONLY)
-            .map_err(|_| format!("File '{}' must exist for partial writes", params.path))?;
-        let mut existing_bytes = Vec::new();
-        file.read_to_end(&mut existing_bytes)?;
-        drop(file);
-
-        let (new_bytes, operation) = if has_old_content {
-            let old_text = params.old_content.as_ref().unwrap();
-            let existing_str = String::from_utf8(existing_bytes.clone())
-                .map_err(|_| "File contains invalid UTF-8, cannot use search-and-replace mode")?;
-
-            if old_text == &params.content {
-                return Err("old_content and content are identical, nothing to replace".into());
-            }
-
-            let match_count = existing_str.matches(old_text.as_str()).count();
-            if match_count == 0 {
-                return Err(format!("old_content not found in file '{}'", params.path).into());
-            }
-
-            let replace_all = params.replace_all.unwrap_or(false);
-            if match_count > 1 && !replace_all {
-                return Err(format!(
-                    "old_content matches {} times in '{}'. Set replace_all=true or provide more context to make it unique",
-                    match_count, params.path
-                ).into());
-            }
-
-            let new_str = if replace_all {
-                existing_str.replace(old_text.as_str(), &params.content)
-            } else {
-                existing_str.replacen(old_text.as_str(), &params.content, 1)
-            };
-            (new_str.into_bytes(), "patch_search_replace")
-        } else if has_offset {
-            let offset = params.offset.unwrap() as usize;
-            let length = params.length.unwrap() as usize;
-
-            if offset > existing_bytes.len() {
-                return Err(format!(
-                    "offset {} is beyond file size {}",
-                    offset,
-                    existing_bytes.len()
-                )
-                .into());
-            }
-            if offset + length > existing_bytes.len() {
-                return Err(format!(
-                    "offset ({}) + length ({}) = {} exceeds file size {}",
-                    offset,
-                    length,
-                    offset + length,
-                    existing_bytes.len()
-                )
-                .into());
-            }
-
-            let mut new_bytes =
-                Vec::with_capacity(existing_bytes.len() - length + params.content.len());
-            new_bytes.extend_from_slice(&existing_bytes[..offset]);
-            new_bytes.extend_from_slice(params.content.as_bytes());
-            new_bytes.extend_from_slice(&existing_bytes[offset + length..]);
-            (new_bytes, "patch_offset")
-        } else {
-            let existing_str = String::from_utf8(existing_bytes.clone())
-                .map_err(|_| "File contains invalid UTF-8, cannot use line-number mode")?;
-
-            let lines: Vec<&str> = existing_str.lines().collect();
-            let start = params.start_line.unwrap() as usize;
-            let end = params.end_line.unwrap() as usize;
-
-            if start == 0 {
-                return Err("start_line is 1-based, cannot be 0".into());
-            }
-            if end < start {
-                return Err(format!("end_line ({}) must be >= start_line ({})", end, start).into());
-            }
-            if start > lines.len() {
-                return Err(format!(
-                    "start_line {} exceeds file line count {}",
-                    start,
-                    lines.len()
-                )
-                .into());
-            }
-            if end > lines.len() {
-                return Err(
-                    format!("end_line {} exceeds file line count {}", end, lines.len()).into(),
-                );
-            }
-
-            let mut new_lines: Vec<&str> = Vec::new();
-            new_lines.extend_from_slice(&lines[..start - 1]);
-            for line in params.content.lines() {
-                new_lines.push(line);
-            }
-            new_lines.extend_from_slice(&lines[end..]);
-
-            let mut new_str = new_lines.join("\n");
-            if existing_str.ends_with('\n') {
-                new_str.push('\n');
-            }
-            (new_str.into_bytes(), "patch_lines")
-        };
-
-        let old_content_for_diff = String::from_utf8(existing_bytes).ok();
-
-        let mut file = root.open_subpath(&params.path, OpenFlags::O_WRONLY | OpenFlags::O_TRUNC)?;
-        {
-            use std::os::unix::io::AsRawFd;
-            let mode = rustix::fs::Mode::from_raw_mode(file_mode);
-            let _ = rustix::fs::fchmod(
-                unsafe { rustix::fd::BorrowedFd::borrow_raw(file.as_raw_fd()) },
-                mode,
-            );
-        }
-        file.write_all(&new_bytes)?;
-
-        let bytes_written = new_bytes.len();
-        let op_display = match operation {
-            "patch_offset" => "PATCH (byte offset)",
-            "patch_lines" => "PATCH (line range)",
-            _ => "PATCH (search & replace)",
-        };
-
-        let result = WriteFileResult {
-            path: params.path.clone(),
-            bytes_written,
-            mode: format!("{:o}", file_mode),
-            created: false,
-            operation: operation.to_string(),
-            message: format!("File '{}' patched successfully", params.path),
-        };
-
-        ctx.println(&format!("\u{1f4dd} {}", result.message));
-        ctx.println(&format!("   Path: {}", result.path));
-        ctx.println(&format!("   Bytes written: {}", result.bytes_written));
-        ctx.println(&format!("   File mode: {}", result.mode));
-        ctx.println(&format!("   Operation: {}", op_display));
-
-        if let Some(old_str) = old_content_for_diff {
-            if let Ok(new_str) = std::str::from_utf8(&new_bytes) {
-                show_diff(ctx, &old_str, new_str, &params.path);
-            }
-        }
-
-        let json_result = serde_json::to_string(&result)?;
-        return Ok(json_result);
-    }
-
-    // Full write mode (existing behavior)
     let existing_content = match root.open_subpath(&params.path, OpenFlags::O_RDONLY) {
         Ok(mut file) => {
             let mut content = Vec::new();
@@ -2333,126 +2160,89 @@ fn search_in_current_directory(
 }
 
 /// entrypoint for the github_issue tool
+/// entrypoint for the github_issue tool: one issue (with its comments if
+/// asked), or the issues updated in the last `days`.
 fn tool_github_issue(params_str: &String, _ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Params {
         repo: String,
-        issue: u64,
+        #[serde(default)]
+        number: Option<u64>,
+        #[serde(default)]
+        comments: bool,
+        #[serde(default)]
+        days: Option<u64>,
     }
-
-    let params: Params = serde_json::from_str::<Params>(&params_str)?;
-
-    debug!("Fetching GitHub issue: {}/{}", params.repo, params.issue);
-    let issue = get_github_issue(&params.repo, params.issue)?;
-
-    let s = serde_json::to_string(&issue)?;
-    Ok(s)
+    let params: Params = serde_json::from_str::<Params>(params_str)?;
+    match params.number {
+        Some(number) => {
+            debug!("Fetching GitHub issue: {}/{}", params.repo, number);
+            let issue = serde_json::to_value(get_github_issue(&params.repo, number)?)?;
+            if !params.comments {
+                return Ok(issue.to_string());
+            }
+            let comments = get_github_issue_comments(&params.repo, number)?;
+            Ok(serde_json::json!({"issue": issue, "comments": comments}).to_string())
+        }
+        None if params.comments => Err("comments needs the issue's number".into()),
+        None => {
+            let days = params.days.unwrap_or(7);
+            debug!(
+                "Fetching GitHub issues from {} for the last {} days",
+                params.repo, days
+            );
+            Ok(serde_json::to_string(&get_github_issues(
+                &params.repo,
+                days,
+            )?)?)
+        }
+    }
 }
 
-/// entrypoint for the github_issue_comments tool
-fn tool_github_issue_comments(
-    params_str: &String,
-    _ctx: &ToolContext,
-) -> Result<String, Box<dyn Error>> {
-    #[derive(Deserialize)]
-    struct Params {
-        repo: String,
-        issue: u64,
-    }
-
-    let params: Params = serde_json::from_str::<Params>(&params_str)?;
-
-    debug!(
-        "Fetching GitHub issue comments: {}/{}",
-        params.repo, params.issue
-    );
-    let comments = get_github_issue_comments(&params.repo, params.issue)?;
-    let s = serde_json::to_string(&comments)?;
-    Ok(s)
-}
-
-/// entrypoint for the github_issues tool
-fn tool_github_issues(params_str: &String, _ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
-    #[derive(Deserialize)]
-    struct Params {
-        repo: String,
-        days: u64,
-    }
-
-    let params: Params = serde_json::from_str::<Params>(&params_str)?;
-
-    debug!(
-        "Fetching GitHub issues from repository {} for the last {} days",
-        params.repo, params.days
-    );
-    let issues = get_github_issues(&params.repo, params.days)?;
-    let s = serde_json::to_string(&issues)?;
-    Ok(s)
-}
-
-/// entrypoint for the github_pull_requests tool
-fn tool_github_pull_requests(
-    params_str: &String,
-    _ctx: &ToolContext,
-) -> Result<String, Box<dyn Error>> {
-    #[derive(Deserialize)]
-    struct Params {
-        repo: String,
-        days: u64,
-    }
-
-    let params: Params = serde_json::from_str::<Params>(&params_str)?;
-
-    debug!(
-        "Fetching GitHub pull requests from repository {} for the last {} days",
-        params.repo, params.days
-    );
-    let pull_requests = get_github_pull_requests(&params.repo, params.days)?;
-    let s = serde_json::to_string(&pull_requests)?;
-    Ok(s)
-}
-
-/// entrypoint for the github_pull_request tool
+/// entrypoint for the github_pull_request tool: one pull request (or its
+/// patch), or the pull requests updated in the last `days`.
 fn tool_github_pull_request(
     params_str: &String,
     _ctx: &ToolContext,
 ) -> Result<String, Box<dyn Error>> {
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Params {
         repo: String,
-        pull_request: u64,
+        #[serde(default)]
+        number: Option<u64>,
+        #[serde(default)]
+        patch: bool,
+        #[serde(default)]
+        days: Option<u64>,
     }
-
-    let params: Params = serde_json::from_str::<Params>(&params_str)?;
-
-    debug!(
-        "Fetching GitHub PR: {}/{}",
-        params.repo, params.pull_request
-    );
-    let pr = get_github_pull_request(&params.repo, params.pull_request)?;
-    let s = serde_json::to_string(&pr)?;
-    Ok(s)
-}
-
-/// entrypoint for the github_pull_request_patch tool
-fn tool_github_pull_request_patch(
-    params_str: &String,
-    _ctx: &ToolContext,
-) -> Result<String, Box<dyn Error>> {
-    #[derive(Deserialize)]
-    struct Params {
-        repo: String,
-        pull_request: u64,
+    let params: Params = serde_json::from_str::<Params>(params_str)?;
+    match params.number {
+        Some(number) if params.patch => {
+            debug!("Fetching GitHub PR patch: {}/{}", params.repo, number);
+            get_github_pull_request_patch(&params.repo, number)
+        }
+        Some(number) => {
+            debug!("Fetching GitHub PR: {}/{}", params.repo, number);
+            Ok(serde_json::to_string(&get_github_pull_request(
+                &params.repo,
+                number,
+            )?)?)
+        }
+        None if params.patch => Err("patch needs the pull request's number".into()),
+        None => {
+            let days = params.days.unwrap_or(7);
+            debug!(
+                "Fetching GitHub PRs from {} for the last {} days",
+                params.repo, days
+            );
+            Ok(serde_json::to_string(&get_github_pull_requests(
+                &params.repo,
+                days,
+            )?)?)
+        }
     }
-
-    let params: Params = serde_json::from_str::<Params>(&params_str)?;
-
-    debug!(
-        "Fetching GitHub PR patch: {}/{}",
-        params.repo, params.pull_request
-    );
-    let pr = get_github_pull_request_patch(&params.repo, params.pull_request)?;
-    Ok(pr)
 }
 
 fn tool_agent_create(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
@@ -2499,6 +2289,56 @@ fn tool_agent_list(params_str: &String, ctx: &ToolContext) -> Result<String, Box
     Ok(serde_json::to_string(&agents)?)
 }
 
+/// The `agent_data` keys behind an agent's configuration (see
+/// `db::get_agent_config`), by the name `agent_configure` uses for each.
+const AGENT_CONFIG_KEYS: &[(&str, &str)] = &[
+    ("model", "config:model"),
+    ("endpoint", "config:endpoint"),
+    ("system_prompt", "config:system_prompt"),
+];
+
+/// entrypoint for the agent_configure tool: sets or clears an agent's own
+/// model, endpoint and system prompt - and nothing else of its stored data.
+fn tool_agent_configure(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        agent: String,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        endpoint: Option<String>,
+        #[serde(default)]
+        system_prompt: Option<String>,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let db = ctx.db()?;
+    if db.get_agent(&params.agent)?.is_none() {
+        return Err(format!("no agent named '{}'", params.agent).into());
+    }
+    let mut changed = Vec::new();
+    for ((name, key), value) in
+        AGENT_CONFIG_KEYS
+            .iter()
+            .zip([&params.model, &params.endpoint, &params.system_prompt])
+    {
+        let Some(value) = value else { continue };
+        if value.trim().is_empty() {
+            db.delete_agent_data(&params.agent, key)?;
+            changed.push(format!("{} cleared", name));
+        } else {
+            db.set_agent_data(&params.agent, key, value)?;
+            changed.push(format!("{} set", name));
+        }
+    }
+    if changed.is_empty() {
+        return Err("give at least one of model, endpoint, system_prompt".into());
+    }
+    ctx.println(&format!("Agent '{}': {}", params.agent, changed.join(", ")));
+    let config = db.get_agent_config(&params.agent)?;
+    Ok(serde_json::json!({"agent": params.agent, "config": config}).to_string())
+}
+
 fn tool_agent_get(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     #[derive(Deserialize)]
     struct Params {
@@ -2509,102 +2349,15 @@ fn tool_agent_get(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
     match db.get_agent(&params.name)? {
         Some(agent) => {
             ctx.println(&format!("Agent '{}': {}", agent.name, agent.description));
-            Ok(serde_json::to_string(&agent)?)
+            let mut result = serde_json::to_value(&agent)?;
+            result["config"] = serde_json::to_value(db.get_agent_config(&agent.name)?)?;
+            Ok(result.to_string())
         }
         None => {
             let result = serde_json::json!({"error": format!("Agent '{}' not found", params.name)});
             Ok(result.to_string())
         }
     }
-}
-
-fn tool_agent_data_set(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
-    #[derive(Deserialize)]
-    struct Params {
-        agent: String,
-        key: String,
-        value: String,
-    }
-    let params: Params = serde_json::from_str(params_str)?;
-    let db = ctx.db()?;
-    db.set_agent_data(&params.agent, &params.key, &params.value)?;
-    ctx.println(&format!(
-        "Set data for agent '{}': {} = {}",
-        params.agent, params.key, params.value
-    ));
-    let result = serde_json::json!({"status": "ok", "agent": params.agent, "key": params.key});
-    Ok(result.to_string())
-}
-
-fn tool_agent_data_get(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
-    #[derive(Deserialize)]
-    struct Params {
-        agent: String,
-        key: String,
-    }
-    let params: Params = serde_json::from_str(params_str)?;
-    let db = ctx.db()?;
-    match db.get_agent_data(&params.agent, &params.key)? {
-        Some(value) => {
-            ctx.println(&format!(
-                "Agent '{}' data: {} = {}",
-                params.agent, params.key, value
-            ));
-            let result =
-                serde_json::json!({"agent": params.agent, "key": params.key, "value": value});
-            Ok(result.to_string())
-        }
-        None => {
-            let result =
-                serde_json::json!({"agent": params.agent, "key": params.key, "value": null});
-            Ok(result.to_string())
-        }
-    }
-}
-
-fn tool_agent_data_delete(
-    params_str: &String,
-    ctx: &ToolContext,
-) -> Result<String, Box<dyn Error>> {
-    #[derive(Deserialize)]
-    struct Params {
-        agent: String,
-        key: String,
-    }
-    let params: Params = serde_json::from_str(params_str)?;
-    let db = ctx.db()?;
-    let deleted = db.delete_agent_data(&params.agent, &params.key)?;
-    if deleted {
-        ctx.println(&format!(
-            "Deleted key '{}' for agent '{}'",
-            params.key, params.agent
-        ));
-    }
-    let result = serde_json::json!({"deleted": deleted, "agent": params.agent, "key": params.key});
-    Ok(result.to_string())
-}
-
-fn tool_agent_data_list(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
-    #[derive(Deserialize)]
-    struct Params {
-        agent: String,
-    }
-    let params: Params = serde_json::from_str(params_str)?;
-    let db = ctx.db()?;
-    let data = db.list_agent_data(&params.agent)?;
-    ctx.println(&format!(
-        "Agent '{}' has {} data entries",
-        params.agent,
-        data.len()
-    ));
-    for (k, v) in &data {
-        ctx.println(&format!("  {} = {}", k, v));
-    }
-    let entries: Vec<serde_json::Value> = data
-        .into_iter()
-        .map(|(k, v)| serde_json::json!({"key": k, "value": v}))
-        .collect();
-    Ok(serde_json::to_string(&entries)?)
 }
 
 /// Who the calling agent is, as a knowledge base viewer.
@@ -2932,86 +2685,132 @@ fn tool_plan_get(_params_str: &String, ctx: &ToolContext) -> Result<String, Box<
     Ok(serde_json::json!({ "items": items }).to_string())
 }
 
-fn tool_task_create_cron(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+/// entrypoint for the task_create tool: one task, run on a cron schedule,
+/// once after a delay or at a time, or (with none of these) right away.
+fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Params {
         name: String,
-        cron_expression: String,
-        #[serde(default)]
-        command: Option<String>,
+        command: String,
         #[serde(default)]
         description: Option<String>,
         #[serde(default)]
         agent_name: Option<String>,
         #[serde(default)]
-        max_runs: Option<i64>,
-    }
-    let params: Params = serde_json::from_str(params_str)?;
-    let agent = params.agent_name.as_deref().or(ctx.agent_name.as_deref());
-    let db = ctx.db()?;
-    let id = db.create_cron_task(
-        &params.name,
-        params.description.as_deref().unwrap_or(""),
-        &params.cron_expression,
-        params.command.as_deref().unwrap_or(""),
-        agent,
-        params.max_runs,
-    )?;
-    ctx.println(&format!(
-        "Created cron task '{}' (id={}) with schedule '{}'",
-        params.name, id, params.cron_expression
-    ));
-    let result = serde_json::json!({"status": "created", "id": id, "name": params.name});
-    Ok(result.to_string())
-}
-
-fn tool_task_create_oneshot(
-    params_str: &String,
-    ctx: &ToolContext,
-) -> Result<String, Box<dyn Error>> {
-    #[derive(Deserialize)]
-    struct Params {
-        name: String,
+        cron_expression: Option<String>,
         #[serde(default)]
-        run_at: Option<String>,
+        max_runs: Option<i64>,
         #[serde(default)]
         delay_seconds: Option<u64>,
         #[serde(default)]
-        command: Option<String>,
-        #[serde(default)]
-        description: Option<String>,
-        #[serde(default)]
-        agent_name: Option<String>,
+        run_at: Option<String>,
     }
     let params: Params = serde_json::from_str(params_str)?;
-
-    let run_at = match (params.run_at, params.delay_seconds) {
-        (Some(t), _) => t,
-        (None, Some(secs)) => {
-            let when = chrono::Utc::now() + chrono::Duration::seconds(secs as i64);
-            when.to_rfc3339()
+    if params.command.trim().is_empty() {
+        return Err("the task needs a command: an instruction, or a JSON tool call".into());
+    }
+    let schedule = match (
+        &params.cron_expression,
+        params.delay_seconds,
+        &params.run_at,
+    ) {
+        (Some(expression), None, None) => db::TaskSchedule::Cron {
+            expression: expression.clone(),
+            max_runs: params.max_runs,
+        },
+        (None, delay, at) => {
+            if params.max_runs.is_some() {
+                return Err("max_runs only applies to a cron_expression task".into());
+            }
+            let at = match (delay, at) {
+                (Some(_), Some(_)) => return Err("give delay_seconds or run_at, not both".into()),
+                (Some(secs), None) => {
+                    (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
+                }
+                (None, Some(at)) => at.clone(),
+                (None, None) => chrono::Utc::now().to_rfc3339(),
+            };
+            db::TaskSchedule::Once { at }
         }
-        (None, None) => {
-            return Err("Either 'run_at' or 'delay_seconds' must be provided".into());
+        (Some(_), _, _) => {
+            return Err("give cron_expression, or delay_seconds/run_at, not both".into());
         }
     };
-
-    let agent = params.agent_name.as_deref().or(ctx.agent_name.as_deref());
-    let db = ctx.db()?;
-    let id = db.create_oneshot_task(
-        &params.name,
-        params.description.as_deref().unwrap_or(""),
-        &run_at,
-        params.command.as_deref().unwrap_or(""),
-        agent,
-    )?;
+    let kind = if db::is_tool_call(&params.command) {
+        db::TaskKind::TOOL
+    } else {
+        db::TaskKind::PROMPT
+    };
+    let task = db::NewTask {
+        name: params.name.clone(),
+        description: params.description.unwrap_or_default(),
+        kind: kind.to_string(),
+        command: params.command,
+        agent_name: params.agent_name.or_else(|| ctx.agent_name.clone()),
+        schedule,
+        held: false,
+    };
+    let id = ctx.db()?.create_task(&task)?;
+    let next_run = ctx.db()?.get_task(id)?.and_then(|t| t.next_run_at);
     ctx.println(&format!(
-        "Created one-shot task '{}' (id={}) scheduled at '{}'",
-        params.name, id, run_at
+        "Created {} task '{}' (id={}), next run {}",
+        kind,
+        task.name,
+        id,
+        next_run.as_deref().unwrap_or("-")
     ));
-    let result =
-        serde_json::json!({"status": "created", "id": id, "name": params.name, "run_at": run_at});
-    Ok(result.to_string())
+    Ok(serde_json::json!({"id": id, "kind": kind, "next_run_at": next_run}).to_string())
+}
+
+/// entrypoint for the task_list tool: tasks (an agent's, or only the due
+/// ones), or one task by id.
+fn tool_task_list(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        #[serde(default)]
+        id: Option<i64>,
+        #[serde(default)]
+        agent_name: Option<String>,
+        #[serde(default)]
+        due: bool,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let db = ctx.db()?;
+    if let Some(id) = params.id {
+        return match db.get_task(id)? {
+            Some(task) => {
+                ctx.println(&format!(
+                    "Task [{}]: {} ({})",
+                    task.id, task.name, task.status
+                ));
+                Ok(serde_json::to_string(&task)?)
+            }
+            None => Ok(serde_json::json!({"error": format!("no task with id {}", id)}).to_string()),
+        };
+    }
+    let mut tasks = if params.due {
+        db.get_pending_tasks()?
+    } else {
+        db.list_tasks(params.agent_name.as_deref())?
+    };
+    if let (true, Some(agent)) = (params.due, params.agent_name.as_deref()) {
+        tasks.retain(|t| t.agent_name.as_deref() == Some(agent));
+    }
+    ctx.println(&format!("Found {} task(s)", tasks.len()));
+    for t in &tasks {
+        let last = t
+            .last_outcome
+            .as_deref()
+            .map(|o| format!(", last run {}", o))
+            .unwrap_or_default();
+        ctx.println(&format!(
+            "  [{}] {} - {} {} ({}{})",
+            t.id, t.name, t.kind, t.task_type, t.status, last
+        ));
+    }
+    Ok(serde_json::to_string(&tasks)?)
 }
 
 fn tool_task_delete(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
@@ -3027,52 +2826,6 @@ fn tool_task_delete(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     }
     let result = serde_json::json!({"deleted": deleted, "id": params.id});
     Ok(result.to_string())
-}
-
-fn tool_task_list(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
-    #[derive(Deserialize)]
-    struct Params {
-        #[serde(default)]
-        agent_name: Option<String>,
-    }
-    let params: Params = serde_json::from_str(params_str)?;
-    let db = ctx.db()?;
-    let tasks = db.list_tasks(params.agent_name.as_deref())?;
-    ctx.println(&format!("Found {} task(s)", tasks.len()));
-    for t in &tasks {
-        let last = t
-            .last_outcome
-            .as_deref()
-            .map(|o| format!(", last run {}", o))
-            .unwrap_or_default();
-        ctx.println(&format!(
-            "  [{}] {} - {} ({}{})",
-            t.id, t.name, t.task_type, t.status, last
-        ));
-    }
-    Ok(serde_json::to_string(&tasks)?)
-}
-
-fn tool_task_get(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
-    #[derive(Deserialize)]
-    struct Params {
-        id: i64,
-    }
-    let params: Params = serde_json::from_str(params_str)?;
-    let db = ctx.db()?;
-    match db.get_task(params.id)? {
-        Some(task) => {
-            ctx.println(&format!(
-                "Task [{}]: {} ({})",
-                task.id, task.name, task.task_type
-            ));
-            Ok(serde_json::to_string(&task)?)
-        }
-        None => {
-            let result = serde_json::json!({"error": format!("Task id={} not found", params.id)});
-            Ok(result.to_string())
-        }
-    }
 }
 
 fn tool_task_set_enabled(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
@@ -3110,23 +2863,6 @@ fn tool_task_set_enabled(params_str: &String, ctx: &ToolContext) -> Result<Strin
         };
     }
     Ok(result.to_string())
-}
-
-fn tool_task_pending(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
-    let _ = params_str;
-    let db = ctx.db()?;
-    let tasks = db.get_pending_tasks()?;
-    ctx.println(&format!("Found {} pending task(s)", tasks.len()));
-    for t in &tasks {
-        ctx.println(&format!(
-            "  [{}] {} - {} (next: {})",
-            t.id,
-            t.name,
-            t.task_type,
-            t.next_run_at.as_deref().unwrap_or("N/A")
-        ));
-    }
-    Ok(serde_json::to_string(&tasks)?)
 }
 
 fn tool_send_message(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
@@ -3329,13 +3065,46 @@ fn line_context(text: &str, byte_start: usize, byte_end: usize) -> (usize, usize
     (start_line, end_line, snippet)
 }
 
+/// The byte range of lines `start..=end` (1-based) of `text`, each with its
+/// line break.
+fn line_range_bytes(text: &str, start: usize, end: usize) -> Result<(usize, usize), String> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    if start == 0 {
+        return Err("start_line is 1-based, cannot be 0".to_string());
+    }
+    if end < start {
+        return Err(format!(
+            "end_line ({}) must be >= start_line ({})",
+            end, start
+        ));
+    }
+    if end > lines.len() {
+        return Err(format!(
+            "end_line {} is past the end of the file ({} lines)",
+            end,
+            lines.len()
+        ));
+    }
+    let first: usize = lines[..start - 1].iter().map(|l| l.len()).sum();
+    let len: usize = lines[start - 1..end].iter().map(|l| l.len()).sum();
+    Ok((first, first + len))
+}
+
 fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     use serde::Serialize;
     use std::os::unix::fs::FileExt;
 
+    /// One edit: replace `old_content` (search and replace), or lines
+    /// `start_line`..=`end_line` (as the file is after the edits before
+    /// this one), with `new_content`.
     #[derive(Deserialize)]
     struct Edit {
-        old_content: String,
+        #[serde(default)]
+        old_content: Option<String>,
+        #[serde(default)]
+        start_line: Option<usize>,
+        #[serde(default)]
+        end_line: Option<usize>,
         new_content: String,
         #[serde(default)]
         replace_all: bool,
@@ -3411,20 +3180,58 @@ fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
     let mut replacements = 0;
     for (i, edit) in params.edits.iter().enumerate() {
         let n = i + 1;
-        if edit.old_content.is_empty() {
-            return Err(format!("edit {}: old_content must not be empty", n).into());
-        }
-        if edit.old_content == edit.new_content {
-            return Err(format!("edit {}: old_content and new_content are identical", n).into());
-        }
+        // The byte range this edit replaces, and with what.
+        let (first, old_end, new_content) =
+            match (&edit.old_content, edit.start_line, edit.end_line) {
+                (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                    return Err(format!(
+                        "edit {}: give either old_content or start_line/end_line, not both",
+                        n
+                    )
+                    .into());
+                }
+                (None, Some(start), Some(end)) => {
+                    let (first, old_end) = line_range_bytes(&text, start, end)
+                        .map_err(|e| format!("edit {}: {}", n, e))?;
+                    // Replacing whole lines: keep the last one's line break
+                    // unless the new text brings its own.
+                    let mut new_content = edit.new_content.clone();
+                    if text[first..old_end].ends_with('\n')
+                        && !new_content.is_empty()
+                        && !new_content.ends_with('\n')
+                    {
+                        new_content.push('\n');
+                    }
+                    (first, old_end, new_content)
+                }
+                (None, _, _) => {
+                    return Err(format!(
+                        "edit {}: give old_content, or both start_line and end_line",
+                        n
+                    )
+                    .into());
+                }
+                (Some(old_content), None, None) => {
+                    if old_content.is_empty() {
+                        return Err(format!("edit {}: old_content must not be empty", n).into());
+                    }
+                    if *old_content == edit.new_content {
+                        return Err(format!(
+                            "edit {}: old_content and new_content are identical",
+                            n
+                        )
+                        .into());
+                    }
+                    let first = text.find(old_content.as_str()).ok_or_else(|| {
+                        format!("edit {}: old_content not found in '{}'", n, params.path)
+                    })?;
+                    (first, first + old_content.len(), edit.new_content.clone())
+                }
+            };
 
-        let first = text
-            .find(edit.old_content.as_str())
-            .ok_or_else(|| format!("edit {}: old_content not found in '{}'", n, params.path))?;
-
-        if edit.replace_all {
-            replacements += text.matches(edit.old_content.as_str()).count();
-            text = text.replace(edit.old_content.as_str(), &edit.new_content);
+        if let (true, Some(old_content)) = (edit.replace_all, &edit.old_content) {
+            replacements += text.matches(old_content.as_str()).count();
+            text = text.replace(old_content.as_str(), &edit.new_content);
             // Multiple occurrences move independently, so exact tracking
             // isn't practical here; show the first one as representative.
             edit_spans.push(
@@ -3433,28 +3240,30 @@ fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
                     .unwrap_or((first, first)),
             );
         } else {
-            // Look for a second match starting after the first character of
-            // the first one, so overlapping matches count as ambiguous too.
-            let skip = first + edit.old_content.chars().next().map_or(1, char::len_utf8);
-            if text[skip..].contains(edit.old_content.as_str()) {
-                return Err(format!(
-                    "edit {}: old_content matches multiple times in '{}'. Set replace_all=true or provide more context to make it unique",
-                    n, params.path
-                )
-                .into());
+            if let Some(old_content) = &edit.old_content {
+                // Look for a second match starting after the first
+                // character of the first one, so overlapping matches count
+                // as ambiguous too.
+                let skip = first + old_content.chars().next().map_or(1, char::len_utf8);
+                if text[skip..].contains(old_content.as_str()) {
+                    return Err(format!(
+                        "edit {}: old_content matches multiple times in '{}'. Set replace_all=true or provide more context to make it unique",
+                        n, params.path
+                    )
+                    .into());
+                }
             }
 
-            let old_end = first + edit.old_content.len();
-            let delta = edit.new_content.len() as isize - edit.old_content.len() as isize;
+            let delta = new_content.len() as isize - (old_end - first) as isize;
             for (s, e) in edit_spans.iter_mut() {
                 if *s >= old_end {
                     *s = (*s as isize + delta) as usize;
                     *e = (*e as isize + delta) as usize;
                 }
             }
-            edit_spans.push((first, first + edit.new_content.len()));
+            edit_spans.push((first, first + new_content.len()));
 
-            text.replace_range(first..old_end, &edit.new_content);
+            text.replace_range(first..old_end, &new_content);
             replacements += 1;
         }
     }
@@ -3532,30 +3341,23 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
 
     append_tool(
         &mut tools,
-        "github_pull_request".to_string(),
-        tool_github_pull_request,
+        "github_issue".to_string(),
+        tool_github_issue,
         r#"
         {
             "type": "function",
             "function": {
-                "name": "github_pull_request",
-                "description": "Get information about a github pull request.",
+                "name": "github_issue",
+                "description": "Read GitHub issues: one issue by number (with comments: true, its comments too), or without a number, the issues updated in the last few days.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "repo": {
-                            "type": "string",
-                            "description": "github repo name, e.g. owner/repo"
-                        },
-                        "pull_request": {
-                            "type": "number",
-                            "description": "number of the pull request"
-                        }
+                        "repo": {"type": "string", "description": "owner/repo, e.g. containers/crun"},
+                        "number": {"type": "integer", "description": "The issue's number"},
+                        "comments": {"type": "boolean", "description": "With number: also get its comments"},
+                        "days": {"type": "integer", "description": "Without number: how many days back to list (default 7)"}
                     },
-                    "required": [
-                        "repo",
-                        "pull_request"
-                    ],
+                    "required": ["repo"],
                     "additionalProperties": false
                 }
             }
@@ -3566,30 +3368,23 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
 
     append_tool(
         &mut tools,
-        "github_pull_request_patch".to_string(),
-        tool_github_pull_request_patch,
+        "github_pull_request".to_string(),
+        tool_github_pull_request,
         r#"
         {
             "type": "function",
             "function": {
-                "name": "github_pull_request_patch",
-                "description": "Get the raw patch for a github pull request.",
+                "name": "github_pull_request",
+                "description": "Read GitHub pull requests: one by number (with patch: true, its diff instead), or without a number, the pull requests updated in the last few days.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "repo": {
-                            "type": "string",
-                            "description": "github repo name, e.g. owner/repo"
-                        },
-                        "pull_request": {
-                            "type": "number",
-                            "description": "number of the pull request"
-                        }
+                        "repo": {"type": "string", "description": "owner/repo, e.g. containers/crun"},
+                        "number": {"type": "integer", "description": "The pull request's number"},
+                        "patch": {"type": "boolean", "description": "With number: get its diff instead of its details"},
+                        "days": {"type": "integer", "description": "Without number: how many days back to list (default 7)"}
                     },
-                    "required": [
-                        "repo",
-                        "pull_request"
-                    ],
+                    "required": ["repo"],
                     "additionalProperties": false
                 }
             }
@@ -3673,7 +3468,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create or replace the content of a file, or partially edit it. For full writes, provide path and content. For partial edits, use one of: (1) offset+length for byte-level patching, (2) start_line+end_line for line-range replacement, or (3) old_content for search-and-replace. Only one partial edit mode can be used at a time. Partial edits require the file to already exist.",
+                "description": "Create a file, or replace a file's whole content. To change part of an existing file, use patch_file instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -3683,36 +3478,11 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         },
                         "content": {
                             "type": "string",
-                            "description": "the file content for full writes, or the replacement text for partial edits"
+                            "description": "the file's full content"
                         },
                         "mode": {
                             "type": "string",
-                            "description": "file permissions mode in octal format (e.g., '0644', '0755', '0600'). Defaults to '0644' for regular files. Use '0755' for executable files.",
-                            "default": "0644"
-                        },
-                        "offset": {
-                            "type": "integer",
-                            "description": "byte offset (0-based) to start the partial write. Requires 'length'. Cannot be combined with start_line or old_content."
-                        },
-                        "length": {
-                            "type": "integer",
-                            "description": "number of bytes to replace starting from 'offset'. The replaced region is substituted with 'content'."
-                        },
-                        "start_line": {
-                            "type": "integer",
-                            "description": "1-based line number to start replacing. Requires 'end_line'. Cannot be combined with offset or old_content."
-                        },
-                        "end_line": {
-                            "type": "integer",
-                            "description": "1-based line number to stop replacing (inclusive). Lines from start_line to end_line are replaced with 'content'."
-                        },
-                        "old_content": {
-                            "type": "string",
-                            "description": "exact text to find in the file and replace with 'content'. Must match exactly once unless replace_all is true. Cannot be combined with offset or start_line."
-                        },
-                        "replace_all": {
-                            "type": "boolean",
-                            "description": "if true, replace all occurrences of old_content. Defaults to false (requires unique match)."
+                            "description": "file permissions in octal, e.g. '0755' for an executable (default '0644')"
                         }
                     },
                     "required": [
@@ -3736,7 +3506,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "patch_file",
-                "description": "Apply one or more search-and-replace edits to an existing file in a single call. Prefer this over write_file for changing several places in a file: the edits are applied in order (each one sees the result of the previous ones), validated together, and either all applied or none, and only the changed bytes are rewritten. Each old_content must match exactly once unless replace_all is true. The result includes a 'previews' entry per edit with a few lines of numbered context around where it landed, so there's usually no need to call read_file afterward just to confirm the change.",
+                "description": "Change part of an existing file: one or more edits, each replacing either exact text (old_content) or a range of lines (start_line..end_line) with new_content. The edits are applied in order (each one sees the result of the previous ones, line numbers included), validated together, and either all applied or none, and only the changed bytes are rewritten. Each old_content must match exactly once unless replace_all is true. The result includes a 'previews' entry per edit with a few lines of numbered context around where it landed, so there's usually no need to call read_file afterward just to confirm the change.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -3755,9 +3525,17 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                                         "type": "string",
                                         "description": "exact, non-empty text to find in the file"
                                     },
+                                    "start_line": {
+                                        "type": "integer",
+                                        "description": "instead of old_content: the first line to replace (1-based)"
+                                    },
+                                    "end_line": {
+                                        "type": "integer",
+                                        "description": "with start_line: the last line to replace (inclusive)"
+                                    },
                                     "new_content": {
                                         "type": "string",
-                                        "description": "text that replaces old_content (may be empty to delete it)"
+                                        "description": "the replacement text (may be empty to delete)"
                                     },
                                     "replace_all": {
                                         "type": "boolean",
@@ -3765,7 +3543,6 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                                     }
                                 },
                                 "required": [
-                                    "old_content",
                                     "new_content"
                                 ],
                                 "additionalProperties": false
@@ -3869,142 +3646,6 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                     },
                     "required": [
                         "pattern"
-                    ],
-                    "additionalProperties": false
-                }
-            }
-        }
-"#
-        .to_string(),
-    );
-
-    append_tool(
-        &mut tools,
-        "github_issue".to_string(),
-        tool_github_issue,
-        r#"
-        {
-            "type": "function",
-            "function": {
-                "name": "github_issue",
-                "description": "Get the github issue description.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "repo": {
-                            "type": "string",
-                            "description": "github repo name, e.g. owner/repo"
-                        },
-                        "issue": {
-                            "type": "number",
-                            "description": "number of the github issue"
-                        }
-                    },
-                    "required": [
-                        "repo",
-                        "issue"
-                    ],
-                    "additionalProperties": false
-                }
-            }
-        }
-"#
-        .to_string(),
-    );
-
-    append_tool(
-        &mut tools,
-        "github_issue_comments".to_string(),
-        tool_github_issue_comments,
-        r#"
-        {
-            "type": "function",
-            "function": {
-                "name": "github_issue_comments",
-                "description": "Get the comments associated with the github issue.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "repo": {
-                            "type": "string",
-                            "description": "github repo name, e.g. owner/repo"
-                        },
-                        "issue": {
-                            "type": "number",
-                            "description": "number of the github issue"
-                        }
-                    },
-                    "required": [
-                        "repo",
-                        "issue"
-                    ],
-                    "additionalProperties": false
-                }
-            }
-        }
-"#
-        .to_string(),
-    );
-
-    append_tool(
-        &mut tools,
-        "github_issues".to_string(),
-        tool_github_issues,
-        r#"
-        {
-            "type": "function",
-            "function": {
-                "name": "github_issues",
-                "description": "Get issues from a GitHub repository that have been updated within the last specified number of days.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "repo": {
-                            "type": "string",
-                            "description": "github repo name, e.g. owner/repo"
-                        },
-                        "days": {
-                            "type": "number",
-                            "description": "number of days to look back for updated issues"
-                        }
-                    },
-                    "required": [
-                        "repo",
-                        "days"
-                    ],
-                    "additionalProperties": false
-                }
-            }
-        }
-"#
-        .to_string(),
-    );
-
-    append_tool(
-        &mut tools,
-        "github_pull_requests".to_string(),
-        tool_github_pull_requests,
-        r#"
-        {
-            "type": "function",
-            "function": {
-                "name": "github_pull_requests",
-                "description": "Get pull requests from a GitHub repository that have been updated within the last specified number of days.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "repo": {
-                            "type": "string",
-                            "description": "github repo name, e.g. owner/repo"
-                        },
-                        "days": {
-                            "type": "number",
-                            "description": "number of days to look back for updated pull requests"
-                        }
-                    },
-                    "required": [
-                        "repo",
-                        "days"
                     ],
                     "additionalProperties": false
                 }
@@ -4129,132 +3770,23 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
 
     append_tool(
         &mut tools,
-        "agent_data_set".to_string(),
-        tool_agent_data_set,
+        "agent_configure".to_string(),
+        tool_agent_configure,
         r#"
         {
             "type": "function",
             "function": {
-                "name": "agent_data_set",
-                "description": "Store a key-value pair for an agent. Overwrites existing value if key exists.",
+                "name": "agent_configure",
+                "description": "Set an agent's own model, API endpoint or system prompt, used from its next turn on. An empty string clears that setting, so the agent goes back to the default. agent_get shows the current configuration.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "agent": {
-                            "type": "string",
-                            "description": "Name of the agent"
-                        },
-                        "key": {
-                            "type": "string",
-                            "description": "The key to store"
-                        },
-                        "value": {
-                            "type": "string",
-                            "description": "The value to associate with the key"
-                        }
+                        "agent": {"type": "string", "description": "Name of the agent"},
+                        "model": {"type": "string", "description": "Model to use for this agent"},
+                        "endpoint": {"type": "string", "description": "API endpoint for this agent"},
+                        "system_prompt": {"type": "string", "description": "System prompt for this agent"}
                     },
-                    "required": [
-                        "agent",
-                        "key",
-                        "value"
-                    ],
-                    "additionalProperties": false
-                }
-            }
-        }
-"#
-        .to_string(),
-    );
-
-    append_tool(
-        &mut tools,
-        "agent_data_get".to_string(),
-        tool_agent_data_get,
-        r#"
-        {
-            "type": "function",
-            "function": {
-                "name": "agent_data_get",
-                "description": "Retrieve the value for a key stored for an agent.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "agent": {
-                            "type": "string",
-                            "description": "Name of the agent"
-                        },
-                        "key": {
-                            "type": "string",
-                            "description": "The key to retrieve"
-                        }
-                    },
-                    "required": [
-                        "agent",
-                        "key"
-                    ],
-                    "additionalProperties": false
-                }
-            }
-        }
-"#
-        .to_string(),
-    );
-
-    append_tool(
-        &mut tools,
-        "agent_data_delete".to_string(),
-        tool_agent_data_delete,
-        r#"
-        {
-            "type": "function",
-            "function": {
-                "name": "agent_data_delete",
-                "description": "Delete a key-value pair for an agent.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "agent": {
-                            "type": "string",
-                            "description": "Name of the agent"
-                        },
-                        "key": {
-                            "type": "string",
-                            "description": "The key to delete"
-                        }
-                    },
-                    "required": [
-                        "agent",
-                        "key"
-                    ],
-                    "additionalProperties": false
-                }
-            }
-        }
-"#
-        .to_string(),
-    );
-
-    append_tool(
-        &mut tools,
-        "agent_data_list".to_string(),
-        tool_agent_data_list,
-        r#"
-        {
-            "type": "function",
-            "function": {
-                "name": "agent_data_list",
-                "description": "List all key-value pairs stored for an agent.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "agent": {
-                            "type": "string",
-                            "description": "Name of the agent"
-                        }
-                    },
-                    "required": [
-                        "agent"
-                    ],
+                    "required": ["agent"],
                     "additionalProperties": false
                 }
             }
@@ -4507,47 +4039,27 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
 
     append_tool(
         &mut tools,
-        "task_create_cron".to_string(),
-        tool_task_create_cron,
+        "task_create".to_string(),
+        tool_task_create,
         r#"
         {
             "type": "function",
             "function": {
-                "name": "task_create_cron",
-                "description": "Create a recurring scheduled task using a cron expression. Uses 7-field cron format: 'sec min hour day_of_month month day_of_week year'. Example: '0 30 9 * * Mon-Fri *' means 9:30 AM every weekday. The command is either an instruction for the agent or a tool call (see command).",
+                "name": "task_create",
+                "description": "Schedule a task: on a cron schedule (cron_expression), once after a delay (delay_seconds, preferred for relative times) or at a time (run_at), or right away if none is given. The command is either an instruction in plain language (e.g. \"tell the user a joke\", \"summarize today's commits\"), which the agent carries out as a new turn of its conversation as soon as it's idle, or a JSON tool call run directly without the AI, e.g. {\"tool\": \"run_command\", \"arguments\": {\"command\": \"echo hello\"}}.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Name for the task"
-                        },
-                        "cron_expression": {
-                            "type": "string",
-                            "description": "7-field cron expression: sec min hour day_of_month month day_of_week year"
-                        },
-                        "command": {
-                            "type": "string",
-                            "description": "What to do when the task fires. Either an instruction in plain language (e.g. \"tell the user a joke\", \"summarize today's commits\"), which the agent carries out as a new turn of its conversation as soon as it's idle; or a JSON tool call to run directly without the AI, e.g. {\"tool\": \"run_command\", \"arguments\": {\"command\": \"echo hello\"}}"
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Optional description of what the task does"
-                        },
-                        "agent_name": {
-                            "type": "string",
-                            "description": "Optional agent to associate the task with"
-                        },
-                        "max_runs": {
-                            "type": "integer",
-                            "description": "Maximum number of times the task will run before auto-disabling. Omit for unlimited."
-                        }
+                        "name": {"type": "string", "description": "Name for the task"},
+                        "command": {"type": "string", "description": "What to do when it fires: an instruction, or a JSON tool call"},
+                        "description": {"type": "string", "description": "What the task is for"},
+                        "agent_name": {"type": "string", "description": "The agent that runs it (default: you)"},
+                        "cron_expression": {"type": "string", "description": "7 fields: 'sec min hour day_of_month month day_of_week year', e.g. '0 30 9 * * Mon-Fri *' for 9:30 every weekday"},
+                        "max_runs": {"type": "integer", "description": "With cron_expression: stop after this many runs"},
+                        "delay_seconds": {"type": "integer", "description": "Run once, this many seconds from now"},
+                        "run_at": {"type": "string", "description": "Run once at this RFC 3339 time, e.g. 2026-10-03T08:00:00Z"}
                     },
-                    "required": [
-                        "name",
-                        "cron_expression",
-                        "command"
-                    ],
+                    "required": ["name", "command"],
                     "additionalProperties": false
                 }
             }
@@ -4558,46 +4070,21 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
 
     append_tool(
         &mut tools,
-        "task_create_oneshot".to_string(),
-        tool_task_create_oneshot,
+        "task_list".to_string(),
+        tool_task_list,
         r#"
         {
             "type": "function",
             "function": {
-                "name": "task_create_oneshot",
-                "description": "Create a one-shot scheduled task that runs once. Use delay_seconds for relative timing (preferred) or run_at for absolute. The command is either an instruction for the agent or a tool call (see command).",
+                "name": "task_list",
+                "description": "List scheduled tasks with their status and last outcome - all of them, an agent's, or only the ones due to run now - or get one task by id.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Name for the task"
-                        },
-                        "command": {
-                            "type": "string",
-                            "description": "What to do when the task fires. Either an instruction in plain language (e.g. \"tell the user a joke\", \"summarize today's commits\"), which the agent carries out as a new turn of its conversation as soon as it's idle; or a JSON tool call to run directly without the AI, e.g. {\"tool\": \"run_command\", \"arguments\": {\"command\": \"echo hello\"}}"
-                        },
-                        "delay_seconds": {
-                            "type": "number",
-                            "description": "Number of seconds from now to fire the task (preferred over run_at)"
-                        },
-                        "run_at": {
-                            "type": "string",
-                            "description": "Absolute time in RFC 3339 format (e.g. '2025-12-31T23:59:59Z'). Use delay_seconds instead when possible."
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "Optional description of what the task does"
-                        },
-                        "agent_name": {
-                            "type": "string",
-                            "description": "Optional agent to associate the task with"
-                        }
+                        "id": {"type": "integer", "description": "Get just this task"},
+                        "agent_name": {"type": "string", "description": "Only this agent's tasks"},
+                        "due": {"type": "boolean", "description": "Only tasks due to run now"}
                     },
-                    "required": [
-                        "name",
-                        "command"
-                    ],
                     "additionalProperties": false
                 }
             }
@@ -4637,62 +4124,6 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
 
     append_tool(
         &mut tools,
-        "task_list".to_string(),
-        tool_task_list,
-        r#"
-        {
-            "type": "function",
-            "function": {
-                "name": "task_list",
-                "description": "List all scheduled tasks, optionally filtered by agent name.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "agent_name": {
-                            "type": "string",
-                            "description": "Optional agent name to filter tasks by"
-                        }
-                    },
-                    "required": [],
-                    "additionalProperties": false
-                }
-            }
-        }
-"#
-        .to_string(),
-    );
-
-    append_tool(
-        &mut tools,
-        "task_get".to_string(),
-        tool_task_get,
-        r#"
-        {
-            "type": "function",
-            "function": {
-                "name": "task_get",
-                "description": "Get details of a specific scheduled task by its ID.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "id": {
-                            "type": "number",
-                            "description": "ID of the task to retrieve"
-                        }
-                    },
-                    "required": [
-                        "id"
-                    ],
-                    "additionalProperties": false
-                }
-            }
-        }
-"#
-        .to_string(),
-    );
-
-    append_tool(
-        &mut tools,
         "task_set_enabled".to_string(),
         tool_task_set_enabled,
         r#"
@@ -4717,28 +4148,6 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "id",
                         "enabled"
                     ],
-                    "additionalProperties": false
-                }
-            }
-        }
-"#
-        .to_string(),
-    );
-
-    append_tool(
-        &mut tools,
-        "task_pending".to_string(),
-        tool_task_pending,
-        r#"
-        {
-            "type": "function",
-            "function": {
-                "name": "task_pending",
-                "description": "List scheduled tasks that are due to run now (next_run_at is in the past), including ones whose run was abandoned by a session that went away.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "required": [],
                     "additionalProperties": false
                 }
             }
@@ -4790,7 +4199,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "spawn_agent",
-                "description": "Spawn a sub-agent to work on a task in parallel. The sub-agent runs in the background and its result will be delivered asynchronously. You can spawn multiple sub-agents at once for parallel work.",
+                "description": "Start a sub-agent on a task in the background and carry on: its result arrives later, as a message, whenever it's done. Use it for long or open-ended work you don't need to wait for. To run the same task over many items and get all the results back together, use fan_out instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -4824,7 +4233,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "fan_out",
-                "description": "Run the same task for many items at once - e.g. review each of these files, answer this question for each module - each in its own worker agent, and get all their results back together, in item order, when every worker has finished. Workers see only their own item and the prompt, and by default can only use read-only tools (reading files, searching, lsp), so have them report findings and make any edits yourself afterwards.",
+                "description": "Run the same task for many items at once - e.g. review each of these files, answer this question for each module - each in its own worker agent, and wait for all their results, which come back together, in item order, as this tool's result. (For one long task to run in the background while you carry on, use spawn_agent.) Workers see only their own item and the prompt, and by default can only use read-only tools (reading files, searching, lsp), so have them report findings and make any edits yourself afterwards.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -10720,6 +10129,143 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_configure_sets_and_clears_only_the_config() {
+        let ctx = plan_test_ctx();
+        let configure = |params: serde_json::Value| tool_agent_configure(&params.to_string(), &ctx);
+        configure(
+            serde_json::json!({"agent": "default", "model": "m1", "system_prompt": "be brief"}),
+        )
+        .unwrap();
+        let get = || -> serde_json::Value {
+            serde_json::from_str(
+                &tool_agent_get(&r#"{"name":"default"}"#.to_string(), &ctx).unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(get()["config"]["model"], "m1");
+        assert_eq!(get()["config"]["system_prompt"], "be brief");
+
+        configure(serde_json::json!({"agent": "default", "model": ""})).unwrap();
+        assert!(get()["config"]["model"].is_null(), "cleared");
+        assert_eq!(
+            get()["config"]["system_prompt"],
+            "be brief",
+            "others untouched"
+        );
+
+        assert!(configure(serde_json::json!({"agent": "nobody", "model": "x"})).is_err());
+        assert!(
+            configure(serde_json::json!({"agent": "default"})).is_err(),
+            "nothing to set"
+        );
+        // Only the configuration: other stored data isn't reachable.
+        assert!(
+            configure(serde_json::json!({"agent": "default", "key": "state:plan", "value": "[]"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_task_create_and_list_tools() {
+        let ctx = plan_test_ctx();
+        let create = |params: serde_json::Value| -> Result<serde_json::Value, String> {
+            tool_task_create(&params.to_string(), &ctx)
+                .map(|r| serde_json::from_str(&r).unwrap())
+                .map_err(|e| e.to_string())
+        };
+        let joke = create(
+            serde_json::json!({"name": "joke", "command": "Tell a joke", "delay_seconds": 60}),
+        )
+        .unwrap();
+        assert_eq!(joke["kind"], "prompt");
+        let tool = create(serde_json::json!({
+            "name": "ls", "command": "{\"tool\": \"glob\", \"arguments\": {\"pattern\": \"*\"}}",
+            "cron_expression": "0 0 9 * * * *", "max_runs": 3
+        }))
+        .unwrap();
+        assert_eq!(tool["kind"], "tool");
+        let now = create(serde_json::json!({"name": "now", "command": "Say hi"})).unwrap();
+
+        for (params, expected) in [
+            (
+                serde_json::json!({"name": "x", "command": " "}),
+                "needs a command",
+            ),
+            (
+                serde_json::json!({"name": "x", "command": "y", "delay_seconds": 5, "run_at": "2026-10-03T08:00:00Z"}),
+                "not both",
+            ),
+            (
+                serde_json::json!({"name": "x", "command": "y", "cron_expression": "* * * * * * *", "delay_seconds": 5}),
+                "not both",
+            ),
+            (
+                serde_json::json!({"name": "x", "command": "y", "max_runs": 2}),
+                "max_runs",
+            ),
+            (
+                serde_json::json!({"name": "x", "command": "y", "agent_name": "nobody"}),
+                "no agent named",
+            ),
+        ] {
+            let err = create(params).unwrap_err();
+            assert!(err.contains(expected), "{err}");
+        }
+
+        let list = |params: serde_json::Value| -> serde_json::Value {
+            serde_json::from_str(&tool_task_list(&params.to_string(), &ctx).unwrap()).unwrap()
+        };
+        let all = list(serde_json::json!({}));
+        assert_eq!(all.as_array().unwrap().len(), 3);
+        assert_eq!(
+            all[0]["agent_name"], "default",
+            "defaults to the calling agent"
+        );
+        let due = list(serde_json::json!({"due": true}));
+        assert_eq!(due.as_array().unwrap().len(), 1);
+        assert_eq!(due[0]["id"], now["id"]);
+        assert_eq!(list(serde_json::json!({"id": joke["id"]}))["name"], "joke");
+        assert!(list(serde_json::json!({"id": 999}))["error"].is_string());
+    }
+
+    #[test]
+    fn test_github_tools_check_their_arguments_before_any_request() {
+        let ctx = test_ctx();
+        let err = |f: ToolCallback, params: serde_json::Value| {
+            f(&params.to_string(), &ctx).unwrap_err().to_string()
+        };
+        assert!(
+            err(
+                tool_github_issue,
+                serde_json::json!({"repo": "o/r", "comments": true})
+            )
+            .contains("number")
+        );
+        assert!(
+            err(
+                tool_github_pull_request,
+                serde_json::json!({"repo": "o/r", "patch": true})
+            )
+            .contains("number")
+        );
+        // The old tools' parameter names are refused, not misread.
+        assert!(
+            err(
+                tool_github_issue,
+                serde_json::json!({"repo": "o/r", "issue": 5})
+            )
+            .contains("unknown field")
+        );
+        assert!(
+            err(
+                tool_github_pull_request,
+                serde_json::json!({"repo": "o/r", "pull_request": 5})
+            )
+            .contains("unknown field")
+        );
+    }
+
+    #[test]
     fn test_kb_tools_round_trip() {
         let mut ctx = plan_test_ctx();
         let call = |f: ToolCallback, ctx: &ToolContext, params: serde_json::Value| {
@@ -11721,7 +11267,7 @@ mod tests {
         );
         assert_eq!(
             schema["function"]["parameters"]["properties"]["edits"]["items"]["required"],
-            serde_json::json!(["old_content", "new_content"])
+            serde_json::json!(["new_content"])
         );
 
         let path = "_test_pf_dispatch.tmp";
@@ -12381,320 +11927,83 @@ mod tests {
     }
 
     #[test]
-    fn test_write_file_search_replace() {
-        let path = "_test_wf_search_replace.tmp";
-        write_test_file(path, "line one\nline two\nline three\n");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "line TWO",
-            "old_content": "line two"
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx()).unwrap();
-        let res: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(res["operation"], "patch_search_replace");
-        assert_eq!(read_test_file(path), "line one\nline TWO\nline three\n");
+    fn test_write_file_refuses_partial_edit_parameters() {
+        // An old-style partial edit must not be taken as a full write of
+        // `content`, which would wipe the rest of the file.
+        let path = "_test_wf_partial_refused.tmp";
+        write_test_file(path, "keep\nme\n");
+        let params = serde_json::json!({"path": path, "content": "x", "old_content": "me"});
+        let err = tool_write_file(&params.to_string(), &test_ctx())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("patch_file"), "{err}");
+        assert_eq!(read_test_file(path), "keep\nme\n");
         cleanup(path);
     }
 
     #[test]
-    fn test_write_file_search_replace_all() {
-        let path = "_test_wf_search_replace_all.tmp";
-        write_test_file(path, "aaa bbb aaa ccc aaa\n");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "XXX",
-            "old_content": "aaa",
-            "replace_all": true
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx()).unwrap();
-        let res: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(res["operation"], "patch_search_replace");
-        assert_eq!(read_test_file(path), "XXX bbb XXX ccc XXX\n");
+    fn test_patch_file_line_ranges() {
+        let path = "_test_pf_lines.tmp";
+        write_test_file(path, "one\ntwo\nthree\nfour\n");
+        // Replace a line (keeping its line break), then - with line numbers
+        // as they are after that - delete two, then a text edit.
+        patch(
+            path,
+            serde_json::json!([
+                {"start_line": 2, "end_line": 2, "new_content": "TWO"},
+                {"start_line": 3, "end_line": 4, "new_content": ""},
+                {"old_content": "one", "new_content": "ONE"}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(read_test_file(path), "ONE\nTWO\n");
+
+        // One line can become several.
+        patch(
+            path,
+            serde_json::json!([{"start_line": 2, "end_line": 2, "new_content": "a\nb\n"}]),
+        )
+        .unwrap();
+        assert_eq!(read_test_file(path), "ONE\na\nb\n");
         cleanup(path);
     }
 
     #[test]
-    fn test_write_file_search_replace_not_found() {
-        let path = "_test_wf_sr_notfound.tmp";
-        write_test_file(path, "hello world\n");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "replacement",
-            "old_content": "nonexistent"
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not found"));
+    fn test_patch_file_line_range_errors_change_nothing() {
+        let path = "_test_pf_lines_err.tmp";
+        write_test_file(path, "a\nb\n");
+        for (edit, expected) in [
+            (
+                serde_json::json!({"start_line": 0, "end_line": 1, "new_content": "x"}),
+                "1-based",
+            ),
+            (
+                serde_json::json!({"start_line": 2, "end_line": 1, "new_content": "x"}),
+                "must be >=",
+            ),
+            (
+                serde_json::json!({"start_line": 1, "end_line": 3, "new_content": "x"}),
+                "past the end",
+            ),
+            (
+                serde_json::json!({"start_line": 1, "new_content": "x"}),
+                "both start_line and end_line",
+            ),
+            (
+                serde_json::json!({"old_content": "a", "start_line": 1, "end_line": 1, "new_content": "x"}),
+                "not both",
+            ),
+        ] {
+            // A good edit first: nothing is applied if any edit fails.
+            let err = patch(
+                path,
+                serde_json::json!([{"old_content": "b", "new_content": "B"}, edit]),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(expected), "{err}");
+            assert_eq!(read_test_file(path), "a\nb\n");
+        }
         cleanup(path);
-    }
-
-    #[test]
-    fn test_write_file_search_replace_multiple_without_flag() {
-        let path = "_test_wf_sr_multi.tmp";
-        write_test_file(path, "foo bar foo baz foo\n");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "X",
-            "old_content": "foo"
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("matches 3 times"));
-        cleanup(path);
-    }
-
-    #[test]
-    fn test_write_file_search_replace_identical() {
-        let path = "_test_wf_sr_identical.tmp";
-        write_test_file(path, "hello world\n");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "hello",
-            "old_content": "hello"
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("identical"));
-        cleanup(path);
-    }
-
-    #[test]
-    fn test_write_file_byte_offset() {
-        let path = "_test_wf_byte_offset.tmp";
-        write_test_file(path, "Hello, World!");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "Rust",
-            "offset": 7,
-            "length": 5
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx()).unwrap();
-        let res: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(res["operation"], "patch_offset");
-        assert_eq!(read_test_file(path), "Hello, Rust!");
-        cleanup(path);
-    }
-
-    #[test]
-    fn test_write_file_byte_offset_expand() {
-        let path = "_test_wf_byte_offset_expand.tmp";
-        write_test_file(path, "ABCDE");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "XXXX",
-            "offset": 1,
-            "length": 2
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx()).unwrap();
-        assert_eq!(read_test_file(path), "AXXXXDE");
-        let res: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(res["bytes_written"], 7);
-        cleanup(path);
-    }
-
-    #[test]
-    fn test_write_file_byte_offset_out_of_bounds() {
-        let path = "_test_wf_byte_oob.tmp";
-        write_test_file(path, "short");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "x",
-            "offset": 100,
-            "length": 1
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("beyond file size"));
-        cleanup(path);
-    }
-
-    #[test]
-    fn test_write_file_byte_offset_length_exceeds() {
-        let path = "_test_wf_byte_len_oob.tmp";
-        write_test_file(path, "short");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "x",
-            "offset": 3,
-            "length": 10
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx());
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds file size")
-        );
-        cleanup(path);
-    }
-
-    #[test]
-    fn test_write_file_line_range() {
-        let path = "_test_wf_line_range.tmp";
-        write_test_file(path, "line1\nline2\nline3\nline4\nline5\n");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "NEW2\nNEW3",
-            "start_line": 2,
-            "end_line": 3
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx()).unwrap();
-        let res: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(res["operation"], "patch_lines");
-        assert_eq!(read_test_file(path), "line1\nNEW2\nNEW3\nline4\nline5\n");
-        cleanup(path);
-    }
-
-    #[test]
-    fn test_write_file_line_range_single_line() {
-        let path = "_test_wf_line_single.tmp";
-        write_test_file(path, "aaa\nbbb\nccc\n");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "BBB",
-            "start_line": 2,
-            "end_line": 2
-        });
-        let _result = tool_write_file(&params.to_string(), &test_ctx()).unwrap();
-        assert_eq!(read_test_file(path), "aaa\nBBB\nccc\n");
-        cleanup(path);
-    }
-
-    #[test]
-    fn test_write_file_line_range_out_of_bounds() {
-        let path = "_test_wf_line_oob.tmp";
-        write_test_file(path, "one\ntwo\n");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "x",
-            "start_line": 1,
-            "end_line": 10
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx());
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds file line count")
-        );
-        cleanup(path);
-    }
-
-    #[test]
-    fn test_write_file_line_range_zero_start() {
-        let path = "_test_wf_line_zero.tmp";
-        write_test_file(path, "one\ntwo\n");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "x",
-            "start_line": 0,
-            "end_line": 1
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("1-based"));
-        cleanup(path);
-    }
-
-    #[test]
-    fn test_write_file_line_range_end_before_start() {
-        let path = "_test_wf_line_inv.tmp";
-        write_test_file(path, "one\ntwo\nthree\n");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "x",
-            "start_line": 3,
-            "end_line": 1
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("must be >="));
-        cleanup(path);
-    }
-
-    #[test]
-    fn test_write_file_conflicting_params_old_content_and_offset() {
-        let path = "_test_wf_conflict1.tmp";
-        write_test_file(path, "content");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "x",
-            "old_content": "con",
-            "offset": 0,
-            "length": 3
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Cannot combine"));
-        cleanup(path);
-    }
-
-    #[test]
-    fn test_write_file_conflicting_params_offset_and_start_line() {
-        let path = "_test_wf_conflict2.tmp";
-        write_test_file(path, "content\n");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "x",
-            "offset": 0,
-            "length": 1,
-            "start_line": 1,
-            "end_line": 1
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Cannot combine"));
-        cleanup(path);
-    }
-
-    #[test]
-    fn test_write_file_offset_without_length() {
-        let path = "_test_wf_no_len.tmp";
-        write_test_file(path, "content");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "x",
-            "offset": 0
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("requires length"));
-        cleanup(path);
-    }
-
-    #[test]
-    fn test_write_file_start_line_without_end_line() {
-        let path = "_test_wf_no_end.tmp";
-        write_test_file(path, "content\n");
-        let params = serde_json::json!({
-            "path": path,
-            "content": "x",
-            "start_line": 1
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx());
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("requires end_line")
-        );
-        cleanup(path);
-    }
-
-    #[test]
-    fn test_write_file_partial_on_nonexistent_file() {
-        let path = "_test_wf_nofile.tmp";
-        cleanup(path);
-        let params = serde_json::json!({
-            "path": path,
-            "content": "x",
-            "old_content": "y"
-        });
-        let result = tool_write_file(&params.to_string(), &test_ctx());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("must exist"));
     }
 }
