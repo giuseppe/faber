@@ -4244,7 +4244,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "items": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "What to run the task for, one worker each (at most 100), e.g. file paths."
+                            "description": "What to run the task for, one worker each (at most 1000), e.g. file paths."
                         },
                         "prompt": {
                             "type": "string",
@@ -4252,7 +4252,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         },
                         "max_parallel": {
                             "type": "integer",
-                            "description": "How many workers run at the same time (default 4, at most 16)."
+                            "description": "How many workers run at the same time (default 32, at most 256)."
                         },
                         "tools": {
                             "type": "array",
@@ -10385,6 +10385,37 @@ mod tests {
             None => unreachable!(),
         };
         assert_eq!(usage.turns, 2, "both workers' tokens counted");
+    }
+
+    #[test]
+    fn test_fan_out_runs_hundreds_of_workers_at_once() {
+        let model = model_script(
+            "wide",
+            serde_json::json!([
+                {"if": "check item", "reply": "fine", "delay_ms": 200},
+            ]),
+        );
+        let ctx = chat_ctx_with_model(local_db_with_agents(&["boss"]), "boss", &model);
+        let items: Vec<String> = (0..500).map(|i| i.to_string()).collect();
+        let started = std::time::Instant::now();
+        let out = fan_out::tool_fan_out(
+            &serde_json::json!({"items": items, "prompt": "check item {item}", "max_parallel": 256})
+                .to_string(),
+            &ctx,
+        )
+        .unwrap();
+        // 500 workers of 200ms each, 256 at a time: two rounds, not 500.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            out.matches("\nfine\n").count(),
+            500,
+            "every worker answered"
+        );
+        assert!(out.contains("## 500. 499\n"));
     }
 
     #[test]

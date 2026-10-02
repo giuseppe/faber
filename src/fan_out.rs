@@ -40,9 +40,12 @@ use crate::openai::{
 use crate::{SubAgentContext, final_response_text};
 use faber::ToolContext;
 
-const MAX_ITEMS: usize = 100;
-const DEFAULT_MAX_PARALLEL: usize = 4;
-const MAX_PARALLEL: usize = 16;
+const MAX_ITEMS: usize = 1000;
+/// Workers are cheap threads; how many requests actually reach the model
+/// at once is up to `max_parallel_requests`, which applies to the whole
+/// process.
+const DEFAULT_MAX_PARALLEL: usize = 32;
+const MAX_PARALLEL: usize = 256;
 
 /// How many times a worker shortens its tool results to recover from a
 /// context overflow before giving up.
