@@ -47,6 +47,30 @@ pub fn max_tool_output_chars_for_context(context_window: u32) -> usize {
     (context_window as usize).max(MIN_MAX_TOOL_OUTPUT_CHARS)
 }
 
+/// What an agent reported as the outcome of its work, with the
+/// `report_result` tool.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportedResult {
+    pub succeeded: bool,
+    pub summary: String,
+    /// Structured data, shaped as `ToolContext::result_schema` asks.
+    pub data: Option<serde_json::Value>,
+}
+
+impl ReportedResult {
+    /// The result as text for whoever gets it: the summary, then the data.
+    pub fn text(&self) -> String {
+        match &self.data {
+            Some(data) => format!(
+                "{}\n```json\n{}\n```",
+                self.summary.trim(),
+                serde_json::to_string_pretty(data).unwrap_or_default()
+            ),
+            None => self.summary.trim().to_string(),
+        }
+    }
+}
+
 pub struct ToolContext {
     pub println: Box<dyn Fn(&str) + Send + Sync>,
     pub db: Option<Arc<dyn db_backend::DbBackend>>,
@@ -72,6 +96,13 @@ pub struct ToolContext {
     /// Most requests to the model one call of the request loop may make -
     /// a budget for a sub-agent's work. `None`: no limit.
     pub max_requests: Option<usize>,
+    /// Where `report_result` puts the outcome of this run of work (a
+    /// sub-agent, fan-out worker or task), when someone's waiting for one.
+    pub result_slot: Option<Arc<Mutex<Option<ReportedResult>>>>,
+    /// The shape `report_result`'s data must have: a JSON object mapping
+    /// each required field to its type ("string", "number", "integer",
+    /// "boolean", "array" or "object").
+    pub result_schema: Option<serde_json::Value>,
 }
 
 impl ToolContext {
@@ -90,6 +121,8 @@ impl ToolContext {
             context_window: None,
             interrupt: None,
             max_requests: None,
+            result_slot: None,
+            result_schema: None,
         }
     }
 

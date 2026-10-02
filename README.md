@@ -229,6 +229,21 @@ one message per sub-agent arriving later. This is also how a sub-agent
 collects the results of sub-agents of its own: only a chat reads
 messages, so without it they'd go unread.
 
+Delegated work - a sub-agent, a `fan_out` worker, or a scheduled task -
+reports its outcome with the `report_result` tool: `succeeded` or
+`failed`, a summary, and optional data. That's what the agent waiting on it
+gets (a failure as "Failed: ..."), and what a task's record says, so a
+failure counts as one even when the model words it politely. Two options
+on `spawn_agent` and `fan_out` help delegation:
+
+- `result_schema` asks for structured data, as field names and types -
+  e.g. `{"duplicate": "boolean", "of": "integer"}`. A report that doesn't
+  match is refused with what's wrong, so the agent corrects it; one that
+  finishes without reporting is reminded once.
+- `context` hands the new agent knowledge base notes (by title or id) and
+  files up front, so it doesn't start cold:
+  `{"notes": ["Deploying"], "files": ["src/main.rs"]}`.
+
 A finished sub-agent is kept, with its conversation, until `faber gc`
 removes it (it then has no live session), so you can see what it did.
 
@@ -518,6 +533,7 @@ that agent.
 | `spawn_agent` | Spawn a sub-agent for parallel work, optionally with a `timeout_seconds` or `max_requests` budget |
 | `agent_cancel` | Stop a running sub-agent you started |
 | `agent_wait` | Wait for your sub-agents (all, some, or the first to finish) and get their results together |
+| `report_result` | For a sub-agent, fan-out worker or task: report the outcome of its work - succeeded/failed, summary, data |
 | `fan_out` | Run the same task for many items (e.g. files) at once, one worker agent each, at most `max_parallel` at a time (default 32, up to 256; up to 1000 items), and return all the results together, in item order, once every worker is done. `{item}` in the prompt is replaced by each worker's item. Workers only get read-only tools (`read_file`, `glob`, `grep_in_current_directory`, `lsp`, web/GitHub reads) unless `tools` names others - workers that write can overwrite each other's changes - and can't spawn agents. Ctrl-C stops every worker. Each result gets a share of the output cap |
 | `run_command` | Execute a command, sandboxed with [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`): no network access, no capabilities, a cleared environment, a read-only root with only the current directory writable, its own PID/IPC/UTS/cgroup namespaces (no visibility into other processes or the host's hostname), killed if faber itself dies, and detached from the controlling terminal. Requires `bwrap` to be installed; use `--unsafe-tools` for unrestricted execution instead |
 
