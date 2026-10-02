@@ -320,6 +320,13 @@ fn dispatch_inner(
             let v = db::create_task(&conn, &task)?;
             Ok(serde_json::to_value(v)?)
         }
+        "prune_tasks" => {
+            let older_than = db::parse_db_time(str_param!("older_than"))
+                .ok_or("bad param 'older_than': not a timestamp")?;
+            let dry_run = p["dry_run"].as_bool().unwrap_or(false);
+            let v = db::prune_tasks(&conn, older_than, dry_run)?;
+            Ok(serde_json::to_value(v)?)
+        }
         "claim_task" => {
             let v = db::claim_task(&conn, i64_param!("task_id"), str_param!("session_id"))?;
             Ok(serde_json::to_value(v)?)

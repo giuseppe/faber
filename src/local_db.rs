@@ -227,6 +227,12 @@ impl DbBackend for LocalDb {
         db::create_task(&conn, task)
     }
 
+    fn prune_tasks(&self, older_than: &str, dry_run: bool) -> Result<Vec<TaskRow>, Box<dyn Error>> {
+        let older_than = db::parse_db_time(older_than).ok_or("invalid prune cutoff time")?;
+        let conn = self.lock()?;
+        db::prune_tasks(&conn, older_than, dry_run)
+    }
+
     fn claim_task(&self, task_id: i64, session_id: &str) -> Result<bool, Box<dyn Error>> {
         let conn = self.lock()?;
         db::claim_task(&conn, task_id, session_id)

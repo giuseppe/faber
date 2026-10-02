@@ -369,6 +369,14 @@ impl DbBackend for RemoteDb {
         Ok(serde_json::from_value(v)?)
     }
 
+    fn prune_tasks(&self, older_than: &str, dry_run: bool) -> Result<Vec<TaskRow>, Box<dyn Error>> {
+        let v = self.call(
+            "prune_tasks",
+            serde_json::json!({"older_than": older_than, "dry_run": dry_run}),
+        )?;
+        Ok(serde_json::from_value(v)?)
+    }
+
     fn claim_task(&self, task_id: i64, session_id: &str) -> Result<bool, Box<dyn Error>> {
         let v = self.call(
             "claim_task",
