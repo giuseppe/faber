@@ -222,6 +222,13 @@ with `/cancel NAME` in the chat. A stopped sub-agent still reports back,
 saying why: "Stopped: timed out after 60s", "Stopped: cancelled by the
 user", and so on.
 
+An agent can wait for its sub-agents with the `agent_wait` tool - all of
+them, the ones it names, or (`any: true`) whichever finishes first, with a
+timeout - and gets their results together, as one tool result, instead of
+one message per sub-agent arriving later. This is also how a sub-agent
+collects the results of sub-agents of its own: only a chat reads
+messages, so without it they'd go unread.
+
 A finished sub-agent is kept, with its conversation, until `faber gc`
 removes it (it then has no live session), so you can see what it did.
 
@@ -476,6 +483,7 @@ that agent.
 | `send_message` | Send a message to another agent |
 | `spawn_agent` | Spawn a sub-agent for parallel work, optionally with a `timeout_seconds` or `max_requests` budget |
 | `agent_cancel` | Stop a running sub-agent you started |
+| `agent_wait` | Wait for your sub-agents (all, some, or the first to finish) and get their results together |
 | `fan_out` | Run the same task for many items (e.g. files) at once, one worker agent each, at most `max_parallel` at a time (default 32, up to 256; up to 1000 items), and return all the results together, in item order, once every worker is done. `{item}` in the prompt is replaced by each worker's item. Workers only get read-only tools (`read_file`, `glob`, `grep_in_current_directory`, `lsp`, web/GitHub reads) unless `tools` names others - workers that write can overwrite each other's changes - and can't spawn agents. Ctrl-C stops every worker. Each result gets a share of the output cap |
 | `run_command` | Execute a command, sandboxed with [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`): no network access, no capabilities, a cleared environment, a read-only root with only the current directory writable, its own PID/IPC/UTS/cgroup namespaces (no visibility into other processes or the host's hostname), killed if faber itself dies, and detached from the controlling terminal. Requires `bwrap` to be installed; use `--unsafe-tools` for unrestricted execution instead |
 

@@ -391,6 +391,7 @@ mod tests {
         let mut ctx = ToolContext::new(|_: &str| {});
         ctx.interrupt = Some(Arc::new(Mutex::new(ctrl_c_rx)));
         ctx.extra = Some(Arc::new(SubAgentContext {
+            runs: Arc::new(crate::SubAgentRuns::default()),
             tools: Arc::new(crate::initialize_tools(false, None)),
             opts: openai::Opts {
                 max_tokens: None,
