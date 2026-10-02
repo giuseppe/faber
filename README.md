@@ -366,6 +366,42 @@ deletes its tasks, and the model can delete one with `task_delete`.
 `--since` also takes a date or `"YYYY-MM-DD HH:MM"` in local time, or an
 RFC 3339 timestamp. It works with `--server` too.
 
+## Knowledge base
+
+Agents keep a knowledge base of notes - project facts, decisions and why,
+how-tos, conventions, gotchas, your preferences - in faber's SQLite
+database, so it outlives conversations and is shared by every agent (and,
+with `faber serve`, every client). The model uses it through the `kb_*`
+tools:
+
+| Tool | Description |
+|---|---|
+| `kb_search` | Ranked full-text search, with a snippet of each match. Common words like "how" or "the" are ignored, and words match their variants ("deploying" finds "deploy") |
+| `kb_read` | A note in full, by id or title |
+| `kb_list` | Notes by most recently updated, optionally by tag |
+| `kb_write` | Saves a note (title, Markdown body, tags). Writing a title that already exists - ignoring case - replaces that note instead of adding a near-duplicate. Shared with all agents unless `private` |
+| `kb_delete` | Deletes a note |
+
+Search ranks matches in a note's title above its tags, and tags above its
+body. There's no default system prompt telling the model about the
+knowledge base; the tool descriptions tell it to search before asking you
+or re-investigating something, and to save what's worth keeping.
+
+You can look at and curate it from the command line - `faber kb` sees every
+note, private ones included:
+
+```bash
+faber kb                                   # list notes, most recently updated first (--tag, --last N)
+faber kb search "deploy staging"           # ranked search
+faber kb show 3                            # a note in full (or by title: faber kb show "Release process")
+faber kb add "Release process" "Cut every other Tuesday..." --tag release
+echo "..." | faber kb add "Code style"     # the body from stdin
+faber kb rm 3 4
+```
+
+`faber kb add --agent NAME` makes a note private to that agent. Deleting an
+agent deletes its private notes.
+
 ## Tools
 
 ### Safe tools (always available)

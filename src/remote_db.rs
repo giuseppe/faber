@@ -17,7 +17,9 @@
  *
  */
 
-use faber::db::{AgentConfig, AgentRow, NewTask, NotificationRow, TaskOutcome, TaskRow};
+use faber::db::{
+    AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow, TaskOutcome, TaskRow,
+};
 use faber::db_backend::DbBackend;
 use faber::protocol::{RpcRequest, RpcResponse};
 use std::error::Error;
@@ -382,6 +384,71 @@ impl DbBackend for RemoteDb {
             "prune_tasks",
             serde_json::json!({"older_than": older_than, "dry_run": dry_run}),
         )?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn kb_write(
+        &self,
+        title: &str,
+        body: &str,
+        tags: &[String],
+        private_to: Option<&str>,
+        author: Option<&str>,
+    ) -> Result<(i64, bool), Box<dyn Error>> {
+        let v = self.call(
+            "kb_write",
+            serde_json::json!({"title": title, "body": body, "tags": tags,
+                               "private_to": private_to, "author": author}),
+        )?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn kb_get(&self, id: i64, viewer: &KbViewer) -> Result<Option<KbNote>, Box<dyn Error>> {
+        let v = self.call("kb_get", serde_json::json!({"id": id, "viewer": viewer}))?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn kb_get_by_title(
+        &self,
+        title: &str,
+        viewer: &KbViewer,
+    ) -> Result<Option<KbNote>, Box<dyn Error>> {
+        let v = self.call(
+            "kb_get_by_title",
+            serde_json::json!({"title": title, "viewer": viewer}),
+        )?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn kb_search(
+        &self,
+        query: &str,
+        viewer: &KbViewer,
+        tag: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<KbHit>, Box<dyn Error>> {
+        let v = self.call(
+            "kb_search",
+            serde_json::json!({"query": query, "viewer": viewer, "tag": tag, "limit": limit}),
+        )?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn kb_list(
+        &self,
+        viewer: &KbViewer,
+        tag: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<KbNote>, Box<dyn Error>> {
+        let v = self.call(
+            "kb_list",
+            serde_json::json!({"viewer": viewer, "tag": tag, "limit": limit}),
+        )?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn kb_delete(&self, id: i64, viewer: &KbViewer) -> Result<bool, Box<dyn Error>> {
+        let v = self.call("kb_delete", serde_json::json!({"id": id, "viewer": viewer}))?;
         Ok(serde_json::from_value(v)?)
     }
 

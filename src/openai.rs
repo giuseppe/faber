@@ -850,7 +850,10 @@ fn tool_access(name: &str, arguments: &str) -> ToolAccess {
         | "task_list"
         | "task_get"
         | "task_pending"
-        | "plan_get" => ToolAccess::Independent,
+        | "plan_get"
+        | "kb_search"
+        | "kb_read"
+        | "kb_list" => ToolAccess::Independent,
         _ => ToolAccess::Exclusive,
     }
 }
