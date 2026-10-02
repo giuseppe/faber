@@ -10268,6 +10268,281 @@ mod tests {
         );
     }
 
+    /// A tool context like a chat's, as `agent`, over `db`, with the
+    /// dummy model behind sub-agents.
+    fn chat_ctx(db: Arc<dyn DbBackend>, agent: &str) -> ToolContext {
+        let mut ctx = ToolContext::new(|_: &str| {});
+        ctx.db = Some(db);
+        ctx.agent_name = Some(agent.to_string());
+        ctx.extra = Some(Arc::new(SubAgentContext {
+            tools: Arc::new(initialize_tools(false, None)),
+            opts: openai::Opts {
+                max_tokens: None,
+                model: "dummy".to_string(),
+                endpoint: String::new(),
+                tool_choice: None,
+                api_key: None,
+                max_retries: None,
+                retry_base_delay_secs: None,
+                parameters: Default::default(),
+            },
+            session_id: "test-session".to_string(),
+            active_subagents: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            status_bar: Arc::new(status_bar::StatusBar::new()),
+            session_usage: Arc::new(Mutex::new(SessionUsage::default())),
+        }));
+        ctx
+    }
+
+    fn local_db_with_agents(agents: &[&str]) -> Arc<dyn DbBackend> {
+        let db: Arc<dyn DbBackend> = Arc::new(LocalDb::new(test_db_conn()));
+        for agent in agents {
+            db.create_agent(agent, "").unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn test_spawn_agent_records_its_parent_and_refuses_ancestors() {
+        let db = local_db_with_agents(&["boss"]);
+        let spawn = |as_agent: &str, name: &str| {
+            tool_spawn_agent(
+                &serde_json::json!({"name": name, "prompt": "hi"}).to_string(),
+                &chat_ctx(db.clone(), as_agent),
+            )
+        };
+        spawn("boss", "helper").unwrap();
+        assert_eq!(
+            db.get_agent("helper").unwrap().unwrap().parent.as_deref(),
+            Some("boss")
+        );
+        spawn("helper", "intern").unwrap();
+        assert_eq!(
+            db.get_agent("intern").unwrap().unwrap().parent.as_deref(),
+            Some("helper")
+        );
+        // An agent can't spawn itself or one of the agents above it.
+        let err = spawn("intern", "boss").unwrap_err().to_string();
+        assert!(err.contains("can't be a sub-agent"), "{err}");
+        assert!(spawn("boss", "boss").is_err());
+        assert_eq!(
+            db.get_agent("boss").unwrap().unwrap().parent,
+            None,
+            "left untouched"
+        );
+    }
+
+    #[test]
+    fn test_kb_tools_follow_the_agent_lineage() {
+        let db = local_db_with_agents(&["boss", "helper"]);
+        db.set_agent_parent("helper", Some("boss")).unwrap();
+        let call = |agent: &str, f: ToolCallback, params: serde_json::Value| {
+            f(&params.to_string(), &chat_ctx(db.clone(), agent)).unwrap()
+        };
+        call(
+            "boss",
+            tool_kb_write,
+            serde_json::json!({"title": "Boss plan", "body": "ship friday", "private": true}),
+        );
+        call(
+            "helper",
+            tool_kb_write,
+            serde_json::json!({"title": "Helper scratch", "body": "tried rebasing", "private": true}),
+        );
+
+        // The helper sees the boss's private note; the boss doesn't see the
+        // helper's.
+        let helper_sees = call(
+            "helper",
+            tool_kb_search,
+            serde_json::json!({"query": "friday rebasing"}),
+        );
+        assert!(
+            helper_sees.contains("Boss plan") && helper_sees.contains("Helper scratch"),
+            "{helper_sees}"
+        );
+        let boss_sees = call(
+            "boss",
+            tool_kb_search,
+            serde_json::json!({"query": "friday rebasing"}),
+        );
+        assert!(
+            boss_sees.contains("Boss plan") && !boss_sees.contains("Helper scratch"),
+            "{boss_sees}"
+        );
+        let read = call(
+            "boss",
+            tool_kb_read,
+            serde_json::json!({"title": "helper scratch"}),
+        );
+        assert_eq!(read, "No such note.");
+
+        // The helper's private notes go with it; the boss's stay.
+        db.delete_agent("helper").unwrap();
+        let after = call("boss", tool_kb_list, serde_json::json!({}));
+        assert!(after.contains("Boss plan"), "{after}");
+    }
+
+    #[test]
+    fn test_kb_cli_commands() {
+        let db = local_db_with_agents(&["bot"]);
+        let run = |action: KbAction| kb_command_inner(db.as_ref(), Some(&action), None, 50);
+        run(KbAction::Add {
+            title: "Deploying".to_string(),
+            body: Some("make deploy".to_string()),
+            tags: vec!["ops".to_string()],
+            agent: None,
+        })
+        .unwrap();
+        run(KbAction::Add {
+            title: "Bot notes".to_string(),
+            body: Some("private to the bot".to_string()),
+            tags: vec![],
+            agent: Some("bot".to_string()),
+        })
+        .unwrap();
+        // The user sees every note, private ones included.
+        assert_eq!(db.kb_list(&db::KbViewer::User, None, 10).unwrap().len(), 2);
+        let note = db
+            .kb_get_by_title("deploying", &db::KbViewer::User)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (note.body.as_str(), note.created_by.as_deref()),
+            ("make deploy", Some("user"))
+        );
+        run(KbAction::Show {
+            note: note.id.to_string(),
+        })
+        .unwrap();
+        run(KbAction::Show {
+            note: "bot notes".to_string(),
+        })
+        .unwrap();
+        assert!(
+            run(KbAction::Show {
+                note: "missing".to_string()
+            })
+            .is_err()
+        );
+        run(KbAction::Search {
+            query: "deploy".to_string(),
+            tag: Some("ops".to_string()),
+            limit: 5,
+        })
+        .unwrap();
+
+        let err = run(KbAction::Rm {
+            ids: vec![note.id, 999],
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("1 of 2"), "{err}");
+        assert!(
+            db.kb_get(note.id, &db::KbViewer::User).unwrap().is_none(),
+            "the existing one went"
+        );
+        assert!(
+            run(KbAction::Add {
+                title: "x".to_string(),
+                body: Some("y".to_string()),
+                tags: vec![],
+                agent: Some("nobody".to_string()),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_kb_cli_on_a_database_without_a_knowledge_base() {
+        let path = std::env::temp_dir().join(format!("faber_test_nokb_{}.db", std::process::id()));
+        let path = path.to_str().unwrap().to_string();
+        let _ = std::fs::remove_file(&path);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        db::initialize_db(&conn).unwrap();
+        conn.execute_batch("DROP TABLE kb_fts; DROP TABLE kb_notes;")
+            .unwrap();
+        drop(conn);
+        let db: Option<Arc<dyn DbBackend>> = Some(Arc::new(LocalDb::new(Arc::new(Mutex::new(
+            db::open_read_only(&path).unwrap(),
+        )))));
+        let err = kb_command(&db, None, None, 50).unwrap_err().to_string();
+        assert!(err.contains("no knowledge base yet"), "{err}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_hold_and_release_commands_report_what_they_couldnt_change() {
+        let db = local_db_with_agents(&[]);
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let a = db
+            .create_oneshot_task("a", "", &past, "do a", None)
+            .unwrap();
+        let b = db
+            .create_oneshot_task("b", "", &past, "do b", None)
+            .unwrap();
+        let db = Some(db);
+        hold_tasks_command(&db, &[a, b], true).unwrap();
+        let tasks = db.as_ref().unwrap();
+        assert_eq!(tasks.get_task(a).unwrap().unwrap().status, "held");
+        let err = hold_tasks_command(&db, &[a, 999], true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 of 2"), "{err}");
+        hold_tasks_command(&db, &[a], false).unwrap();
+        assert_eq!(tasks.get_task(a).unwrap().unwrap().status, "scheduled");
+        assert_eq!(tasks.get_task(b).unwrap().unwrap().status, "held");
+        assert!(hold_tasks_command(&db, &[a], false).is_err(), "not on hold");
+    }
+
+    #[test]
+    fn test_prune_command_done_ignores_age_unless_older_than_is_given() {
+        let db = local_db_with_agents(&[]);
+        db.create_agent("default", "").unwrap();
+        assert!(db.claim_agent("default", "s").unwrap());
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let recent = db
+            .create_oneshot_task("recent", "", &past, "x", None)
+            .unwrap();
+        let waiting = db
+            .create_oneshot_task("waiting", "", &past, "x", None)
+            .unwrap();
+        assert!(db.claim_task(recent, "s").unwrap());
+        let ok = db::TaskOutcome {
+            succeeded: true,
+            exit_code: None,
+            result: String::new(),
+        };
+        assert!(db.finish_task(recent, "s", &ok).unwrap());
+        let db = Some(db);
+
+        prune_tasks_command(&db, None, false, false).unwrap();
+        assert!(
+            db.as_ref().unwrap().get_task(recent).unwrap().is_some(),
+            "7d default keeps it"
+        );
+        prune_tasks_command(&db, Some("1d"), true, false).unwrap();
+        assert!(
+            db.as_ref().unwrap().get_task(recent).unwrap().is_some(),
+            "--older-than still applies"
+        );
+        prune_tasks_command(&db, None, true, true).unwrap();
+        assert!(
+            db.as_ref().unwrap().get_task(recent).unwrap().is_some(),
+            "dry run"
+        );
+        prune_tasks_command(&db, None, true, false).unwrap();
+        assert!(
+            db.as_ref().unwrap().get_task(recent).unwrap().is_none(),
+            "--done removes it"
+        );
+        assert!(
+            db.as_ref().unwrap().get_task(waiting).unwrap().is_some(),
+            "never a scheduled one"
+        );
+        assert!(prune_tasks_command(&db, Some("soon"), false, false).is_err());
+    }
+
     #[test]
     fn test_kb_tools_round_trip() {
         let mut ctx = plan_test_ctx();
