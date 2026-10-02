@@ -26,19 +26,35 @@ use std::net::TcpStream;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Both directions of the connection, behind one lock: a request and the
+/// line answering it must be one exchange, or two threads calling at once
+/// could each read the other's response.
+struct Connection {
+    reader: BufReader<TcpStream>,
+    writer: TcpStream,
+    /// Set once a response didn't match its request: what's left on the
+    /// stream can no longer be paired up with requests.
+    desynced: bool,
+}
+
 pub struct RemoteDb {
-    reader: Mutex<BufReader<TcpStream>>,
-    writer: Mutex<TcpStream>,
+    connection: Mutex<Connection>,
     next_id: AtomicU64,
 }
 
 impl RemoteDb {
     pub fn connect(addr: &str) -> Result<Self, Box<dyn Error>> {
         let stream = TcpStream::connect(addr)?;
+        // Small request/response exchanges: don't let Nagle's algorithm
+        // hold a request back waiting for an ACK.
+        stream.set_nodelay(true)?;
         let reader = BufReader::new(stream.try_clone()?);
         Ok(Self {
-            reader: Mutex::new(reader),
-            writer: Mutex::new(stream),
+            connection: Mutex::new(Connection {
+                reader,
+                writer: stream,
+                desynced: false,
+            }),
             next_id: AtomicU64::new(1),
         })
     }
@@ -63,29 +79,31 @@ impl RemoteDb {
             method: method.to_string(),
             params,
         };
-        let request_json = serde_json::to_string(&request)?;
+        // One write per request (see `send_response` in the server).
+        let mut request_line = serde_json::to_string(&request)?;
+        request_line.push('\n');
 
-        let mut writer = self
-            .writer
+        let mut connection = self
+            .connection
             .lock()
-            .map_err(|e| format!("write lock: {}", e))?;
-        writer.write_all(request_json.as_bytes())?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
-        drop(writer);
-
-        let mut reader = self
-            .reader
-            .lock()
-            .map_err(|e| format!("read lock: {}", e))?;
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-
-        let response: RpcResponse = serde_json::from_str(&line)?;
-        if let Some(err) = response.error {
-            return Err(err.into());
+            .map_err(|e| format!("connection lock: {}", e))?;
+        if connection.desynced {
+            return Err("connection to the faber server is out of sync; restart faber".into());
         }
-        Ok(response.result.unwrap_or(serde_json::Value::Null))
+        connection.writer.write_all(request_line.as_bytes())?;
+        connection.writer.flush()?;
+
+        let mut line = String::new();
+        if connection.reader.read_line(&mut line)? == 0 {
+            return Err("the faber server closed the connection".into());
+        }
+        let response: RpcResponse = serde_json::from_str(&line)?;
+        // A null id (the server couldn't parse the request) still answers
+        // this line; only another request's id means the stream is off.
+        if response.id.is_some_and(|response_id| response_id != id) {
+            connection.desynced = true;
+        }
+        Ok(response.into_result(id)?)
     }
 }
 
@@ -368,5 +386,53 @@ impl DbBackend for RemoteDb {
     fn gc_agents(&self) -> Result<Vec<String>, Box<dyn Error>> {
         let v = self.call("gc_agents", serde_json::json!({}))?;
         Ok(serde_json::from_value(v)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// A server that answers every request with the given ids, in turn.
+    fn fake_server(answer_ids: Vec<u64>) -> RemoteDb {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            let mut answer_ids = answer_ids.into_iter();
+            loop {
+                // Read the request before answering - or before hanging up,
+                // so the client sees a clean end of stream, not a reset.
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let Some(id) = answer_ids.next() else { return };
+                let _ = writeln!(writer, r#"{{"id":{},"result":null}}"#, id);
+            }
+        });
+        RemoteDb::connect(&addr.to_string()).unwrap()
+    }
+
+    #[test]
+    fn test_mismatched_response_id_is_an_error_and_stops_the_connection() {
+        let client = fake_server(vec![1, 999, 3]);
+        client.heartbeat_all("s").unwrap();
+        let err = client.heartbeat_all("s").unwrap_err().to_string();
+        assert!(err.contains("doesn't match request id 2"), "{err}");
+        // The server would answer the next one "correctly", but the
+        // stream can't be trusted any more.
+        let err = client.heartbeat_all("s").unwrap_err().to_string();
+        assert!(err.contains("out of sync"), "{err}");
+    }
+
+    #[test]
+    fn test_closed_connection_is_an_error() {
+        let client = fake_server(vec![]);
+        let err = client.heartbeat_all("s").unwrap_err().to_string();
+        assert!(err.contains("closed the connection"), "{err}");
     }
 }
