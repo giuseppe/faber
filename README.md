@@ -308,6 +308,8 @@ faber --db-path state.db tasks --since 2h   # active in the last 2 hours (also 3
 faber --db-path state.db tasks --since 2026-10-01 --agent mybot
 faber --db-path state.db tasks --watch      # redraw every 2s until Ctrl-C (--watch=N for N seconds)
 faber --db-path state.db tasks --board --watch   # as a board, one column per state
+faber --db-path state.db tasks show 7       # everything about task #7: full command, times, last result
+faber --db-path state.db tasks show 7 --json
 ```
 
 `--board` shows the tasks as cards in four columns - **Scheduled**

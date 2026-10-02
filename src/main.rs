@@ -7817,6 +7817,107 @@ fn new_task_from_cli(
     })
 }
 
+/// Everything about `task`, for `faber tasks show`: one labelled line per
+/// field, times both absolute (local) and relative to `now`, and the full
+/// command and last result indented below.
+fn describe_task(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> String {
+    let time = |t: &Option<String>| match t.as_deref() {
+        None => "-".to_string(),
+        Some(text) => match db::parse_db_time(text) {
+            Some(t) => format!(
+                "{} ({})",
+                t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S"),
+                format_relative(t, now)
+            ),
+            None => text.to_string(),
+        },
+    };
+    let schedule = match (&task.cron_expression, &task.run_at) {
+        (Some(cron), _) => format!("cron \"{}\"", cron),
+        (None, Some(at)) => format!("once, at {}", time(&Some(at.clone()))),
+        (None, None) => "-".to_string(),
+    };
+    let runs = match task.max_runs {
+        Some(max) => format!("{} of at most {}", task.run_count, max),
+        None => task.run_count.to_string(),
+    };
+    let who = match (task.kind.as_str(), &task.agent_name) {
+        (db::TaskKind::PROMPT, None) => "any agent".to_string(),
+        (_, None) => "-".to_string(),
+        (_, Some(agent)) => agent.clone(),
+    };
+    let outcome = match task.last_outcome.as_deref() {
+        Some(outcome) => match task.last_exit_code {
+            Some(code) => format!("{} (exit code {})", outcome, code),
+            None => outcome.to_string(),
+        },
+        None => "-".to_string(),
+    };
+    let fields: Vec<(&str, String)> = vec![
+        ("Name", task.name.clone()),
+        ("Kind", task.kind.clone()),
+        ("Status", task.status.clone()),
+        ("Agent", who),
+        ("Schedule", schedule),
+        (
+            "Next run",
+            if task.status == db::TaskStatus::SCHEDULED {
+                time(&task.next_run_at)
+            } else {
+                "-".to_string()
+            },
+        ),
+        ("Runs", runs),
+        ("Created", time(&Some(task.created_at.clone()))),
+        ("Started", time(&task.started_at)),
+        ("Last run", time(&task.last_run_at)),
+        (
+            "Claimed by",
+            task.claimed_by.clone().unwrap_or_else(|| "-".to_string()),
+        ),
+        ("Last outcome", outcome),
+    ];
+    let indent = |text: &str| {
+        text.lines()
+            .map(|l| format!("    {}", l))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut out = format!("Task #{}\n", task.id);
+    for (label, value) in fields {
+        out.push_str(&format!("  {:<14}{}\n", format!("{}:", label), value));
+    }
+    if !task.description.trim().is_empty() {
+        out.push_str(&format!(
+            "\nDescription:\n{}\n",
+            indent(task.description.trim())
+        ));
+    }
+    out.push_str(&format!("\nCommand:\n{}\n", indent(task.command.trim())));
+    if let Some(result) = task.last_result.as_deref().filter(|r| !r.trim().is_empty()) {
+        out.push_str(&format!("\nLast result:\n{}\n", indent(result.trim())));
+    }
+    out
+}
+
+/// `faber tasks show`: prints everything about one task.
+fn show_task_command(
+    db: &Option<Arc<dyn DbBackend>>,
+    id: i64,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let db = db.as_ref().ok_or(
+        "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
+    )?;
+    let task = db.get_task(id)?.ok_or_else(|| format!("no task #{}", id))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&task)?);
+    } else {
+        print!("{}", describe_task(&task, chrono::Utc::now()));
+    }
+    Ok(())
+}
+
 /// `faber tasks prune`: deletes (or with `dry_run` lists) done tasks whose
 /// last run is older than `older_than`.
 fn prune_tasks_command(
@@ -8402,6 +8503,15 @@ fn parse_mcp_server_flag(
 
 #[derive(Debug, Subcommand)]
 enum TasksAction {
+    /// Show everything about one task: its full command, schedule, state
+    /// and the full result of its last run
+    Show {
+        /// The task's id, as `faber tasks` lists it
+        id: i64,
+        /// Print the task as JSON instead
+        #[clap(long)]
+        json: bool,
+    },
     /// Delete done tasks whose last run is older than --older-than (7d by
     /// default), or all of them with --done. Scheduled, running and
     /// disabled tasks are never deleted
@@ -8602,7 +8712,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(Arc::new(remote))
     } else if let Some(ref db_path) = opts.db_path {
         debug!("Opening SQLite database at: {}", db_path);
-        let conn = if matches!(opts.command, CliCommand::Tasks { action: None, .. }) {
+        let conn = if matches!(
+            opts.command,
+            CliCommand::Tasks {
+                action: None | Some(TasksAction::Show { .. }),
+                ..
+            }
+        ) {
             // Only looks: never create or migrate a database for it.
             db::open_read_only(db_path)?
         } else {
@@ -8656,6 +8772,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }),
             ..
         } => prune_tasks_command(&db_connection, older_than.as_deref(), *done, *dry_run),
+        CliCommand::Tasks {
+            action: Some(TasksAction::Show { id, json }),
+            ..
+        } => show_task_command(&db_connection, *id, *json),
         CliCommand::Tasks {
             action: Some(action),
             ..
@@ -9492,6 +9612,42 @@ mod tests {
         assert!(
             widths.windows(2).all(|w| w[0] == w[1]),
             "cards are ragged: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn test_describe_task_shows_every_field_in_full() {
+        let now = utc("2026-10-02T12:00:00Z");
+        let mut task = task_row(7, "2026-10-01 10:00:00", Some("2026-10-02T11:00:00Z"));
+        task.name = "nightly".to_string();
+        task.kind = "prompt".to_string();
+        task.status = "scheduled".to_string();
+        task.cron_expression = Some("0 0 3 * * * *".to_string());
+        task.next_run_at = Some("2026-10-03T03:00:00Z".to_string());
+        task.run_count = 2;
+        task.max_runs = Some(5);
+        task.last_outcome = Some("failed".to_string());
+        task.last_exit_code = Some(2);
+        task.command = "Summarize the day.\nKeep it short.".to_string();
+        task.last_result = Some("line one\nline two".to_string());
+        let text = describe_task(&task, now);
+        for expected in [
+            "Task #7",
+            "Name:         nightly",
+            "Kind:         prompt",
+            "Agent:        any agent",
+            "Schedule:     cron \"0 0 3 * * * *\"",
+            "(in 15h)",
+            "Runs:         2 of at most 5",
+            "Last outcome: failed (exit code 2)",
+            "Command:\n    Summarize the day.\n    Keep it short.",
+            "Last result:\n    line one\n    line two",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+        assert!(
+            !text.contains("Description:"),
+            "empty description is left out"
         );
     }
 
