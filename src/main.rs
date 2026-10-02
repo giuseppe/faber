@@ -7131,6 +7131,8 @@ fn chat_command(
     chat_pb.set_printer(Box::new(rl.create_external_printer()?));
 
     let prompt_text_clone = prompt_text.clone();
+    let ctrl_c_tx_for_input = ctrl_c_tx.clone();
+    let turn_running = signal_handler_active.clone();
     std::thread::spawn(move || {
         loop {
             if ready_rx.recv().is_err() {
@@ -7141,6 +7143,16 @@ fn chat_command(
                 .map(|p| p.clone())
                 .unwrap_or_else(|_| "> ".to_string());
             let result = rl.readline(&prompt);
+            // A turn can start while the prompt is still up - a scheduled
+            // task or another agent's message, injected while idle - and
+            // then the terminal is in rustyline's raw mode, where Ctrl-C
+            // is a key it reads rather than a signal. Pass it on as one, so
+            // it interrupts the turn as it would a typed message's.
+            if matches!(result, Err(rustyline::error::ReadlineError::Interrupted))
+                && turn_running.load(Ordering::Relaxed)
+            {
+                let _ = ctrl_c_tx_for_input.send(());
+            }
             let is_eof = matches!(result, Err(rustyline::error::ReadlineError::Eof));
             let _ = input_tx.send(result);
             if is_eof {
@@ -7371,6 +7383,9 @@ fn chat_command(
                             &status_bar,
                             &chat_pb,
                         );
+                        // Interruptible with Ctrl-C like a typed message: a
+                        // scheduled task or an agent's message can run as long.
+                        let injected_agent_name = active_agent.name.clone();
                         let result = request_with_summary_fallback(
                             &mut active_agent,
                             &openai_opts,
@@ -7380,17 +7395,22 @@ fn chat_command(
                             &status_bar,
                             &chat_pb,
                             |messages| {
-                                post_request_with_mode(
+                                execute_ai_request(
                                     messages,
                                     &tools,
                                     &openai_opts,
                                     ResponseMode::Complete,
                                     &tool_context,
-                                    None,
+                                    Some(ctrl_c_rx.clone()),
+                                    &signal_handler_active,
+                                    &status_bar,
+                                    &chat_pb,
+                                    &injected_agent_name,
                                 )
                             },
                         );
-                        if let (Some(task_id), Some(db)) = (running_prompt_task.take(), &db) {
+                        let task_turn = running_prompt_task.take();
+                        if let (Some(task_id), Some(db)) = (task_turn, &db) {
                             let outcome = prompt_task_outcome(result.as_ref());
                             if let Err(e) = db.finish_task(task_id, &session_id, &outcome) {
                                 warn!("Couldn't record the outcome of task {}: {}", task_id, e);
@@ -7442,8 +7462,15 @@ fn chat_command(
                             }
                             Err(e) => {
                                 if e.downcast_ref::<InterruptedError>().is_none() {
-                                    chat_pb
-                                        .println(&format!("Error processing notification: {}", e));
+                                    chat_pb.println(&match task_turn {
+                                        Some(task_id) => {
+                                            format!(
+                                                "Error running scheduled task #{}: {}",
+                                                task_id, e
+                                            )
+                                        }
+                                        None => format!("Error processing notification: {}", e),
+                                    });
                                 }
                             }
                         }
