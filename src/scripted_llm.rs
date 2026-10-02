@@ -164,6 +164,11 @@ pub fn post_request_scripted(
     let mut request = 0;
     loop {
         request += 1;
+        if ctx.max_requests.is_some_and(|limit| request > limit) {
+            return Err(crate::openai::request_budget_error(
+                ctx.max_requests.unwrap_or(0),
+            ));
+        }
         check_interrupted(&ctrl_c_rx)?;
         report(&mode, StatusUpdate::Thinking, start)?;
         let last = messages

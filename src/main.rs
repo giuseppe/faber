@@ -137,11 +137,38 @@ fn estimate_cost_usd(usage: &SessionUsage, pricing: &openai::Pricing) -> Option<
     )
 }
 
+/// A sub-agent running in this session, and how to stop it.
+struct RunningSubAgent {
+    cancel: mpsc::Sender<()>,
+    /// Why it was stopped, for the result its parent gets.
+    stop_reason: Arc<Mutex<Option<String>>>,
+}
+
+/// The sub-agents running in this session, by name.
+type RunningSubAgents = Arc<Mutex<HashMap<String, RunningSubAgent>>>;
+
+/// Stops the running sub-agent `name`, recording `reason` (unless it was
+/// already stopped for another). Returns whether one was running.
+fn stop_sub_agent(running: &RunningSubAgents, name: &str, reason: &str) -> bool {
+    let running = running.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(agent) = running.get(name) else {
+        return false;
+    };
+    agent
+        .stop_reason
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(|| reason.to_string());
+    let _ = agent.cancel.send(());
+    true
+}
+
 struct SubAgentContext {
     tools: Arc<ToolsCollection>,
     opts: openai::Opts,
     session_id: String,
     active_subagents: Arc<std::sync::atomic::AtomicUsize>,
+    running_subagents: RunningSubAgents,
     status_bar: Arc<status_bar::StatusBar>,
     /// Sub-agents' and fan-out workers' tokens count toward `/cost` too.
     session_usage: Arc<Mutex<SessionUsage>>,
@@ -164,6 +191,9 @@ const CHAT_COMMANDS: &[&str] = &[
     "/tools",
     "/chdir",
     "/pwd",
+    "/cost",
+    "/plan",
+    "/cancel",
 ];
 
 /// Directory-completion candidates for `/chdir`'s in-progress path argument.
@@ -2884,15 +2914,56 @@ fn tool_send_message(params_str: &String, ctx: &ToolContext) -> Result<String, B
     Ok(result.to_string())
 }
 
+/// entrypoint for the agent_cancel tool: stops a running sub-agent the
+/// caller started, directly or through its own sub-agents.
+fn tool_agent_cancel(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        name: String,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let sa_ctx = ctx
+        .extra
+        .as_ref()
+        .and_then(|e| e.downcast_ref::<SubAgentContext>())
+        .ok_or("Sub-agent context not configured")?;
+    let caller = ctx.agent_name.as_deref().unwrap_or("default");
+    let lineage = ctx.db()?.agent_lineage(&params.name)?;
+    if params.name == caller || !lineage.iter().any(|a| a == caller) {
+        return Err(format!(
+            "can only cancel sub-agents you started (or they did); '{}' isn't one",
+            params.name
+        )
+        .into());
+    }
+    if !stop_sub_agent(
+        &sa_ctx.running_subagents,
+        &params.name,
+        &format!("cancelled by {}", caller),
+    ) {
+        return Err(format!("no sub-agent named '{}' is running", params.name).into());
+    }
+    ctx.println(&format!("Cancelling sub-agent '{}'", params.name));
+    Ok(serde_json::json!({"cancelled": params.name}).to_string())
+}
+
 /// How deep sub-agents may nest: a sub-agent of a sub-agent of ... - so a
 /// task that keeps delegating ends instead of recursing forever.
 const MAX_AGENT_DEPTH: usize = 8;
 
 fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Params {
         name: String,
         prompt: String,
+        /// Stop it if it's still working after this long.
+        #[serde(default)]
+        timeout_seconds: Option<u64>,
+        /// Stop it once it has made this many requests to the model.
+        #[serde(default)]
+        max_requests: Option<usize>,
     }
     let params: Params = serde_json::from_str(params_str)?;
 
@@ -2909,6 +2980,14 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
 
     let agent_name = params.name.clone();
     let prompt = params.prompt.clone();
+    if sa_ctx
+        .running_subagents
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&agent_name)
+    {
+        return Err(format!("a sub-agent named '{}' is already running", agent_name).into());
+    }
 
     let agent_config = {
         if db.get_agent(&agent_name)?.is_none() {
@@ -2961,6 +3040,36 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         agent_ansi_code(&agent_name_for_status),
     );
 
+    let (cancel_tx, cancel_rx) = mpsc::channel();
+    let stop_reason = Arc::new(Mutex::new(None));
+    let running = sa_ctx.running_subagents.clone();
+    running.lock().unwrap_or_else(|e| e.into_inner()).insert(
+        agent_name.clone(),
+        RunningSubAgent {
+            cancel: cancel_tx,
+            stop_reason: stop_reason.clone(),
+        },
+    );
+    if let Some(timeout) = params.timeout_seconds {
+        let running = running.clone();
+        let name = agent_name.clone();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(timeout);
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+                if !running
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&name)
+                {
+                    return; // finished in time
+                }
+            }
+            stop_sub_agent(&running, &name, &format!("timed out after {}s", timeout));
+        });
+    }
+    let max_requests = params.max_requests;
+
     let session_id_for_sub = sa_ctx.session_id.clone();
     let mcp_for_sub = ctx.mcp_manager.clone();
     // The sub-agent gets the same machinery, so it can spawn its own.
@@ -2972,12 +3081,17 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         struct SubAgentGuard {
             status_bar: Arc<status_bar::StatusBar>,
             counter: Arc<std::sync::atomic::AtomicUsize>,
+            running: RunningSubAgents,
             db: Arc<dyn DbBackend>,
             name: String,
             session_id: String,
         }
         impl Drop for SubAgentGuard {
             fn drop(&mut self) {
+                self.running
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&self.name);
                 self.status_bar.clear_agent_status(&self.name);
                 self.counter
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -2987,6 +3101,7 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         let _guard = SubAgentGuard {
             status_bar: sub_status_bar,
             counter: active_counter,
+            running,
             db: db.clone(),
             name: agent_name_for_status,
             session_id: session_id_for_sub,
@@ -2998,13 +3113,14 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         sub_ctx.mcp_manager = mcp_for_sub;
         sub_ctx.context_window = context_window;
         sub_ctx.extra = extra_for_sub;
+        sub_ctx.max_requests = max_requests;
         let result = post_request_with_mode(
             messages,
             &tools,
             &agent_opts,
             ResponseMode::Complete,
             &sub_ctx,
-            None,
+            Some(Arc::new(Mutex::new(cancel_rx))),
         );
         if let Some(usage) = result.as_ref().ok().and_then(|r| r.turn_usage.as_ref()) {
             session_usage
@@ -3012,7 +3128,17 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
                 .unwrap_or_else(|e| e.into_inner())
                 .record(usage);
         }
-        let response_text = final_response_text(result).unwrap_or_else(|e| format!("Error: {}", e));
+        let response_text = match result {
+            Err(e) if e.downcast_ref::<InterruptedError>().is_some() => format!(
+                "Stopped: {}",
+                stop_reason
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                    .unwrap_or_else(|| "cancelled".to_string())
+            ),
+            result => final_response_text(result).unwrap_or_else(|e| format!("Error: {}", e)),
+        };
         let notification = serde_json::json!({
             "type": "subagent_result",
             "agent": agent_name,
@@ -4229,12 +4355,44 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "prompt": {
                             "type": "string",
                             "description": "The task or question for the sub-agent to work on"
+                        },
+                        "timeout_seconds": {
+                            "type": "integer",
+                            "description": "Stop it if it's still working after this many seconds"
+                        },
+                        "max_requests": {
+                            "type": "integer",
+                            "description": "Stop it once it has made this many requests to the model"
                         }
                     },
                     "required": [
                         "name",
                         "prompt"
                     ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "agent_cancel".to_string(),
+        tool_agent_cancel,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "agent_cancel",
+                "description": "Stop a running sub-agent you started (directly, or through your sub-agents). Its result then says it was cancelled.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "The sub-agent's name"}
+                    },
+                    "required": ["name"],
                     "additionalProperties": false
                 }
             }
@@ -4542,6 +4700,7 @@ enum ChatCommand {
     Pwd,
     Cost,
     Plan,
+    Cancel(String),
     Message(String),
     Empty,
     Invalid(String),
@@ -4664,6 +4823,13 @@ fn parse_chat_command(line: &str) -> ChatCommand {
     if normalized == "/plan" {
         return ChatCommand::Plan;
     }
+    if let Some(name) = normalized.strip_prefix("/cancel") {
+        let name = name.trim();
+        if name.is_empty() {
+            return ChatCommand::Invalid("Usage: /cancel <sub-agent>".to_string());
+        }
+        return ChatCommand::Cancel(name.to_string());
+    }
 
     if normalized.starts_with('/') {
         return ChatCommand::Invalid(format!("Unknown command: {}", normalized));
@@ -4725,6 +4891,7 @@ fn handle_chat_command(
     status_bar: &status_bar::StatusBar,
     session_usage: &Arc<Mutex<SessionUsage>>,
     model_pricing: &Arc<Mutex<Option<openai::Pricing>>>,
+    running_subagents: &RunningSubAgents,
 ) -> Result<bool, Box<dyn Error>> {
     let messages = &mut active_agent.messages;
     match command {
@@ -4748,6 +4915,7 @@ fn handle_chat_command(
             chat_pb.println("  /pwd                   Show the current working directory");
             chat_pb.println("  /cost                  Show session token usage and estimated cost");
             chat_pb.println("  /plan                  Show the current agent's plan");
+            chat_pb.println("  /cancel <sub-agent>    Stop a running sub-agent");
             Ok(true)
         }
         ChatCommand::Quit => Ok(false),
@@ -5107,6 +5275,14 @@ fn handle_chat_command(
                 None => chat_pb.println(
                     "  Estimated cost:    unknown (couldn't fetch pricing for this model/endpoint)",
                 ),
+            }
+            Ok(true)
+        }
+        ChatCommand::Cancel(name) => {
+            if stop_sub_agent(running_subagents, &name, "cancelled by the user") {
+                chat_pb.println(&format!("Cancelling sub-agent '{}'...", name));
+            } else {
+                chat_pb.println(&format!("No sub-agent named '{}' is running.", name));
             }
             Ok(true)
         }
@@ -6416,6 +6592,7 @@ fn chat_command(
         chrono::Utc::now().timestamp_millis()
     );
     let active_subagents = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let running_subagents: RunningSubAgents = Arc::new(Mutex::new(HashMap::new()));
     let initial_agent_name = opts.agent.clone().unwrap_or_else(|| "default".to_string());
 
     let agent_config = if let Some(ref db) = db {
@@ -6762,6 +6939,7 @@ fn chat_command(
             &status_bar,
             &session_usage,
             &model_pricing,
+            &running_subagents,
         ) {
             Ok(handled) => handled,
             Err(e) => {
@@ -6802,6 +6980,7 @@ fn chat_command(
                         opts: openai_opts.clone(),
                         session_id: session_id.to_string(),
                         active_subagents: active_subagents.clone(),
+                        running_subagents: running_subagents.clone(),
                         status_bar: status_bar.clone(),
                         session_usage: session_usage.clone(),
                     }));
@@ -10319,6 +10498,7 @@ mod tests {
             opts: script_opts(model),
             session_id: "test-session".to_string(),
             active_subagents: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            running_subagents: Arc::new(Mutex::new(HashMap::new())),
             status_bar: Arc::new(status_bar::StatusBar::new()),
             session_usage: Arc::new(Mutex::new(SessionUsage::default())),
         }));
@@ -10443,6 +10623,110 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         false
+    }
+
+    /// The result `parent` got from its sub-agent `agent`, waiting for it.
+    fn sub_agent_result(db: &Arc<dyn DbBackend>, parent: &str, agent: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            db.heartbeat_all("test-session").unwrap();
+            for notification in db.poll_notifications_for_session("test-session").unwrap() {
+                let message: serde_json::Value =
+                    serde_json::from_str(&notification.message).unwrap();
+                if notification.to_agent == parent && message["agent"] == agent {
+                    return message["response"].as_str().unwrap().to_string();
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("no result from {agent}");
+    }
+
+    fn spawning_setup(name: &str, rules: serde_json::Value) -> (Arc<dyn DbBackend>, ToolContext) {
+        let model = model_script(name, rules);
+        let db = local_db_with_agents(&["boss", "bystander"]);
+        assert!(db.claim_agent("boss", "test-session").unwrap());
+        let ctx = chat_ctx_with_model(db.clone(), "boss", &model);
+        (db, ctx)
+    }
+
+    #[test]
+    fn test_agent_cancel_stops_a_sub_agent_and_says_so() {
+        let (db, ctx) = spawning_setup(
+            "cancel",
+            serde_json::json!([{"if": "slow job", "reply": "done", "delay_ms": 30000}]),
+        );
+        let spawn = serde_json::json!({"name": "worker", "prompt": "slow job"}).to_string();
+        tool_spawn_agent(&spawn, &ctx).unwrap();
+        assert!(
+            tool_spawn_agent(&spawn, &ctx)
+                .unwrap_err()
+                .to_string()
+                .contains("already running")
+        );
+
+        // Only the agent that started it (or one above it) may cancel it.
+        let bystander = chat_ctx(db.clone(), "bystander");
+        let err = tool_agent_cancel(&r#"{"name":"worker"}"#.to_string(), &bystander).unwrap_err();
+        assert!(err.to_string().contains("can only cancel"), "{err}");
+
+        let started = std::time::Instant::now();
+        tool_agent_cancel(&r#"{"name":"worker"}"#.to_string(), &ctx).unwrap();
+        assert_eq!(
+            sub_agent_result(&db, "boss", "worker"),
+            "Stopped: cancelled by boss"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(eventually(|| tool_agent_cancel(
+            &r#"{"name":"worker"}"#.to_string(),
+            &ctx
+        )
+        .is_err_and(|e| e.to_string().contains("no sub-agent named"))));
+    }
+
+    #[test]
+    fn test_sub_agent_timeout() {
+        let (db, ctx) = spawning_setup(
+            "timeout",
+            serde_json::json!([{"if": "slow job", "reply": "done", "delay_ms": 30000}]),
+        );
+        tool_spawn_agent(
+            &serde_json::json!({"name": "slowpoke", "prompt": "slow job", "timeout_seconds": 1})
+                .to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            sub_agent_result(&db, "boss", "slowpoke"),
+            "Stopped: timed out after 1s"
+        );
+    }
+
+    #[test]
+    fn test_sub_agent_request_budget() {
+        // A sub-agent that would call tools forever.
+        let (db, ctx) = spawning_setup(
+            "budget",
+            serde_json::json!([{"tool": "glob", "arguments": {"pattern": "Cargo.toml"}}]),
+        );
+        tool_spawn_agent(
+            &serde_json::json!({"name": "looper", "prompt": "go", "max_requests": 3}).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        let result = sub_agent_result(&db, "boss", "looper");
+        assert!(result.contains("budget of 3 requests"), "{result}");
+    }
+
+    #[test]
+    fn test_parse_chat_command_cancel() {
+        assert!(
+            matches!(parse_chat_command("/cancel worker"), ChatCommand::Cancel(n) if n == "worker")
+        );
+        assert!(matches!(
+            parse_chat_command("/cancel"),
+            ChatCommand::Invalid(_)
+        ));
     }
 
     #[test]

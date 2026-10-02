@@ -75,6 +75,7 @@ faber --db-path state.db --agent mybot chat  # start as a specific agent
 | `/pwd` | Show the current working directory |
 | `/cost` | Show session token usage and estimated cost |
 | `/plan` | Show the current agent's plan (see `plan_update`) |
+| `/cancel <name>` | Stop a running sub-agent |
 
 Commands can also use `\` as the prefix (e.g. `\quit`).
 
@@ -210,7 +211,16 @@ The model sets or clears them with the `agent_configure` tool, and
 
 The `spawn_agent` tool launches a sub-agent in a background thread.
 Sub-agents run independently and deliver their result as a notification
-when complete. Multiple sub-agents can run concurrently.
+when complete. Multiple sub-agents can run concurrently, and a sub-agent
+can spawn its own, up to 8 levels deep.
+
+A sub-agent can be given a budget: `timeout_seconds` stops it if it's still
+working after that long, and `max_requests` once it has made that many
+requests to the model. It can also be stopped on demand - by the agent
+that started it (or one above it) with the `agent_cancel` tool, or by you
+with `/cancel NAME` in the chat. A stopped sub-agent still reports back,
+saying why: "Stopped: timed out after 60s", "Stopped: cancelled by the
+user", and so on.
 
 The terminal status bar cycles through active sub-agents, showing each
 one's name, status, and elapsed time. A `(+N more)` suffix indicates
@@ -439,7 +449,8 @@ that agent.
 | `task_list` | List tasks (all, an agent's, or only the due ones), or get one by id |
 | `task_set_enabled` | Enable or disable a task |
 | `send_message` | Send a message to another agent |
-| `spawn_agent` | Spawn a sub-agent for parallel work |
+| `spawn_agent` | Spawn a sub-agent for parallel work, optionally with a `timeout_seconds` or `max_requests` budget |
+| `agent_cancel` | Stop a running sub-agent you started |
 | `fan_out` | Run the same task for many items (e.g. files) at once, one worker agent each, at most `max_parallel` at a time (default 32, up to 256; up to 1000 items), and return all the results together, in item order, once every worker is done. `{item}` in the prompt is replaced by each worker's item. Workers only get read-only tools (`read_file`, `glob`, `grep_in_current_directory`, `lsp`, web/GitHub reads) unless `tools` names others - workers that write can overwrite each other's changes - and can't spawn agents. Ctrl-C stops every worker. Each result gets a share of the output cap |
 | `run_command` | Execute a command, sandboxed with [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`): no network access, no capabilities, a cleared environment, a read-only root with only the current directory writable, its own PID/IPC/UTS/cgroup namespaces (no visibility into other processes or the host's hostname), killed if faber itself dies, and detached from the controlling terminal. Requires `bwrap` to be installed; use `--unsafe-tools` for unrestricted execution instead |
 
