@@ -241,6 +241,12 @@ fn dispatch_inner(
             let v = db::get_agent_config(&conn, str_param!("agent_name"))?;
             Ok(serde_json::to_value(v)?)
         }
+        "set_agent_config" => {
+            let config: db::AgentConfig = serde_json::from_value(p["config"].clone())
+                .map_err(|e| format!("bad param 'config': {}", e))?;
+            db::set_agent_config(&conn, str_param!("agent_name"), &config)?;
+            Ok(serde_json::json!(true))
+        }
         "save_agent_messages" => {
             let msgs = p["messages"].as_array().ok_or("missing param 'messages'")?;
             db::save_agent_messages(&conn, str_param!("agent_name"), msgs)?;
@@ -325,6 +331,15 @@ fn dispatch_inner(
         "set_task_held" => {
             let held = p["held"].as_bool().ok_or("missing param 'held'")?;
             let v = db::set_task_held(&conn, i64_param!("task_id"), held)?;
+            Ok(serde_json::to_value(v)?)
+        }
+        "set_task_target" => {
+            let v = db::set_task_target(
+                &conn,
+                i64_param!("task_id"),
+                opt_str_param!("agent"),
+                opt_str_param!("profile"),
+            )?;
             Ok(serde_json::to_value(v)?)
         }
         "get_pending_tasks" => {
@@ -486,6 +501,51 @@ mod tests {
         );
         assert!(client.kb_delete(id, &viewer).unwrap());
         assert!(client.kb_get(id, &db::KbViewer::User).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_agent_config_and_task_targets_over_a_remote_connection() {
+        let client = connected_client();
+        client.create_agent("bob", "").unwrap();
+        let config = db::AgentConfig {
+            model: Some("qwen".to_string()),
+            max_tokens: Some(512),
+            tools: Some(vec!["read_file".to_string()]),
+            profile: Some("fast".to_string()),
+            ..Default::default()
+        };
+        client.set_agent_config("bob", &config).unwrap();
+        assert_eq!(client.get_agent_config("bob").unwrap(), config);
+
+        let at = chrono::Utc::now().to_rfc3339();
+        let id = client
+            .create_task(&db::NewTask {
+                name: "t".to_string(),
+                description: String::new(),
+                kind: db::TaskKind::PROMPT.to_string(),
+                command: "do it".to_string(),
+                agent_name: None,
+                schedule: db::TaskSchedule::Once { at },
+                held: false,
+                depends_on: Vec::new(),
+                profile: Some("fast".to_string()),
+            })
+            .unwrap();
+        assert_eq!(
+            client.get_task(id).unwrap().unwrap().profile.as_deref(),
+            Some("fast")
+        );
+        assert!(client.set_task_target(id, Some("bob"), None).unwrap());
+        assert!(
+            client
+                .set_task_target(id, Some("bob"), Some("fast"))
+                .is_err()
+        );
+        let task = client.get_task(id).unwrap().unwrap();
+        assert_eq!(
+            (task.agent_name.as_deref(), task.profile),
+            (Some("bob"), None)
+        );
     }
 
     #[test]

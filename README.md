@@ -196,16 +196,72 @@ endpoint. Agents are stored in the SQLite database.
 
 ### Per-agent configuration
 
-Set agent-specific configuration via the `agent_data` key-value store:
+Each agent can have its own settings, over the session's, kept in the
+`agent_data` key-value store:
 
 ```
-config:model       - Override the model for this agent
-config:endpoint    - Override the API endpoint
-config:system_prompt - Custom system prompt
+config:model          - the model
+config:endpoint       - the API endpoint
+config:system_prompt  - added to its system prompt
+config:api_key        - file holding the API key
+config:max_tokens     - maximum tokens to generate
+config:context_window - the model's context window
+config:parameters     - request parameters (JSON), over --parameter's
+config:tools          - the only tools it may use (JSON list), of the session's
+config:profile        - the profile it was made from, if any
 ```
 
-The model sets or clears them with the `agent_configure` tool, and
-`agent_get` shows them.
+The model sets or clears the model, endpoint and system prompt with the
+`agent_configure` tool, or replaces them all with a profile's; `agent_get`
+and `faber agents show NAME` show them.
+
+### Profiles
+
+A profile is a named set of agent settings in the config file, to make
+any number of agents with the same endpoint, model, effort and so on:
+
+```json
+{
+  "profiles": {
+    "fast": {
+      "description": "quick, cheap checks",
+      "endpoint": "http://gpu1:8080/v1",
+      "model": "qwen3",
+      "parameters": {"reasoning_effort": "low", "temperature": 0.2},
+      "max_tokens": 4096,
+      "tools": ["read_file", "glob", "grep_in_current_directory", "report_result"]
+    },
+    "deep": {
+      "model": "deepseek-r1",
+      "api_key": "/home/me/.keys/deepseek",
+      "parameters": {"reasoning_effort": "high"},
+      "context_window": 128000,
+      "system_prompt": "Think it through before answering."
+    }
+  }
+}
+```
+
+Every field is optional: what a profile doesn't set comes from the
+session (or, for a sub-agent, from the agent that started it). `tools`
+lists built-in tools by name, and only narrows: a profile never gives an
+agent a tool its session doesn't have, such as unsafe ones without
+`--unsafe-tools`. `faber profiles` lists them.
+
+An agent made from a profile gets a **copy** of its settings, so changing
+the profile later doesn't change agents already made from it. Agents are
+made from a profile by:
+
+- `spawn_agent` with `profile` - a new sub-agent;
+- `fan_out` with `profile` - every worker runs with its settings;
+- `agent_create` with `profile`, and `agent_configure` with `profile` to
+  re-copy one onto an existing agent;
+- `faber --agent NAME --profile fast chat` - the chat's agent, made from it
+  (or re-copied, if it exists);
+- a task bound to the profile (see [Choosing where a task runs](#choosing-where-a-task-runs)).
+
+The model is told which profiles there are, with their descriptions,
+models and parameters, so it can pick one.
 
 ### Sub-agents
 
@@ -273,8 +329,8 @@ The terminal status bar cycles through active sub-agents, showing each
 one's name, status, and elapsed time. A `(+N more)` suffix indicates
 how many additional agents are running.
 
-Sub-agents are automatically cleaned up when they finish: the agent
-entry is deleted from the database and the status bar entry is removed.
+A sub-agent's status bar entry is removed when it finishes; the agent
+itself stays until `faber gc`.
 
 ### Inter-agent messaging
 
@@ -387,6 +443,33 @@ Only a `scheduled` task can be held (a running one is already assigned)
 and only a held one released; `faber tasks` shows when a held task would
 run, and the board marks it ✋.
 
+### Choosing where a task runs
+
+A prompt task runs on one of three:
+
+- **an existing agent** (`--agent NAME`, `agent_name`): only a session
+  running that agent - a chat, or `faber worker --agent NAME` - picks it up;
+- **a new agent made from a profile** (`--profile NAME`, `profile`): a
+  `faber worker` whose config file has the profile picks it up, and runs it
+  on a new agent, `<profile>-<task id>`, made from the profile under the
+  worker's agent (kept, with its conversation, until `faber gc`). Chats
+  don't run these;
+- **any agent** (neither): whichever chat or worker is free first.
+
+```bash
+faber tasks add "Review the diff in PR 12" --profile deep
+faber tasks assign 7 8 --profile fast     # move tasks that haven't run yet
+faber tasks assign 7 --agent triage
+faber tasks assign 7 --any
+```
+
+The model does the same with `task_create`'s `profile` and the
+`task_assign` tool. Which workers you start, and with which config files,
+decides where each profile's tasks run - e.g. one machine's config points
+`deep` at a big GPU, and `faber worker --profile deep` there takes only
+those. Until a worker with the profile is running, `faber tasks` shows the
+task as "waiting for a worker".
+
 ### Headless workers
 
 `faber worker` works through tasks without a terminal, as an agent - like
@@ -397,6 +480,10 @@ agent) and running tool tasks:
 faber --db-path state.db worker --agent w1 --parallel 8   # up to 8 tasks at once
 faber --server host:9090 worker                           # as worker-<pid>, against a shared server
 ```
+
+A worker also takes on tasks bound to a profile in its config file - all
+of them, or only those given with `--profile fast,deep` - each on a new
+agent made from it (see [Choosing where a task runs](#choosing-where-a-task-runs)).
 
 Each task gets a fresh conversation (the agent's system prompt, then the
 task), with every tool - including `spawn_agent`, `fan_out` and
@@ -413,6 +500,7 @@ faber --db-path state.db tasks              # every task, most recently active f
 faber --db-path state.db tasks --last 10    # the 10 most recently active
 faber --db-path state.db tasks --since 2h   # active in the last 2 hours (also 30m, 3d, 1w)
 faber --db-path state.db tasks --since 2026-10-01 --agent mybot
+faber --db-path state.db tasks --profile fast   # tasks that run on the fast profile
 faber --db-path state.db tasks --watch      # redraw every 2s until Ctrl-C (--watch=N for N seconds)
 faber --db-path state.db tasks --board --watch   # as a board, one column per state
 faber --db-path state.db tasks show 7       # everything about task #7: full command, times, last result
@@ -426,11 +514,11 @@ the start of the result) - sized to the terminal, at most 10 cards per
 column. `--since`, `--last` and `--agent` work with it too.
 
 ```
- ID | Name           | Agent | Schedule        | Status    | Next run | Last run | Runs | Last result
-----+----------------+-------+-----------------+-----------+----------+----------+------+--------------------------
- 3  | check every 2s | -     | */2 * * * * * * | done      | -        | 6s ago   | 3/3  | ✓ src/main.rs:7966:fn main…
- 2  | broken command | -     | once            | done      | -        | 10s ago  | 1    | ✗ the task's command isn't…
- 4  | nightly report | -     | 0 0 3 * * * *   | scheduled | in 13h   | -        | 0    | -
+ ID | Name           | Runs on | Schedule        | Status    | Next run | Last run | Runs | Last result
+----+----------------+---------+-----------------+-----------+----------+----------+------+--------------------------
+ 3  | check every 2s | -       | */2 * * * * * * | done      | -        | 6s ago   | 3/3  | ✓ src/main.rs:7966:fn main…
+ 2  | broken command | -       | once            | done      | -        | 10s ago  | 1    | ✗ the task's command isn't…
+ 4  | nightly report | -       | 0 0 3 * * * *   | scheduled | in 13h   | -        | 0    | -
 ```
 
 `faber tasks` only reads: it never creates a database (a wrong path is an
@@ -728,6 +816,7 @@ faber --server 127.0.0.1:9090 --server-key mysecret chat
     --mcp-server <N=URL>     Add a remote MCP server (can be repeated); see MCP section
     --db-path <PATH>         SQLite database for persistent storage
     --agent <NAME>           Start chat as this agent instead of 'default'
+    --profile <NAME>         Make the chat's agent from this profile (see Profiles)
     --display-graphics       Render LaTeX blocks as images on terminals that support it; see below
     --server <ADDR>          Connect to a remote faber server
     --server-key <KEY>       Pre-shared key for server authentication

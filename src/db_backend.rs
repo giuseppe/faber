@@ -45,6 +45,12 @@ pub trait DbBackend: Send + Sync {
     fn delete_agent_data(&self, agent: &str, key: &str) -> Result<bool, Box<dyn Error>>;
     fn list_agent_data(&self, agent: &str) -> Result<Vec<(String, String)>, Box<dyn Error>>;
     fn get_agent_config(&self, agent_name: &str) -> Result<AgentConfig, Box<dyn Error>>;
+    /// See `db::set_agent_config`.
+    fn set_agent_config(
+        &self,
+        agent_name: &str,
+        config: &AgentConfig,
+    ) -> Result<(), Box<dyn Error>>;
 
     fn save_agent_messages(
         &self,
@@ -99,6 +105,13 @@ pub trait DbBackend: Send + Sync {
     fn set_task_enabled(&self, task_id: i64, enabled: bool) -> Result<bool, Box<dyn Error>>;
     /// See `db::set_task_held`.
     fn set_task_held(&self, task_id: i64, held: bool) -> Result<bool, Box<dyn Error>>;
+    /// See `db::set_task_target`.
+    fn set_task_target(
+        &self,
+        task_id: i64,
+        agent: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<bool, Box<dyn Error>>;
     fn get_pending_tasks(&self) -> Result<Vec<TaskRow>, Box<dyn Error>>;
     /// See `db::prune_tasks`; `older_than` is RFC 3339.
     fn prune_tasks(&self, older_than: &str, dry_run: bool) -> Result<Vec<TaskRow>, Box<dyn Error>>;

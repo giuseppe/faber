@@ -73,6 +73,11 @@ pub struct TaskRow {
     /// Tasks that must be done, successfully, before this one is due.
     #[serde(default)]
     pub depends_on: Vec<i64>,
+    /// For a prompt task: run it on a new agent made from this profile (see
+    /// `config.json`'s "profiles"), rather than on `agent_name` or on any
+    /// agent. Never set together with `agent_name`.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 /// What a task's `command` is:
@@ -117,6 +122,10 @@ pub struct NewTask {
     /// Tasks that must be done, successfully, first (see `DEPENDENCIES_MET`).
     #[serde(default)]
     pub depends_on: Vec<i64>,
+    /// Run it on a new agent made from this profile (prompt tasks only;
+    /// not together with `agent_name`).
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 /// A task's lifecycle:
@@ -196,13 +205,16 @@ const TASK_TABLE_DEFINITION: &str = "
     last_exit_code INTEGER DEFAULT NULL,
     last_result TEXT DEFAULT NULL,
     depends_on TEXT DEFAULT NULL,
+    profile TEXT DEFAULT NULL,
+    CHECK(agent_name IS NULL OR profile IS NULL),
     FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE SET NULL";
 
 /// Every column of `TASK_TABLE_DEFINITION`, for copying rows across.
-const TASK_TABLE_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, kind, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, depends_on";
+const TASK_TABLE_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, kind, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, depends_on, profile";
 
 /// Brings an existing `scheduled_tasks` table to `TASK_TABLE_DEFINITION`
-/// when its `status` constraint predates the `held` state. SQLite can't
+/// when its constraints are older: its `status` one predates the `held`
+/// state, or it lacks the one keeping `agent_name` and `profile` apart. SQLite can't
 /// change a CHECK constraint in place, so the table is rebuilt: a new one
 /// is created, the rows copied over, and it takes the old one's place, all
 /// in one transaction. The id counter is carried over too, so ids of
@@ -213,7 +225,7 @@ fn rebuild_task_table_if_needed(conn: &Connection) -> Result<(), rusqlite::Error
         [],
         |row| row.get(0),
     )?;
-    if sql.contains("'held'") {
+    if sql.contains("'held'") && sql.contains("profile IS NULL") {
         return Ok(());
     }
     let next_id: i64 = conn
@@ -317,6 +329,7 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
         "last_exit_code INTEGER DEFAULT NULL",
         "last_result TEXT DEFAULT NULL",
         "depends_on TEXT DEFAULT NULL",
+        "profile TEXT DEFAULT NULL",
         "kind TEXT NOT NULL DEFAULT 'tool' CHECK(kind IN ('tool', 'prompt'))",
     ] {
         let _ = conn.execute_batch(&format!(
@@ -424,6 +437,7 @@ pub fn open_read_only(path: &str) -> Result<Connection, Box<dyn Error>> {
     if !table_has_column(&conn, "scheduled_tasks", "status")?
         || !table_has_column(&conn, "scheduled_tasks", "kind")?
         || !table_has_column(&conn, "agents", "activity")?
+        || !table_has_column(&conn, "scheduled_tasks", "profile")?
     {
         return Err(format!(
             "{} is from an older version of faber: open it once with `faber chat` to upgrade it",
@@ -718,10 +732,11 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
             .get::<_, Option<String>>(20)?
             .and_then(|deps| serde_json::from_str(&deps).ok())
             .unwrap_or_default(),
+        profile: row.get(21)?,
     })
 }
 
-const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, kind, depends_on";
+const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, kind, depends_on, profile";
 
 pub fn create_cron_task(
     conn: &Connection,
@@ -797,6 +812,11 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
             return Err(format!("no agent named '{}'", agent).into());
         }
     }
+    check_task_target(
+        &task.kind,
+        task.agent_name.as_deref(),
+        task.profile.as_deref(),
+    )?;
     for dependency in &task.depends_on {
         if get_task(conn, *dependency)?.is_none() {
             return Err(format!("no task #{} to depend on", dependency).into());
@@ -828,8 +848,8 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
     conn.execute(
         "INSERT INTO scheduled_tasks
              (name, description, kind, task_type, cron_expression, run_at, next_run_at,
-              agent_name, command, max_runs, status, depends_on)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+              agent_name, command, max_runs, status, depends_on, profile)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             task.name,
             task.description,
@@ -846,10 +866,59 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
             } else {
                 TaskStatus::SCHEDULED
             },
-            depends_on
+            depends_on,
+            task.profile
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Checks where a task of `kind` is to run: on `agent`, on a new agent made
+/// from `profile`, or (neither) on any agent - not both, and a profile only
+/// for a prompt task, as only those run on a model.
+fn check_task_target(
+    kind: &str,
+    agent: Option<&str>,
+    profile: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    match profile {
+        Some(_) if agent.is_some() => {
+            Err("a task runs either on an agent or on a profile, not both".into())
+        }
+        Some(p) if p.trim().is_empty() => Err("empty profile name".into()),
+        Some(_) if kind != TaskKind::PROMPT => {
+            Err("only prompt tasks can run on a profile: a tool task needs no model".into())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Changes where a task runs: on `agent`, on a new agent made from
+/// `profile`, or (neither) on whichever agent picks it up first. A running
+/// or done task is left alone - it's been picked up already - and so is a
+/// missing one; returns false for those.
+pub fn set_task_target(
+    conn: &Connection,
+    task_id: i64,
+    agent: Option<&str>,
+    profile: Option<&str>,
+) -> Result<bool, Box<dyn Error>> {
+    let Some(task) = get_task(conn, task_id)? else {
+        return Ok(false);
+    };
+    if let Some(agent) = agent {
+        if get_agent(conn, agent)?.is_none() {
+            return Err(format!("no agent named '{}'", agent).into());
+        }
+    }
+    check_task_target(&task.kind, agent, profile)
+        .map_err(|e| format!("task #{}: {}", task_id, e))?;
+    let rows = conn.execute(
+        "UPDATE scheduled_tasks SET agent_name = ?2, profile = ?3
+         WHERE id = ?1 AND status NOT IN ('running', 'done')",
+        params![task_id, agent, profile],
+    )?;
+    Ok(rows > 0)
 }
 
 pub fn create_oneshot_task(
@@ -1533,22 +1602,117 @@ pub fn kb_delete(conn: &Connection, id: i64, viewer: &KbViewer) -> Result<bool, 
 
 // --- Agent Config ---
 
-#[derive(Serialize, Deserialize)]
+/// An agent's own settings, overriding the session's: set one at a time
+/// (`agent_configure`), or all at once from a profile when the agent is
+/// made from one. Each field is an `agent_data` key, `config:<field>`.
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq)]
 pub struct AgentConfig {
     pub model: Option<String>,
     pub endpoint: Option<String>,
     pub system_prompt: Option<String>,
+    /// Path to the file holding the API key.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    /// Request parameters (`temperature`, `reasoning_effort`, ...), layered
+    /// over the session's.
+    #[serde(default)]
+    pub parameters: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The only tools it may use, of those the session has.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    /// The profile it was made from, if any - for showing only: the
+    /// settings were copied when it was made.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
+
+const AGENT_CONFIG_FIELDS: [&str; 9] = [
+    "model",
+    "endpoint",
+    "system_prompt",
+    "api_key",
+    "max_tokens",
+    "context_window",
+    "parameters",
+    "tools",
+    "profile",
+];
 
 pub fn get_agent_config(
     conn: &Connection,
     agent_name: &str,
 ) -> Result<AgentConfig, Box<dyn Error>> {
-    Ok(AgentConfig {
-        model: get_agent_data(conn, agent_name, "config:model")?,
-        endpoint: get_agent_data(conn, agent_name, "config:endpoint")?,
-        system_prompt: get_agent_data(conn, agent_name, "config:system_prompt")?,
-    })
+    let mut fields = serde_json::Map::new();
+    for field in AGENT_CONFIG_FIELDS {
+        let Some(text) = get_agent_data(conn, agent_name, &format!("config:{}", field))? else {
+            continue;
+        };
+        // Strings are stored as they are, everything else as JSON; a value
+        // that doesn't parse as what the field takes is ignored.
+        let value = match field {
+            "max_tokens" | "context_window" | "parameters" | "tools" => {
+                match serde_json::from_str(&text) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                }
+            }
+            _ => serde_json::Value::String(text),
+        };
+        fields.insert(field.to_string(), value);
+    }
+    let mut config = AgentConfig::default();
+    for (field, value) in fields {
+        let mut one = serde_json::Map::new();
+        one.insert(field, value);
+        if let Ok(parsed) = serde_json::from_value::<AgentConfig>(one.into()) {
+            config = merge_agent_config(config, parsed);
+        }
+    }
+    Ok(config)
+}
+
+/// `base` with every field `over` sets replaced.
+fn merge_agent_config(base: AgentConfig, over: AgentConfig) -> AgentConfig {
+    AgentConfig {
+        model: over.model.or(base.model),
+        endpoint: over.endpoint.or(base.endpoint),
+        system_prompt: over.system_prompt.or(base.system_prompt),
+        api_key: over.api_key.or(base.api_key),
+        max_tokens: over.max_tokens.or(base.max_tokens),
+        context_window: over.context_window.or(base.context_window),
+        parameters: over.parameters.or(base.parameters),
+        tools: over.tools.or(base.tools),
+        profile: over.profile.or(base.profile),
+    }
+}
+
+/// Replaces all of `agent_name`'s config with `config`: fields it doesn't
+/// set are cleared. One transaction, so nobody sees half of it.
+pub fn set_agent_config(
+    conn: &Connection,
+    agent_name: &str,
+    config: &AgentConfig,
+) -> Result<(), Box<dyn Error>> {
+    let serde_json::Value::Object(fields) = serde_json::to_value(config)? else {
+        return Err("agent config isn't an object".into());
+    };
+    let tx = conn.unchecked_transaction()?;
+    for field in AGENT_CONFIG_FIELDS {
+        let key = format!("config:{}", field);
+        match fields.get(field) {
+            None | Some(serde_json::Value::Null) => {
+                delete_agent_data(&tx, agent_name, &key)?;
+            }
+            Some(serde_json::Value::String(text)) => set_agent_data(&tx, agent_name, &key, text)?,
+            Some(value) => set_agent_data(&tx, agent_name, &key, &value.to_string())?,
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 // --- Agent Messages ---
@@ -2216,6 +2380,7 @@ mod tests {
             schedule: TaskSchedule::Once { at: at.clone() },
             held: false,
             depends_on: Vec::new(),
+            profile: None,
         };
         let id = create_task(&conn, &task("prompt")).unwrap();
         let row = get_task(&conn, id).unwrap().unwrap();
@@ -2403,6 +2568,7 @@ mod tests {
                 },
                 held: true,
                 depends_on: Vec::new(),
+                profile: None,
             },
         )
         .unwrap();
@@ -2802,6 +2968,7 @@ mod tests {
                 },
                 held: false,
                 depends_on,
+                profile: None,
             },
         )
         .unwrap()
@@ -2899,6 +3066,7 @@ mod tests {
                 },
                 held: false,
                 depends_on: vec![999],
+                profile: None,
             },
         )
         .unwrap_err();
@@ -2980,6 +3148,133 @@ mod tests {
         assert_eq!(config.model, Some("gpt-4".to_string()));
         assert_eq!(config.system_prompt, Some("be nice".to_string()));
         assert!(config.endpoint.is_none());
+    }
+
+    #[test]
+    fn test_agent_config_round_trip() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        let mut parameters = serde_json::Map::new();
+        parameters.insert("reasoning_effort".to_string(), "low".into());
+        parameters.insert("temperature".to_string(), 0.2.into());
+        let config = AgentConfig {
+            model: Some("qwen".to_string()),
+            endpoint: Some("http://gpu:8080/v1".to_string()),
+            system_prompt: Some("be brief".to_string()),
+            api_key: Some("/keys/k".to_string()),
+            max_tokens: Some(4096),
+            context_window: Some(32768),
+            parameters: Some(parameters),
+            tools: Some(vec!["read_file".to_string()]),
+            profile: Some("fast".to_string()),
+        };
+        set_agent_config(&conn, "alice", &config).unwrap();
+        assert_eq!(get_agent_config(&conn, "alice").unwrap(), config);
+        // Replacing it clears what the new one doesn't set.
+        let smaller = AgentConfig {
+            model: Some("other".to_string()),
+            ..Default::default()
+        };
+        set_agent_config(&conn, "alice", &smaller).unwrap();
+        assert_eq!(get_agent_config(&conn, "alice").unwrap(), smaller);
+        // A value that doesn't parse is ignored rather than failing.
+        set_agent_data(&conn, "alice", "config:max_tokens", "lots").unwrap();
+        assert_eq!(get_agent_config(&conn, "alice").unwrap().max_tokens, None);
+    }
+
+    #[test]
+    fn test_task_target_agent_profile_or_any() {
+        let conn = test_db();
+        create_agent(&conn, "bob", "").unwrap();
+        let at = chrono::Utc::now().to_rfc3339();
+        let task = |kind: &str, agent: Option<&str>, profile: Option<&str>| NewTask {
+            name: "t".to_string(),
+            description: String::new(),
+            kind: kind.to_string(),
+            command: "do it".to_string(),
+            agent_name: agent.map(String::from),
+            schedule: TaskSchedule::Once { at: at.clone() },
+            held: false,
+            depends_on: Vec::new(),
+            profile: profile.map(String::from),
+        };
+        let id = create_task(&conn, &task(TaskKind::PROMPT, None, Some("fast"))).unwrap();
+        assert_eq!(
+            get_task(&conn, id).unwrap().unwrap().profile.as_deref(),
+            Some("fast")
+        );
+        assert!(create_task(&conn, &task(TaskKind::PROMPT, Some("bob"), Some("fast"))).is_err());
+        assert!(create_task(&conn, &task(TaskKind::TOOL, None, Some("fast"))).is_err());
+        // And the table itself refuses both.
+        assert!(
+            conn.execute(
+                "UPDATE scheduled_tasks SET agent_name = 'bob' WHERE id = ?1",
+                params![id]
+            )
+            .is_err()
+        );
+
+        assert!(set_task_target(&conn, id, Some("bob"), None).unwrap());
+        let row = get_task(&conn, id).unwrap().unwrap();
+        assert_eq!(
+            (row.agent_name.as_deref(), row.profile),
+            (Some("bob"), None)
+        );
+        assert!(set_task_target(&conn, id, None, None).unwrap());
+        assert_eq!(get_task(&conn, id).unwrap().unwrap().agent_name, None);
+        assert!(set_task_target(&conn, id, Some("nobody"), None).is_err());
+        assert!(set_task_target(&conn, id, Some("bob"), Some("fast")).is_err());
+        assert!(!set_task_target(&conn, 999, None, None).unwrap());
+        let tool = create_task(&conn, &task(TaskKind::TOOL, None, None)).unwrap();
+        assert!(set_task_target(&conn, tool, None, Some("fast")).is_err());
+        // A running task has been picked up already.
+        assert!(claim_task(&conn, id, "s").unwrap());
+        assert!(!set_task_target(&conn, id, None, Some("fast")).unwrap());
+        let outcome = TaskOutcome {
+            succeeded: true,
+            exit_code: None,
+            result: String::new(),
+        };
+        assert!(finish_task(&conn, id, "s", &outcome).unwrap());
+        assert!(!set_task_target(&conn, id, None, None).unwrap(), "done");
+    }
+
+    #[test]
+    fn test_task_table_rebuilt_to_keep_agent_and_profile_apart() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_db(&conn).unwrap();
+        // The table as it was before profiles: no column, no constraint.
+        conn.execute_batch(&format!(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE scheduled_tasks;
+             CREATE TABLE scheduled_tasks ({});
+             PRAGMA foreign_keys = ON;",
+            TASK_TABLE_DEFINITION
+                .replace("    profile TEXT DEFAULT NULL,\n", "")
+                .replace("    CHECK(agent_name IS NULL OR profile IS NULL),\n", "")
+        ))
+        .unwrap();
+        assert!(!table_has_column(&conn, "scheduled_tasks", "profile").unwrap());
+        create_agent(&conn, "bob", "").unwrap();
+        let at = chrono::Utc::now().to_rfc3339();
+        let keep = create_oneshot_task(&conn, "keep", "", &at, "say hi", Some("bob")).unwrap();
+
+        initialize_db(&conn).unwrap();
+
+        let task = get_task(&conn, keep).unwrap().unwrap();
+        assert_eq!(
+            (task.agent_name.as_deref(), task.profile),
+            (Some("bob"), None)
+        );
+        assert!(
+            conn.execute(
+                "UPDATE scheduled_tasks SET profile = 'fast' WHERE id = ?1",
+                params![keep]
+            )
+            .is_err(),
+            "the constraint is in place"
+        );
+        assert!(set_task_target(&conn, keep, None, Some("fast")).unwrap());
     }
 
     #[test]
