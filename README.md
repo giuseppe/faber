@@ -258,6 +258,7 @@ Each task has a status:
 | Status | Meaning |
 |---|---|
 | `scheduled` | waiting for its next run |
+| `held` | scheduled, but not picked up by anyone until released, even when due |
 | `running` | claimed by one session, which is running it |
 | `done` | a one-shot task that ran, or a cron task that reached `max_runs` |
 | `disabled` | switched off with `task_set_enabled` (switching it back on makes it `scheduled`) |
@@ -298,6 +299,19 @@ that created it, carried out once its chat is idle again.
 
 With no `--in`, `--at` or `--cron`, a task is due right away. `--max-runs N`
 limits a `--cron` task.
+
+A task can be put on hold, so that nobody picks it up - e.g. to create
+work ahead of time and start it on a signal:
+
+```bash
+faber tasks add "Deploy the release notes" --hold   # created held
+faber tasks hold 7 8                                 # hold scheduled tasks
+faber tasks release 7 8                              # picked up again - right away if already due
+```
+
+Only a `scheduled` task can be held (a running one is already assigned)
+and only a held one released; `faber tasks` shows when a held task would
+run, and the board marks it ✋.
 
 ### Listing tasks
 

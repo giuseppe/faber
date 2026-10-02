@@ -89,6 +89,8 @@ pub trait DbBackend: Send + Sync {
     fn list_tasks(&self, agent_name: Option<&str>) -> Result<Vec<TaskRow>, Box<dyn Error>>;
     fn get_task(&self, task_id: i64) -> Result<Option<TaskRow>, Box<dyn Error>>;
     fn set_task_enabled(&self, task_id: i64, enabled: bool) -> Result<bool, Box<dyn Error>>;
+    /// See `db::set_task_held`.
+    fn set_task_held(&self, task_id: i64, held: bool) -> Result<bool, Box<dyn Error>>;
     fn get_pending_tasks(&self) -> Result<Vec<TaskRow>, Box<dyn Error>>;
     /// See `db::prune_tasks`; `older_than` is RFC 3339.
     fn prune_tasks(&self, older_than: &str, dry_run: bool) -> Result<Vec<TaskRow>, Box<dyn Error>>;

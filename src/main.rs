@@ -2934,6 +2934,9 @@ fn tool_task_set_enabled(params_str: &String, ctx: &ToolContext) -> Result<Strin
             Some(db::TaskStatus::DONE) => {
                 "the task is done; create a new one to run it again".into()
             }
+            Some(db::TaskStatus::HELD) if params.enabled => {
+                "the task is on hold; the user releases it with `faber tasks release`".into()
+            }
             Some(other) => format!("the task is already {}", other).into(),
         };
     }
@@ -7491,7 +7494,13 @@ fn task_table_row(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> Row
         .as_deref()
         .and_then(db::parse_db_time)
         .is_some_and(|t| t <= now);
-    let next = if task.status != db::TaskStatus::SCHEDULED {
+    let next = if task.status == db::TaskStatus::HELD {
+        if due {
+            "when released".to_string()
+        } else {
+            format!("{} (if released)", when(&task.next_run_at))
+        }
+    } else if task.status != db::TaskStatus::SCHEDULED {
         "-".to_string()
     } else if due && task.kind == db::TaskKind::PROMPT {
         // Only a chat session waiting at its prompt picks these up.
@@ -7593,6 +7602,8 @@ fn board_card_lines(
             lines.push(format!("{} · {}", task.kind, schedule));
             if status == db::TaskStatus::DISABLED {
                 lines.push(styles.dim.apply_to("⏸ disabled").to_string());
+            } else if status == db::TaskStatus::HELD {
+                lines.push(styles.busy.apply_to("✋ on hold").to_string());
             } else if board_column(task, now) == 1 {
                 lines.push(format!("due {} · for {}", ago(&task.next_run_at), who));
             } else {
@@ -7750,6 +7761,7 @@ fn new_task_from_cli(
         agent,
         tool,
         name,
+        hold,
     } = action
     else {
         return Err("not a `tasks add` command".to_string());
@@ -7814,6 +7826,7 @@ fn new_task_from_cli(
         command: text.clone(),
         agent_name: agent.clone(),
         schedule,
+        held: *hold,
     })
 }
 
@@ -7861,10 +7874,10 @@ fn describe_task(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> Stri
         ("Schedule", schedule),
         (
             "Next run",
-            if task.status == db::TaskStatus::SCHEDULED {
-                time(&task.next_run_at)
-            } else {
-                "-".to_string()
+            match task.status.as_str() {
+                db::TaskStatus::SCHEDULED => time(&task.next_run_at),
+                db::TaskStatus::HELD => format!("{}, once released", time(&task.next_run_at)),
+                _ => "-".to_string(),
             },
         ),
         ("Runs", runs),
@@ -7898,6 +7911,53 @@ fn describe_task(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> Stri
         out.push_str(&format!("\nLast result:\n{}\n", indent(result.trim())));
     }
     out
+}
+
+/// `faber tasks hold` / `release`: puts tasks on hold or releases them,
+/// saying for each one that couldn't be changed why not.
+fn hold_tasks_command(
+    db: &Option<Arc<dyn DbBackend>>,
+    ids: &[i64],
+    hold: bool,
+) -> Result<(), Box<dyn Error>> {
+    let db = db.as_ref().ok_or(
+        "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
+    )?;
+    let mut failed = 0;
+    for &id in ids {
+        if db.set_task_held(id, hold)? {
+            println!(
+                "Task #{} {}.",
+                id,
+                if hold { "is on hold" } else { "is released" }
+            );
+            continue;
+        }
+        failed += 1;
+        let reason = match db.get_task(id)?.map(|t| t.status) {
+            None => "no such task".to_string(),
+            Some(status) if hold && status == db::TaskStatus::HELD => {
+                "it's already on hold".to_string()
+            }
+            Some(status) if !hold && status == db::TaskStatus::SCHEDULED => {
+                "it isn't on hold".to_string()
+            }
+            Some(status) if hold && status == db::TaskStatus::RUNNING => {
+                "it's already running".to_string()
+            }
+            Some(status) => format!("it's {}", status),
+        };
+        eprintln!(
+            "Task #{} can't be {}: {}.",
+            id,
+            if hold { "held" } else { "released" },
+            reason
+        );
+    }
+    if failed > 0 {
+        return Err(format!("{} of {} task(s) not changed", failed, ids.len()).into());
+    }
+    Ok(())
 }
 
 /// `faber tasks show`: prints everything about one task.
@@ -8005,10 +8065,17 @@ fn add_task_command(
         (_, Some(agent)) => format!("by agent '{}' once a chat with it is waiting", agent),
         (_, None) => "by the first agent waiting in a chat".to_string(),
     };
-    println!(
-        "Created task #{} \"{}\": runs {}, {}.",
-        id, task.name, when, by
-    );
+    if task.held {
+        println!(
+            "Created task #{} \"{}\" on hold: once released (faber tasks release {}), it runs {}, {}.",
+            id, task.name, id, when, by
+        );
+    } else {
+        println!(
+            "Created task #{} \"{}\": runs {}, {}.",
+            id, task.name, when, by
+        );
+    }
     Ok(())
 }
 
@@ -8557,6 +8624,21 @@ enum TasksAction {
         /// A name to show in `faber tasks` (default: the start of the text)
         #[clap(long)]
         name: Option<String>,
+        /// Create it on hold: nobody picks it up until `faber tasks release`
+        #[clap(long)]
+        hold: bool,
+    },
+    /// Put scheduled tasks on hold, so they aren't picked up even when due
+    Hold {
+        /// The ids of the tasks, as `faber tasks` lists them
+        #[clap(required = true)]
+        ids: Vec<i64>,
+    },
+    /// Release held tasks, so they're picked up again (right away if due)
+    Release {
+        /// The ids of the tasks, as `faber tasks` lists them
+        #[clap(required = true)]
+        ids: Vec<i64>,
     },
 }
 
@@ -8776,6 +8858,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             action: Some(TasksAction::Show { id, json }),
             ..
         } => show_task_command(&db_connection, *id, *json),
+        CliCommand::Tasks {
+            action: Some(TasksAction::Hold { ids }),
+            ..
+        } => hold_tasks_command(&db_connection, ids, true),
+        CliCommand::Tasks {
+            action: Some(TasksAction::Release { ids }),
+            ..
+        } => hold_tasks_command(&db_connection, ids, false),
         CliCommand::Tasks {
             action: Some(action),
             ..
@@ -9457,6 +9547,37 @@ mod tests {
     }
 
     #[test]
+    fn test_tasks_add_hold_and_hold_release_commands_parse() {
+        let now = utc("2026-10-02T12:00:00Z");
+        let task = new_task_from_cli(&add_args(&["later", "--hold"]), now).unwrap();
+        assert!(task.held);
+        assert!(!new_task_from_cli(&add_args(&["now"]), now).unwrap().held);
+        match Opts::try_parse_from(["faber", "tasks", "hold", "3", "4"])
+            .unwrap()
+            .command
+        {
+            CliCommand::Tasks {
+                action: Some(TasksAction::Hold { ids }),
+                ..
+            } => assert_eq!(ids, vec![3, 4]),
+            other => panic!("{:?}", other),
+        }
+        assert!(
+            Opts::try_parse_from(["faber", "tasks", "release"]).is_err(),
+            "needs an id"
+        );
+    }
+
+    #[test]
+    fn test_board_marks_held_tasks() {
+        let now = utc("2026-10-02T12:00:00Z");
+        let held = board_task(1, "held", "prompt", "2026-10-02T11:00:00Z");
+        let board = render_board(&[held], now, 120, false);
+        assert!(board.starts_with("SCHEDULED (1)"), "{board}");
+        assert!(board.contains("✋ on hold"), "{board}");
+    }
+
+    #[test]
     fn test_tasks_add_rejects_bad_input() {
         let now = utc("2026-10-02T12:00:00Z");
         assert!(new_task_from_cli(&add_args(&["x", "--in", "soon"]), now).is_err());
@@ -9508,6 +9629,7 @@ mod tests {
             command: "say hi".to_string(),
             agent_name: agent.map(String::from),
             schedule: db::TaskSchedule::Once { at: past.clone() },
+            held: false,
         };
         let for_bob = db.create_task(&prompt(Some("bob"))).unwrap();
         assert!(claim_prompt_task(db.as_ref(), "s1", "alice").is_none());
