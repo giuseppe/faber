@@ -63,6 +63,9 @@ fn handle_client(
     db: Arc<Mutex<Connection>>,
     auth_key: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
+    // Every message is a small request/response exchange; don't let
+    // Nagle's algorithm hold any of them back.
+    stream.set_nodelay(true)?;
     let reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
     let mut authenticated = auth_key.is_none();
@@ -76,7 +79,8 @@ fn handle_client(
         let request: RpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                let resp = RpcResponse::error(0, format!("invalid request: {}", e));
+                let resp =
+                    RpcResponse::error(request_id_hint(&line), format!("invalid request: {}", e));
                 send_response(&mut writer, &resp)?;
                 continue;
             }
@@ -89,12 +93,12 @@ fn handle_client(
                     authenticated = true;
                     RpcResponse::success(request.id, serde_json::json!(true))
                 } else {
-                    let r = RpcResponse::error(request.id, "unauthorized".into());
+                    let r = RpcResponse::error(Some(request.id), "unauthorized".into());
                     send_response(&mut writer, &r)?;
                     return Ok(());
                 }
             } else {
-                let r = RpcResponse::error(request.id, "auth required".into());
+                let r = RpcResponse::error(Some(request.id), "auth required".into());
                 send_response(&mut writer, &r)?;
                 return Ok(());
             };
@@ -108,10 +112,23 @@ fn handle_client(
     Ok(())
 }
 
+/// The `id` of a line that isn't a valid request, if it's JSON with a
+/// numeric `id` at all - so the client can still tell which request was
+/// rejected. `None` (sent as `null`) otherwise.
+fn request_id_hint(line: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("id")?
+        .as_u64()
+}
+
+/// Sends `resp` as one line, in a single write: with the newline written
+/// separately, Nagle's algorithm would hold it back until the client's
+/// delayed ACK, adding ~40ms to every call.
 fn send_response(writer: &mut TcpStream, resp: &RpcResponse) -> Result<(), Box<dyn Error>> {
-    let json = serde_json::to_string(resp)?;
-    writer.write_all(json.as_bytes())?;
-    writer.write_all(b"\n")?;
+    let mut line = serde_json::to_string(resp)?;
+    line.push('\n');
+    writer.write_all(line.as_bytes())?;
     writer.flush()?;
     Ok(())
 }
@@ -119,7 +136,7 @@ fn send_response(writer: &mut TcpStream, resp: &RpcResponse) -> Result<(), Box<d
 fn dispatch(db: &Arc<Mutex<Connection>>, req: &RpcRequest) -> RpcResponse {
     match dispatch_inner(db, req) {
         Ok(value) => RpcResponse::success(req.id, value),
-        Err(e) => RpcResponse::error(req.id, e.to_string()),
+        Err(e) => RpcResponse::error(Some(req.id), e.to_string()),
     }
 }
 
@@ -312,5 +329,65 @@ fn dispatch_inner(
             Ok(serde_json::to_value(v)?)
         }
         _ => Err(format!("unknown method: {}", req.method).into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote_db::RemoteDb;
+    use faber::db_backend::DbBackend;
+
+    /// A `RemoteDb` talking to the real `handle_client` over a local
+    /// socket, backed by an in-memory database.
+    fn connected_client() -> RemoteDb {
+        let conn = Connection::open_in_memory().unwrap();
+        db::initialize_db(&conn).unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = handle_client(stream, db, None);
+        });
+        RemoteDb::connect(&addr.to_string()).unwrap()
+    }
+
+    #[test]
+    fn test_remote_calls_returning_null_succeed() {
+        let client = connected_client();
+        client.heartbeat_all("session").unwrap();
+        client.create_agent("a", "desc").unwrap();
+        assert!(client.get_agent("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_concurrent_remote_calls_each_get_their_own_response() {
+        let client = Arc::new(connected_client());
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let client = client.clone();
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        let name = format!("agent-{}-{}", t, i);
+                        client.create_agent(&name, "desc").unwrap();
+                        client.heartbeat_all("session").unwrap();
+                        let row = client.get_agent(&name).unwrap();
+                        assert_eq!(row.map(|r| r.name), Some(name));
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(client.list_agents().unwrap().len(), 8 * 25);
+    }
+
+    #[test]
+    fn test_request_id_hint() {
+        assert_eq!(request_id_hint(r#"{"id": 7, "method": 1}"#), Some(7));
+        assert_eq!(request_id_hint(r#"{"id": "x"}"#), None);
+        assert_eq!(request_id_hint("not json"), None);
     }
 }
