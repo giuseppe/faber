@@ -393,6 +393,7 @@ mod tests {
             },
             session_id: "test".to_string(),
             active_subagents: Arc::new(AtomicUsize::new(0)),
+            running_subagents: Arc::new(Mutex::new(std::collections::HashMap::new())),
             status_bar: Arc::new(crate::status_bar::StatusBar::new()),
             session_usage: usage.clone(),
         }));

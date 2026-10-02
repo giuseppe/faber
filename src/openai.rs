@@ -117,6 +117,16 @@ pub fn normalize_endpoint(endpoint: &str) -> String {
 }
 
 /// Check for Ctrl-C signal and return InterruptedError if found
+/// The error a request loop stops with once it has used up its
+/// `ToolContext::max_requests`.
+pub fn request_budget_error(limit: usize) -> Box<dyn Error> {
+    format!(
+        "stopped after using up its budget of {} requests to the model",
+        limit
+    )
+    .into()
+}
+
 /// Limits how many requests to the model are in flight at once. The
 /// process has one (`request_limiter`), shared by the chat, sub-agents,
 /// fan-out workers and task turns alike: a model server with few slots
@@ -1249,6 +1259,7 @@ fn post_request_with_mode_and_recursion(
     let start_time = Instant::now();
     let mut messages = messages;
     let mut turn_usage: Option<Usage> = None;
+    let mut requests = 0;
 
     loop {
         let mut headers = HeaderMap::new();
@@ -1314,6 +1325,12 @@ fn post_request_with_mode_and_recursion(
             .timeout(Duration::from_secs(1000))
             .build()?;
 
+        requests += 1;
+        if let Some(limit) = ctx.max_requests {
+            if requests > limit {
+                return Err(request_budget_error(limit));
+            }
+        }
         // Held until this round trip's response has been read in full.
         let _slot = request_limiter().acquire(&ctrl_c_rx, &mode, start_time)?;
 

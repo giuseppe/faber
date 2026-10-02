@@ -69,6 +69,9 @@ pub struct ToolContext {
     /// (e.g. `fan_out`) to notice it. Whoever takes the signal must stop
     /// and return `openai::InterruptedError`.
     pub interrupt: Option<Arc<Mutex<mpsc::Receiver<()>>>>,
+    /// Most requests to the model one call of the request loop may make -
+    /// a budget for a sub-agent's work. `None`: no limit.
+    pub max_requests: Option<usize>,
 }
 
 impl ToolContext {
@@ -86,6 +89,7 @@ impl ToolContext {
             max_tool_output_chars: None,
             context_window: None,
             interrupt: None,
+            max_requests: None,
         }
     }
 
