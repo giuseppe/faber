@@ -188,6 +188,10 @@ fn dispatch_inner(
             db::create_agent(&conn, str_param!("name"), str_param!("description"))?;
             Ok(serde_json::json!(true))
         }
+        "set_agent_parent" => {
+            db::set_agent_parent(&conn, str_param!("agent"), opt_str_param!("parent"))?;
+            Ok(serde_json::json!(true))
+        }
         "delete_agent" => {
             let v = db::delete_agent(&conn, str_param!("name"))?;
             Ok(serde_json::to_value(v)?)
@@ -470,6 +474,38 @@ mod tests {
         );
         assert!(client.kb_delete(id, &viewer).unwrap());
         assert!(client.kb_get(id, &db::KbViewer::User).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_kb_lineage_over_a_remote_connection() {
+        let client = connected_client();
+        client.create_agent("boss", "").unwrap();
+        client.create_agent("helper", "").unwrap();
+        client.set_agent_parent("helper", Some("boss")).unwrap();
+        assert!(
+            client.set_agent_parent("boss", Some("helper")).is_err(),
+            "no loops"
+        );
+        client
+            .kb_write("Secret", "boss only", &[], Some("boss"), None)
+            .unwrap();
+        let as_helper = db::KbViewer::Agent(Some("helper".to_string()));
+        assert_eq!(
+            client
+                .kb_search("secret", &as_helper, None, 5)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            client
+                .get_agent("helper")
+                .unwrap()
+                .unwrap()
+                .parent
+                .as_deref(),
+            Some("boss")
+        );
     }
 
     #[test]

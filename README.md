@@ -401,8 +401,16 @@ echo "..." | faber kb add "Code style"     # the body from stdin
 faber kb rm 3 4
 ```
 
-`faber kb add --agent NAME` makes a note private to that agent. Deleting an
-agent deletes its private notes.
+A note is either **shared** - every agent sees it, and it outlives whoever
+wrote it - or **private** to the agent that wrote it. A private note is
+also seen by the sub-agents that agent starts, at any depth (`fan_out`
+workers act as the agent that called them), but never by the agents above
+it: a sub-agent can keep notes for itself and its own sub-agents that its
+parent doesn't see. Each agent records which agent spawned it, and if a
+title exists at several levels, the nearest note wins. Deleting an agent
+deletes its private notes; its own sub-agents, if any are left, become
+top-level agents. `faber kb add --agent NAME` makes a note private to
+that agent.
 
 ## Tools
 

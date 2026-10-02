@@ -30,6 +30,9 @@ pub struct AgentRow {
     pub created_at: String,
     pub session_id: Option<String>,
     pub heartbeat_at: Option<String>,
+    /// The agent that spawned this one, for a sub-agent.
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -319,6 +322,13 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN session_id TEXT DEFAULT NULL;");
     let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN heartbeat_at TEXT DEFAULT NULL;");
+    // A sub-agent whose parent is deleted (sub-agents are, once done)
+    // becomes a top-level agent rather than going too: its own sub-agents
+    // may still be running.
+    let _ = conn.execute_batch(
+        "ALTER TABLE agents ADD COLUMN parent TEXT DEFAULT NULL
+             REFERENCES agents(name) ON DELETE SET NULL;",
+    );
 
     initialize_kb(conn)?;
     Ok(())
@@ -563,10 +573,11 @@ fn row_to_agent(row: &rusqlite::Row) -> rusqlite::Result<AgentRow> {
         created_at: row.get(2)?,
         session_id: row.get(3)?,
         heartbeat_at: row.get(4)?,
+        parent: row.get(5)?,
     })
 }
 
-const AGENT_COLUMNS: &str = "name, description, created_at, session_id, heartbeat_at";
+const AGENT_COLUMNS: &str = "name, description, created_at, session_id, heartbeat_at, parent";
 
 pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRow>, Box<dyn Error>> {
     let sql = format!("SELECT {} FROM agents ORDER BY name", AGENT_COLUMNS);
@@ -1047,6 +1058,61 @@ pub fn finish_task(
     Ok(rows > 0)
 }
 
+/// SQL for `agent` (bound to `?1`) and its ancestors, nearest first, as
+/// rows of `lineage(name, depth)`. Depth-bounded, so it ends even if
+/// parents ever formed a loop (`set_agent_parent` refuses to make one).
+const LINEAGE_CTE: &str = "WITH RECURSIVE lineage(name, depth) AS (
+        SELECT ?1, 0
+        UNION
+        SELECT agents.parent, lineage.depth + 1
+        FROM agents JOIN lineage ON agents.name = lineage.name
+        WHERE agents.parent IS NOT NULL AND lineage.depth < 64
+    )";
+
+/// `agent` and its ancestors - its parent, its parent's parent... -
+/// nearest first.
+pub fn agent_lineage(conn: &Connection, agent: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let sql = format!(
+        "{} SELECT name FROM lineage GROUP BY name ORDER BY MIN(depth)",
+        LINEAGE_CTE
+    );
+    let names = conn
+        .prepare(&sql)?
+        .query_map(params![agent], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(names)
+}
+
+/// Records `parent` as the agent that spawned `agent` (`None`: makes it a
+/// top-level agent). Refused if `parent` is `agent` itself or one of its
+/// descendants, which would make a loop.
+pub fn set_agent_parent(
+    conn: &Connection,
+    agent: &str,
+    parent: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(parent) = parent {
+        if agent_lineage(conn, parent)?.iter().any(|a| a == agent) {
+            return Err(format!(
+                "'{}' can't be a sub-agent of '{}': '{}' is '{}' itself or one of its sub-agents",
+                agent, parent, parent, agent
+            )
+            .into());
+        }
+        if get_agent(conn, parent)?.is_none() {
+            return Err(format!("no agent named '{}'", parent).into());
+        }
+    }
+    let rows = conn.execute(
+        "UPDATE agents SET parent = ?2 WHERE name = ?1",
+        params![agent, parent],
+    )?;
+    if rows == 0 {
+        return Err(format!("no agent named '{}'", agent).into());
+    }
+    Ok(())
+}
+
 // --- Knowledge base ---
 
 /// A knowledge base note.
@@ -1117,20 +1183,28 @@ fn row_to_kb_note(row: &rusqlite::Row) -> rusqlite::Result<KbNote> {
 pub enum KbViewer {
     /// The user, through `faber kb`: sees every note, private ones too.
     User,
-    /// An agent (`None`: one without an identity, e.g. a fan-out worker):
-    /// sees shared notes and its own private ones.
+    /// An agent (`None`: one without an identity): sees shared notes, its
+    /// own private ones, and those of every agent above it - the one that
+    /// spawned it, and so on up. A sub-agent's own private notes aren't
+    /// seen by the agents above it.
     Agent(Option<String>),
 }
 
 impl KbViewer {
     /// The SQL condition for notes this viewer sees, and the value to bind
     /// to its `?1` (always referenced, so the parameter count is fixed).
-    fn condition(&self) -> (&'static str, Option<&str>) {
+    fn condition(&self) -> (String, Option<&str>) {
         match self {
-            KbViewer::User => ("(?1 IS NULL OR 1)", None),
-            KbViewer::Agent(None) => ("(kb_notes.agent_name IS NULL AND ?1 IS NULL)", None),
+            KbViewer::User => ("(?1 IS NULL OR 1)".to_string(), None),
+            KbViewer::Agent(None) => (
+                "(kb_notes.agent_name IS NULL AND ?1 IS NULL)".to_string(),
+                None,
+            ),
             KbViewer::Agent(Some(agent)) => (
-                "(kb_notes.agent_name IS NULL OR kb_notes.agent_name = ?1)",
+                format!(
+                    "(kb_notes.agent_name IS NULL OR kb_notes.agent_name IN ({} SELECT name FROM lineage))",
+                    LINEAGE_CTE
+                ),
                 Some(agent.as_str()),
             ),
         }
@@ -1208,24 +1282,50 @@ pub fn kb_get(
     Ok(rows.pop().transpose()?)
 }
 
-/// The note with this title (ignoring case) that `viewer` sees - a
-/// private one before a shared one.
+/// The note with this title (ignoring case) that `viewer` sees: a private
+/// one before a shared one, and the viewer's own before its parent's, and
+/// so on up.
 pub fn kb_get_by_title(
     conn: &Connection,
     title: &str,
     viewer: &KbViewer,
 ) -> Result<Option<KbNote>, Box<dyn Error>> {
-    let (visible, who) = viewer.condition();
+    let owners: Vec<Option<String>> = match viewer {
+        KbViewer::User => {
+            // Any note with the title: shared first, then by owner.
+            let sql = format!(
+                "SELECT {} FROM kb_notes WHERE lower(title) = lower(?1)
+                 ORDER BY agent_name IS NOT NULL, agent_name LIMIT 1",
+                KB_COLUMNS
+            );
+            let mut rows = conn
+                .prepare(&sql)?
+                .query_map(params![title.trim()], row_to_kb_note)?
+                .collect::<Vec<_>>();
+            return Ok(rows.pop().transpose()?);
+        }
+        KbViewer::Agent(None) => vec![None],
+        KbViewer::Agent(Some(agent)) => agent_lineage(conn, agent)?
+            .into_iter()
+            .map(Some)
+            .chain([None])
+            .collect(),
+    };
     let sql = format!(
-        "SELECT {} FROM kb_notes WHERE {} AND lower(title) = lower(?2)
-         ORDER BY agent_name IS NULL LIMIT 1",
-        KB_COLUMNS, visible
+        "SELECT {} FROM kb_notes
+         WHERE lower(title) = lower(?1) AND COALESCE(agent_name, '') = COALESCE(?2, '')",
+        KB_COLUMNS
     );
-    let mut rows = conn
-        .prepare(&sql)?
-        .query_map(params![who, title.trim()], row_to_kb_note)?
-        .collect::<Vec<_>>();
-    Ok(rows.pop().transpose()?)
+    for owner in owners {
+        let mut rows = conn
+            .prepare(&sql)?
+            .query_map(params![title.trim(), owner], row_to_kb_note)?
+            .collect::<Vec<_>>();
+        if let Some(note) = rows.pop().transpose()? {
+            return Ok(Some(note));
+        }
+    }
+    Ok(None)
 }
 
 /// Words too common to say anything about which note is meant. Left out
@@ -2472,6 +2572,119 @@ mod tests {
             kb_fts_query("who are we").unwrap(),
             "\"who\" OR \"are\" OR \"we\""
         );
+    }
+
+    /// root <- middle <- leaf, each with a private note, plus a shared one.
+    fn agent_tree(conn: &Connection) {
+        for (agent, parent) in [
+            ("root", None),
+            ("middle", Some("root")),
+            ("leaf", Some("middle")),
+        ] {
+            create_agent(conn, agent, "").unwrap();
+            set_agent_parent(conn, agent, parent).unwrap();
+            kb_write(
+                conn,
+                &format!("{} notes", agent),
+                "private stuff",
+                &[],
+                Some(agent),
+                Some(agent),
+            )
+            .unwrap();
+        }
+        kb_write(conn, "team notes", "shared stuff", &[], None, None).unwrap();
+    }
+
+    fn visible(conn: &Connection, agent: &str) -> Vec<String> {
+        let mut titles: Vec<String> =
+            kb_list(conn, &KbViewer::Agent(Some(agent.to_string())), None, 50)
+                .unwrap()
+                .into_iter()
+                .map(|n| n.title)
+                .collect();
+        titles.sort();
+        titles
+    }
+
+    #[test]
+    fn test_kb_private_notes_are_inherited_down_not_up() {
+        let conn = test_db();
+        agent_tree(&conn);
+        assert_eq!(
+            agent_lineage(&conn, "leaf").unwrap(),
+            ["leaf", "middle", "root"]
+        );
+        assert_eq!(
+            visible(&conn, "leaf"),
+            ["leaf notes", "middle notes", "root notes", "team notes"]
+        );
+        assert_eq!(
+            visible(&conn, "middle"),
+            ["middle notes", "root notes", "team notes"]
+        );
+        assert_eq!(visible(&conn, "root"), ["root notes", "team notes"]);
+        // Search follows the same rule.
+        let found = kb_search(
+            &conn,
+            "private",
+            &KbViewer::Agent(Some("middle".to_string())),
+            None,
+            50,
+        )
+        .unwrap();
+        assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn test_kb_deleting_a_middle_agent_keeps_the_rest() {
+        let conn = test_db();
+        agent_tree(&conn);
+        delete_agent(&conn, "middle").unwrap();
+        // Its private notes go; its sub-agent is now top-level; shared stays.
+        assert_eq!(visible(&conn, "leaf"), ["leaf notes", "team notes"]);
+        assert_eq!(get_agent(&conn, "leaf").unwrap().unwrap().parent, None);
+        assert_eq!(visible(&conn, "root"), ["root notes", "team notes"]);
+    }
+
+    #[test]
+    fn test_kb_title_lookup_prefers_the_nearest_note() {
+        let conn = test_db();
+        agent_tree(&conn);
+        kb_write(&conn, "Plan", "root's", &[], Some("root"), None).unwrap();
+        kb_write(&conn, "Plan", "middle's", &[], Some("middle"), None).unwrap();
+        kb_write(&conn, "Plan", "everyone's", &[], None, None).unwrap();
+        let body = |agent: &str| {
+            kb_get_by_title(&conn, "plan", &KbViewer::Agent(Some(agent.to_string())))
+                .unwrap()
+                .unwrap()
+                .body
+        };
+        assert_eq!(body("leaf"), "middle's");
+        assert_eq!(body("middle"), "middle's");
+        assert_eq!(body("root"), "root's");
+        assert_eq!(
+            kb_get_by_title(&conn, "plan", &KbViewer::Agent(None))
+                .unwrap()
+                .unwrap()
+                .body,
+            "everyone's"
+        );
+    }
+
+    #[test]
+    fn test_set_agent_parent_refuses_loops() {
+        let conn = test_db();
+        agent_tree(&conn);
+        assert!(set_agent_parent(&conn, "root", Some("leaf")).is_err());
+        assert!(set_agent_parent(&conn, "root", Some("root")).is_err());
+        assert!(set_agent_parent(&conn, "leaf", Some("nobody")).is_err());
+        assert!(set_agent_parent(&conn, "nobody", Some("root")).is_err());
+        // Moving a sub-agent elsewhere in the tree, or to the top, is fine.
+        set_agent_parent(&conn, "leaf", Some("root")).unwrap();
+        assert_eq!(agent_lineage(&conn, "leaf").unwrap(), ["leaf", "root"]);
+        set_agent_parent(&conn, "leaf", None).unwrap();
+        assert_eq!(agent_lineage(&conn, "leaf").unwrap(), ["leaf"]);
     }
 
     #[test]

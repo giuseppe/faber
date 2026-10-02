@@ -160,6 +160,14 @@ impl DbBackend for RemoteDb {
         Ok(serde_json::from_value(v)?)
     }
 
+    fn set_agent_parent(&self, agent: &str, parent: Option<&str>) -> Result<(), Box<dyn Error>> {
+        self.call(
+            "set_agent_parent",
+            serde_json::json!({"agent": agent, "parent": parent}),
+        )?;
+        Ok(())
+    }
+
     fn get_agent(&self, name: &str) -> Result<Option<AgentRow>, Box<dyn Error>> {
         let v = self.call("get_agent", serde_json::json!({"name": name}))?;
         if v.is_null() {
