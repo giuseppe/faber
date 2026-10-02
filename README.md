@@ -271,6 +271,34 @@ How the last run went is recorded separately - `last_outcome`
 cron task whose last run failed is still `scheduled` for the next one. A
 task whose command isn't a valid tool call fails with an explanation.
 
+### Creating tasks from the command line
+
+```bash
+faber tasks add "Tell me a joke about SQLite" --in 30s       # a prompt for an agent
+faber tasks add "Summarize open issues" --cron "0 0 9 * * * *" --agent triage
+faber tasks add "Check the build" --at "2026-10-03 08:00"
+faber tasks add --tool '{"tool":"glob","arguments":{"pattern":"*.md"}}' --in 1m
+```
+
+A task's `kind` says what its command is:
+
+- `prompt` (the default for `tasks add`): an instruction for an agent. Once
+  it's due, the first `faber chat` session **waiting at its prompt** claims
+  it - with `--agent NAME`, only a session whose current agent is `NAME` -
+  and runs it as a turn of that agent's conversation, shown in that chat.
+  The agent's final answer becomes the task's result. Until some agent is
+  waiting, `faber tasks` shows it as "waiting for an agent".
+- `tool` (`--tool`): a tool call run directly by any session's
+  scheduler, with no LLM.
+
+The model's `task_create_cron`/`task_create_oneshot` tools make either
+kind, depending on the command: a `{"tool": ...}` call is a `tool` task,
+plain language ("tell the user a joke") is a `prompt` task for the agent
+that created it, carried out once its chat is idle again.
+
+With no `--in`, `--at` or `--cron`, a task is due right away. `--max-runs N`
+limits a `--cron` task.
+
 ### Listing tasks
 
 ```bash

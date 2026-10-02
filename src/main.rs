@@ -4217,7 +4217,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "task_create_cron",
-                "description": "Create a recurring scheduled task using a cron expression. Uses 7-field cron format: 'sec min hour day_of_month month day_of_week year'. Example: '0 30 9 * * Mon-Fri *' means 9:30 AM every weekday. The command is sent to the AI when the task fires.",
+                "description": "Create a recurring scheduled task using a cron expression. Uses 7-field cron format: 'sec min hour day_of_month month day_of_week year'. Example: '0 30 9 * * Mon-Fri *' means 9:30 AM every weekday. The command is either an instruction for the agent or a tool call (see command).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -4231,7 +4231,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         },
                         "command": {
                             "type": "string",
-                            "description": "JSON tool call to execute when the task fires, e.g. {\"tool\": \"run_command\", \"arguments\": {\"command\": \"echo hello\"}}"
+                            "description": "What to do when the task fires. Either an instruction in plain language (e.g. \"tell the user a joke\", \"summarize today's commits\"), which the agent carries out as a new turn of its conversation as soon as it's idle; or a JSON tool call to run directly without the AI, e.g. {\"tool\": \"run_command\", \"arguments\": {\"command\": \"echo hello\"}}"
                         },
                         "description": {
                             "type": "string",
@@ -4268,7 +4268,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "task_create_oneshot",
-                "description": "Create a one-shot scheduled task that runs once. Use delay_seconds for relative timing (preferred) or run_at for absolute. The command is sent to the AI when the task fires.",
+                "description": "Create a one-shot scheduled task that runs once. Use delay_seconds for relative timing (preferred) or run_at for absolute. The command is either an instruction for the agent or a tool call (see command).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -4278,7 +4278,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         },
                         "command": {
                             "type": "string",
-                            "description": "JSON tool call to execute when the task fires, e.g. {\"tool\": \"run_command\", \"arguments\": {\"command\": \"echo hello\"}}"
+                            "description": "What to do when the task fires. Either an instruction in plain language (e.g. \"tell the user a joke\", \"summarize today's commits\"), which the agent carries out as a new turn of its conversation as soon as it's idle; or a JSON tool call to run directly without the AI, e.g. {\"tool\": \"run_command\", \"arguments\": {\"command\": \"echo hello\"}}"
                         },
                         "delay_seconds": {
                             "type": "number",
@@ -6559,6 +6559,43 @@ fn run_scheduled_task(
     }
 }
 
+/// Claims the next due prompt task (`TaskKind::PROMPT`) that `agent` may
+/// take - one for any agent, or for it by name - for this idle session.
+fn claim_prompt_task(db: &dyn DbBackend, session_id: &str, agent: &str) -> Option<db::TaskRow> {
+    let tasks = db.get_pending_tasks().ok()?;
+    tasks
+        .into_iter()
+        .filter(|t| t.kind == db::TaskKind::PROMPT)
+        .filter(|t| t.agent_name.as_deref().is_none_or(|a| a == agent))
+        .find(|t| db.claim_task(t.id, session_id).unwrap_or(false))
+}
+
+/// The outcome of a prompt task's turn: the agent's final answer, or why
+/// the turn failed.
+fn prompt_task_outcome(result: Result<&OpenAIResponse, &Box<dyn Error>>) -> db::TaskOutcome {
+    match result {
+        Ok(response) => db::TaskOutcome {
+            succeeded: true,
+            exit_code: None,
+            result: openai::truncate_tool_output(
+                response
+                    .choices
+                    .as_ref()
+                    .and_then(|c| c.first())
+                    .and_then(|c| c.message.content.as_deref())
+                    .unwrap_or("")
+                    .trim(),
+                MAX_TASK_RESULT_CHARS,
+            ),
+        },
+        Err(e) => db::TaskOutcome {
+            succeeded: false,
+            exit_code: None,
+            result: e.to_string(),
+        },
+    }
+}
+
 /// Polls for due scheduled tasks once a second and runs each one this
 /// session manages to claim (`claim_task`), each on its own thread. The
 /// claim is what keeps two sessions sharing a database - or a task still
@@ -6576,7 +6613,9 @@ fn scheduler_loop(
             Err(_) => continue,
         };
 
-        for task in tasks {
+        // Prompt tasks are for agents, picked up by idle chat sessions
+        // (`claim_prompt_task`), not run here.
+        for task in tasks.into_iter().filter(|t| t.kind == db::TaskKind::TOOL) {
             match db.claim_task(task.id, &session_id) {
                 Ok(true) => {}
                 Ok(false) => continue, // another session (or run) got it
@@ -6797,6 +6836,10 @@ fn chat_command(
     });
 
     let mut prompt_shown = false;
+    // A prompt task this session claimed and is running as the current
+    // injected turn, and when the last check for one was.
+    let mut running_prompt_task: Option<i64> = None;
+    let mut last_prompt_task_poll = std::time::Instant::now();
 
     loop {
         while let Ok((task_agent, command, assistant_msg, tool_msg)) = task_rx.try_recv() {
@@ -6851,6 +6894,29 @@ fn chat_command(
                         "[Message from agent '{}']: {}",
                         notif.from_agent, notif.message
                     ));
+                }
+            }
+        }
+        // Idle, with nothing else to inject: take a due prompt task meant
+        // for this agent (or any agent), if there is one.
+        if pending_injections.is_empty()
+            && last_prompt_task_poll.elapsed() >= Duration::from_secs(1)
+        {
+            last_prompt_task_poll = std::time::Instant::now();
+            if let Some(ref db) = db {
+                if let Some(task) = claim_prompt_task(db.as_ref(), &session_id, &active_agent.name)
+                {
+                    chat_pb.println(&format!(
+                        "Picked up scheduled task #{} \"{}\"",
+                        task.id, task.name
+                    ));
+                    // Never starts with "/", so it can't be taken for a
+                    // chat command.
+                    pending_injections.push(format!(
+                        "[Scheduled task #{} \"{}\"]: {}",
+                        task.id, task.name, task.command
+                    ));
+                    running_prompt_task = Some(task.id);
                 }
             }
         }
@@ -6991,7 +7057,7 @@ fn chat_command(
                             &status_bar,
                             &chat_pb,
                         );
-                        match request_with_summary_fallback(
+                        let result = request_with_summary_fallback(
                             &mut active_agent,
                             &openai_opts,
                             &db,
@@ -7009,7 +7075,14 @@ fn chat_command(
                                     None,
                                 )
                             },
-                        ) {
+                        );
+                        if let (Some(task_id), Some(db)) = (running_prompt_task.take(), &db) {
+                            let outcome = prompt_task_outcome(result.as_ref());
+                            if let Err(e) = db.finish_task(task_id, &session_id, &outcome) {
+                                warn!("Couldn't record the outcome of task {}: {}", task_id, e);
+                            }
+                        }
+                        match result {
                             Ok(response) => {
                                 warn_if_truncated(&response, &chat_pb);
                                 if let Some(prompt_tokens) =
@@ -7260,46 +7333,58 @@ fn parse_db_time(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|t| t.and_utc())
 }
 
+/// A duration like `45s`, `30m`, `2h`, `3d` or `1w`.
+fn parse_duration(text: &str) -> Option<chrono::Duration> {
+    let text = text.trim();
+    let unit = text.chars().last()?;
+    let n: i64 = text[..text.len() - unit.len_utf8()].parse().ok()?;
+    let seconds = match unit {
+        's' => n,
+        'm' => n * 60,
+        'h' => n * 3600,
+        'd' => n * 86_400,
+        'w' => n * 7 * 86_400,
+        _ => return None,
+    };
+    Some(chrono::Duration::seconds(seconds))
+}
+
+/// A point in time: RFC 3339, or `YYYY-MM-DD[ HH:MM]` in local time.
+fn parse_datetime(text: &str) -> Option<Result<chrono::DateTime<chrono::Utc>, String>> {
+    let text = text.trim();
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Some(Ok(t.with_timezone(&chrono::Utc)));
+    }
+    let local = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M")
+        .or_else(|_| {
+            chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+                .map(|d| d.and_hms_opt(0, 0, 0).unwrap_or_default())
+        })
+        .ok()?;
+    Some(
+        local
+            .and_local_timezone(chrono::Local)
+            .earliest()
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .ok_or_else(|| format!("'{}' doesn't exist in the local time zone", text)),
+    )
+}
+
 /// `--since`: a duration back from `now` (`45s`, `30m`, `2h`, `3d`, `1w`),
 /// or a date/time - RFC 3339, or `YYYY-MM-DD[ HH:MM]` in local time.
 fn parse_since(
     text: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<chrono::DateTime<chrono::Utc>, String> {
-    let text = text.trim();
-    if let Some(unit) = text.chars().last() {
-        if let Ok(n) = text[..text.len() - unit.len_utf8()].parse::<i64>() {
-            let seconds = match unit {
-                's' => Some(n),
-                'm' => Some(n * 60),
-                'h' => Some(n * 3600),
-                'd' => Some(n * 86_400),
-                'w' => Some(n * 7 * 86_400),
-                _ => None,
-            };
-            if let Some(seconds) = seconds {
-                return Ok(now - chrono::Duration::seconds(seconds));
-            }
-        }
+    if let Some(duration) = parse_duration(text) {
+        return Ok(now - duration);
     }
-    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(text) {
-        return Ok(t.with_timezone(&chrono::Utc));
-    }
-    let local = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M").or_else(|_| {
-        chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
-            .map(|d| d.and_hms_opt(0, 0, 0).unwrap_or_default())
-    });
-    match local {
-        Ok(t) => t
-            .and_local_timezone(chrono::Local)
-            .earliest()
-            .map(|t| t.with_timezone(&chrono::Utc))
-            .ok_or_else(|| format!("'{}' doesn't exist in the local time zone", text)),
-        Err(_) => Err(format!(
+    parse_datetime(text).unwrap_or_else(|| {
+        Err(format!(
             "can't read --since '{}': use a duration like 30m, 2h, 3d, 1w, or a date like 2026-10-01",
-            text
-        )),
-    }
+            text.trim()
+        ))
+    })
 }
 
 /// `t` relative to `now`, compactly: "in 5m", "3h ago", "now"; a date
@@ -7396,10 +7481,18 @@ fn task_table_row(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> Row
         .style_spec("Fy"),
         status => Cell::new(status),
     };
-    let next = if task.status == db::TaskStatus::SCHEDULED {
-        when(&task.next_run_at)
-    } else {
+    let due = task
+        .next_run_at
+        .as_deref()
+        .and_then(parse_db_time)
+        .is_some_and(|t| t <= now);
+    let next = if task.status != db::TaskStatus::SCHEDULED {
         "-".to_string()
+    } else if due && task.kind == db::TaskKind::PROMPT {
+        // Only a chat session waiting at its prompt picks these up.
+        "waiting for an agent".to_string()
+    } else {
+        when(&task.next_run_at)
     };
     let result = match task.last_outcome.as_deref() {
         Some(outcome) => {
@@ -7422,6 +7515,7 @@ fn task_table_row(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> Row
         Cell::new(&task.id.to_string()),
         Cell::new(&task.name),
         Cell::new(task.agent_name.as_deref().unwrap_or("-")),
+        Cell::new(&task.kind),
         Cell::new(&schedule),
         status,
         Cell::new(&next),
@@ -7452,6 +7546,7 @@ fn print_tasks_table(
             "ID",
             "Name",
             "Agent",
+            "Kind",
             "Schedule",
             "Status",
             "Next run",
@@ -7467,6 +7562,119 @@ fn print_tasks_table(
         table.add_row(task_table_row(task, now));
     }
     table.printstd();
+    Ok(())
+}
+
+/// The task `faber tasks add` describes, as of `now`.
+fn new_task_from_cli(
+    action: &TasksAction,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<db::NewTask, String> {
+    let TasksAction::Add {
+        text,
+        after,
+        at,
+        cron,
+        max_runs,
+        agent,
+        tool,
+        name,
+    } = action;
+    if text.trim().is_empty() {
+        return Err("the task's text is empty".to_string());
+    }
+    if *tool {
+        let call: serde_json::Value = serde_json::from_str(text)
+            .map_err(|e| format!("--tool expects a JSON tool call: {}", e))?;
+        if call
+            .get("tool")
+            .and_then(|t| t.as_str())
+            .is_none_or(str::is_empty)
+        {
+            return Err(r#"--tool expects {"tool": "<name>", "arguments": {...}}"#.to_string());
+        }
+    }
+    let schedule = match (after, at, cron) {
+        (_, _, Some(expression)) => db::TaskSchedule::Cron {
+            expression: expression.clone(),
+            max_runs: *max_runs,
+        },
+        (Some(after), _, _) => {
+            let duration = parse_duration(after)
+                .ok_or_else(|| format!("can't read --in '{}': use e.g. 30s, 10m, 2h, 1d", after))?;
+            db::TaskSchedule::Once {
+                at: (now + duration).to_rfc3339(),
+            }
+        }
+        (None, Some(at), None) => db::TaskSchedule::Once {
+            at: parse_datetime(at)
+                .unwrap_or_else(|| {
+                    Err(format!(
+                        "can't read --at '{}': use e.g. \"2026-10-03 08:00\"",
+                        at
+                    ))
+                })?
+                .to_rfc3339(),
+        },
+        (None, None, None) => db::TaskSchedule::Once {
+            at: now.to_rfc3339(),
+        },
+    };
+    let name = match name {
+        Some(name) => name.clone(),
+        None if *tool => serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .and_then(|c| c["tool"].as_str().map(String::from))
+            .unwrap_or_default(),
+        None => first_line(text, 40),
+    };
+    Ok(db::NewTask {
+        name,
+        description: String::new(),
+        kind: if *tool {
+            db::TaskKind::TOOL
+        } else {
+            db::TaskKind::PROMPT
+        }
+        .to_string(),
+        command: text.clone(),
+        agent_name: agent.clone(),
+        schedule,
+    })
+}
+
+/// `faber tasks add`: creates a task and says when and by whom it'll run.
+fn add_task_command(
+    db: &Option<Arc<dyn DbBackend>>,
+    action: &TasksAction,
+) -> Result<(), Box<dyn Error>> {
+    let db = db.as_ref().ok_or(
+        "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
+    )?;
+    let now = chrono::Utc::now();
+    let task = new_task_from_cli(action, now)?;
+    let id = db.create_task(&task)?;
+    let when = match &task.schedule {
+        db::TaskSchedule::Cron { expression, .. } => format!("on \"{}\"", expression),
+        db::TaskSchedule::Once { at } => match parse_db_time(at) {
+            Some(t) if t <= now + chrono::Duration::seconds(1) => "as soon as possible".to_string(),
+            Some(t) => format!(
+                "{} ({})",
+                format_relative(t, now),
+                t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S")
+            ),
+            None => at.clone(),
+        },
+    };
+    let by = match (task.kind.as_str(), &task.agent_name) {
+        (db::TaskKind::TOOL, _) => "by any session's scheduler".to_string(),
+        (_, Some(agent)) => format!("by agent '{}' once a chat with it is waiting", agent),
+        (_, None) => "by the first agent waiting in a chat".to_string(),
+    };
+    println!(
+        "Created task #{} \"{}\": runs {}, {}.",
+        id, task.name, when, by
+    );
     Ok(())
 }
 
@@ -7949,6 +8157,41 @@ fn parse_mcp_server_flag(
 }
 
 #[derive(Debug, Subcommand)]
+enum TasksAction {
+    /// Create a task: by default a prompt for an agent, run by the first
+    /// `faber chat` waiting at its prompt (only one whose agent is --agent,
+    /// if given) once it's due
+    Add {
+        /// What the agent should do - or, with --tool, the tool call to
+        /// run, as JSON: {"tool": "...", "arguments": {...}}
+        text: String,
+        /// Run it this long from now: 30s, 10m, 2h, 1d, 1w
+        #[clap(long = "in", value_name = "DURATION", conflicts_with_all = ["at", "cron"])]
+        after: Option<String>,
+        /// Run it at this time: "2026-10-03 08:00" (local), 2026-10-03, or RFC 3339
+        #[clap(long, conflicts_with = "cron")]
+        at: Option<String>,
+        /// Run it repeatedly, on a 7-field cron schedule
+        /// ("sec min hour day month weekday year", e.g. "0 0 9 * * * *")
+        #[clap(long)]
+        cron: Option<String>,
+        /// With --cron, stop after this many runs
+        #[clap(long, requires = "cron")]
+        max_runs: Option<i64>,
+        /// Only this agent may pick it up (for --tool: the agent whose
+        /// conversation gets the result)
+        #[clap(long)]
+        agent: Option<String>,
+        /// The text is a tool call to run directly, not a prompt for an agent
+        #[clap(long)]
+        tool: bool,
+        /// A name to show in `faber tasks` (default: the start of the text)
+        #[clap(long)]
+        name: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum CliCommand {
     /// Pass a request to the AI model and print its response
     Prompt {
@@ -7970,8 +8213,11 @@ enum CliCommand {
     /// Remove dormant agents (no active session)
     Gc {},
 
-    /// Show scheduled tasks: their status, schedule and how their last run went
+    /// Show scheduled tasks: their status, schedule and how their last run
+    /// went - or, with `add`, create one
     Tasks {
+        #[clap(subcommand)]
+        action: Option<TasksAction>,
         /// Only tasks created, started or run since then: how long ago
         /// (e.g. 30m, 2h, 3d, 1w) or a date/time (2026-10-01,
         /// "2026-10-01 14:00", 2026-10-01T14:00:00Z)
@@ -8070,7 +8316,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(Arc::new(remote))
     } else if let Some(ref db_path) = opts.db_path {
         debug!("Opening SQLite database at: {}", db_path);
-        let conn = if matches!(opts.command, CliCommand::Tasks { .. }) {
+        let conn = if matches!(opts.command, CliCommand::Tasks { action: None, .. }) {
             // Only looks: never create or migrate a database for it.
             db::open_read_only(db_path)?
         } else {
@@ -8116,6 +8362,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::ListTools {} => list_tools_command(&mcp_manager),
         CliCommand::Gc {} => gc_command(&opts),
         CliCommand::Tasks {
+            action: Some(action),
+            ..
+        } => add_task_command(&db_connection, action),
+        CliCommand::Tasks {
+            action: None,
             since,
             last,
             agent,
@@ -8613,9 +8864,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let bad = db
-            .create_oneshot_task("bad", "", &past, "not a tool call", None)
-            .unwrap();
+        // An empty command (and description) can't be run at all.
+        let bad = db.create_oneshot_task("bad", "", &past, "", None).unwrap();
         let tools = Arc::new(initialize_tools(false, None));
         let (tx, rx) = mpsc::channel();
 
@@ -8705,6 +8955,7 @@ mod tests {
             last_outcome: None,
             last_exit_code: None,
             last_result: None,
+            kind: "tool".to_string(),
         }
     }
 
@@ -8720,6 +8971,158 @@ mod tests {
         assert_eq!(ids(select_tasks(tasks.clone(), None, Some(2))), vec![1, 2]);
         let since = Some(utc("2026-09-30T00:00:00Z"));
         assert_eq!(ids(select_tasks(tasks, since, None)), vec![1, 2]);
+    }
+
+    fn add_args(args: &[&str]) -> TasksAction {
+        let mut argv = vec!["faber", "tasks", "add"];
+        argv.extend_from_slice(args);
+        match Opts::try_parse_from(argv).unwrap().command {
+            CliCommand::Tasks {
+                action: Some(action),
+                ..
+            } => action,
+            other => panic!("not tasks add: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tasks_add_builds_prompt_and_tool_tasks() {
+        let now = utc("2026-10-02T12:00:00Z");
+        let task = new_task_from_cli(&add_args(&["Tell me a joke", "--in", "30s"]), now).unwrap();
+        assert_eq!(task.kind, "prompt");
+        assert_eq!(task.name, "Tell me a joke");
+        assert_eq!(task.agent_name, None);
+        assert_eq!(
+            task.schedule,
+            db::TaskSchedule::Once {
+                at: "2026-10-02T12:00:30+00:00".to_string()
+            }
+        );
+
+        let task = new_task_from_cli(
+            &add_args(&[
+                "triage",
+                "--cron",
+                "0 0 9 * * * *",
+                "--max-runs",
+                "3",
+                "--agent",
+                "bot",
+            ]),
+            now,
+        )
+        .unwrap();
+        assert_eq!(task.agent_name.as_deref(), Some("bot"));
+        assert!(matches!(
+            task.schedule,
+            db::TaskSchedule::Cron {
+                max_runs: Some(3),
+                ..
+            }
+        ));
+
+        let task = new_task_from_cli(
+            &add_args(&[
+                "--tool",
+                r#"{"tool":"glob","arguments":{"pattern":"*.md"}}"#,
+            ]),
+            now,
+        )
+        .unwrap();
+        assert_eq!(task.kind, "tool");
+        assert_eq!(task.name, "glob");
+        assert_eq!(
+            task.schedule,
+            db::TaskSchedule::Once {
+                at: now.to_rfc3339()
+            }
+        );
+    }
+
+    #[test]
+    fn test_tasks_add_rejects_bad_input() {
+        let now = utc("2026-10-02T12:00:00Z");
+        assert!(new_task_from_cli(&add_args(&["x", "--in", "soon"]), now).is_err());
+        assert!(new_task_from_cli(&add_args(&["x", "--at", "tomorrow"]), now).is_err());
+        assert!(new_task_from_cli(&add_args(&["--tool", "glob *.md"]), now).is_err());
+        assert!(new_task_from_cli(&add_args(&["--tool", r#"{"pattern":"x"}"#]), now).is_err());
+        assert!(new_task_from_cli(&add_args(&["  "]), now).is_err());
+        // Conflicting schedules and --max-runs without --cron are rejected
+        // by the argument parser itself.
+        for argv in [
+            vec![
+                "faber",
+                "tasks",
+                "add",
+                "x",
+                "--in",
+                "1m",
+                "--at",
+                "2026-10-03",
+            ],
+            vec![
+                "faber",
+                "tasks",
+                "add",
+                "x",
+                "--in",
+                "1m",
+                "--cron",
+                "* * * * * * *",
+            ],
+            vec!["faber", "tasks", "add", "x", "--max-runs", "2"],
+        ] {
+            assert!(Opts::try_parse_from(argv).is_err());
+        }
+    }
+
+    #[test]
+    fn test_prompt_tasks_go_to_matching_idle_agents_only() {
+        let db: Arc<dyn DbBackend> = Arc::new(LocalDb::new(test_db_conn()));
+        for (agent, session) in [("alice", "s1"), ("bob", "s2")] {
+            db.create_agent(agent, "").unwrap();
+            assert!(db.claim_agent(agent, session).unwrap());
+        }
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        let prompt = |agent: Option<&str>| db::NewTask {
+            name: "p".to_string(),
+            description: String::new(),
+            kind: "prompt".to_string(),
+            command: "say hi".to_string(),
+            agent_name: agent.map(String::from),
+            schedule: db::TaskSchedule::Once { at: past.clone() },
+        };
+        let for_bob = db.create_task(&prompt(Some("bob"))).unwrap();
+        assert!(claim_prompt_task(db.as_ref(), "s1", "alice").is_none());
+        assert_eq!(
+            claim_prompt_task(db.as_ref(), "s2", "bob").unwrap().id,
+            for_bob
+        );
+
+        let for_anyone = db.create_task(&prompt(None)).unwrap();
+        assert_eq!(
+            claim_prompt_task(db.as_ref(), "s1", "alice").unwrap().id,
+            for_anyone
+        );
+        assert!(
+            claim_prompt_task(db.as_ref(), "s2", "bob").is_none(),
+            "already taken"
+        );
+
+        assert!(
+            db.create_task(&prompt(Some("carol")))
+                .unwrap_err()
+                .to_string()
+                .contains("no agent named")
+        );
+    }
+
+    #[test]
+    fn test_prompt_task_outcome() {
+        let err: Box<dyn Error> = "boom".into();
+        let failed = prompt_task_outcome(Err(&err));
+        assert!(!failed.succeeded);
+        assert_eq!(failed.result, "boom");
     }
 
     #[test]

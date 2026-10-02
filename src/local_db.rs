@@ -18,7 +18,7 @@
  */
 
 use crate::db;
-use crate::db::{AgentConfig, AgentRow, NotificationRow, TaskOutcome, TaskRow};
+use crate::db::{AgentConfig, AgentRow, NewTask, NotificationRow, TaskOutcome, TaskRow};
 use crate::db_backend::DbBackend;
 use std::error::Error;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -220,6 +220,11 @@ impl DbBackend for LocalDb {
     fn get_pending_tasks(&self) -> Result<Vec<TaskRow>, Box<dyn Error>> {
         let conn = self.lock()?;
         db::get_pending_tasks(&conn)
+    }
+
+    fn create_task(&self, task: &NewTask) -> Result<i64, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::create_task(&conn, task)
     }
 
     fn claim_task(&self, task_id: i64, session_id: &str) -> Result<bool, Box<dyn Error>> {

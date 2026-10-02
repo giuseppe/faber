@@ -314,6 +314,12 @@ fn dispatch_inner(
             let v = db::get_pending_tasks(&conn)?;
             Ok(serde_json::to_value(v)?)
         }
+        "create_task" => {
+            let task: db::NewTask = serde_json::from_value(p["task"].clone())
+                .map_err(|e| format!("bad param 'task': {}", e))?;
+            let v = db::create_task(&conn, &task)?;
+            Ok(serde_json::to_value(v)?)
+        }
         "claim_task" => {
             let v = db::claim_task(&conn, i64_param!("task_id"), str_param!("session_id"))?;
             Ok(serde_json::to_value(v)?)

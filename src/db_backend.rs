@@ -17,7 +17,7 @@
  *
  */
 
-use crate::db::{AgentConfig, AgentRow, NotificationRow, TaskOutcome, TaskRow};
+use crate::db::{AgentConfig, AgentRow, NewTask, NotificationRow, TaskOutcome, TaskRow};
 use std::error::Error;
 
 pub trait DbBackend: Send + Sync {
@@ -83,6 +83,8 @@ pub trait DbBackend: Send + Sync {
         command: &str,
         agent_name: Option<&str>,
     ) -> Result<i64, Box<dyn Error>>;
+    /// See `db::create_task`.
+    fn create_task(&self, task: &NewTask) -> Result<i64, Box<dyn Error>>;
     fn delete_task(&self, task_id: i64) -> Result<bool, Box<dyn Error>>;
     fn list_tasks(&self, agent_name: Option<&str>) -> Result<Vec<TaskRow>, Box<dyn Error>>;
     fn get_task(&self, task_id: i64) -> Result<Option<TaskRow>, Box<dyn Error>>;
