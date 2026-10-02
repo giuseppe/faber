@@ -372,6 +372,25 @@ Only a `scheduled` task can be held (a running one is already assigned)
 and only a held one released; `faber tasks` shows when a held task would
 run, and the board marks it ✋.
 
+### Headless workers
+
+`faber worker` works through tasks without a terminal, as an agent - like
+a `faber chat` sitting idle, picking up prompt tasks for it (or for any
+agent) and running tool tasks:
+
+```bash
+faber --db-path state.db worker --agent w1 --parallel 8   # up to 8 tasks at once
+faber --server host:9090 worker                           # as worker-<pid>, against a shared server
+```
+
+Each task gets a fresh conversation (the agent's system prompt, then the
+task), with every tool - including `spawn_agent`, `fan_out` and
+`agent_wait` - and its outcome is recorded as usual. The worker logs a line
+as each task starts and ends; `faber tasks` and `faber agents` show the
+same from anywhere. Run several, next to a `faber serve`, and they share
+the queue - each task is claimed by exactly one. Ctrl-C interrupts the
+tasks still running (recorded as failed), releases the agent, and exits.
+
 ### Listing tasks
 
 ```bash
