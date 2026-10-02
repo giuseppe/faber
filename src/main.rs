@@ -163,7 +163,64 @@ fn stop_sub_agent(running: &RunningSubAgents, name: &str, reason: &str) -> bool 
     true
 }
 
+/// One `spawn_agent` run: whose it is and, once done, its result.
+struct SubAgentRun {
+    name: String,
+    parent: String,
+    result: Option<String>,
+    /// Already handed to the parent by `agent_wait`, so the chat doesn't
+    /// inject it again when the notification arrives.
+    delivered: bool,
+}
+
+/// Every sub-agent run in this session, by run id, with a condition
+/// variable signalled whenever one finishes.
+#[derive(Default)]
+struct SubAgentRuns {
+    runs: Mutex<HashMap<u64, SubAgentRun>>,
+    finished: std::sync::Condvar,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+impl SubAgentRuns {
+    fn start(&self, name: &str, parent: &str) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        self.runs.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id,
+            SubAgentRun {
+                name: name.to_string(),
+                parent: parent.to_string(),
+                result: None,
+                delivered: false,
+            },
+        );
+        id
+    }
+
+    fn finish(&self, id: u64, result: &str) {
+        if let Some(run) = self
+            .runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&id)
+        {
+            run.result = Some(result.to_string());
+        }
+        self.finished.notify_all();
+    }
+
+    fn was_delivered(&self, id: u64) -> bool {
+        self.runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .is_some_and(|run| run.delivered)
+    }
+}
+
 struct SubAgentContext {
+    /// Every sub-agent run in this session (see `agent_wait`).
+    runs: Arc<SubAgentRuns>,
     tools: Arc<ToolsCollection>,
     opts: openai::Opts,
     session_id: String,
@@ -2914,6 +2971,102 @@ fn tool_send_message(params_str: &String, ctx: &ToolContext) -> Result<String, B
     Ok(result.to_string())
 }
 
+/// entrypoint for the agent_wait tool: waits for the caller's sub-agents
+/// to finish - all, the named ones, or the first one - and returns their
+/// results, which then aren't also delivered as messages.
+fn tool_agent_wait(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        #[serde(default)]
+        names: Option<Vec<String>>,
+        #[serde(default)]
+        any: bool,
+        #[serde(default)]
+        timeout_seconds: Option<u64>,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let sa_ctx = ctx
+        .extra
+        .as_ref()
+        .and_then(|e| e.downcast_ref::<SubAgentContext>())
+        .ok_or("Sub-agent context not configured")?;
+    let caller = ctx.agent_name.as_deref().unwrap_or("default");
+    let runs = &sa_ctx.runs;
+    let wanted = |run: &SubAgentRun| {
+        run.parent == caller
+            && !run.delivered
+            && params
+                .names
+                .as_ref()
+                .is_none_or(|names| names.contains(&run.name))
+    };
+    let mut state = runs.runs.lock().unwrap_or_else(|e| e.into_inner());
+    let targets: Vec<u64> = state
+        .iter()
+        .filter(|(_, run)| wanted(run))
+        .map(|(id, _)| *id)
+        .collect();
+    if targets.is_empty() {
+        return Err(match &params.names {
+            Some(names) => format!(
+                "none of {} is a sub-agent of yours with a result still to collect",
+                names.join(", ")
+            ),
+            None => "you have no sub-agents with results still to collect".to_string(),
+        }
+        .into());
+    }
+    let names: Vec<String> = targets.iter().map(|id| state[id].name.clone()).collect();
+    ctx.println(&format!("Waiting for {}...", names.join(", ")));
+    if let Some(db) = &ctx.db {
+        let _ = db.set_agent_activity(caller, &format!("waiting for {}", names.join(", ")));
+    }
+    let deadline =
+        std::time::Instant::now() + Duration::from_secs(params.timeout_seconds.unwrap_or(600));
+    loop {
+        let done = targets
+            .iter()
+            .filter(|id| state[id].result.is_some())
+            .count();
+        if done == targets.len() || (params.any && done > 0) {
+            break;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        state = runs
+            .finished
+            .wait_timeout(state, (deadline - now).min(Duration::from_millis(100)))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+        let interrupted = ctx.interrupt.as_ref().is_some_and(|rx| {
+            rx.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .try_recv()
+                .is_ok()
+        });
+        if interrupted {
+            return Err(Box::new(InterruptedError::new(
+                "Operation interrupted by user",
+            )));
+        }
+    }
+    let mut out = String::new();
+    for id in &targets {
+        let run = state.get_mut(id).expect("targets come from the map");
+        match &run.result {
+            Some(result) => {
+                run.delivered = true;
+                out.push_str(&format!("## {}\n{}\n\n", run.name, result.trim()));
+            }
+            None => out.push_str(&format!("## {}\n(still running)\n\n", run.name)),
+        }
+    }
+    Ok(out)
+}
+
 /// entrypoint for the agent_cancel tool: stops a running sub-agent the
 /// caller started, directly or through its own sub-agents.
 fn tool_agent_cancel(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
@@ -3041,6 +3194,8 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         agent_ansi_code(&agent_name_for_status),
     );
 
+    let runs = sa_ctx.runs.clone();
+    let run_id = runs.start(&agent_name, &parent_agent);
     let (cancel_tx, cancel_rx) = mpsc::channel();
     let stop_reason = Arc::new(Mutex::new(None));
     let running = sa_ctx.running_subagents.clone();
@@ -3181,17 +3336,23 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
                 format!("finished: {}", first_line)
             },
         );
+        runs.finish(run_id, &response_text);
         let notification = serde_json::json!({
             "type": "subagent_result",
             "agent": agent_name,
+            "run": run_id,
             "prompt": prompt,
             "response": response_text,
         });
         let _ = db.send_notification(&agent_name, &parent_agent, &notification.to_string());
     });
 
-    let result =
-        serde_json::json!({"status": "spawned", "agent": params.name, "prompt": params.prompt});
+    let result = serde_json::json!({
+        "status": "spawned",
+        "agent": params.name,
+        "prompt": params.prompt,
+        "hint": "use agent_wait to wait for its result",
+    });
     Ok(result.to_string())
 }
 
@@ -4386,7 +4547,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "spawn_agent",
-                "description": "Start a sub-agent on a task in the background and carry on: its result arrives later, as a message, whenever it's done. Use it for long or open-ended work you don't need to wait for. To run the same task over many items and get all the results back together, use fan_out instead.",
+                "description": "Start a sub-agent on a task in the background and carry on: its result arrives later, as a message, whenever it's done - or collect it with agent_wait. Use it for long or open-ended work you don't need to wait for. To run the same task over many items and get all the results back together, use fan_out instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -4435,6 +4596,31 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "name": {"type": "string", "description": "The sub-agent's name"}
                     },
                     "required": ["name"],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "agent_wait".to_string(),
+        tool_agent_wait,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "agent_wait",
+                "description": "Wait for sub-agents you spawned to finish and get their results together - all of them, the ones named, or (any: true) just the first to finish. Results you collect this way aren't also sent to you as messages. Anything still running when the timeout passes is listed as still running.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "names": {"type": "array", "items": {"type": "string"}, "description": "Only these sub-agents (default: all of yours with results not yet collected)"},
+                        "any": {"type": "boolean", "description": "Return as soon as one of them finishes"},
+                        "timeout_seconds": {"type": "integer", "description": "Stop waiting after this long (default 600)"}
+                    },
                     "additionalProperties": false
                 }
             }
@@ -6689,6 +6875,7 @@ fn chat_command(
     );
     let active_subagents = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let running_subagents: RunningSubAgents = Arc::new(Mutex::new(HashMap::new()));
+    let sub_agent_runs: Arc<SubAgentRuns> = Arc::new(SubAgentRuns::default());
     let initial_agent_name = opts.agent.clone().unwrap_or_else(|| "default".to_string());
 
     let agent_config = if let Some(ref db) = db {
@@ -6911,6 +7098,13 @@ fn chat_command(
                                 status_bar.clear_agent_status(agent);
                                 status_bar.set_agent_plan(agent, None);
                             }
+                            // Already handed over by agent_wait.
+                            if obj["run"]
+                                .as_u64()
+                                .is_some_and(|run| sub_agent_runs.was_delivered(run))
+                            {
+                                continue;
+                            }
                             obj.get("response")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or(&notif.message)
@@ -7077,6 +7271,7 @@ fn chat_command(
                     tool_context.context_window =
                         *context_window.lock().unwrap_or_else(|e| e.into_inner());
                     tool_context.extra = Some(Arc::new(SubAgentContext {
+                        runs: sub_agent_runs.clone(),
                         tools: tools_arc.clone(),
                         opts: openai_opts.clone(),
                         session_id: session_id.to_string(),
@@ -10844,6 +11039,7 @@ mod tests {
         ctx.db = Some(db);
         ctx.agent_name = Some(agent.to_string());
         ctx.extra = Some(Arc::new(SubAgentContext {
+            runs: Arc::new(SubAgentRuns::default()),
             tools: Arc::new(initialize_tools(false, None)),
             opts: script_opts(model),
             session_id: "test-session".to_string(),
@@ -10998,6 +11194,103 @@ mod tests {
         assert!(db.claim_agent("boss", "test-session").unwrap());
         let ctx = chat_ctx_with_model(db.clone(), "boss", &model);
         (db, ctx)
+    }
+
+    #[test]
+    fn test_agent_wait_collects_results_together() {
+        // Coordinator rules first: spawn_agent's results echo the prompts.
+        let (db, ctx) = spawning_setup(
+            "wait",
+            serde_json::json!([
+                {"if": "\"agent\":\"a\"", "tool": "spawn_agent", "arguments": {"name": "b", "prompt": "job b"}},
+                {"if": "\"agent\":\"b\"", "tool": "agent_wait", "arguments": {}},
+                {"if": "## a", "reply": "got both"},
+                {"if": "start", "tool": "spawn_agent", "arguments": {"name": "a", "prompt": "job a"}},
+                {"if": "job a", "reply": "result A", "delay_ms": 100},
+                {"if": "job b", "reply": "result B", "delay_ms": 300},
+            ]),
+        );
+        let model = match &ctx.extra {
+            Some(extra) => extra
+                .downcast_ref::<SubAgentContext>()
+                .unwrap()
+                .opts
+                .model
+                .clone(),
+            None => unreachable!(),
+        };
+        assert_eq!(run_turn(&ctx, &model, "start"), "got both");
+        let runs = &ctx
+            .extra
+            .as_ref()
+            .unwrap()
+            .downcast_ref::<SubAgentContext>()
+            .unwrap()
+            .runs;
+        let state = runs.runs.lock().unwrap();
+        assert_eq!(state.len(), 2);
+        assert!(
+            state
+                .values()
+                .all(|run| run.delivered && run.result.is_some())
+        );
+        drop(state);
+        // Collected, so nothing left to wait for.
+        let err = tool_agent_wait(&"{}".to_string(), &ctx)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no sub-agents"), "{err}");
+        let _ = db;
+    }
+
+    #[test]
+    fn test_a_sub_agent_can_wait_for_its_own() {
+        // Before agent_wait, a sub-agent's sub-agents' results went to a
+        // parent nobody read messages for, and were lost.
+        let (db, ctx) = spawning_setup(
+            "nested_wait",
+            serde_json::json!([
+                {"if": "\"agent\":\"leaf\"", "tool": "agent_wait", "arguments": {"names": ["leaf"]}},
+                {"if": "## leaf", "reply": "the leaf says 42"},
+                {"if": "middle job", "tool": "spawn_agent", "arguments": {"name": "leaf", "prompt": "leaf job"}},
+                {"if": "leaf job", "reply": "42"},
+            ]),
+        );
+        tool_spawn_agent(
+            &serde_json::json!({"name": "middle", "prompt": "middle job"}).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(sub_agent_result(&db, "boss", "middle"), "the leaf says 42");
+    }
+
+    #[test]
+    fn test_agent_wait_any_and_timeout() {
+        let (_db, ctx) = spawning_setup(
+            "wait_any",
+            serde_json::json!([
+                {"if": "quick", "reply": "fast one"},
+                {"if": "slow", "reply": "slow one", "delay_ms": 30000},
+            ]),
+        );
+        for (name, prompt) in [("fast", "quick"), ("slow", "slow")] {
+            tool_spawn_agent(
+                &serde_json::json!({"name": name, "prompt": prompt}).to_string(),
+                &ctx,
+            )
+            .unwrap();
+        }
+        let first = tool_agent_wait(&r#"{"any": true}"#.to_string(), &ctx).unwrap();
+        assert!(first.contains("## fast\nfast one"), "{first}");
+        assert!(first.contains("## slow\n(still running)"), "{first}");
+        let started = std::time::Instant::now();
+        let later = tool_agent_wait(&r#"{"timeout_seconds": 1}"#.to_string(), &ctx).unwrap();
+        assert!(!later.contains("## fast"), "already collected: {later}");
+        assert!(later.contains("## slow\n(still running)"), "{later}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let err = tool_agent_wait(&r#"{"names": ["nobody"]}"#.to_string(), &ctx).unwrap_err();
+        assert!(err.to_string().contains("none of nobody"), "{err}");
+        tool_agent_cancel(&r#"{"name":"slow"}"#.to_string(), &ctx).unwrap();
     }
 
     #[test]
