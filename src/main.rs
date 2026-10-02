@@ -402,6 +402,7 @@ impl SubAgentRuns {
     }
 }
 
+#[derive(Clone)]
 struct SubAgentContext {
     /// Every sub-agent run in this session (see `agent_wait`).
     runs: Arc<SubAgentRuns>,
@@ -413,6 +414,8 @@ struct SubAgentContext {
     status_bar: Arc<status_bar::StatusBar>,
     /// Sub-agents' and fan-out workers' tokens count toward `/cost` too.
     session_usage: Arc<Mutex<SessionUsage>>,
+    /// The config file's profiles, to make agents from.
+    profiles: Arc<Profiles>,
 }
 
 const CHAT_COMMANDS: &[&str] = &[
@@ -2528,12 +2531,25 @@ fn tool_agent_create(params_str: &String, ctx: &ToolContext) -> Result<String, B
         name: String,
         #[serde(default)]
         description: Option<String>,
+        #[serde(default)]
+        profile: Option<String>,
     }
     let params: Params = serde_json::from_str(params_str)?;
     let db = ctx.db()?;
     db.create_agent(&params.name, params.description.as_deref().unwrap_or(""))?;
+    let mut result = serde_json::json!({"status": "created", "name": params.name});
+    if let Some(name) = &params.profile {
+        let profiles = ctx_profiles(ctx);
+        let made = find_profile(&profiles, name)
+            .map_err(|e| e.into())
+            .and_then(|profile| apply_profile(db, &params.name, name, profile));
+        if let Err(e) = made {
+            let _ = db.delete_agent(&params.name);
+            return Err(e);
+        }
+        result["profile"] = name.clone().into();
+    }
     ctx.println(&format!("Agent '{}' created successfully", params.name));
-    let result = serde_json::json!({"status": "created", "name": params.name});
     Ok(result.to_string())
 }
 
@@ -2582,6 +2598,8 @@ fn tool_agent_configure(params_str: &String, ctx: &ToolContext) -> Result<String
     struct Params {
         agent: String,
         #[serde(default)]
+        profile: Option<String>,
+        #[serde(default)]
         model: Option<String>,
         #[serde(default)]
         endpoint: Option<String>,
@@ -2594,6 +2612,11 @@ fn tool_agent_configure(params_str: &String, ctx: &ToolContext) -> Result<String
         return Err(format!("no agent named '{}'", params.agent).into());
     }
     let mut changed = Vec::new();
+    if let Some(name) = &params.profile {
+        let profiles = ctx_profiles(ctx);
+        apply_profile(db, &params.agent, name, find_profile(&profiles, name)?)?;
+        changed.push(format!("settings copied from profile '{}'", name));
+    }
     for ((name, key), value) in
         AGENT_CONFIG_KEYS
             .iter()
@@ -2609,7 +2632,7 @@ fn tool_agent_configure(params_str: &String, ctx: &ToolContext) -> Result<String
         }
     }
     if changed.is_empty() {
-        return Err("give at least one of model, endpoint, system_prompt".into());
+        return Err("give at least one of profile, model, endpoint, system_prompt".into());
     }
     ctx.println(&format!("Agent '{}': {}", params.agent, changed.join(", ")));
     let config = db.get_agent_config(&params.agent)?;
@@ -2984,6 +3007,8 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         run_at: Option<String>,
         #[serde(default)]
         depends_on: Vec<i64>,
+        #[serde(default)]
+        profile: Option<String>,
     }
     let params: Params = serde_json::from_str(params_str)?;
     if params.command.trim().is_empty() {
@@ -3026,10 +3051,16 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         description: params.description.unwrap_or_default(),
         kind: kind.to_string(),
         command: params.command,
-        agent_name: params.agent_name.or_else(|| ctx.agent_name.clone()),
+        // Without a profile, it runs on the agent creating it unless told
+        // otherwise.
+        agent_name: match params.profile {
+            Some(_) => params.agent_name,
+            None => params.agent_name.or_else(|| ctx.agent_name.clone()),
+        },
         schedule,
         held: false,
         depends_on: params.depends_on,
+        profile: params.profile,
     };
     let id = ctx.db()?.create_task(&task)?;
     let next_run = ctx.db()?.get_task(id)?.and_then(|t| t.next_run_at);
@@ -3054,6 +3085,8 @@ fn tool_task_list(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
         #[serde(default)]
         agent_name: Option<String>,
         #[serde(default)]
+        profile: Option<String>,
+        #[serde(default)]
         due: bool,
     }
     let params: Params = serde_json::from_str(params_str)?;
@@ -3077,6 +3110,9 @@ fn tool_task_list(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
     };
     if let (true, Some(agent)) = (params.due, params.agent_name.as_deref()) {
         tasks.retain(|t| t.agent_name.as_deref() == Some(agent));
+    }
+    if let Some(profile) = params.profile.as_deref() {
+        tasks.retain(|t| t.profile.as_deref() == Some(profile));
     }
     ctx.println(&format!("Found {} task(s)", tasks.len()));
     for t in &tasks {
@@ -3141,6 +3177,41 @@ fn tool_task_set_enabled(params_str: &String, ctx: &ToolContext) -> Result<Strin
             }
             Some(other) => format!("the task is already {}", other).into(),
         };
+    }
+    Ok(result.to_string())
+}
+
+/// entrypoint for the task_assign tool: changes where a task runs - on an
+/// agent, on a new agent made from a profile, or on any agent.
+fn tool_task_assign(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        id: i64,
+        #[serde(default)]
+        agent_name: Option<String>,
+        #[serde(default)]
+        profile: Option<String>,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let db = ctx.db()?;
+    let updated = db.set_task_target(
+        params.id,
+        params.agent_name.as_deref(),
+        params.profile.as_deref(),
+    )?;
+    let task = db.get_task(params.id)?;
+    let mut result = serde_json::json!({"updated": updated, "id": params.id});
+    match (&task, updated) {
+        (Some(task), true) => {
+            let target = task_target(task);
+            ctx.println(&format!("Task id={} now runs on {}", params.id, target));
+            result["runs_on"] = target.into();
+        }
+        (Some(task), false) => {
+            result["reason"] = format!("the task is {} already", task.status).into();
+        }
+        (None, _) => result["reason"] = "no such task".into(),
     }
     Ok(result.to_string())
 }
@@ -3316,6 +3387,9 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         /// Knowledge base notes and files to hand it up front.
         #[serde(default)]
         context: Option<Handoff>,
+        /// Make it from this profile.
+        #[serde(default)]
+        profile: Option<String>,
     }
     let params: Params = serde_json::from_str(params_str)?;
 
@@ -3325,8 +3399,11 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         .and_then(|e| e.downcast_ref::<SubAgentContext>())
         .ok_or("Sub-agent context not configured")?;
 
-    let tools = sa_ctx.tools.clone();
-    let mut agent_opts = sa_ctx.opts.clone();
+    let profile = params
+        .profile
+        .as_deref()
+        .map(|name| find_profile(&sa_ctx.profiles, name).map(|p| (name, p)))
+        .transpose()?;
     let db = ctx.db.clone().ok_or("Database required for sub-agents")?;
     let parent_agent = ctx.agent_name.clone().unwrap_or("default".to_string());
 
@@ -3342,8 +3419,27 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     }
 
     let agent_config = {
-        if db.get_agent(&agent_name)?.is_none() {
-            db.create_agent(&agent_name, &format!("Sub-agent: {}", agent_name))?;
+        let existing = db.get_agent(&agent_name)?;
+        if let (Some(_), Some((name, _))) = (&existing, profile) {
+            let current = db.get_agent_config(&agent_name)?.profile;
+            if current.as_deref() != Some(name) {
+                return Err(format!(
+                    "'{}' already exists, made from {}: give it no profile, or use a new name",
+                    agent_name,
+                    current
+                        .map(|p| format!("profile '{}'", p))
+                        .unwrap_or_else(|| "no profile".to_string())
+                )
+                .into());
+            }
+        }
+        if existing.is_none() {
+            match profile {
+                Some((name, settings)) => {
+                    apply_profile(db.as_ref(), &agent_name, name, settings)?;
+                }
+                None => db.create_agent(&agent_name, &format!("Sub-agent: {}", agent_name))?,
+            }
         }
         let depth = db.agent_lineage(&parent_agent)?.len();
         if depth >= MAX_AGENT_DEPTH {
@@ -3360,12 +3456,8 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         db.get_agent_config(&agent_name)?
     };
 
-    if let Some(ref model) = agent_config.model {
-        agent_opts.model = model.clone();
-    }
-    if let Some(ref endpoint) = agent_config.endpoint {
-        agent_opts.endpoint = openai::normalize_endpoint(endpoint);
-    }
+    let agent_opts = with_agent_config(&sa_ctx.opts, &agent_config);
+    let tools = Arc::new(effective_tools(&sa_ctx.tools, &agent_config));
 
     let mut messages: Vec<Message> = vec![make_message(
         "system",
@@ -3436,10 +3528,15 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
 
     let session_id_for_sub = sa_ctx.session_id.clone();
     let mcp_for_sub = ctx.mcp_manager.clone();
-    // The sub-agent gets the same machinery, so it can spawn its own.
-    let extra_for_sub = ctx.extra.clone();
+    // The sub-agent gets the same machinery, so it can spawn its own -
+    // which start from its settings and tools.
+    let extra_for_sub: Arc<dyn std::any::Any + Send + Sync> = Arc::new(SubAgentContext {
+        opts: agent_opts.clone(),
+        tools: tools.clone(),
+        ..sa_ctx.clone()
+    });
     let agent_name_for_ctx = agent_name.clone();
-    let context_window = ctx.context_window;
+    let context_window = agent_config.context_window.or(ctx.context_window);
     let session_usage = sa_ctx.session_usage.clone();
     std::thread::spawn(move || {
         struct SubAgentGuard {
@@ -3476,7 +3573,7 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         sub_ctx.agent_name = Some(agent_name_for_ctx);
         sub_ctx.mcp_manager = mcp_for_sub;
         sub_ctx.context_window = context_window;
-        sub_ctx.extra = extra_for_sub;
+        sub_ctx.extra = Some(extra_for_sub);
         sub_ctx.max_requests = max_requests;
         let slot = Arc::new(Mutex::new(None));
         sub_ctx.result_slot = Some(slot.clone());
@@ -4251,6 +4348,10 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "description": {
                             "type": "string",
                             "description": "Optional description of the agent's purpose"
+                        },
+                        "profile": {
+                            "type": "string",
+                            "description": "Make it from this profile: it gets a copy of the profile's settings"
                         }
                     },
                     "required": [
@@ -4353,11 +4454,12 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "agent_configure",
-                "description": "Set an agent's own model, API endpoint or system prompt, used from its next turn on. An empty string clears that setting, so the agent goes back to the default. agent_get shows the current configuration.",
+                "description": "Set an agent's own model, API endpoint or system prompt, used from its next turn on - or replace all its settings with a copy of a profile's. An empty string clears that setting, so the agent goes back to the default. agent_get shows the current configuration.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "agent": {"type": "string", "description": "Name of the agent"},
+                        "profile": {"type": "string", "description": "Replace its settings with this profile's (other fields given are then set over them)"},
                         "model": {"type": "string", "description": "Model to use for this agent"},
                         "endpoint": {"type": "string", "description": "API endpoint for this agent"},
                         "system_prompt": {"type": "string", "description": "System prompt for this agent"}
@@ -4629,7 +4731,8 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "name": {"type": "string", "description": "Name for the task"},
                         "command": {"type": "string", "description": "What to do when it fires: an instruction, or a JSON tool call"},
                         "description": {"type": "string", "description": "What the task is for"},
-                        "agent_name": {"type": "string", "description": "The agent that runs it (default: you)"},
+                        "agent_name": {"type": "string", "description": "The agent that runs it (default: you, unless a profile is given)"},
+                        "profile": {"type": "string", "description": "For an instruction: run it on a new agent made from this profile (one listed in your system prompt), by a worker that has it, instead of on an agent"},
                         "cron_expression": {"type": "string", "description": "7 fields: 'sec min hour day_of_month month day_of_week year', e.g. '0 30 9 * * Mon-Fri *' for 9:30 every weekday"},
                         "max_runs": {"type": "integer", "description": "With cron_expression: stop after this many runs"},
                         "delay_seconds": {"type": "integer", "description": "Run once, this many seconds from now"},
@@ -4660,6 +4763,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                     "properties": {
                         "id": {"type": "integer", "description": "Get just this task"},
                         "agent_name": {"type": "string", "description": "Only this agent's tasks"},
+                        "profile": {"type": "string", "description": "Only tasks that run on this profile"},
                         "due": {"type": "boolean", "description": "Only tasks due to run now"}
                     },
                     "additionalProperties": false
@@ -4691,6 +4795,32 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                     "required": [
                         "id"
                     ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "task_assign".to_string(),
+        tool_task_assign,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "task_assign",
+                "description": "Change where a task that isn't running or done yet runs: on an existing agent (agent_name), on a new agent made from a profile (profile, instructions only), or with neither on whichever agent is free first.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer", "description": "ID of the task"},
+                        "agent_name": {"type": "string", "description": "Run it on this agent"},
+                        "profile": {"type": "string", "description": "Run it on a new agent made from this profile"}
+                    },
+                    "required": ["id"],
                     "additionalProperties": false
                 }
             }
@@ -4795,6 +4925,10 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "max_requests": {
                             "type": "integer",
                             "description": "Stop it once it has made this many requests to the model"
+                        },
+                        "profile": {
+                            "type": "string",
+                            "description": "Make a new sub-agent from this profile (one listed in your system prompt): its model, endpoint, parameters such as reasoning effort, and tools"
                         },
                         "result_schema": {
                             "type": "object",
@@ -4922,6 +5056,10 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "max_parallel": {
                             "type": "integer",
                             "description": "How many workers run at the same time (default 32, at most 256)."
+                        },
+                        "profile": {
+                            "type": "string",
+                            "description": "Run the workers with this profile's settings (one listed in your system prompt): model, endpoint, parameters such as reasoning effort, and the tools they may have."
                         },
                         "tools": {
                             "type": "array",
@@ -5089,8 +5227,238 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
 /// the user explicitly adds - via `/system`, a per-agent `system_prompt`
 /// config, or system-context files passed to `prompt` - becomes a system
 /// message; nothing is injected by default.
-fn initialize_chat_messages(_tools: &ToolsCollection, _opts: &Opts) -> Vec<Message> {
-    vec![]
+fn initialize_chat_messages(tools: &ToolsCollection, opts: &Opts) -> Vec<Message> {
+    let uses_profiles = ["spawn_agent", "fan_out", "task_create"]
+        .iter()
+        .any(|t| tools.contains_key(*t));
+    match profiles_overview(&opts.profiles) {
+        Some(overview) if uses_profiles => vec![make_message("system", overview)],
+        _ => vec![],
+    }
+}
+
+/// A named set of agent settings, from the config file's "profiles": an
+/// agent made from one (`spawn_agent`, `fan_out`, `faber chat --profile`,
+/// a task's `profile`) gets a copy of them as its own config, so later
+/// changes to the profile don't affect it.
+#[derive(Deserialize, Serialize, Debug, Clone, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct Profile {
+    /// What it's for, shown to the model choosing one.
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+    /// Path to the file holding the API key.
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    context_window: Option<u32>,
+    /// Request parameters, e.g. {"reasoning_effort": "low", "temperature": 0.2},
+    /// over the ones given with --parameter.
+    #[serde(default)]
+    parameters: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Added to the agent's system prompt.
+    #[serde(default)]
+    system_prompt: Option<String>,
+    /// The only built-in tools it may use - of those the session has, so a
+    /// profile can't add unsafe tools to a session without them.
+    #[serde(default)]
+    tools: Option<Vec<String>>,
+}
+
+impl Profile {
+    /// The agent config an agent made from this profile, `name`, gets.
+    fn agent_config(&self, name: &str) -> db::AgentConfig {
+        db::AgentConfig {
+            model: self.model.clone(),
+            endpoint: self.endpoint.clone(),
+            system_prompt: self.system_prompt.clone(),
+            api_key: self.api_key.clone(),
+            max_tokens: self.max_tokens,
+            context_window: self.context_window,
+            parameters: self.parameters.clone(),
+            tools: self.tools.clone(),
+            profile: Some(name.to_string()),
+        }
+    }
+}
+
+type Profiles = HashMap<String, Profile>;
+
+/// An agent's settings as labelled lines, the model always (`-` for the
+/// session's) and the rest only when set.
+fn agent_config_lines(config: &db::AgentConfig) -> Vec<(&'static str, String)> {
+    let mut lines = vec![
+        (
+            "Profile",
+            config.profile.clone().unwrap_or_else(|| "-".to_string()),
+        ),
+        (
+            "Model",
+            config.model.clone().unwrap_or_else(|| "-".to_string()),
+        ),
+    ];
+    let optional = [
+        ("Endpoint", config.endpoint.clone()),
+        ("API key", config.api_key.clone()),
+        ("Max tokens", config.max_tokens.map(|n| n.to_string())),
+        ("Context", config.context_window.map(|n| n.to_string())),
+        (
+            "Parameters",
+            config.parameters.as_ref().map(|p| {
+                p.iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }),
+        ),
+        ("Tools", config.tools.as_ref().map(|t| t.join(", "))),
+        (
+            "System prompt",
+            config.system_prompt.as_deref().map(|p| first_line(p, 80)),
+        ),
+    ];
+    lines.extend(
+        optional
+            .into_iter()
+            .filter_map(|(label, value)| value.map(|v| (label, v))),
+    );
+    lines
+}
+
+/// `faber profiles`: the config file's profiles, and what each sets.
+fn profiles_command(opts: &Opts) -> Result<(), Box<dyn Error>> {
+    if opts.profiles.is_empty() {
+        println!("No profiles: add them under \"profiles\" in the config file.");
+        return Ok(());
+    }
+    let mut names: Vec<&String> = opts.profiles.keys().collect();
+    names.sort();
+    for name in names {
+        let profile = &opts.profiles[name];
+        println!("{}", name);
+        if let Some(description) = &profile.description {
+            println!("  {}", description);
+        }
+        for (label, value) in agent_config_lines(&profile.agent_config(name))
+            .into_iter()
+            .skip(1)
+        {
+            println!("  {:<13} {}", format!("{}:", label), value);
+        }
+    }
+    Ok(())
+}
+
+/// The profiles the session behind `ctx` has, if any.
+fn ctx_profiles(ctx: &ToolContext) -> Arc<Profiles> {
+    ctx.extra
+        .as_ref()
+        .and_then(|e| e.downcast_ref::<SubAgentContext>())
+        .map(|sa| sa.profiles.clone())
+        .unwrap_or_default()
+}
+
+/// The profile called `name`, or an error naming the ones there are.
+fn find_profile<'a>(profiles: &'a Profiles, name: &str) -> Result<&'a Profile, String> {
+    profiles.get(name).ok_or_else(|| {
+        let mut names: Vec<&str> = profiles.keys().map(String::as_str).collect();
+        names.sort();
+        if names.is_empty() {
+            format!("no profile '{}': none are configured", name)
+        } else {
+            format!("no profile '{}': use one of {}", name, names.join(", "))
+        }
+    })
+}
+
+/// Checks the config file's profiles: sensible names, and tools that exist.
+fn validate_profiles(profiles: &Profiles) -> Result<(), String> {
+    let known = initialize_tools(true, None);
+    for (name, profile) in profiles {
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            return Err(format!(
+                "profile name '{}': use letters, digits, '-', '_' and '.'",
+                name
+            ));
+        }
+        for tool in profile.tools.iter().flatten() {
+            if !known.contains_key(tool) {
+                return Err(format!("profile '{}': unknown tool '{}'", name, tool));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What the model is told about the profiles it can pick from, if any.
+fn profiles_overview(profiles: &Profiles) -> Option<String> {
+    if profiles.is_empty() {
+        return None;
+    }
+    let mut names: Vec<&String> = profiles.keys().collect();
+    names.sort();
+    let mut text = "Agent profiles you can run work on, with the `profile` parameter of spawn_agent, fan_out and task_create:".to_string();
+    for name in names {
+        let profile = &profiles[name];
+        let mut details = Vec::new();
+        if let Some(model) = &profile.model {
+            details.push(format!("model {}", model));
+        }
+        for (key, value) in profile.parameters.iter().flatten() {
+            details.push(format!("{} {}", key, value));
+        }
+        text.push_str(&format!("\n- {}", name));
+        if let Some(description) = &profile.description {
+            text.push_str(&format!(": {}", description));
+        }
+        if !details.is_empty() {
+            text.push_str(&format!(" ({})", details.join(", ")));
+        }
+    }
+    Some(text)
+}
+
+/// Makes `agent` from `profile` (called `name`), or re-applies it to an
+/// existing one: its config becomes a copy of the profile's.
+fn apply_profile(
+    db: &dyn DbBackend,
+    agent: &str,
+    name: &str,
+    profile: &Profile,
+) -> Result<db::AgentConfig, Box<dyn Error>> {
+    if db.get_agent(agent)?.is_none() {
+        let description = profile
+            .description
+            .clone()
+            .unwrap_or_else(|| format!("Made from profile '{}'", name));
+        db.create_agent(agent, &description)?;
+    }
+    let config = profile.agent_config(name);
+    db.set_agent_config(agent, &config)?;
+    Ok(config)
+}
+
+/// The tools an agent with `config` gets of `available`: all of them, or
+/// only those its config lists.
+fn effective_tools(available: &ToolsCollection, config: &db::AgentConfig) -> ToolsCollection {
+    match &config.tools {
+        None => available.clone(),
+        Some(names) => available
+            .iter()
+            .filter(|(name, _)| names.contains(name))
+            .map(|(name, tool)| (name.clone(), tool.clone()))
+            .collect(),
+    }
 }
 
 /// Sends a prompt to the OpenAI API and prints the AI's response to standard output.
@@ -5349,29 +5717,43 @@ fn parse_chat_command(line: &str) -> ChatCommand {
 }
 
 fn build_openai_opts(opts: &Opts, agent_config: &db::AgentConfig) -> openai::Opts {
-    let model = agent_config
-        .model
-        .clone()
-        .or_else(|| opts.model.clone())
-        .unwrap_or(DEFAULT_MODEL.to_string());
-    let endpoint = agent_config
+    let endpoint = opts
         .endpoint
         .clone()
-        .or_else(|| opts.endpoint.clone())
         .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
-    let normalized_endpoint = openai::normalize_endpoint(&endpoint);
-    let parameters = parse_parameters(&opts.parameter).unwrap_or_default();
-
-    openai::Opts {
+    let session = openai::Opts {
         max_tokens: opts.max_tokens,
-        model,
-        endpoint: normalized_endpoint,
+        model: opts.model.clone().unwrap_or(DEFAULT_MODEL.to_string()),
+        endpoint: openai::normalize_endpoint(&endpoint),
         tool_choice: opts.tool_choice.clone(),
         api_key: opts.api_key.clone(),
         max_retries: None,
         retry_base_delay_secs: None,
-        parameters,
+        parameters: parse_parameters(&opts.parameter).unwrap_or_default(),
+    };
+    with_agent_config(&session, agent_config)
+}
+
+/// `base` with what an agent's own config sets in its place; its
+/// parameters are added to `base`'s, replacing those with the same name.
+fn with_agent_config(base: &openai::Opts, config: &db::AgentConfig) -> openai::Opts {
+    let mut opts = base.clone();
+    if let Some(model) = &config.model {
+        opts.model = model.clone();
     }
+    if let Some(endpoint) = &config.endpoint {
+        opts.endpoint = openai::normalize_endpoint(endpoint);
+    }
+    if let Some(api_key) = &config.api_key {
+        opts.api_key = Some(api_key.clone());
+    }
+    if let Some(max_tokens) = config.max_tokens {
+        opts.max_tokens = Some(max_tokens);
+    }
+    if let Some(parameters) = &config.parameters {
+        opts.parameters.extend(parameters.clone());
+    }
+    opts
 }
 
 fn initialize_agent_messages(
@@ -7034,13 +7416,20 @@ fn run_scheduled_task(
 }
 
 /// Claims the next due prompt task (`TaskKind::PROMPT`) that `agent` may
-/// take - one for any agent, or for it by name - for this idle session.
-fn claim_prompt_task(db: &dyn DbBackend, session_id: &str, agent: &str) -> Option<db::TaskRow> {
+/// take - one for any agent, for it by name, or for one of `profiles` (to
+/// run on a new agent made from it) - for this idle session.
+fn claim_prompt_task(
+    db: &dyn DbBackend,
+    session_id: &str,
+    agent: &str,
+    profiles: &[String],
+) -> Option<db::TaskRow> {
     let tasks = db.get_pending_tasks().ok()?;
     tasks
         .into_iter()
         .filter(|t| t.kind == db::TaskKind::PROMPT)
         .filter(|t| t.agent_name.as_deref().is_none_or(|a| a == agent))
+        .filter(|t| t.profile.as_ref().is_none_or(|p| profiles.contains(p)))
         .find(|t| db.claim_task(t.id, session_id).unwrap_or(false))
 }
 
@@ -7183,6 +7572,11 @@ fn chat_command(
     let file_versions = Arc::new(Mutex::new(HashMap::new()));
     let initial_agent_name = opts.agent.clone().unwrap_or_else(|| "default".to_string());
 
+    let profile = opts
+        .profile
+        .as_deref()
+        .map(|name| find_profile(&opts.profiles, name).map(|p| (name, p)))
+        .transpose()?;
     let agent_config = if let Some(ref db) = db {
         db.ensure_default_agent()?;
         if initial_agent_name != "default" {
@@ -7197,14 +7591,18 @@ fn chat_command(
             )
             .into());
         }
+        if let Some((name, profile)) = profile {
+            apply_profile(db.as_ref(), &initial_agent_name, name, profile)?;
+        }
         db.get_agent_config(&initial_agent_name)?
     } else {
-        db::AgentConfig {
-            model: None,
-            endpoint: None,
-            system_prompt: None,
-        }
+        profile
+            .map(|(name, profile)| profile.agent_config(name))
+            .unwrap_or_default()
     };
+    // The agent's own tool list narrows the session's. (Only the starting
+    // agent's: switching agents in the chat keeps these tools.)
+    let tools = effective_tools(&tools, &agent_config);
 
     let initial_messages = if let Some(ref db) = db {
         let vals = db.load_agent_messages(&initial_agent_name)?;
@@ -7254,11 +7652,12 @@ fn chat_command(
     // request_with_summary_fallback still fully covers an actual context
     // overflow regardless, and /cost's raw token counts are always
     // accurate even if the price estimate briefly isn't.
-    let context_window: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(opts.context_window));
+    let configured_window = agent_config.context_window.or(opts.context_window);
+    let context_window: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(configured_window));
     let model_pricing: Arc<Mutex<Option<openai::Pricing>>> = Arc::new(Mutex::new(None));
     spawn_model_metadata_lookup(
         context_window.clone(),
-        opts.context_window.is_some(),
+        configured_window.is_some(),
         model_pricing.clone(),
         openai_opts.endpoint.clone(),
         openai_opts.api_key.clone(),
@@ -7324,6 +7723,7 @@ fn chat_command(
     }
 
     let tools_arc = Arc::new(tools.clone());
+    let profiles = Arc::new(opts.profiles.clone());
 
     let (input_tx, input_rx) = mpsc::channel::<Result<String, rustyline::error::ReadlineError>>();
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
@@ -7435,7 +7835,8 @@ fn chat_command(
         {
             last_prompt_task_poll = std::time::Instant::now();
             if let Some(ref db) = db {
-                if let Some(task) = claim_prompt_task(db.as_ref(), &session_id, &active_agent.name)
+                if let Some(task) =
+                    claim_prompt_task(db.as_ref(), &session_id, &active_agent.name, &[])
                 {
                     chat_pb.println(&format!(
                         "Picked up scheduled task #{} \"{}\"",
@@ -7584,6 +7985,7 @@ fn chat_command(
                         running_subagents: running_subagents.clone(),
                         status_bar: status_bar.clone(),
                         session_usage: session_usage.clone(),
+                        profiles: profiles.clone(),
                     }));
                     tool_context.interrupt = Some(ctrl_c_rx.clone());
                     tool_context.file_versions = Some(file_versions.clone());
@@ -8030,6 +8432,18 @@ fn unmet_dependencies(all: &[db::TaskRow]) -> HashMap<i64, Vec<i64>> {
         .collect()
 }
 
+/// Where a task runs, for showing: "profile fast", an agent's name, "any
+/// agent" for an unbound prompt task, or "-" for a tool task (any
+/// session's scheduler runs those).
+fn task_target(task: &db::TaskRow) -> String {
+    match (&task.profile, &task.agent_name, task.kind.as_str()) {
+        (Some(profile), _, _) => format!("profile {}", profile),
+        (None, Some(agent), _) => agent.clone(),
+        (None, None, db::TaskKind::PROMPT) => "any agent".to_string(),
+        (None, None, _) => "-".to_string(),
+    }
+}
+
 fn format_task_ids(ids: &[i64]) -> String {
     ids.iter()
         .map(|id| format!("#{}", id))
@@ -8076,6 +8490,9 @@ fn task_table_row(
         "-".to_string()
     } else if let Some(unmet) = blocked.get(&task.id) {
         format!("after {}", format_task_ids(unmet))
+    } else if due && task.profile.is_some() {
+        // Only a worker that has the profile picks these up.
+        "waiting for a worker".to_string()
     } else if due && task.kind == db::TaskKind::PROMPT {
         // Only a chat session waiting at its prompt picks these up.
         "waiting for an agent".to_string()
@@ -8102,7 +8519,7 @@ fn task_table_row(
     Row::new(vec![
         Cell::new(&task.id.to_string()),
         Cell::new(&task.name),
-        Cell::new(task.agent_name.as_deref().unwrap_or("-")),
+        Cell::new(&task_target(task)),
         Cell::new(&task.kind),
         Cell::new(&schedule),
         status,
@@ -8153,7 +8570,7 @@ fn board_card_lines(
             .map(|t| format_relative(t, now))
             .unwrap_or_else(|| "-".to_string())
     };
-    let who = task.agent_name.as_deref().unwrap_or("any agent");
+    let who = task_target(task);
     let mut lines = vec![format!("#{} {}", task.id, task.name)];
     match task.status.as_str() {
         db::TaskStatus::DONE => {
@@ -8293,13 +8710,18 @@ fn print_tasks_table(
     since: Option<&str>,
     last: Option<usize>,
     agent: Option<&str>,
+    profile: Option<&str>,
     board: bool,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Box<dyn Error>> {
     let since = since.map(|s| parse_since(s, now)).transpose()?;
     let all = db.list_tasks(None)?;
     let blocked = unmet_dependencies(&all);
-    let tasks = select_tasks(db.list_tasks(agent)?, since, last);
+    let mut tasks = db.list_tasks(agent)?;
+    if let Some(profile) = profile {
+        tasks.retain(|t| t.profile.as_deref() == Some(profile));
+    }
+    let tasks = select_tasks(tasks, since, last);
     if board {
         let term = console::Term::stdout();
         let width = if term.is_term() {
@@ -8323,7 +8745,7 @@ fn print_tasks_table(
         [
             "ID",
             "Name",
-            "Agent",
+            "Runs on",
             "Kind",
             "Schedule",
             "Status",
@@ -8355,6 +8777,7 @@ fn new_task_from_cli(
         cron,
         max_runs,
         agent,
+        profile,
         tool,
         name,
         hold,
@@ -8425,6 +8848,7 @@ fn new_task_from_cli(
         schedule,
         held: *hold,
         depends_on: depends_on.clone(),
+        profile: profile.clone(),
     })
 }
 
@@ -8456,11 +8880,7 @@ fn describe_task(
         Some(max) => format!("{} of at most {}", task.run_count, max),
         None => task.run_count.to_string(),
     };
-    let who = match (task.kind.as_str(), &task.agent_name) {
-        (db::TaskKind::PROMPT, None) => "any agent".to_string(),
-        (_, None) => "-".to_string(),
-        (_, Some(agent)) => agent.clone(),
-    };
+    let who = task_target(task);
     let outcome = match task.last_outcome.as_deref() {
         Some(outcome) => match task.last_exit_code {
             Some(code) => format!("{} (exit code {})", outcome, code),
@@ -8472,7 +8892,7 @@ fn describe_task(
         ("Name", task.name.clone()),
         ("Kind", task.kind.clone()),
         ("Status", task.status.clone()),
-        ("Agent", who),
+        ("Runs on", who),
         ("Schedule", schedule),
         (
             "Next run",
@@ -8523,8 +8943,30 @@ fn describe_task(
     out
 }
 
+/// The agent a profile task runs on: `<profile>-<task id>`, made from the
+/// profile (again, for a later run of a cron task) as a sub-agent of the
+/// worker `parent`, and claimed by its session.
+fn profile_task_agent(
+    task: &db::TaskRow,
+    profile: &str,
+    parent: &str,
+    db: &dyn DbBackend,
+    session_id: &str,
+    profiles: &Profiles,
+) -> Result<String, Box<dyn Error>> {
+    let settings = find_profile(profiles, profile)?;
+    let name = format!("{}-{}", profile, task.id);
+    apply_profile(db, &name, profile, settings)?;
+    db.set_agent_parent(&name, Some(parent))?;
+    if !db.claim_agent(&name, session_id)? {
+        return Err(format!("agent '{}' is in use by another session", name).into());
+    }
+    Ok(name)
+}
+
 /// Runs one claimed prompt task headlessly, in a fresh conversation, and
-/// records how it went. Returns that outcome.
+/// records how it went. Returns that outcome. It runs as `agent`, or, for
+/// a task bound to a profile, as a new agent made from it under `agent`.
 fn run_prompt_task_headless(
     task: &db::TaskRow,
     agent: &str,
@@ -8536,12 +8978,41 @@ fn run_prompt_task_headless(
     mcp_manager: &Option<Arc<faber::mcp::McpManager>>,
     cancel: mpsc::Receiver<()>,
 ) -> db::TaskOutcome {
-    let agent_config = db.get_agent_config(agent).unwrap_or(db::AgentConfig {
-        model: None,
-        endpoint: None,
-        system_prompt: None,
+    let worker = agent;
+    let profile_agent = task.profile.as_deref().map(|profile| {
+        profile_task_agent(
+            task,
+            profile,
+            worker,
+            db.as_ref(),
+            session_id,
+            &opts.profiles,
+        )
     });
+    let agent = match &profile_agent {
+        None => worker,
+        Some(Ok(name)) => name.as_str(),
+        Some(Err(e)) => {
+            let outcome = db::TaskOutcome {
+                succeeded: false,
+                exit_code: None,
+                result: format!("Couldn't make its agent: {}", e),
+            };
+            if let Err(e) = db.finish_task(task.id, session_id, &outcome) {
+                warn!("Couldn't record the outcome of task {}: {}", task.id, e);
+            }
+            return outcome;
+        }
+    };
+    let agent_config = db.get_agent_config(agent).unwrap_or_default();
     let openai_opts = build_openai_opts(opts, &agent_config);
+    let tools = &effective_tools(tools, &agent_config);
+    // Its sub-agents start from its settings and tools, not the worker's.
+    let extra = Arc::new(SubAgentContext {
+        opts: openai_opts.clone(),
+        tools: Arc::new(tools.clone()),
+        ..(*extra).clone()
+    });
     let mut messages = initialize_agent_messages(tools, opts, &agent_config);
     messages.push(make_message(
         "user",
@@ -8554,7 +9025,7 @@ fn run_prompt_task_headless(
     ctx.db = Some(db.clone());
     ctx.agent_name = Some(agent.to_string());
     ctx.mcp_manager = mcp_manager.clone();
-    ctx.context_window = opts.context_window;
+    ctx.context_window = agent_config.context_window.or(opts.context_window);
     ctx.extra = Some(extra);
     let slot = Arc::new(Mutex::new(None));
     ctx.result_slot = Some(slot.clone());
@@ -8590,6 +9061,16 @@ fn run_prompt_task_headless(
     if let Err(e) = db.finish_task(task.id, session_id, &outcome) {
         warn!("Couldn't record the outcome of task {}: {}", task.id, e);
     }
+    if agent != worker {
+        // The worker's own activity is the worker loop's to keep.
+        let first = first_line(&outcome.result, 80);
+        activity.set(&if outcome.succeeded {
+            format!("finished: {}", first)
+        } else {
+            format!("failed: {}", first)
+        });
+        let _ = db.release_agent(agent, session_id);
+    }
     outcome
 }
 
@@ -8601,10 +9082,20 @@ fn worker_command(
     mcp_manager: Option<Arc<faber::mcp::McpManager>>,
     agent: Option<String>,
     parallel: usize,
+    only_profiles: &[String],
 ) -> Result<(), Box<dyn Error>> {
     let db = db.ok_or(
         "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
     )?;
+    for name in only_profiles {
+        find_profile(&opts.profiles, name)?;
+    }
+    let mut profiles: Vec<String> = if only_profiles.is_empty() {
+        opts.profiles.keys().cloned().collect()
+    } else {
+        only_profiles.to_vec()
+    };
+    profiles.sort();
     let agent = agent.unwrap_or_else(|| format!("worker-{}", std::process::id()));
     let session_id = format!(
         "{}-{}",
@@ -8666,11 +9157,16 @@ fn worker_command(
         .clone()
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     log(format!(
-        "Working as '{}' ({} task{} at a time, model {}); Ctrl-C to stop",
+        "Working as '{}' ({} task{} at a time, model {}{}); Ctrl-C to stop",
         agent,
         parallel,
         if parallel == 1 { "" } else { "s" },
-        model
+        model,
+        if profiles.is_empty() {
+            String::new()
+        } else {
+            format!(", profiles {}", profiles.join(", "))
+        }
     ));
     let extra = Arc::new(SubAgentContext {
         runs: Arc::new(SubAgentRuns::default()),
@@ -8681,6 +9177,7 @@ fn worker_command(
         running_subagents: Arc::new(Mutex::new(HashMap::new())),
         status_bar: Arc::new(status_bar::StatusBar::new()),
         session_usage: Arc::new(Mutex::new(SessionUsage::default())),
+        profiles: Arc::new(opts.profiles.clone()),
     });
     let activity = ActivityRecorder::new(db.clone(), &agent);
     activity.set("idle");
@@ -8697,14 +9194,20 @@ fn worker_command(
                 ));
             }
             if running.load(Ordering::Relaxed) < parallel {
-                if let Some(task) = claim_prompt_task(db.as_ref(), &session_id, &agent) {
+                if let Some(task) = claim_prompt_task(db.as_ref(), &session_id, &agent, &profiles) {
                     let (cancel_tx, cancel_rx) = mpsc::channel();
                     cancels
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(task.id, cancel_tx);
                     running.fetch_add(1, Ordering::Relaxed);
-                    log(format!("#{} \"{}\" started", task.id, task.name));
+                    log(match &task.profile {
+                        Some(profile) => format!(
+                            "#{} \"{}\" started on profile {}",
+                            task.id, task.name, profile
+                        ),
+                        None => format!("#{} \"{}\" started", task.id, task.name),
+                    });
                     let (db, session_id, tools, extra, mcp_manager, agent) = (
                         &db,
                         &session_id,
@@ -8947,7 +9450,9 @@ fn agents_command(
                 .map(|t| format!(" ({})", format_relative(t, now)))
                 .unwrap_or_default()
         );
-        println!("  Model:        {}", config.model.as_deref().unwrap_or("-"));
+        for (label, value) in agent_config_lines(&config) {
+            println!("  {:<13} {}", format!("{}:", label), value);
+        }
         let messages: Vec<Message> = db
             .load_agent_messages(name)?
             .into_iter()
@@ -9163,6 +9668,53 @@ fn hold_tasks_command(
     Ok(())
 }
 
+/// `faber tasks assign`: moves tasks to run on `agent`, on a new agent made
+/// from `profile`, or (neither) on any agent.
+fn assign_tasks_command(
+    db: &Option<Arc<dyn DbBackend>>,
+    ids: &[i64],
+    agent: Option<&str>,
+    profile: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let db = db.as_ref().ok_or(
+        "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
+    )?;
+    let mut failed = 0;
+    for &id in ids {
+        let result = db.set_task_target(id, agent, profile);
+        let task = db.get_task(id)?;
+        match (result, task) {
+            (Ok(true), Some(task)) => {
+                println!("Task #{} now runs on {}.", id, task_target(&task));
+                continue;
+            }
+            (Ok(_), None) => eprintln!("Task #{} can't be moved: no such task.", id),
+            (Ok(_), Some(task)) => {
+                eprintln!("Task #{} can't be moved: it's {} already.", id, task.status)
+            }
+            (Err(e), _) => eprintln!("Task #{} can't be moved: {}.", id, e),
+        }
+        failed += 1;
+    }
+    if failed > 0 {
+        return Err(format!("{} of {} task(s) not changed", failed, ids.len()).into());
+    }
+    Ok(())
+}
+
+/// Warns when `profile` isn't one of this config's: the task can still be
+/// made, since a worker elsewhere, with another config, may have it.
+fn warn_unknown_profile(opts: &Opts, profile: Option<&str>) {
+    if let Some(profile) = profile {
+        if !opts.profiles.contains_key(profile) {
+            eprintln!(
+                "Warning: no profile '{}' in this config; only a worker whose config has it will run the task.",
+                profile
+            );
+        }
+    }
+}
+
 /// `faber tasks show`: prints everything about one task.
 fn show_task_command(
     db: &Option<Arc<dyn DbBackend>>,
@@ -9283,10 +9835,14 @@ fn add_task_command(
             None => at.clone(),
         },
     };
-    let by = match (task.kind.as_str(), &task.agent_name) {
-        (db::TaskKind::TOOL, _) => "by any session's scheduler".to_string(),
-        (_, Some(agent)) => format!("by agent '{}' once a chat with it is waiting", agent),
-        (_, None) => "by the first agent waiting in a chat".to_string(),
+    let by = match (task.kind.as_str(), &task.agent_name, &task.profile) {
+        (db::TaskKind::TOOL, _, _) => "by any session's scheduler".to_string(),
+        (_, _, Some(profile)) => format!(
+            "on a new agent made from profile '{}', by a `faber worker` that has it",
+            profile
+        ),
+        (_, Some(agent), _) => format!("by agent '{}' once a chat with it is waiting", agent),
+        (_, None, _) => "by the first agent waiting in a chat".to_string(),
     };
     if task.held {
         println!(
@@ -9309,6 +9865,7 @@ fn tasks_command(
     since: Option<&str>,
     last: Option<usize>,
     agent: Option<&str>,
+    profile: Option<&str>,
     watch: Option<u64>,
     board: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -9316,7 +9873,15 @@ fn tasks_command(
         "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
     )?;
     let Some(interval) = watch else {
-        return print_tasks_table(db.as_ref(), since, last, agent, board, chrono::Utc::now());
+        return print_tasks_table(
+            db.as_ref(),
+            since,
+            last,
+            agent,
+            profile,
+            board,
+            chrono::Utc::now(),
+        );
     };
     // Fail on a bad --since right away rather than on every refresh.
     if let Some(since) = since {
@@ -9334,7 +9899,7 @@ fn tasks_command(
         );
         // A failed refresh (e.g. a dropped --server connection) is shown
         // and retried, not fatal.
-        if let Err(e) = print_tasks_table(db.as_ref(), since, last, agent, board, now) {
+        if let Err(e) = print_tasks_table(db.as_ref(), since, last, agent, profile, board, now) {
             println!("Error: {}", e);
         }
         std::io::stdout().flush()?;
@@ -9590,6 +10155,17 @@ struct Opts {
     #[serde(default)]
     lsp_servers: HashMap<String, Option<lsp::ServerConfig>>,
 
+    /// Named agent settings to make agents from - see `Profile`.
+    #[clap(skip)]
+    #[serde(default)]
+    profiles: Profiles,
+
+    #[clap(long)]
+    #[serde(skip)]
+    /// Make the chat's agent (--agent, or 'default') from this profile in
+    /// the config file, replacing its settings with the profile's
+    profile: Option<String>,
+
     #[clap(long, value_name = "N")]
     /// At most this many requests to the model in flight at once, across the
     /// chat, sub-agents, fan-out workers and scheduled tasks - e.g. the
@@ -9641,6 +10217,8 @@ impl Default for Opts {
             server_key_file: None,
             mcp_servers: HashMap::new(),
             lsp_servers: HashMap::new(),
+            profiles: HashMap::new(),
+            profile: None,
             task_retention: None,
             max_parallel_requests: None,
             mcp_server: Vec::new(),
@@ -9731,6 +10309,10 @@ impl Opts {
 
         if self.mcp_servers.is_empty() {
             self.mcp_servers = config.mcp_servers;
+        }
+
+        if self.profiles.is_empty() {
+            self.profiles = config.profiles;
         }
 
         if self.lsp_servers.is_empty() {
@@ -9853,6 +10435,10 @@ enum TasksAction {
         /// conversation gets the result)
         #[clap(long)]
         agent: Option<String>,
+        /// Run it on a new agent made from this profile (see "profiles" in
+        /// the config file), by a `faber worker` that has it
+        #[clap(long, conflicts_with_all = ["agent", "tool"])]
+        profile: Option<String>,
         /// The text is a tool call to run directly, not a prompt for an agent
         #[clap(long)]
         tool: bool,
@@ -9878,6 +10464,23 @@ enum TasksAction {
         /// The ids of the tasks, as `faber tasks` lists them
         #[clap(required = true)]
         ids: Vec<i64>,
+    },
+    /// Change where tasks that aren't running or done yet run: on an agent, on a
+    /// new agent made from a profile, or on any agent
+    #[clap(group(clap::ArgGroup::new("target").required(true).args(["agent", "profile", "any"])))]
+    Assign {
+        /// The ids of the tasks, as `faber tasks` lists them
+        #[clap(required = true)]
+        ids: Vec<i64>,
+        /// Only this agent may pick them up
+        #[clap(long)]
+        agent: Option<String>,
+        /// Run them on a new agent made from this profile
+        #[clap(long)]
+        profile: Option<String>,
+        /// Whichever agent is free first picks them up
+        #[clap(long)]
+        any: bool,
     },
 }
 
@@ -9965,7 +10568,15 @@ enum CliCommand {
         /// How many prompt tasks to work on at once
         #[clap(long, default_value = "1")]
         parallel: usize,
+        /// Only take on tasks bound to these profiles (comma-separated) of
+        /// the config file's; default: all of them. Tasks bound to no
+        /// profile are taken on either way
+        #[clap(long = "profile", value_delimiter = ',')]
+        profiles: Vec<String>,
     },
+
+    /// List the profiles in the config file, to make agents from
+    Profiles {},
 
     /// Show the agents as a tree by who spawned whom, with what each is
     /// doing - or, with `show`, one agent and its conversation
@@ -10005,8 +10616,11 @@ enum CliCommand {
         #[clap(long)]
         last: Option<usize>,
         /// Only this agent's tasks
-        #[clap(long)]
+        #[clap(long, conflicts_with = "profile")]
         agent: Option<String>,
+        /// Only tasks that run on this profile
+        #[clap(long)]
+        profile: Option<String>,
         /// Keep the table on screen, refreshed every 2 seconds (or every
         /// N with --watch=N), until Ctrl-C
         #[clap(long, value_name = "N", num_args = 0..=1, require_equals = true, default_missing_value = "2")]
@@ -10055,6 +10669,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             | CliCommand::Agents { .. }
             | CliCommand::Models {}
             | CliCommand::ListTools {}
+            | CliCommand::Profiles {}
             | CliCommand::Gc {}
     ) {
         unsafe {
@@ -10091,6 +10706,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     opts.apply_mcp_server_flags()?;
     lsp::configure(&opts.lsp_servers)?;
+    validate_profiles(&opts.profiles).map_err(|e| format!("Configuration file error: {}", e))?;
     openai::set_max_parallel_requests(opts.max_parallel_requests.unwrap_or(0));
     if let Some(retention) = &opts.task_retention {
         parse_duration(retention).ok_or_else(|| {
@@ -10178,16 +10794,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Models {} => list_models_command(&opts),
         CliCommand::ListTools {} => list_tools_command(&mcp_manager),
         CliCommand::Gc {} => gc_command(&opts),
-        CliCommand::Worker { agent, parallel } => worker_command(
+        CliCommand::Worker {
+            agent,
+            parallel,
+            profiles,
+        } => worker_command(
             &opts,
             db_connection.clone(),
             mcp_manager.clone(),
             agent.clone(),
             *parallel,
+            profiles,
         ),
         CliCommand::Agents { action, watch } => {
             agents_command(&db_connection, action.as_ref(), *watch)
         }
+        CliCommand::Profiles {} => profiles_command(&opts),
         CliCommand::Kb { action, tag, last } => {
             kb_command(&db_connection, action.as_ref(), tag.as_deref(), *last)
         }
@@ -10213,14 +10835,33 @@ fn main() -> Result<(), Box<dyn Error>> {
             ..
         } => hold_tasks_command(&db_connection, ids, false),
         CliCommand::Tasks {
+            action:
+                Some(TasksAction::Assign {
+                    ids,
+                    agent,
+                    profile,
+                    ..
+                }),
+            ..
+        } => {
+            warn_unknown_profile(&opts, profile.as_deref());
+            assign_tasks_command(&db_connection, ids, agent.as_deref(), profile.as_deref())
+        }
+        CliCommand::Tasks {
             action: Some(action),
             ..
-        } => add_task_command(&db_connection, action),
+        } => {
+            if let TasksAction::Add { profile, .. } = action {
+                warn_unknown_profile(&opts, profile.as_deref());
+            }
+            add_task_command(&db_connection, action)
+        }
         CliCommand::Tasks {
             action: None,
             since,
             last,
             agent,
+            profile,
             watch,
             board,
         } => tasks_command(
@@ -10228,6 +10869,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             since.as_deref(),
             *last,
             agent.as_deref(),
+            profile.as_deref(),
             *watch,
             *board,
         ),
@@ -10810,6 +11452,7 @@ mod tests {
             last_result: None,
             kind: "tool".to_string(),
             depends_on: Vec::new(),
+            profile: None,
         }
     }
 
@@ -11004,21 +11647,24 @@ mod tests {
             schedule: db::TaskSchedule::Once { at: past.clone() },
             held: false,
             depends_on: Vec::new(),
+            profile: None,
         };
         let for_bob = db.create_task(&prompt(Some("bob"))).unwrap();
-        assert!(claim_prompt_task(db.as_ref(), "s1", "alice").is_none());
+        assert!(claim_prompt_task(db.as_ref(), "s1", "alice", &[]).is_none());
         assert_eq!(
-            claim_prompt_task(db.as_ref(), "s2", "bob").unwrap().id,
+            claim_prompt_task(db.as_ref(), "s2", "bob", &[]).unwrap().id,
             for_bob
         );
 
         let for_anyone = db.create_task(&prompt(None)).unwrap();
         assert_eq!(
-            claim_prompt_task(db.as_ref(), "s1", "alice").unwrap().id,
+            claim_prompt_task(db.as_ref(), "s1", "alice", &[])
+                .unwrap()
+                .id,
             for_anyone
         );
         assert!(
-            claim_prompt_task(db.as_ref(), "s2", "bob").is_none(),
+            claim_prompt_task(db.as_ref(), "s2", "bob", &[]).is_none(),
             "already taken"
         );
 
@@ -11131,7 +11777,7 @@ mod tests {
             "Task #7",
             "Name:         nightly",
             "Kind:         prompt",
-            "Agent:        any agent",
+            "Runs on:      any agent",
             "Schedule:     cron \"0 0 3 * * * *\"",
             "(in 15h)",
             "Runs:         2 of at most 5",
@@ -11732,6 +12378,7 @@ mod tests {
             running_subagents: Arc::new(Mutex::new(HashMap::new())),
             status_bar: Arc::new(status_bar::StatusBar::new()),
             session_usage: Arc::new(Mutex::new(SessionUsage::default())),
+            profiles: Default::default(),
         }));
         ctx
     }
@@ -11978,6 +12625,394 @@ mod tests {
         tool_agent_cancel(&r#"{"name":"slow"}"#.to_string(), &ctx).unwrap();
     }
 
+    /// `ctx` with `profiles` for making agents from.
+    fn with_profiles(ctx: &mut ToolContext, profiles: Profiles) {
+        let extra = ctx
+            .extra
+            .as_ref()
+            .unwrap()
+            .downcast_ref::<SubAgentContext>()
+            .unwrap()
+            .clone();
+        ctx.extra = Some(Arc::new(SubAgentContext {
+            profiles: Arc::new(profiles),
+            ..extra
+        }));
+    }
+
+    /// A profile whose model is a script answering everything with `reply`.
+    fn scripted_profile(name: &str, reply: &str) -> Profile {
+        Profile {
+            model: Some(model_script(
+                name,
+                serde_json::json!([{"if": "", "reply": reply}]),
+            )),
+            parameters: Some(
+                serde_json::json!({"reasoning_effort": "low"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_agent_settings_layer_over_the_session() {
+        let mut opts = Opts::default();
+        opts.model = Some("base".to_string());
+        opts.parameter = vec!["temperature=0.7".to_string(), "top_p=0.9".to_string()];
+        opts.api_key = Some("/keys/session".to_string());
+        opts.max_tokens = Some(100);
+        let plain = build_openai_opts(&opts, &db::AgentConfig::default());
+        assert_eq!(plain.model, "base");
+        let config = db::AgentConfig {
+            model: Some("small".to_string()),
+            api_key: Some("/keys/agent".to_string()),
+            parameters: Some(
+                serde_json::json!({"temperature": 0.1, "reasoning_effort": "low"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            ..Default::default()
+        };
+        let layered = build_openai_opts(&opts, &config);
+        assert_eq!(layered.model, "small");
+        assert_eq!(layered.api_key.as_deref(), Some("/keys/agent"));
+        assert_eq!(
+            layered.max_tokens,
+            Some(100),
+            "unset fields stay the session's"
+        );
+        assert_eq!(layered.parameters["temperature"], serde_json::json!(0.1));
+        assert_eq!(layered.parameters["reasoning_effort"], "low");
+        assert!(layered.parameters.contains_key("top_p"));
+    }
+
+    #[test]
+    fn test_agent_tools_narrow_but_never_widen() {
+        let safe = initialize_tools(false, None);
+        assert!(!safe.contains_key("fetch_web_content"));
+        let config = db::AgentConfig {
+            tools: Some(vec![
+                "read_file".to_string(),
+                "fetch_web_content".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let tools = effective_tools(&safe, &config);
+        assert_eq!(tools.keys().collect::<Vec<_>>(), vec!["read_file"]);
+        assert_eq!(
+            effective_tools(&safe, &db::AgentConfig::default()).len(),
+            safe.len()
+        );
+    }
+
+    #[test]
+    fn test_profiles_from_the_config_file() {
+        let opts: Opts = serde_json::from_str(
+            r#"{"profiles": {"fast": {"model": "qwen", "parameters": {"reasoning_effort": "low"},
+                                      "tools": ["read_file"], "description": "quick looks"}}}"#,
+        )
+        .unwrap();
+        let fast = &opts.profiles["fast"];
+        assert_eq!(fast.model.as_deref(), Some("qwen"));
+        assert!(validate_profiles(&opts.profiles).is_ok());
+        let config = fast.agent_config("fast");
+        assert_eq!(config.profile.as_deref(), Some("fast"));
+        assert_eq!(config.tools, Some(vec!["read_file".to_string()]));
+        let overview = profiles_overview(&opts.profiles).unwrap();
+        assert!(
+            overview.contains("- fast: quick looks (model qwen, reasoning_effort \"low\")"),
+            "{overview}"
+        );
+
+        let typo = serde_json::from_str::<Opts>(r#"{"profiles": {"fast": {"modle": "x"}}}"#);
+        assert!(typo.is_err(), "unknown keys are rejected");
+        let bad_tool: Profiles = serde_json::from_str(r#"{"fast": {"tools": ["nope"]}}"#).unwrap();
+        assert!(
+            validate_profiles(&bad_tool)
+                .unwrap_err()
+                .contains("unknown tool 'nope'")
+        );
+        let bad_name: Profiles = serde_json::from_str(r#"{"a b": {}}"#).unwrap();
+        assert!(validate_profiles(&bad_name).is_err());
+        let err = find_profile(&opts.profiles, "slow").unwrap_err();
+        assert!(err.contains("use one of fast"), "{err}");
+    }
+
+    #[test]
+    fn test_tasks_add_and_assign_pick_where_a_task_runs() {
+        let now = utc("2026-10-02T12:00:00Z");
+        let task = new_task_from_cli(&add_args(&["review it", "--profile", "fast"]), now).unwrap();
+        assert_eq!(
+            (task.profile.as_deref(), task.agent_name.as_deref()),
+            (Some("fast"), None)
+        );
+        for conflicting in [
+            vec![
+                "faber",
+                "tasks",
+                "add",
+                "x",
+                "--profile",
+                "fast",
+                "--agent",
+                "bob",
+            ],
+            vec!["faber", "tasks", "add", "{}", "--profile", "fast", "--tool"],
+            vec!["faber", "tasks", "assign", "1"],
+            vec![
+                "faber",
+                "tasks",
+                "assign",
+                "1",
+                "--any",
+                "--profile",
+                "fast",
+            ],
+        ] {
+            assert!(
+                Opts::try_parse_from(&conflicting).is_err(),
+                "{conflicting:?}"
+            );
+        }
+
+        let db: Option<Arc<dyn DbBackend>> = Some(local_db_with_agents(&["bob"]));
+        let backend = db.as_ref().unwrap();
+        let id = backend.create_task(&task).unwrap();
+        assign_tasks_command(&db, &[id], Some("bob"), None).unwrap();
+        let row = backend.get_task(id).unwrap().unwrap();
+        assert_eq!(
+            (row.agent_name.as_deref(), row.profile.as_deref()),
+            (Some("bob"), None)
+        );
+        assert_eq!(task_target(&row), "bob");
+        assign_tasks_command(&db, &[id], None, None).unwrap();
+        assert_eq!(
+            task_target(&backend.get_task(id).unwrap().unwrap()),
+            "any agent"
+        );
+        assign_tasks_command(&db, &[id], None, Some("slow")).unwrap();
+        assert_eq!(
+            task_target(&backend.get_task(id).unwrap().unwrap()),
+            "profile slow"
+        );
+        let err = assign_tasks_command(&db, &[id, 999], None, None).unwrap_err();
+        assert!(err.to_string().contains("1 of 2"), "{err}");
+    }
+
+    #[test]
+    fn test_profile_tasks_go_only_to_workers_with_the_profile() {
+        let db = local_db_with_agents(&["w"]);
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let id = db
+            .create_task(&db::NewTask {
+                name: "t".to_string(),
+                description: String::new(),
+                kind: db::TaskKind::PROMPT.to_string(),
+                command: "do it".to_string(),
+                agent_name: None,
+                schedule: db::TaskSchedule::Once { at: past },
+                held: false,
+                depends_on: Vec::new(),
+                profile: Some("fast".to_string()),
+            })
+            .unwrap();
+        // A chat, or a worker without the profile, leaves it alone.
+        assert!(claim_prompt_task(db.as_ref(), "s", "w", &[]).is_none());
+        assert!(claim_prompt_task(db.as_ref(), "s", "w", &["slow".to_string()]).is_none());
+        let task = claim_prompt_task(db.as_ref(), "s", "w", &["fast".to_string()]).unwrap();
+        assert_eq!(task.id, id);
+    }
+
+    #[test]
+    fn test_spawn_agent_makes_a_sub_agent_from_a_profile() {
+        let (db, mut ctx) = spawning_setup(
+            "profile_spawn",
+            serde_json::json!([{"if": "", "reply": "from the session's model"}]),
+        );
+        with_profiles(
+            &mut ctx,
+            HashMap::from([(
+                "fast".to_string(),
+                scripted_profile("profile_spawn_fast", "from fast"),
+            )]),
+        );
+        tool_spawn_agent(
+            &serde_json::json!({"name": "helper", "prompt": "look", "profile": "fast"}).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(sub_agent_result(&db, "boss", "helper"), "from fast");
+        let config = db.get_agent_config("helper").unwrap();
+        assert_eq!(config.profile.as_deref(), Some("fast"));
+        assert_eq!(config.parameters.unwrap()["reasoning_effort"], "low");
+
+        // Without a profile, it's the session's model.
+        tool_spawn_agent(
+            &serde_json::json!({"name": "plain", "prompt": "look"}).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            sub_agent_result(&db, "boss", "plain"),
+            "from the session's model"
+        );
+        // An existing agent can't be switched to a profile this way.
+        let err = tool_spawn_agent(
+            &serde_json::json!({"name": "plain", "prompt": "again", "profile": "fast"}).to_string(),
+            &ctx,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no profile"), "{err}");
+        let err = tool_spawn_agent(
+            &serde_json::json!({"name": "x", "prompt": "p", "profile": "slow"}).to_string(),
+            &ctx,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("use one of fast"), "{err}");
+        // agent_configure re-applies a profile to an existing agent.
+        tool_agent_configure(
+            &serde_json::json!({"agent": "plain", "profile": "fast"}).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_agent_config("plain").unwrap().profile.as_deref(),
+            Some("fast")
+        );
+        tool_agent_create(
+            &serde_json::json!({"name": "made", "profile": "fast"}).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_agent_config("made").unwrap().profile.as_deref(),
+            Some("fast")
+        );
+        assert!(
+            tool_agent_create(
+                &serde_json::json!({"name": "unmade", "profile": "slow"}).to_string(),
+                &ctx,
+            )
+            .is_err()
+        );
+        assert!(
+            db.get_agent("unmade").unwrap().is_none(),
+            "not left half made"
+        );
+    }
+
+    #[test]
+    fn test_fan_out_workers_run_with_a_profile() {
+        let (_db, mut ctx) = spawning_setup(
+            "profile_fan_out",
+            serde_json::json!([{"if": "", "reply": "session"}]),
+        );
+        with_profiles(
+            &mut ctx,
+            HashMap::from([(
+                "fast".to_string(),
+                scripted_profile("profile_fan_out_fast", "fast says hi"),
+            )]),
+        );
+        let out = fan_out::tool_fan_out(
+            &serde_json::json!({"items": ["a", "b"], "prompt": "greet {item}", "profile": "fast"})
+                .to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(out.matches("fast says hi").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn test_worker_runs_a_profile_task_on_a_new_agent() {
+        let db = local_db_with_agents(&["w"]);
+        assert!(db.claim_agent("w", "worker-session").unwrap());
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let id = db
+            .create_task(&db::NewTask {
+                name: "review".to_string(),
+                description: String::new(),
+                kind: db::TaskKind::PROMPT.to_string(),
+                command: "review the diff".to_string(),
+                agent_name: None,
+                schedule: db::TaskSchedule::Once { at: past },
+                held: false,
+                depends_on: Vec::new(),
+                profile: Some("fast".to_string()),
+            })
+            .unwrap();
+        let mut opts = Opts::default();
+        opts.model = Some(model_script(
+            "profile_worker_session",
+            serde_json::json!([{"if": "", "reply": "worker's own model"}]),
+        ));
+        opts.profiles = HashMap::from([(
+            "fast".to_string(),
+            scripted_profile("profile_worker_fast", "looks good"),
+        )]);
+        let task =
+            claim_prompt_task(db.as_ref(), "worker-session", "w", &["fast".to_string()]).unwrap();
+        let ctx = chat_ctx_with_model(db.clone(), "w", opts.model.as_deref().unwrap());
+        let extra = ctx
+            .extra
+            .clone()
+            .unwrap()
+            .downcast::<SubAgentContext>()
+            .ok()
+            .unwrap();
+        let (_cancel_tx, cancel_rx) = mpsc::channel();
+        let outcome = run_prompt_task_headless(
+            &task,
+            "w",
+            &db,
+            "worker-session",
+            &extra.tools,
+            &opts,
+            extra.clone(),
+            &None,
+            cancel_rx,
+        );
+        assert!(outcome.succeeded, "{}", outcome.result);
+        assert_eq!(outcome.result, "looks good");
+        let agent_name = format!("fast-{}", id);
+        let agent = db.get_agent(&agent_name).unwrap().unwrap();
+        assert_eq!(agent.parent.as_deref(), Some("w"));
+        assert!(agent.activity.unwrap().starts_with("finished: looks good"));
+        let transcript = db.load_agent_messages(&agent_name).unwrap();
+        assert_eq!(transcript.last().unwrap()["content"], "looks good");
+        assert!(
+            db.load_agent_messages("w").unwrap().is_empty(),
+            "not the worker's"
+        );
+
+        // A profile this worker doesn't have fails the task, saying why.
+        opts.profiles.clear();
+        db.set_task_target(id, None, Some("fast")).unwrap();
+        let task = db.get_task(id).unwrap().unwrap();
+        let (_cancel_tx, cancel_rx) = mpsc::channel();
+        let outcome = run_prompt_task_headless(
+            &task,
+            "w",
+            &db,
+            "worker-session",
+            &extra.tools,
+            &opts,
+            extra.clone(),
+            &None,
+            cancel_rx,
+        );
+        assert!(!outcome.succeeded);
+        assert!(
+            outcome.result.contains("no profile 'fast'"),
+            "{}",
+            outcome.result
+        );
+    }
+
     #[test]
     fn test_headless_task_run_records_its_outcome_and_transcript() {
         let model = model_script(
@@ -11990,7 +13025,7 @@ mod tests {
         let id = db
             .create_oneshot_task("check", "", &past, "summarize the logs", None)
             .unwrap();
-        let task = claim_prompt_task(db.as_ref(), "worker-session", "w").expect("claimable");
+        let task = claim_prompt_task(db.as_ref(), "worker-session", "w", &[]).expect("claimable");
         assert_eq!(task.id, id);
         let ctx = chat_ctx_with_model(db.clone(), "w", &model);
         let extra = ctx
@@ -12116,7 +13151,7 @@ mod tests {
         let id = db
             .create_oneshot_task("t", "", &past, "check item 3", Some("w"))
             .unwrap();
-        let task = claim_prompt_task(db.as_ref(), "worker-session", "w").unwrap();
+        let task = claim_prompt_task(db.as_ref(), "worker-session", "w", &[]).unwrap();
         let extra = ctx
             .extra
             .clone()

@@ -236,6 +236,18 @@ impl DbBackend for RemoteDb {
         Ok(serde_json::from_value(v)?)
     }
 
+    fn set_agent_config(
+        &self,
+        agent_name: &str,
+        config: &AgentConfig,
+    ) -> Result<(), Box<dyn Error>> {
+        self.call(
+            "set_agent_config",
+            serde_json::json!({"agent_name": agent_name, "config": config}),
+        )?;
+        Ok(())
+    }
+
     fn save_agent_messages(
         &self,
         agent_name: &str,
@@ -386,6 +398,19 @@ impl DbBackend for RemoteDb {
         let v = self.call(
             "set_task_held",
             serde_json::json!({"task_id": task_id, "held": held}),
+        )?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn set_task_target(
+        &self,
+        task_id: i64,
+        agent: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<bool, Box<dyn Error>> {
+        let v = self.call(
+            "set_task_target",
+            serde_json::json!({"task_id": task_id, "agent": agent, "profile": profile}),
         )?;
         Ok(serde_json::from_value(v)?)
     }

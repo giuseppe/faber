@@ -127,6 +127,15 @@ impl DbBackend for LocalDb {
         db::get_agent_config(&conn, agent_name)
     }
 
+    fn set_agent_config(
+        &self,
+        agent_name: &str,
+        config: &AgentConfig,
+    ) -> Result<(), Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::set_agent_config(&conn, agent_name, config)
+    }
+
     fn save_agent_messages(
         &self,
         agent_name: &str,
@@ -237,6 +246,16 @@ impl DbBackend for LocalDb {
     fn set_task_held(&self, task_id: i64, held: bool) -> Result<bool, Box<dyn Error>> {
         let conn = self.lock()?;
         db::set_task_held(&conn, task_id, held)
+    }
+
+    fn set_task_target(
+        &self,
+        task_id: i64,
+        agent: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<bool, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::set_task_target(&conn, task_id, agent, profile)
     }
 
     fn get_pending_tasks(&self) -> Result<Vec<TaskRow>, Box<dyn Error>> {

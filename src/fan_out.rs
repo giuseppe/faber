@@ -39,6 +39,7 @@ use crate::openai::{
 };
 use crate::{ActivityRecorder, SubAgentContext};
 use faber::ToolContext;
+use faber::db::AgentConfig;
 
 const MAX_ITEMS: usize = 1000;
 /// Workers are cheap threads; how many requests actually reach the model
@@ -88,6 +89,8 @@ struct Params {
     result_schema: Option<serde_json::Value>,
     #[serde(default)]
     context: Option<crate::Handoff>,
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 /// The prompt for one item: `{item}` in `template` replaced by it, or the
@@ -169,6 +172,7 @@ fn run_worker(
     sa_ctx: &SubAgentContext,
     ctx: &ToolContext,
     tools: &ToolsCollection,
+    config: &AgentConfig,
     status_key: &str,
     prompt: String,
     handoff: Option<&crate::Message>,
@@ -176,6 +180,7 @@ fn run_worker(
     cancel: mpsc::Receiver<()>,
 ) -> Result<String, Box<dyn Error>> {
     let mut worker_ctx = worker_context(ctx);
+    worker_ctx.context_window = config.context_window.or(ctx.context_window);
     let slot = Arc::new(Mutex::new(None));
     worker_ctx.result_slot = Some(slot.clone());
     worker_ctx.result_schema = schema.cloned();
@@ -202,6 +207,9 @@ fn run_worker(
     };
     let cancel = Some(Arc::new(Mutex::new(cancel)));
     let mut messages = vec![make_message("system", WORKER_INSTRUCTIONS.to_string())];
+    if let Some(system_prompt) = &config.system_prompt {
+        messages.push(make_message("system", system_prompt.clone()));
+    }
     messages.extend(handoff.cloned());
     messages.push(make_message(
         "user",
@@ -270,7 +278,7 @@ pub(crate) fn tool_fan_out(
     ctx: &ToolContext,
 ) -> Result<String, Box<dyn Error>> {
     let params: Params = serde_json::from_str(params_str)?;
-    let sa_ctx = ctx
+    let caller = ctx
         .extra
         .as_ref()
         .and_then(|e| e.downcast_ref::<SubAgentContext>())
@@ -278,9 +286,20 @@ pub(crate) fn tool_fan_out(
     if params.items.is_empty() || params.items.len() > MAX_ITEMS {
         return Err(format!("give between 1 and {} items", MAX_ITEMS).into());
     }
+    // Workers run with the profile's settings and tools, if given, else
+    // the caller's.
+    let config = match params.profile.as_deref() {
+        Some(name) => crate::find_profile(&caller.profiles, name)?.agent_config(name),
+        None => AgentConfig::default(),
+    };
+    let sa_ctx = &SubAgentContext {
+        opts: crate::with_agent_config(&caller.opts, &config),
+        tools: Arc::new(crate::effective_tools(&caller.tools, &config)),
+        ..caller.clone()
+    };
     let mut tools = worker_tools(&sa_ctx.tools, params.tools.as_deref())?;
     // Workers can always report their outcome.
-    if let Some(report) = sa_ctx.tools.get("report_result") {
+    if let Some(report) = caller.tools.get("report_result") {
         tools.insert("report_result".to_string(), report.clone());
     }
     let handoff =
@@ -364,6 +383,7 @@ pub(crate) fn tool_fan_out(
                             sa_ctx,
                             ctx,
                             &tools,
+                            &config,
                             &key,
                             expand_prompt(&params.prompt, item),
                             handoff.as_ref(),
@@ -444,6 +464,7 @@ mod tests {
             running_subagents: Arc::new(Mutex::new(std::collections::HashMap::new())),
             status_bar: Arc::new(crate::status_bar::StatusBar::new()),
             session_usage: usage.clone(),
+            profiles: Default::default(),
         }));
         (ctx, ctrl_c_tx, usage)
     }
