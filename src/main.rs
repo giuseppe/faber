@@ -97,6 +97,190 @@ fn final_response_text(result: Result<OpenAIResponse, Box<dyn Error>>) -> Result
         .unwrap_or_else(|| "(no response)".to_string()))
 }
 
+/// Checks `data` against a `result_schema`: an object mapping each required
+/// field to its JSON type.
+fn validate_result_data(
+    schema: &serde_json::Value,
+    data: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    let Some(fields) = schema.as_object() else {
+        return Err("result_schema must be an object of field names to types".to_string());
+    };
+    let data = data
+        .and_then(|d| d.as_object())
+        .ok_or("data must be an object with the fields asked for")?;
+    for (field, kind) in fields {
+        let kind = kind.as_str().unwrap_or("any");
+        let value = data
+            .get(field)
+            .ok_or_else(|| format!("data is missing '{}' ({})", field, kind))?;
+        let ok = match kind {
+            "string" => value.is_string(),
+            "number" => value.is_number(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "boolean" => value.is_boolean(),
+            "array" => value.is_array(),
+            "object" => value.is_object(),
+            _ => true,
+        };
+        if !ok {
+            return Err(format!("data's '{}' must be a {}", field, kind));
+        }
+    }
+    Ok(())
+}
+
+/// entrypoint for the report_result tool: records the outcome of the work
+/// this agent was given, for whoever's waiting for it.
+fn tool_report_result(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        status: String,
+        summary: String,
+        #[serde(default)]
+        data: Option<serde_json::Value>,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let slot = ctx.result_slot.as_ref().ok_or(
+        "nobody is waiting for a result from you: just answer (report_result is for sub-agents, fan-out workers and tasks)",
+    )?;
+    let succeeded = match params.status.as_str() {
+        "succeeded" => true,
+        "failed" => false,
+        other => return Err(format!("status must be succeeded or failed, not '{}'", other).into()),
+    };
+    if let Some(schema) = &ctx.result_schema {
+        validate_result_data(schema, params.data.as_ref())?;
+    }
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(faber::ReportedResult {
+        succeeded,
+        summary: params.summary,
+        data: params.data,
+    });
+    Ok("Result recorded. Finish now with a short final answer.".to_string())
+}
+
+/// Runs a piece of delegated work with `run`, and if a `schema` asks for a
+/// structured result that wasn't reported, reminds the agent once and
+/// lets it continue.
+pub(crate) fn run_reporting(
+    messages: Vec<Message>,
+    slot: &Arc<Mutex<Option<faber::ReportedResult>>>,
+    schema: Option<&serde_json::Value>,
+    mut run: impl FnMut(Vec<Message>) -> Result<OpenAIResponse, Box<dyn Error>>,
+) -> Result<OpenAIResponse, Box<dyn Error>> {
+    let response = run(messages)?;
+    let reported = slot.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    match schema {
+        Some(schema) if !reported => {
+            let mut history = response.history.clone();
+            history.push(make_message(
+                "user",
+                format!(
+                    "You haven't reported your result. Call report_result with status, summary, \
+                     and data with these fields: {}",
+                    schema
+                ),
+            ));
+            run(history)
+        }
+        _ => Ok(response),
+    }
+}
+
+/// The outcome of delegated work: what it reported with `report_result`,
+/// or else its final answer as a success. An error (the request failing)
+/// stays an error.
+pub(crate) fn work_outcome(
+    result: Result<OpenAIResponse, Box<dyn Error>>,
+    slot: &Arc<Mutex<Option<faber::ReportedResult>>>,
+) -> Result<faber::ReportedResult, String> {
+    if let Some(reported) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        return Ok(reported);
+    }
+    final_response_text(result).map(|summary| faber::ReportedResult {
+        succeeded: true,
+        summary,
+        data: None,
+    })
+}
+
+/// The task text for delegated work, telling the agent how to report when
+/// a structured result is wanted.
+pub(crate) fn delegated_prompt(prompt: &str, schema: Option<&serde_json::Value>) -> String {
+    match schema {
+        Some(schema) => format!(
+            "{}\n\nWhen you're done, call report_result with status, summary, and data with \
+             these fields: {}",
+            prompt, schema
+        ),
+        None => prompt.to_string(),
+    }
+}
+
+/// Context an agent hands to the one it starts: knowledge base notes (by
+/// title or id) and files, so it doesn't start cold.
+#[derive(Deserialize, Default, Debug)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Handoff {
+    #[serde(default)]
+    notes: Vec<String>,
+    #[serde(default)]
+    files: Vec<String>,
+}
+
+/// Most of each handed-off file included.
+const MAX_HANDOFF_FILE_CHARS: usize = 20_000;
+
+/// The message carrying `handoff` to a new agent, as the agent in `ctx`
+/// sees the notes. `None` if there's nothing to hand off.
+pub(crate) fn handoff_message(
+    ctx: &ToolContext,
+    handoff: &Handoff,
+) -> Result<Option<Message>, Box<dyn Error>> {
+    if handoff.notes.is_empty() && handoff.files.is_empty() {
+        return Ok(None);
+    }
+    let mut text = String::from("Context from the agent that started you:\n");
+    let viewer = db::KbViewer::Agent(ctx.agent_name.clone());
+    for note in &handoff.notes {
+        let db = ctx.db()?;
+        let found = match note.trim_start_matches('#').parse::<i64>() {
+            Ok(id) => db.kb_get(id, &viewer)?,
+            Err(_) => db.kb_get_by_title(note, &viewer)?,
+        };
+        let found = found.ok_or_else(|| format!("no knowledge base note '{}'", note))?;
+        text.push_str(&format!(
+            "\n## Note: {}\n{}\n",
+            found.title,
+            found.body.trim()
+        ));
+    }
+    for file in &handoff.files {
+        let path = std::path::Path::new(file);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+        {
+            return Err(format!(
+                "file '{}' must be relative to the current directory, without '..'",
+                file
+            )
+            .into());
+        }
+        let content =
+            std::fs::read_to_string(path).map_err(|e| format!("can't read '{}': {}", file, e))?;
+        text.push_str(&format!(
+            "\n## File: {}\n```\n{}\n```\n",
+            file,
+            openai::truncate_tool_output(&content, MAX_HANDOFF_FILE_CHARS)
+        ));
+    }
+    Ok(Some(make_message("user", text)))
+}
+
 /// Accumulated token usage across every chat turn in the current session
 /// (every agent, not just the active one - switching agents doesn't reset
 /// this, unlike `AgentState::last_prompt_tokens` - plus every sub-agent
@@ -3120,6 +3304,13 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         /// Stop it once it has made this many requests to the model.
         #[serde(default)]
         max_requests: Option<usize>,
+        /// The data it must report with `report_result` (see
+        /// `validate_result_data`).
+        #[serde(default)]
+        result_schema: Option<serde_json::Value>,
+        /// Knowledge base notes and files to hand it up front.
+        #[serde(default)]
+        context: Option<Handoff>,
     }
     let params: Params = serde_json::from_str(params_str)?;
 
@@ -3181,7 +3372,16 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     if let Some(ref sp) = agent_config.system_prompt {
         messages.push(make_message("system", sp.clone()));
     }
-    messages.push(make_message("user", prompt.clone()));
+    if let Some(handoff) =
+        handoff_message(ctx, params.context.as_ref().unwrap_or(&Handoff::default()))?
+    {
+        messages.push(handoff);
+    }
+    messages.push(make_message(
+        "user",
+        delegated_prompt(&prompt, params.result_schema.as_ref()),
+    ));
+    let result_schema = params.result_schema.clone();
 
     ctx.println(&format!("Spawning sub-agent '{}'...", agent_name));
 
@@ -3273,11 +3473,14 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         sub_ctx.context_window = context_window;
         sub_ctx.extra = extra_for_sub;
         sub_ctx.max_requests = max_requests;
+        let slot = Arc::new(Mutex::new(None));
+        sub_ctx.result_slot = Some(slot.clone());
+        sub_ctx.result_schema = result_schema.clone();
         let activity = ActivityRecorder::new(db.clone(), &agent_name);
         activity.set("thinking");
         // Streamed, though nothing is shown: its progress keeps the status
         // bar and `faber agents` current.
-        let mode = {
+        let mode = || {
             let activity = activity.clone();
             let status_bar = sub_status_bar_for_progress.clone();
             let name = agent_name.clone();
@@ -3294,14 +3497,17 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
             }
         };
         let transcript_start = messages.clone();
-        let result = post_request_with_mode(
-            messages,
-            &tools,
-            &agent_opts,
-            mode,
-            &sub_ctx,
-            Some(Arc::new(Mutex::new(cancel_rx))),
-        );
+        let cancel = Some(Arc::new(Mutex::new(cancel_rx)));
+        let result = run_reporting(messages, &slot, result_schema.as_ref(), |messages| {
+            post_request_with_mode(
+                messages,
+                &tools,
+                &agent_opts,
+                mode(),
+                &sub_ctx,
+                cancel.clone(),
+            )
+        });
         // Kept, with the agent, until `faber gc`: `faber agents show` reads it.
         let transcript = match &result {
             Ok(response) => response.history.clone(),
@@ -3327,13 +3533,20 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
                     .clone()
                     .unwrap_or_else(|| "cancelled".to_string())
             ),
-            result => final_response_text(result).unwrap_or_else(|e| format!("Error: {}", e)),
+            result => match work_outcome(result, &slot) {
+                Ok(outcome) if outcome.succeeded => outcome.text(),
+                Ok(outcome) => format!("Failed: {}", outcome.text()),
+                Err(e) => format!("Error: {}", e),
+            },
         };
         let first_line = first_line(&response_text, 80);
         activity.set(
             &if let Some(reason) = first_line.strip_prefix("Stopped: ") {
                 format!("stopped: {}", reason)
-            } else if let Some(error) = first_line.strip_prefix("Error: ") {
+            } else if let Some(error) = first_line
+                .strip_prefix("Error: ")
+                .or_else(|| first_line.strip_prefix("Failed: "))
+            {
                 format!("failed: {}", error)
             } else {
                 format!("finished: {}", first_line)
@@ -4570,6 +4783,19 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "max_requests": {
                             "type": "integer",
                             "description": "Stop it once it has made this many requests to the model"
+                        },
+                        "result_schema": {
+                            "type": "object",
+                            "description": "Ask for a structured result: the data fields it must report, with their types, e.g. {\"severity\": \"string\", \"files\": \"array\"}"
+                        },
+                        "context": {
+                            "type": "object",
+                            "description": "Hand it context up front: {\"notes\": [knowledge base note titles or ids], \"files\": [paths]}",
+                            "properties": {
+                                "notes": {"type": "array", "items": {"type": "string"}},
+                                "files": {"type": "array", "items": {"type": "string"}}
+                            },
+                            "additionalProperties": false
                         }
                     },
                     "required": [
@@ -4635,6 +4861,32 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
 
     append_tool(
         &mut tools,
+        "report_result".to_string(),
+        tool_report_result,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "report_result",
+                "description": "When you're a sub-agent, a fan-out worker or running a scheduled task: report the outcome of the work you were given - whether it succeeded or failed, a summary, and any data asked for. This is what the agent waiting on you (or the task record) gets, so report a failure as failed rather than describing it in a successful answer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string", "enum": ["succeeded", "failed"]},
+                        "summary": {"type": "string", "description": "What you found or did, or why it failed"},
+                        "data": {"type": "object", "description": "Structured results, with the fields you were asked for"}
+                    },
+                    "required": ["status", "summary"],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
         "fan_out".to_string(),
         fan_out::tool_fan_out,
         r#"
@@ -4663,6 +4915,20 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Tools the workers may use, by name, instead of the default read-only ones. Workers that write files can overwrite each other's changes."
+                        }
+,
+                        "result_schema": {
+                            "type": "object",
+                            "description": "Ask each worker for a structured result: the data fields it must report, with their types, e.g. {\"duplicate\": \"boolean\", \"reason\": \"string\"}"
+                        },
+                        "context": {
+                            "type": "object",
+                            "description": "Hand every worker context up front: {\"notes\": [knowledge base note titles or ids], \"files\": [paths]}",
+                            "properties": {
+                                "notes": {"type": "array", "items": {"type": "string"}},
+                                "files": {"type": "array", "items": {"type": "string"}}
+                            },
+                            "additionalProperties": false
                         }
                     },
                     "required": ["items", "prompt"],
@@ -6764,6 +7030,23 @@ fn claim_prompt_task(db: &dyn DbBackend, session_id: &str, agent: &str) -> Optio
         .find(|t| db.claim_task(t.id, session_id).unwrap_or(false))
 }
 
+/// The outcome of a prompt task's turn: what the agent reported with
+/// `report_result` if it did, else its final answer, or why the turn
+/// failed.
+fn reported_task_outcome(
+    result: Result<&OpenAIResponse, &Box<dyn Error>>,
+    slot: &Arc<Mutex<Option<faber::ReportedResult>>>,
+) -> db::TaskOutcome {
+    match slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        Some(reported) => db::TaskOutcome {
+            succeeded: reported.succeeded,
+            exit_code: None,
+            result: openai::truncate_tool_output(&reported.text(), MAX_TASK_RESULT_CHARS),
+        },
+        None => prompt_task_outcome(result),
+    }
+}
+
 /// The outcome of a prompt task's turn: the agent's final answer, or why
 /// the turn failed.
 fn prompt_task_outcome(result: Result<&OpenAIResponse, &Box<dyn Error>>) -> db::TaskOutcome {
@@ -7287,6 +7570,11 @@ fn chat_command(
                         session_usage: session_usage.clone(),
                     }));
                     tool_context.interrupt = Some(ctrl_c_rx.clone());
+                    // A prompt task's turn can report its outcome.
+                    let task_result_slot = Arc::new(Mutex::new(None));
+                    if running_prompt_task.is_some() {
+                        tool_context.result_slot = Some(task_result_slot.clone());
+                    }
 
                     if is_injected {
                         maybe_summarize_proactively(
@@ -7327,7 +7615,7 @@ fn chat_command(
                         );
                         let task_turn = running_prompt_task.take();
                         if let (Some(task_id), Some(db)) = (task_turn, &db) {
-                            let outcome = prompt_task_outcome(result.as_ref());
+                            let outcome = reported_task_outcome(result.as_ref(), &task_result_slot);
                             if let Err(e) = db.finish_task(task_id, &session_id, &outcome) {
                                 warn!("Couldn't record the outcome of task {}: {}", task_id, e);
                             }
@@ -8251,6 +8539,8 @@ fn run_prompt_task_headless(
     ctx.mcp_manager = mcp_manager.clone();
     ctx.context_window = opts.context_window;
     ctx.extra = Some(extra);
+    let slot = Arc::new(Mutex::new(None));
+    ctx.result_slot = Some(slot.clone());
     let activity = ActivityRecorder::new(db.clone(), agent);
     let mode = {
         let activity = activity.clone();
@@ -8279,7 +8569,7 @@ fn run_prompt_task_headless(
             .collect();
         let _ = db.save_agent_messages(agent, &values);
     }
-    let outcome = prompt_task_outcome(result.as_ref());
+    let outcome = reported_task_outcome(result.as_ref(), &slot);
     if let Err(e) = db.finish_task(task.id, session_id, &outcome) {
         warn!("Couldn't record the outcome of task {}: {}", task.id, e);
     }
@@ -11716,6 +12006,169 @@ mod tests {
         );
         let transcript = db.load_agent_messages("w").unwrap();
         assert!(transcript.last().unwrap()["content"] == "all quiet");
+    }
+
+    #[test]
+    fn test_structured_results_are_checked_and_corrected() {
+        let (db, ctx) = spawning_setup(
+            "schema",
+            serde_json::json!([
+                // First attempt is missing a field; the error makes it fix it.
+                {"if": "triage issue", "tool": "report_result", "once": true,
+                 "arguments": {"status": "succeeded", "summary": "dup", "data": {"duplicate": true}}},
+                {"if": "data is missing 'of'", "tool": "report_result",
+                 "arguments": {"status": "succeeded", "summary": "duplicate of 12", "data": {"duplicate": true, "of": 12}}},
+                {"if": "Result recorded", "reply": "done"},
+            ]),
+        );
+        tool_spawn_agent(
+            &serde_json::json!({"name": "triager", "prompt": "triage issue 40",
+                                "result_schema": {"duplicate": "boolean", "of": "integer"}})
+            .to_string(),
+            &ctx,
+        )
+        .unwrap();
+        let result = sub_agent_result(&db, "boss", "triager");
+        assert!(result.starts_with("duplicate of 12\n```json"), "{result}");
+        assert!(result.contains("\"of\": 12"), "{result}");
+    }
+
+    #[test]
+    fn test_unreported_structured_result_gets_one_reminder() {
+        let (db, ctx) = spawning_setup(
+            "reminder",
+            serde_json::json!([
+                {"if": "You haven't reported", "tool": "report_result",
+                 "arguments": {"status": "succeeded", "summary": "3 files", "data": {"count": 3}}},
+                {"if": "Result recorded", "reply": "ok"},
+                {"if": "count the files", "reply": "there are three"},
+            ]),
+        );
+        tool_spawn_agent(
+            &serde_json::json!({"name": "counter", "prompt": "count the files", "result_schema": {"count": "integer"}})
+                .to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert!(sub_agent_result(&db, "boss", "counter").starts_with("3 files"));
+    }
+
+    #[test]
+    fn test_reported_failures_reach_the_parent_fan_out_and_tasks() {
+        let (db, ctx) = spawning_setup(
+            "failures",
+            serde_json::json!([
+                {"if": "check item 3", "tool": "report_result", "arguments": {"status": "failed", "summary": "item 3 is broken"}},
+                {"if": "check item", "reply": "item ok"},
+                {"if": "Result recorded", "reply": "reported"},
+            ]),
+        );
+        // A sub-agent.
+        tool_spawn_agent(
+            &r#"{"name": "checker", "prompt": "check item 3"}"#.to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            sub_agent_result(&db, "boss", "checker"),
+            "Failed: item 3 is broken"
+        );
+        assert_eq!(
+            db.get_agent("checker")
+                .unwrap()
+                .unwrap()
+                .activity
+                .as_deref(),
+            Some("failed: item 3 is broken")
+        );
+        // Fan-out workers.
+        let out = fan_out::tool_fan_out(
+            &serde_json::json!({"items": ["1", "3"], "prompt": "check item {item}"}).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert!(out.contains("## 1. 1\nitem ok"), "{out}");
+        assert!(
+            out.contains("## 2. 3\nError: reported failure - item 3 is broken"),
+            "{out}"
+        );
+        // A prompt task run headlessly.
+        db.create_agent("w", "").unwrap();
+        assert!(db.claim_agent("w", "worker-session").unwrap());
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let id = db
+            .create_oneshot_task("t", "", &past, "check item 3", Some("w"))
+            .unwrap();
+        let task = claim_prompt_task(db.as_ref(), "worker-session", "w").unwrap();
+        let extra = ctx
+            .extra
+            .clone()
+            .unwrap()
+            .downcast::<SubAgentContext>()
+            .ok()
+            .unwrap();
+        let mut opts = Opts::default();
+        opts.model = Some(extra.opts.model.clone());
+        let (_tx, rx) = mpsc::channel();
+        let outcome = run_prompt_task_headless(
+            &task,
+            "w",
+            &db,
+            "worker-session",
+            &extra.tools,
+            &opts,
+            extra.clone(),
+            &None,
+            rx,
+        );
+        assert!(!outcome.succeeded);
+        assert_eq!(
+            db.get_task(id).unwrap().unwrap().last_outcome.as_deref(),
+            Some("failed")
+        );
+    }
+
+    #[test]
+    fn test_context_is_handed_to_the_new_agent() {
+        let (db, ctx) = spawning_setup("handoff", serde_json::json!([{"reply": "on it"}]));
+        db.kb_write("Deploying", "make deploy", &[], Some("boss"), None)
+            .unwrap();
+        tool_spawn_agent(
+            &serde_json::json!({"name": "helper", "prompt": "go",
+                                "context": {"notes": ["deploying"], "files": ["Cargo.toml"]}})
+            .to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(sub_agent_result(&db, "boss", "helper"), "on it");
+        // system, handoff, task, answer.
+        let transcript = db.load_agent_messages("helper").unwrap();
+        let handoff = transcript[1]["content"].as_str().unwrap();
+        assert!(
+            handoff.contains("## Note: Deploying\nmake deploy"),
+            "{handoff}"
+        );
+        assert!(
+            handoff.contains("## File: Cargo.toml\n```\n[package]"),
+            "{handoff}"
+        );
+        assert_eq!(transcript[2]["content"], "go");
+        for bad in [r#"{"notes": ["nope"]}"#, r#"{"files": ["/etc/passwd"]}"#] {
+            let params = format!(r#"{{"name": "x", "prompt": "go", "context": {}}}"#, bad);
+            assert!(tool_spawn_agent(&params, &ctx).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn test_report_result_needs_someone_waiting() {
+        let ctx = test_ctx();
+        let err = tool_report_result(
+            &r#"{"status": "succeeded", "summary": "x"}"#.to_string(),
+            &ctx,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("nobody is waiting"), "{err}");
     }
 
     #[test]

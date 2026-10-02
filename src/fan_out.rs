@@ -37,7 +37,7 @@ use crate::openai::{
     self, ContextLengthError, InterruptedError, ProgressInfo, ResponseMode, StatusUpdate,
     ToolsCollection, make_message, post_request_with_mode,
 };
-use crate::{ActivityRecorder, SubAgentContext, final_response_text};
+use crate::{ActivityRecorder, SubAgentContext};
 use faber::ToolContext;
 
 const MAX_ITEMS: usize = 1000;
@@ -84,6 +84,10 @@ struct Params {
     max_parallel: Option<usize>,
     #[serde(default)]
     tools: Option<Vec<String>>,
+    #[serde(default)]
+    result_schema: Option<serde_json::Value>,
+    #[serde(default)]
+    context: Option<crate::Handoff>,
 }
 
 /// The prompt for one item: `{item}` in `template` replaced by it, or the
@@ -167,9 +171,14 @@ fn run_worker(
     tools: &ToolsCollection,
     status_key: &str,
     prompt: String,
+    handoff: Option<&crate::Message>,
+    schema: Option<&serde_json::Value>,
     cancel: mpsc::Receiver<()>,
 ) -> Result<String, Box<dyn Error>> {
-    let worker_ctx = worker_context(ctx);
+    let mut worker_ctx = worker_context(ctx);
+    let slot = Arc::new(Mutex::new(None));
+    worker_ctx.result_slot = Some(slot.clone());
+    worker_ctx.result_schema = schema.cloned();
     // Streamed, although nothing is shown, so Ctrl-C is noticed between
     // chunks rather than only once a whole response has arrived.
     let mode = || ResponseMode::Streaming {
@@ -192,40 +201,55 @@ fn run_worker(
         },
     };
     let cancel = Some(Arc::new(Mutex::new(cancel)));
-    let mut messages = vec![
-        make_message("system", WORKER_INSTRUCTIONS.to_string()),
-        make_message("user", prompt),
-    ];
+    let mut messages = vec![make_message("system", WORKER_INSTRUCTIONS.to_string())];
+    messages.extend(handoff.cloned());
+    messages.push(make_message(
+        "user",
+        crate::delegated_prompt(&prompt, schema),
+    ));
     // Like the chat, recover from a context overflow by shortening tool
     // results (keeping the worker's progress) and carrying on.
-    let mut shrinks = 0;
-    let result = loop {
-        let result = post_request_with_mode(
-            messages,
-            tools,
-            &sa_ctx.opts,
-            mode(),
-            &worker_ctx,
-            cancel.clone(),
-        );
-        let Err(e) = &result else { break result };
+    let run_once = |mut messages: Vec<crate::Message>| {
+        let mut shrinks = 0;
+        loop {
+            let result = post_request_with_mode(
+                messages,
+                tools,
+                &sa_ctx.opts,
+                mode(),
+                &worker_ctx,
+                cancel.clone(),
+            );
+            let Err(e) = &result else { return result };
+            if e.downcast_ref::<InterruptedError>().is_some() {
+                return Err(
+                    Box::new(InterruptedError::new("Operation interrupted by user"))
+                        as Box<dyn Error>,
+                );
+            }
+            let shrunk = e
+                .downcast_ref::<ContextLengthError>()
+                .filter(|_| shrinks < MAX_TOOL_RESULT_SHRINKS)
+                .and_then(|overflow| {
+                    openai::shrink_tool_results(&overflow.history, &overflow.message)
+                });
+            match shrunk {
+                Some(shrunk) => {
+                    shrinks += 1;
+                    messages = shrunk;
+                }
+                None => return result,
+            }
+        }
+    };
+    let result = crate::run_reporting(messages, &slot, schema, run_once);
+    if let Err(e) = &result {
         if e.downcast_ref::<InterruptedError>().is_some() {
             return Err(Box::new(InterruptedError::new(
                 "Operation interrupted by user",
             )));
         }
-        let shrunk = e
-            .downcast_ref::<ContextLengthError>()
-            .filter(|_| shrinks < MAX_TOOL_RESULT_SHRINKS)
-            .and_then(|overflow| openai::shrink_tool_results(&overflow.history, &overflow.message));
-        match shrunk {
-            Some(shrunk) => {
-                shrinks += 1;
-                messages = shrunk;
-            }
-            None => break result,
-        }
-    };
+    }
     if let Some(usage) = result.as_ref().ok().and_then(|r| r.turn_usage.as_ref()) {
         sa_ctx
             .session_usage
@@ -233,7 +257,11 @@ fn run_worker(
             .unwrap_or_else(|e| e.into_inner())
             .record(usage);
     }
-    final_response_text(result).map_err(|e| e.into())
+    match crate::work_outcome(result, &slot) {
+        Ok(outcome) if outcome.succeeded => Ok(outcome.text()),
+        Ok(outcome) => Err(format!("reported failure - {}", outcome.text()).into()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// entrypoint for the fan_out tool
@@ -250,7 +278,13 @@ pub(crate) fn tool_fan_out(
     if params.items.is_empty() || params.items.len() > MAX_ITEMS {
         return Err(format!("give between 1 and {} items", MAX_ITEMS).into());
     }
-    let tools = worker_tools(&sa_ctx.tools, params.tools.as_deref())?;
+    let mut tools = worker_tools(&sa_ctx.tools, params.tools.as_deref())?;
+    // Workers can always report their outcome.
+    if let Some(report) = sa_ctx.tools.get("report_result") {
+        tools.insert("report_result".to_string(), report.clone());
+    }
+    let handoff =
+        crate::handoff_message(ctx, params.context.as_ref().unwrap_or(&Default::default()))?;
     let parallel = params
         .max_parallel
         .unwrap_or(DEFAULT_MAX_PARALLEL)
@@ -332,6 +366,8 @@ pub(crate) fn tool_fan_out(
                             &tools,
                             &key,
                             expand_prompt(&params.prompt, item),
+                            handoff.as_ref(),
+                            params.result_schema.as_ref(),
                             rx,
                         );
                         sa_ctx.status_bar.clear_agent_status(&key);
