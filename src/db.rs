@@ -43,12 +43,59 @@ pub struct TaskRow {
     pub run_at: Option<String>,
     pub next_run_at: Option<String>,
     pub last_run_at: Option<String>,
-    pub enabled: bool,
+    /// `scheduled`, `running`, `done` or `disabled` - see `TaskStatus`.
+    pub status: String,
     pub created_at: String,
     pub command: String,
     pub max_runs: Option<i64>,
     pub run_count: i64,
+    /// The session running it, while `running`.
+    pub claimed_by: Option<String>,
+    /// When the current (or last) run started.
+    pub started_at: Option<String>,
+    /// `succeeded` or `failed`, for the last finished run.
+    pub last_outcome: Option<String>,
+    pub last_exit_code: Option<i64>,
+    /// The last run's output (truncated), or why it failed.
+    pub last_result: Option<String>,
 }
+
+/// A task's lifecycle:
+///
+/// - `scheduled`: waiting for `next_run_at`, then picked up by whichever
+///   session's scheduler claims it first (`claim_task`).
+/// - `running`: claimed by `claimed_by`. If that session stops
+///   heartbeating, the claim is abandoned and the task can be claimed again.
+/// - back to `scheduled` after a cron run (`finish_task`), or `done` after
+///   a one-shot run or a cron task's last allowed run (`max_runs`).
+/// - `disabled`: switched off by the user; switching it back on makes it
+///   `scheduled` again.
+///
+/// Whether a run succeeded is separate (`last_outcome`): a cron task whose
+/// last run failed is still `scheduled` for its next one.
+pub struct TaskStatus;
+
+impl TaskStatus {
+    pub const SCHEDULED: &'static str = "scheduled";
+    pub const RUNNING: &'static str = "running";
+    pub const DONE: &'static str = "done";
+    pub const DISABLED: &'static str = "disabled";
+}
+
+/// How a task's run went, recorded by `finish_task`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TaskOutcome {
+    pub succeeded: bool,
+    pub exit_code: Option<i64>,
+    pub result: String,
+}
+
+/// SQL condition: the task's claim belongs to a session that's no longer
+/// heartbeating (or no longer exists) - its run was abandoned. Sessions
+/// heartbeat every 5 seconds.
+const CLAIM_ABANDONED: &str = "claimed_by IS NULL OR claimed_by NOT IN (
+    SELECT session_id FROM agents
+    WHERE session_id IS NOT NULL AND heartbeat_at >= datetime('now', '-30 seconds'))";
 
 pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
@@ -80,7 +127,8 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
             run_at TEXT,
             next_run_at TEXT,
             last_run_at TEXT,
-            enabled INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'scheduled'
+                CHECK(status IN ('scheduled', 'running', 'done', 'disabled')),
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE SET NULL
         );
@@ -105,8 +153,6 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_agent_data_agent ON agent_data(agent_name);
-        CREATE INDEX IF NOT EXISTS idx_tasks_next_run ON scheduled_tasks(next_run_at)
-            WHERE enabled = 1;
         CREATE INDEX IF NOT EXISTS idx_tasks_agent ON scheduled_tasks(agent_name);
         CREATE INDEX IF NOT EXISTS idx_agent_messages_agent_seq ON agent_messages(agent_name, seq);
         CREATE INDEX IF NOT EXISTS idx_notifications_to_agent ON notifications(to_agent);
@@ -127,10 +173,61 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
         "ALTER TABLE scheduled_tasks ADD COLUMN run_count INTEGER NOT NULL DEFAULT 0;",
     );
 
+    for column in [
+        "claimed_by TEXT DEFAULT NULL",
+        "started_at TEXT DEFAULT NULL",
+        "last_outcome TEXT DEFAULT NULL",
+        "last_exit_code INTEGER DEFAULT NULL",
+        "last_result TEXT DEFAULT NULL",
+    ] {
+        let _ = conn.execute_batch(&format!(
+            "ALTER TABLE scheduled_tasks ADD COLUMN {};",
+            column
+        ));
+    }
+    migrate_task_enabled_to_status(conn)?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_due ON scheduled_tasks(status, next_run_at);",
+    )?;
+
     let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN session_id TEXT DEFAULT NULL;");
     let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN heartbeat_at TEXT DEFAULT NULL;");
 
     Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, rusqlite::Error> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+    let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Replaces the old `enabled` flag of databases created before tasks had a
+/// `status`: enabled tasks are `scheduled`; disabled ones are `done` if
+/// they had run their course (a one-shot that ran, a cron task at its
+/// `max_runs`), `disabled` otherwise.
+fn migrate_task_enabled_to_status(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !table_has_column(conn, "scheduled_tasks", "enabled")? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "BEGIN;
+         ALTER TABLE scheduled_tasks ADD COLUMN status TEXT NOT NULL DEFAULT 'scheduled'
+             CHECK(status IN ('scheduled', 'running', 'done', 'disabled'));
+         UPDATE scheduled_tasks SET status = CASE
+             WHEN enabled = 1 THEN 'scheduled'
+             WHEN run_count > 0 AND (task_type = 'oneshot'
+                 OR (max_runs IS NOT NULL AND run_count >= max_runs)) THEN 'done'
+             ELSE 'disabled' END;
+         DROP INDEX IF EXISTS idx_tasks_next_run;
+         ALTER TABLE scheduled_tasks DROP COLUMN enabled;
+         COMMIT;",
+    )
 }
 
 // --- Session ownership ---
@@ -364,15 +461,20 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         run_at: row.get(6)?,
         next_run_at: row.get(7)?,
         last_run_at: row.get(8)?,
-        enabled: row.get::<_, i32>(9)? != 0,
+        status: row.get(9)?,
         created_at: row.get(10)?,
         command: row.get(11)?,
         max_runs: row.get(12)?,
         run_count: row.get(13)?,
+        claimed_by: row.get(14)?,
+        started_at: row.get(15)?,
+        last_outcome: row.get(16)?,
+        last_exit_code: row.get(17)?,
+        last_result: row.get(18)?,
     })
 }
 
-const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, enabled, created_at, command, max_runs, run_count";
+const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result";
 
 pub fn create_cron_task(
     conn: &Connection,
@@ -472,18 +574,31 @@ pub fn set_task_enabled(
     task_id: i64,
     enabled: bool,
 ) -> Result<bool, Box<dyn Error>> {
-    let rows = conn.execute(
-        "UPDATE scheduled_tasks SET enabled = ?1 WHERE id = ?2",
-        params![enabled as i32, task_id],
-    )?;
+    // Disabling a running task lets the run finish but keeps it disabled
+    // (see `finish_task`); a task that's `done` stays done.
+    let rows = if enabled {
+        conn.execute(
+            "UPDATE scheduled_tasks SET status = 'scheduled' WHERE id = ?1 AND status = 'disabled'",
+            params![task_id],
+        )?
+    } else {
+        conn.execute(
+            "UPDATE scheduled_tasks SET status = 'disabled'
+             WHERE id = ?1 AND status IN ('scheduled', 'running')",
+            params![task_id],
+        )?
+    };
     Ok(rows > 0)
 }
 
 pub fn get_pending_tasks(conn: &Connection) -> Result<Vec<TaskRow>, Box<dyn Error>> {
     let now = chrono::Utc::now().to_rfc3339();
     let sql = format!(
-        "SELECT {} FROM scheduled_tasks WHERE enabled = 1 AND next_run_at <= ?1 ORDER BY next_run_at",
-        TASK_COLUMNS
+        "SELECT {} FROM scheduled_tasks
+         WHERE next_run_at <= ?1
+           AND (status = 'scheduled' OR (status = 'running' AND ({})))
+         ORDER BY next_run_at",
+        TASK_COLUMNS, CLAIM_ABANDONED
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![now], row_to_task)?;
@@ -494,51 +609,81 @@ pub fn get_pending_tasks(conn: &Connection) -> Result<Vec<TaskRow>, Box<dyn Erro
     Ok(tasks)
 }
 
-pub fn mark_task_executed(
+/// Claims a due task for `session_id` to run. Returns false if it isn't due
+/// any more or another session got to it first - the check and the claim
+/// are one statement, so only one session can ever win. A task whose
+/// claim was abandoned (see `CLAIM_ABANDONED`) can be claimed again.
+pub fn claim_task(
     conn: &Connection,
     task_id: i64,
-    task_type: &str,
-    cron_expression: Option<&str>,
-    max_runs: Option<i64>,
-) -> Result<(), Box<dyn Error>> {
+    session_id: &str,
+) -> Result<bool, Box<dyn Error>> {
     let now = chrono::Utc::now().to_rfc3339();
-    conn.execute(
-        "UPDATE scheduled_tasks SET run_count = run_count + 1 WHERE id = ?1",
-        params![task_id],
-    )?;
+    let sql = format!(
+        "UPDATE scheduled_tasks SET status = 'running', claimed_by = ?2, started_at = ?3
+         WHERE id = ?1 AND next_run_at <= ?3
+           AND (status = 'scheduled' OR (status = 'running' AND ({})))",
+        CLAIM_ABANDONED
+    );
+    let rows = conn.execute(&sql, params![task_id, session_id, now])?;
+    Ok(rows > 0)
+}
 
-    if task_type == "cron" {
-        if let Some(expr) = cron_expression {
-            let schedule = Schedule::from_str(expr)?;
-            let next_run = schedule
-                .upcoming(chrono::Utc)
-                .next()
-                .map(|dt| dt.to_rfc3339());
-            conn.execute(
-                "UPDATE scheduled_tasks SET last_run_at = ?1, next_run_at = ?2 WHERE id = ?3",
-                params![now, next_run, task_id],
-            )?;
-        } else {
-            conn.execute(
-                "UPDATE scheduled_tasks SET last_run_at = ?1, enabled = 0 WHERE id = ?2",
-                params![now, task_id],
-            )?;
-        }
+/// Records the outcome of a run of a task claimed by `session_id`, and
+/// moves it on: a cron task is `scheduled` for its next run, a one-shot
+/// task or a cron task that reached `max_runs` is `done`. A task disabled
+/// while it ran stays disabled. Returns false (recording nothing) if the
+/// claim isn't `session_id`'s any more.
+pub fn finish_task(
+    conn: &Connection,
+    task_id: i64,
+    session_id: &str,
+    outcome: &TaskOutcome,
+) -> Result<bool, Box<dyn Error>> {
+    let Some(task) = get_task(conn, task_id)? else {
+        return Ok(false);
+    };
+    let runs = task.run_count + 1;
+    let next_run = match (&task.task_type[..], &task.cron_expression) {
+        ("cron", Some(expr)) => Schedule::from_str(expr)?
+            .upcoming(chrono::Utc)
+            .next()
+            .map(|dt| dt.to_rfc3339()),
+        _ => None,
+    };
+    let finished = next_run.is_none() || task.max_runs.is_some_and(|max| runs >= max);
+    let status = if finished {
+        TaskStatus::DONE
     } else {
-        conn.execute(
-            "UPDATE scheduled_tasks SET last_run_at = ?1, enabled = 0 WHERE id = ?2",
-            params![now, task_id],
-        )?;
-    }
-
-    if let Some(max) = max_runs {
-        conn.execute(
-            "UPDATE scheduled_tasks SET enabled = 0 WHERE id = ?1 AND run_count >= ?2",
-            params![task_id, max],
-        )?;
-    }
-
-    Ok(())
+        TaskStatus::SCHEDULED
+    };
+    let rows = conn.execute(
+        "UPDATE scheduled_tasks SET
+             status = CASE WHEN status = 'running' THEN ?3 ELSE status END,
+             run_count = run_count + 1,
+             last_run_at = ?4,
+             next_run_at = COALESCE(?5, next_run_at),
+             last_outcome = ?6,
+             last_exit_code = ?7,
+             last_result = ?8,
+             claimed_by = NULL
+         WHERE id = ?1 AND claimed_by = ?2",
+        params![
+            task_id,
+            session_id,
+            status,
+            chrono::Utc::now().to_rfc3339(),
+            next_run,
+            if outcome.succeeded {
+                "succeeded"
+            } else {
+                "failed"
+            },
+            outcome.exit_code,
+            outcome.result,
+        ],
+    )?;
+    Ok(rows > 0)
 }
 
 // --- Agent Config ---
@@ -940,7 +1085,7 @@ mod tests {
         let task = get_task(&conn, id).unwrap().unwrap();
         assert_eq!(task.name, "task1");
         assert_eq!(task.task_type, "oneshot");
-        assert!(task.enabled);
+        assert_eq!(task.status, TaskStatus::SCHEDULED);
     }
 
     #[test]
@@ -977,49 +1122,230 @@ mod tests {
         assert!(get_task(&conn, id).unwrap().is_none());
     }
 
-    #[test]
-    fn test_set_task_enabled() {
-        let conn = test_db();
-        let run_at = chrono::Utc::now().to_rfc3339();
-        let id = create_oneshot_task(&conn, "t", "", &run_at, "", None).unwrap();
-        set_task_enabled(&conn, id, false).unwrap();
-        let task = get_task(&conn, id).unwrap().unwrap();
-        assert!(!task.enabled);
+    fn ok(result: &str) -> TaskOutcome {
+        TaskOutcome {
+            succeeded: true,
+            exit_code: Some(0),
+            result: result.to_string(),
+        }
+    }
+
+    /// A session that's alive: it holds an agent and has just heartbeated.
+    fn live_session(conn: &Connection, session: &str) {
+        let agent = format!("agent-of-{}", session);
+        create_agent(conn, &agent, "").unwrap();
+        assert!(claim_agent(conn, &agent, session).unwrap());
+    }
+
+    fn due_oneshot(conn: &Connection) -> i64 {
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+        create_oneshot_task(conn, "t", "", &past, "", None).unwrap()
+    }
+
+    fn make_due(conn: &Connection, id: i64) {
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE scheduled_tasks SET next_run_at = ?1 WHERE id = ?2",
+            params![past, id],
+        )
+        .unwrap();
     }
 
     #[test]
-    fn test_mark_oneshot_task_executed() {
+    fn test_new_task_is_scheduled() {
         let conn = test_db();
-        let run_at = chrono::Utc::now().to_rfc3339();
-        let id = create_oneshot_task(&conn, "t", "", &run_at, "", None).unwrap();
-        mark_task_executed(&conn, id, "oneshot", None, None).unwrap();
+        let id = due_oneshot(&conn);
         let task = get_task(&conn, id).unwrap().unwrap();
-        assert!(!task.enabled);
-        assert_eq!(task.run_count, 1);
+        assert_eq!(task.status, TaskStatus::SCHEDULED);
+        assert_eq!(task.last_outcome, None);
     }
 
     #[test]
-    fn test_mark_cron_task_executed_with_max_runs() {
+    fn test_oneshot_lifecycle_and_exclusive_claim() {
         let conn = test_db();
-        let id = create_cron_task(&conn, "c", "", "* * * * * * *", "", None, Some(2)).unwrap();
-        mark_task_executed(&conn, id, "cron", Some("* * * * * * *"), Some(2)).unwrap();
-        let task = get_task(&conn, id).unwrap().unwrap();
-        assert!(task.enabled);
-        assert_eq!(task.run_count, 1);
+        live_session(&conn, "s1");
+        live_session(&conn, "s2");
+        let id = due_oneshot(&conn);
 
-        mark_task_executed(&conn, id, "cron", Some("* * * * * * *"), Some(2)).unwrap();
+        assert!(claim_task(&conn, id, "s1").unwrap());
+        assert!(
+            !claim_task(&conn, id, "s2").unwrap(),
+            "s1 is still running it"
+        );
+        assert!(get_pending_tasks(&conn).unwrap().is_empty());
         let task = get_task(&conn, id).unwrap().unwrap();
-        assert!(!task.enabled);
+        assert_eq!(task.status, TaskStatus::RUNNING);
+        assert_eq!(task.claimed_by.as_deref(), Some("s1"));
+        assert!(task.started_at.is_some());
+
+        assert!(finish_task(&conn, id, "s1", &ok("hello")).unwrap());
+        let task = get_task(&conn, id).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::DONE);
+        assert_eq!(task.run_count, 1);
+        assert_eq!(task.claimed_by, None);
+        assert_eq!(task.last_outcome.as_deref(), Some("succeeded"));
+        assert_eq!(task.last_exit_code, Some(0));
+        assert_eq!(task.last_result.as_deref(), Some("hello"));
+        assert!(task.last_run_at.is_some());
+        assert!(
+            !claim_task(&conn, id, "s2").unwrap(),
+            "done tasks don't run again"
+        );
+    }
+
+    #[test]
+    fn test_cron_task_is_rescheduled_until_max_runs() {
+        let conn = test_db();
+        live_session(&conn, "s");
+        let id = create_cron_task(&conn, "c", "", "0 0 * * * * *", "", None, Some(2)).unwrap();
+        make_due(&conn, id);
+
+        assert!(claim_task(&conn, id, "s").unwrap());
+        finish_task(&conn, id, "s", &ok("")).unwrap();
+        let task = get_task(&conn, id).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::SCHEDULED);
+        assert!(task.next_run_at.unwrap() > chrono::Utc::now().to_rfc3339());
+        assert!(!claim_task(&conn, id, "s").unwrap(), "not due again yet");
+
+        make_due(&conn, id);
+        assert!(claim_task(&conn, id, "s").unwrap());
+        finish_task(&conn, id, "s", &ok("")).unwrap();
+        let task = get_task(&conn, id).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::DONE);
         assert_eq!(task.run_count, 2);
     }
 
     #[test]
-    fn test_mark_cron_task_with_no_expression_disables() {
+    fn test_failed_run_keeps_cron_task_scheduled() {
         let conn = test_db();
-        let id = create_cron_task(&conn, "c", "", "* * * * * * *", "", None, None).unwrap();
-        mark_task_executed(&conn, id, "cron", None, None).unwrap();
+        live_session(&conn, "s");
+        let id = create_cron_task(&conn, "c", "", "0 0 * * * * *", "", None, None).unwrap();
+        make_due(&conn, id);
+        claim_task(&conn, id, "s").unwrap();
+        let failed = TaskOutcome {
+            succeeded: false,
+            exit_code: Some(2),
+            result: "boom".to_string(),
+        };
+        finish_task(&conn, id, "s", &failed).unwrap();
         let task = get_task(&conn, id).unwrap().unwrap();
-        assert!(!task.enabled);
+        assert_eq!(task.status, TaskStatus::SCHEDULED);
+        assert_eq!(task.last_outcome.as_deref(), Some("failed"));
+        assert_eq!(task.last_exit_code, Some(2));
+    }
+
+    #[test]
+    fn test_abandoned_claim_can_be_taken_over() {
+        let conn = test_db();
+        live_session(&conn, "alive");
+        let id = due_oneshot(&conn);
+        // Claimed by a session that never heartbeated (e.g. it crashed).
+        assert!(claim_task(&conn, id, "gone").unwrap());
+        assert_eq!(get_pending_tasks(&conn).unwrap().len(), 1);
+        assert!(claim_task(&conn, id, "alive").unwrap());
+        // The old session's late finish is ignored.
+        assert!(!finish_task(&conn, id, "gone", &ok("late")).unwrap());
+        assert!(finish_task(&conn, id, "alive", &ok("")).unwrap());
+        assert_eq!(get_task(&conn, id).unwrap().unwrap().run_count, 1);
+    }
+
+    #[test]
+    fn test_set_task_enabled() {
+        let conn = test_db();
+        live_session(&conn, "s");
+        let id = due_oneshot(&conn);
+        assert!(set_task_enabled(&conn, id, false).unwrap());
+        assert_eq!(
+            get_task(&conn, id).unwrap().unwrap().status,
+            TaskStatus::DISABLED
+        );
+        assert!(!claim_task(&conn, id, "s").unwrap());
+        assert!(
+            !set_task_enabled(&conn, id, false).unwrap(),
+            "already disabled"
+        );
+        assert!(set_task_enabled(&conn, id, true).unwrap());
+        assert_eq!(
+            get_task(&conn, id).unwrap().unwrap().status,
+            TaskStatus::SCHEDULED
+        );
+
+        // Disabled while running: the run finishes, the task stays disabled.
+        assert!(claim_task(&conn, id, "s").unwrap());
+        assert!(set_task_enabled(&conn, id, false).unwrap());
+        finish_task(&conn, id, "s", &ok("")).unwrap();
+        let task = get_task(&conn, id).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::DISABLED);
+        assert_eq!(task.run_count, 1);
+    }
+
+    #[test]
+    fn test_done_task_cannot_be_re_enabled() {
+        let conn = test_db();
+        live_session(&conn, "s");
+        let id = due_oneshot(&conn);
+        claim_task(&conn, id, "s").unwrap();
+        finish_task(&conn, id, "s", &ok("")).unwrap();
+        assert!(!set_task_enabled(&conn, id, true).unwrap());
+        assert_eq!(
+            get_task(&conn, id).unwrap().unwrap().status,
+            TaskStatus::DONE
+        );
+    }
+
+    #[test]
+    fn test_migration_from_enabled_flag() {
+        let conn = Connection::open_in_memory().unwrap();
+        // The table as it was before tasks had a status.
+        conn.execute_batch(
+            "CREATE TABLE scheduled_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_name TEXT,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                task_type TEXT NOT NULL CHECK(task_type IN ('cron', 'oneshot')),
+                cron_expression TEXT,
+                run_at TEXT,
+                next_run_at TEXT,
+                last_run_at TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                command TEXT NOT NULL DEFAULT '',
+                max_runs INTEGER DEFAULT NULL,
+                run_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX idx_tasks_next_run ON scheduled_tasks(next_run_at) WHERE enabled = 1;
+             INSERT INTO scheduled_tasks (name, task_type, enabled, run_count)
+                 VALUES ('active', 'cron', 1, 3);
+             INSERT INTO scheduled_tasks (name, task_type, enabled, run_count)
+                 VALUES ('ran once', 'oneshot', 0, 1);
+             INSERT INTO scheduled_tasks (name, task_type, enabled, run_count, max_runs)
+                 VALUES ('used up', 'cron', 0, 5, 5);
+             INSERT INTO scheduled_tasks (name, task_type, enabled, run_count)
+                 VALUES ('switched off', 'cron', 0, 1);",
+        )
+        .unwrap();
+
+        initialize_db(&conn).unwrap();
+        // Running it again on the migrated database is a no-op.
+        initialize_db(&conn).unwrap();
+
+        let statuses: Vec<(String, String)> = list_tasks(&conn, None)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.name, t.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                ("active", "scheduled"),
+                ("ran once", "done"),
+                ("used up", "done"),
+                ("switched off", "disabled"),
+            ]
+            .map(|(n, s)| (n.to_string(), s.to_string()))
+        );
+        assert!(!table_has_column(&conn, "scheduled_tasks", "enabled").unwrap());
     }
 
     #[test]

@@ -314,15 +314,20 @@ fn dispatch_inner(
             let v = db::get_pending_tasks(&conn)?;
             Ok(serde_json::to_value(v)?)
         }
-        "mark_task_executed" => {
-            db::mark_task_executed(
+        "claim_task" => {
+            let v = db::claim_task(&conn, i64_param!("task_id"), str_param!("session_id"))?;
+            Ok(serde_json::to_value(v)?)
+        }
+        "finish_task" => {
+            let outcome: db::TaskOutcome = serde_json::from_value(p["outcome"].clone())
+                .map_err(|e| format!("bad param 'outcome': {}", e))?;
+            let v = db::finish_task(
                 &conn,
                 i64_param!("task_id"),
-                str_param!("task_type"),
-                opt_str_param!("cron_expression"),
-                p["max_runs"].as_i64(),
+                str_param!("session_id"),
+                &outcome,
             )?;
-            Ok(serde_json::json!(true))
+            Ok(serde_json::to_value(v)?)
         }
         "gc_agents" => {
             let v = db::gc_agents(&conn)?;

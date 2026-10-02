@@ -17,7 +17,7 @@
  *
  */
 
-use crate::db::{AgentConfig, AgentRow, NotificationRow, TaskRow};
+use crate::db::{AgentConfig, AgentRow, NotificationRow, TaskOutcome, TaskRow};
 use std::error::Error;
 
 pub trait DbBackend: Send + Sync {
@@ -88,13 +88,15 @@ pub trait DbBackend: Send + Sync {
     fn get_task(&self, task_id: i64) -> Result<Option<TaskRow>, Box<dyn Error>>;
     fn set_task_enabled(&self, task_id: i64, enabled: bool) -> Result<bool, Box<dyn Error>>;
     fn get_pending_tasks(&self) -> Result<Vec<TaskRow>, Box<dyn Error>>;
-    fn mark_task_executed(
+    /// See `db::claim_task`.
+    fn claim_task(&self, task_id: i64, session_id: &str) -> Result<bool, Box<dyn Error>>;
+    /// See `db::finish_task`.
+    fn finish_task(
         &self,
         task_id: i64,
-        task_type: &str,
-        cron_expression: Option<&str>,
-        max_runs: Option<i64>,
-    ) -> Result<(), Box<dyn Error>>;
+        session_id: &str,
+        outcome: &TaskOutcome,
+    ) -> Result<bool, Box<dyn Error>>;
 
     fn gc_agents(&self) -> Result<Vec<String>, Box<dyn Error>>;
 }

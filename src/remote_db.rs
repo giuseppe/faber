@@ -17,7 +17,7 @@
  *
  */
 
-use faber::db::{AgentConfig, AgentRow, NotificationRow, TaskRow};
+use faber::db::{AgentConfig, AgentRow, NotificationRow, TaskOutcome, TaskRow};
 use faber::db_backend::DbBackend;
 use faber::protocol::{RpcRequest, RpcResponse};
 use std::error::Error;
@@ -364,23 +364,25 @@ impl DbBackend for RemoteDb {
         Ok(serde_json::from_value(v)?)
     }
 
-    fn mark_task_executed(
+    fn claim_task(&self, task_id: i64, session_id: &str) -> Result<bool, Box<dyn Error>> {
+        let v = self.call(
+            "claim_task",
+            serde_json::json!({"task_id": task_id, "session_id": session_id}),
+        )?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn finish_task(
         &self,
         task_id: i64,
-        task_type: &str,
-        cron_expression: Option<&str>,
-        max_runs: Option<i64>,
-    ) -> Result<(), Box<dyn Error>> {
-        self.call(
-            "mark_task_executed",
-            serde_json::json!({
-                "task_id": task_id,
-                "task_type": task_type,
-                "cron_expression": cron_expression,
-                "max_runs": max_runs,
-            }),
+        session_id: &str,
+        outcome: &TaskOutcome,
+    ) -> Result<bool, Box<dyn Error>> {
+        let v = self.call(
+            "finish_task",
+            serde_json::json!({"task_id": task_id, "session_id": session_id, "outcome": outcome}),
         )?;
-        Ok(())
+        Ok(serde_json::from_value(v)?)
     }
 
     fn gc_agents(&self) -> Result<Vec<String>, Box<dyn Error>> {
