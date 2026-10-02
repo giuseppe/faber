@@ -2871,10 +2871,14 @@ fn tool_task_list(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
     let tasks = db.list_tasks(params.agent_name.as_deref())?;
     ctx.println(&format!("Found {} task(s)", tasks.len()));
     for t in &tasks {
-        let status = if t.enabled { "enabled" } else { "disabled" };
+        let last = t
+            .last_outcome
+            .as_deref()
+            .map(|o| format!(", last run {}", o))
+            .unwrap_or_default();
         ctx.println(&format!(
-            "  [{}] {} - {} ({})",
-            t.id, t.name, t.task_type, status
+            "  [{}] {} - {} ({}{})",
+            t.id, t.name, t.task_type, t.status, last
         ));
     }
     Ok(serde_json::to_string(&tasks)?)
@@ -2911,16 +2915,28 @@ fn tool_task_set_enabled(params_str: &String, ctx: &ToolContext) -> Result<Strin
     let params: Params = serde_json::from_str(params_str)?;
     let db = ctx.db()?;
     let updated = db.set_task_enabled(params.id, params.enabled)?;
-    let status = if params.enabled {
-        "enabled"
-    } else {
-        "disabled"
-    };
+    let status = db.get_task(params.id)?.map(|t| t.status);
     if updated {
-        ctx.println(&format!("Task id={} {}", params.id, status));
+        ctx.println(&format!(
+            "Task id={} {}",
+            params.id,
+            if params.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ));
     }
-    let result =
-        serde_json::json!({"updated": updated, "id": params.id, "enabled": params.enabled});
+    let mut result = serde_json::json!({"updated": updated, "id": params.id, "status": status});
+    if !updated {
+        result["reason"] = match status.as_deref() {
+            None => "no such task".into(),
+            Some(db::TaskStatus::DONE) => {
+                "the task is done; create a new one to run it again".into()
+            }
+            Some(other) => format!("the task is already {}", other).into(),
+        };
+    }
     Ok(result.to_string())
 }
 
@@ -4387,7 +4403,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "task_set_enabled",
-                "description": "Enable or disable a scheduled task.",
+                "description": "Disable a scheduled task (one that's running finishes its current run first), or re-enable a disabled one. A task that's done (a one-shot that ran, or a cron task that reached max_runs) can't be re-enabled.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -4421,7 +4437,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "task_pending",
-                "description": "List all enabled scheduled tasks whose next_run_at is in the past (i.e. tasks that are due to run).",
+                "description": "List scheduled tasks that are due to run now (next_run_at is in the past), including ones whose run was abandoned by a session that went away.",
                 "parameters": {
                     "type": "object",
                     "properties": {},
@@ -6476,14 +6492,52 @@ fn execute_scheduled_command(
     Some((assistant_msg, tool_msg))
 }
 
-/// Runs one due scheduled task to completion: `execute_scheduled_command`,
-/// forwarding its result (if any) over `tx`, then marking the task
-/// executed either way. Split out of `scheduler_loop` so each due task can
-/// run on its own thread instead of blocking every other one - see that
-/// function's own doc comment for why.
+/// Most of a task's output kept in `last_result`.
+const MAX_TASK_RESULT_CHARS: usize = 2000;
+
+/// How a task's run went, from its tool result (`None`: its command isn't
+/// a tool call at all). `run_command` reports success and an exit code;
+/// any other tool failed if its result is an `error: ...`.
+fn task_outcome(tool_msg: Option<&Message>) -> db::TaskOutcome {
+    let Some(content) = tool_msg.and_then(|m| m.content.as_deref()) else {
+        return db::TaskOutcome {
+            succeeded: false,
+            exit_code: None,
+            result: r#"the task's command isn't a {"tool": ..., "arguments": ...} object"#
+                .to_string(),
+        };
+    };
+    let truncate = |s: &str| openai::truncate_tool_output(s.trim(), MAX_TASK_RESULT_CHARS);
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Some(success) = json.get("success").and_then(|s| s.as_bool()) {
+            let output = [json["stdout"].as_str(), json["stderr"].as_str()]
+                .into_iter()
+                .flatten()
+                .filter(|s| !s.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            return db::TaskOutcome {
+                succeeded: success,
+                exit_code: json.get("exit_code").and_then(|c| c.as_i64()),
+                result: truncate(&output),
+            };
+        }
+    }
+    db::TaskOutcome {
+        succeeded: !content.starts_with("error:"),
+        exit_code: None,
+        result: truncate(content),
+    }
+}
+
+/// Runs one claimed scheduled task to completion: `execute_scheduled_command`,
+/// forwarding its result (if any) over `tx`, then recording how it went
+/// with `finish_task` either way. Split out of `scheduler_loop` so each due
+/// task can run on its own thread instead of blocking every other one.
 fn run_scheduled_task(
     task: db::TaskRow,
     db: Arc<dyn DbBackend>,
+    session_id: &str,
     tools: Arc<ToolsCollection>,
     tx: mpsc::Sender<(Option<String>, String, Message, Message)>,
 ) {
@@ -6494,40 +6548,27 @@ fn run_scheduled_task(
     };
 
     let db_opt: Option<Arc<dyn DbBackend>> = Some(db.clone());
-    if let Some((assistant_msg, tool_msg)) = execute_scheduled_command(&command, &tools, &db_opt) {
+    let executed = execute_scheduled_command(&command, &tools, &db_opt);
+    let outcome = task_outcome(executed.as_ref().map(|(_, tool_msg)| tool_msg));
+    if let Some((assistant_msg, tool_msg)) = executed {
         let _ = tx.send((task.agent_name.clone(), command, assistant_msg, tool_msg));
     }
 
-    let _ = db.mark_task_executed(
-        task.id,
-        &task.task_type,
-        task.cron_expression.as_deref(),
-        task.max_runs,
-    );
+    if let Err(e) = db.finish_task(task.id, session_id, &outcome) {
+        warn!("Couldn't record the outcome of task {}: {}", task.id, e);
+    }
 }
 
-/// Polls for due scheduled tasks once a second and runs each one.
-///
-/// Each due task runs on its own thread (`run_scheduled_task`) rather than
-/// blocking this loop: a task that invokes a slow tool (e.g.
-/// `fetch_web_content` with a long timeout, or a `run_command` build) used
-/// to delay every other due task, including ones due on a completely
-/// unrelated schedule, until it finished. `db`/`tools`/`tx` are all
-/// already `Arc`/`Sender` - cheap to clone per task, same pattern
-/// `tool_spawn_agent` already uses for its own background sub-agents.
+/// Polls for due scheduled tasks once a second and runs each one this
+/// session manages to claim (`claim_task`), each on its own thread. The
+/// claim is what keeps two sessions sharing a database - or a task still
+/// running when it next comes due - from running the same task twice.
 fn scheduler_loop(
     db: Arc<dyn DbBackend>,
+    session_id: String,
     tools: Arc<ToolsCollection>,
     tx: mpsc::Sender<(Option<String>, String, Message, Message)>,
 ) {
-    // Tracks task IDs a background thread is already executing. A task
-    // that takes longer than one polling interval to finish hasn't called
-    // `mark_task_executed` yet by the next poll, so `get_pending_tasks`
-    // would return it again - without this, that means a second thread
-    // running the very same task concurrently with the first, rather than
-    // just other, unrelated due tasks running in parallel as intended.
-    let running: Arc<Mutex<std::collections::HashSet<i64>>> =
-        Arc::new(Mutex::new(std::collections::HashSet::new()));
     loop {
         std::thread::sleep(Duration::from_secs(1));
         let tasks = match db.get_pending_tasks() {
@@ -6536,23 +6577,20 @@ fn scheduler_loop(
         };
 
         for task in tasks {
-            let task_id = task.id;
-            let newly_claimed = {
-                let mut set = running.lock().unwrap_or_else(|e| e.into_inner());
-                set.insert(task_id)
-            };
-            if !newly_claimed {
-                continue; // already running from a still-in-flight earlier poll
+            match db.claim_task(task.id, &session_id) {
+                Ok(true) => {}
+                Ok(false) => continue, // another session (or run) got it
+                Err(e) => {
+                    warn!("Couldn't claim task {}: {}", task.id, e);
+                    continue;
+                }
             }
-
             let db = db.clone();
+            let session_id = session_id.clone();
             let tools = tools.clone();
             let tx = tx.clone();
-            let running = running.clone();
             std::thread::spawn(move || {
-                run_scheduled_task(task, db, tools, tx);
-                let mut set = running.lock().unwrap_or_else(|e| e.into_inner());
-                set.remove(&task_id);
+                run_scheduled_task(task, db, &session_id, tools, tx);
             });
         }
     }
@@ -6720,8 +6758,9 @@ fn chat_command(
 
         let scheduler_db = scheduler_db.clone();
         let scheduler_tools = Arc::new(tools.clone());
+        let scheduler_session = session_id.to_string();
         std::thread::spawn(move || {
-            scheduler_loop(scheduler_db, scheduler_tools, task_tx);
+            scheduler_loop(scheduler_db, scheduler_session, scheduler_tools, task_tx);
         });
         std::thread::spawn(move || {
             loop {
@@ -8228,6 +8267,75 @@ mod tests {
             plan_item("c", PlanStatus::Pending),
         ];
         assert_eq!(format_plan(&items), vec!["[x] a", "[>] b", "[ ] c"]);
+    }
+
+    fn tool_message(content: &str) -> Message {
+        make_message("tool", content.to_string())
+    }
+
+    #[test]
+    fn test_task_outcome_from_run_command_result() {
+        let msg = tool_message(
+            r#"{"stdout":"built\n","stderr":"warning: x\n","exit_code":0,"success":true}"#,
+        );
+        let outcome = task_outcome(Some(&msg));
+        assert!(outcome.succeeded);
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(outcome.result, "built\n\nwarning: x");
+
+        let msg = tool_message(r#"{"stdout":"","stderr":"boom","exit_code":2,"success":false}"#);
+        let outcome = task_outcome(Some(&msg));
+        assert!(!outcome.succeeded);
+        assert_eq!(outcome.exit_code, Some(2));
+    }
+
+    #[test]
+    fn test_task_outcome_from_other_tools_and_bad_commands() {
+        assert!(task_outcome(Some(&tool_message("[\"Cargo.toml\"]"))).succeeded);
+        let failed = task_outcome(Some(&tool_message("error: tool 'x' failed: nope")));
+        assert!(!failed.succeeded);
+        assert_eq!(failed.result, "error: tool 'x' failed: nope");
+        let invalid = task_outcome(None);
+        assert!(!invalid.succeeded);
+        assert!(invalid.result.contains("isn't a"), "{}", invalid.result);
+    }
+
+    #[test]
+    fn test_scheduled_task_runs_and_records_its_outcome() {
+        let db: Arc<dyn DbBackend> = Arc::new(LocalDb::new(test_db_conn()));
+        db.create_agent("a", "").unwrap();
+        assert!(db.claim_agent("a", "session").unwrap());
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let good = db
+            .create_oneshot_task(
+                "good",
+                "",
+                &past,
+                r#"{"tool":"glob","arguments":{"pattern":"Cargo.toml"}}"#,
+                None,
+            )
+            .unwrap();
+        let bad = db
+            .create_oneshot_task("bad", "", &past, "not a tool call", None)
+            .unwrap();
+        let tools = Arc::new(initialize_tools(false, None));
+        let (tx, rx) = mpsc::channel();
+
+        for id in [good, bad] {
+            assert!(db.claim_task(id, "session").unwrap());
+            let task = db.get_task(id).unwrap().unwrap();
+            run_scheduled_task(task, db.clone(), "session", tools.clone(), tx.clone());
+        }
+
+        let good = db.get_task(good).unwrap().unwrap();
+        assert_eq!(good.status, db::TaskStatus::DONE);
+        assert_eq!(good.last_outcome.as_deref(), Some("succeeded"));
+        assert!(good.last_result.unwrap().contains("Cargo.toml"));
+        let bad = db.get_task(bad).unwrap().unwrap();
+        assert_eq!(bad.status, db::TaskStatus::DONE);
+        assert_eq!(bad.last_outcome.as_deref(), Some("failed"));
+        // Only the real tool call produced a message for the agent's chat.
+        assert_eq!(rx.try_iter().count(), 1);
     }
 
     #[test]
