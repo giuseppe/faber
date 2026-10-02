@@ -510,7 +510,7 @@ that agent.
 | Tool | Description |
 |---|---|
 | `read_file` | Read file contents, optionally just a `start_line`..`end_line` range; reports `total_lines` |
-| `write_file` | Create a file, or replace its whole content, with optional permissions. Anything else is refused and pointed at `patch_file` |
+| `write_file` | Create a file, or replace its whole content, with optional permissions. Replacing an existing file requires having read it, and is refused if it changed since (see below). Anything else is refused and pointed at `patch_file` |
 | `patch_file` | Change part of an existing file: a batch of edits, each replacing exact text (`old_content`) or a range of lines (`start_line`..`end_line`), applied in order, all-or-nothing, rewriting only the changed bytes; the result includes a numbered-context preview of where each edit landed, so a follow-up `read_file` usually isn't needed to confirm it |
 | `delete_path` | Delete a file or directory |
 | `glob` | Find files matching a glob pattern |
@@ -582,6 +582,20 @@ extension isn't a well-known one - it defaults to the extension itself.
 the answer to its `workspace/configuration` requests. faber refuses to
 start if two servers claim the same extension. Configured servers are
 sandboxed exactly like the built-in ones.
+
+### Concurrent edits
+
+Several agents - sub-agents, `fan_out` workers, task workers - and you can
+change the same files. So that nobody's changes get silently overwritten,
+each agent remembers what every file looked like when it last read or
+wrote it, and `write_file` refuses to replace an existing file the agent
+hasn't read, or one that has changed since: the agent has to read it
+again and redo its change on top. `patch_file`'s text edits need no such
+check - they only apply where `old_content` still matches - but its
+line-range edits do, since line numbers mean nothing in a file that has
+changed. A chat remembers across its turns, so this also protects your own
+edits between them. Scheduled tool tasks, which run a fixed tool call
+with no model involved, aren't checked.
 
 ### Parallel tool calls
 

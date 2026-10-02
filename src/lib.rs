@@ -18,6 +18,8 @@
  */
 
 use std::any::Any;
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -103,6 +105,41 @@ pub struct ToolContext {
     /// each required field to its type ("string", "number", "integer",
     /// "boolean", "array" or "object").
     pub result_schema: Option<serde_json::Value>,
+    /// What each file this agent read (or wrote) looked like then - so a
+    /// write can be refused if someone else has changed the file since
+    /// (see `check_file_unchanged`). Shared by the turns of one chat;
+    /// `None` turns the check off (a scheduled tool call, with no model to
+    /// read anything first).
+    pub file_versions: Option<Arc<Mutex<HashMap<PathBuf, u64>>>>,
+}
+
+/// A file's key in `ToolContext::file_versions`: absolute, `.` and `..`
+/// folded away.
+fn file_key(path: &str) -> PathBuf {
+    let path = Path::new(path);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    let mut key = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                key.pop();
+            }
+            c => key.push(c),
+        }
+    }
+    key
+}
+
+fn content_hash(content: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl ToolContext {
@@ -123,6 +160,41 @@ impl ToolContext {
             max_requests: None,
             result_slot: None,
             result_schema: None,
+            file_versions: Some(Arc::new(Mutex::new(HashMap::new()))),
+        }
+    }
+
+    /// Remembers `content` as what this agent last saw of `path`.
+    pub fn note_file_version(&self, path: &str, content: &[u8]) {
+        if let Some(versions) = &self.file_versions {
+            versions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(file_key(path), content_hash(content));
+        }
+    }
+
+    /// Before changing the existing file `path`, whose content is now
+    /// `current`: refuses if this agent never read it, or if it changed
+    /// since this agent last saw it - e.g. another agent, a command or the
+    /// user edited it - so nobody's changes get silently overwritten.
+    pub fn check_file_unchanged(&self, path: &str, current: &[u8]) -> Result<(), String> {
+        let Some(versions) = &self.file_versions else {
+            return Ok(());
+        };
+        let versions = versions.lock().unwrap_or_else(|e| e.into_inner());
+        match versions.get(&file_key(path)) {
+            None => Err(format!(
+                "'{}' already exists and you haven't read it: read it first, so you don't \
+                 overwrite something you haven't seen",
+                path
+            )),
+            Some(seen) if *seen != content_hash(current) => Err(format!(
+                "'{}' has changed since you read it (someone else edited it): read it again \
+                 and redo your change on top of what's there now",
+                path
+            )),
+            Some(_) => Ok(()),
         }
     }
 

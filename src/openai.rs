@@ -1094,6 +1094,7 @@ fn run_tool_call_group(
                     buffered.max_tool_output_chars = ctx.max_tool_output_chars;
                     buffered.context_window = ctx.context_window;
                     buffered.interrupt = ctx.interrupt.clone();
+                    buffered.file_versions = ctx.file_versions.clone();
                     let tool_start_time = Instant::now();
                     let result =
                         tool_call(tools_collection, req, &buffered).map_err(|e| e.to_string());
