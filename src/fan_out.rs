@@ -146,6 +146,17 @@ pub(crate) fn format_results(
     out
 }
 
+/// The tool context a worker runs with: quiet, with the caller's database
+/// and context window, and acting as the caller - e.g. seeing its private
+/// knowledge base notes. No MCP tools, and no sub-agent machinery.
+fn worker_context(ctx: &ToolContext) -> ToolContext {
+    let mut worker_ctx = ToolContext::new(|_: &str| {});
+    worker_ctx.db = ctx.db.clone();
+    worker_ctx.agent_name = ctx.agent_name.clone();
+    worker_ctx.context_window = ctx.context_window;
+    worker_ctx
+}
+
 /// Runs one worker to completion. `cancel` gets a message on Ctrl-C.
 fn run_worker(
     sa_ctx: &SubAgentContext,
@@ -155,12 +166,7 @@ fn run_worker(
     prompt: String,
     cancel: mpsc::Receiver<()>,
 ) -> Result<String, Box<dyn Error>> {
-    let mut worker_ctx = ToolContext::new(|_: &str| {});
-    worker_ctx.db = ctx.db.clone();
-    // Workers act as their caller, e.g. seeing its private knowledge base
-    // notes.
-    worker_ctx.agent_name = ctx.agent_name.clone();
-    worker_ctx.context_window = ctx.context_window;
+    let worker_ctx = worker_context(ctx);
     // Streamed, although nothing is shown, so Ctrl-C is noticed between
     // chunks rather than only once a whole response has arrived.
     let mode = || ResponseMode::Streaming {
@@ -433,6 +439,18 @@ mod tests {
             "took {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn test_worker_context_acts_as_the_caller() {
+        let (mut ctx, _ctrl_c, _) = dummy_chat_ctx();
+        ctx.agent_name = Some("boss".to_string());
+        ctx.context_window = Some(32_000);
+        let worker = worker_context(&ctx);
+        assert_eq!(worker.agent_name.as_deref(), Some("boss"));
+        assert_eq!(worker.context_window, Some(32_000));
+        assert!(worker.extra.is_none(), "workers can't spawn agents");
+        assert!(worker.mcp_manager.is_none());
     }
 
     #[test]
