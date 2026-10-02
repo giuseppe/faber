@@ -5568,6 +5568,13 @@ fn create_response_mode(
                         false,
                     );
                 }
+                StatusUpdate::WaitingForSlot => {
+                    status_bar.set_agent_status(
+                        &agent_name,
+                        "Waiting for other requests to the model to finish",
+                        true,
+                    );
+                }
                 StatusUpdate::SendingRequest { bytes } => {
                     // Reported once per turn, right before the request is
                     // sent. A long wait here means a large prompt is still
@@ -8238,6 +8245,13 @@ struct Opts {
     #[serde(default)]
     lsp_servers: HashMap<String, Option<lsp::ServerConfig>>,
 
+    #[clap(long, value_name = "N")]
+    /// At most this many requests to the model in flight at once, across the
+    /// chat, sub-agents, fan-out workers and scheduled tasks - e.g. the
+    /// number of slots a llama.cpp server runs with (--parallel). Unlimited
+    /// unless set.
+    max_parallel_requests: Option<usize>,
+
     #[clap(long, value_name = "DURATION")]
     /// While `faber chat` runs, delete done tasks whose last run is older
     /// than this (e.g. 30d), checked hourly. Off unless set.
@@ -8283,6 +8297,7 @@ impl Default for Opts {
             mcp_servers: HashMap::new(),
             lsp_servers: HashMap::new(),
             task_retention: None,
+            max_parallel_requests: None,
             mcp_server: Vec::new(),
             command: CliCommand::Chat {},
             args: Vec::new(),
@@ -8379,6 +8394,10 @@ impl Opts {
 
         if self.task_retention.is_none() {
             self.task_retention = config.task_retention;
+        }
+
+        if self.max_parallel_requests.is_none() {
+            self.max_parallel_requests = config.max_parallel_requests;
         }
 
         debug!("Configuration merge completed");
@@ -8686,6 +8705,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     opts.apply_mcp_server_flags()?;
     lsp::configure(&opts.lsp_servers)?;
+    openai::set_max_parallel_requests(opts.max_parallel_requests.unwrap_or(0));
     if let Some(retention) = &opts.task_retention {
         parse_duration(retention).ok_or_else(|| {
             format!(

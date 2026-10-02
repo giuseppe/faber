@@ -117,6 +117,98 @@ pub fn normalize_endpoint(endpoint: &str) -> String {
 }
 
 /// Check for Ctrl-C signal and return InterruptedError if found
+/// Limits how many requests to the model are in flight at once. The
+/// process has one (`request_limiter`), shared by the chat, sub-agents,
+/// fan-out workers and task turns alike: a model server with few slots
+/// (llama.cpp's --parallel) otherwise gets more concurrent requests than it
+/// can serve, each splitting its context further.
+pub struct RequestLimiter {
+    /// (limit, in use); a limit of 0 means none.
+    state: Mutex<(usize, usize)>,
+    changed: std::sync::Condvar,
+}
+
+/// A request's place among the ones a `RequestLimiter` allows at once;
+/// frees it when dropped.
+pub struct RequestSlot<'a>(Option<&'a RequestLimiter>);
+
+impl Drop for RequestSlot<'_> {
+    fn drop(&mut self) {
+        if let Some(limiter) = self.0 {
+            limiter.state.lock().unwrap_or_else(|e| e.into_inner()).1 -= 1;
+            limiter.changed.notify_one();
+        }
+    }
+}
+
+impl RequestLimiter {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            state: Mutex::new((limit, 0)),
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    pub fn set_limit(&self, limit: usize) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).0 = limit;
+        self.changed.notify_all();
+    }
+
+    /// Waits - interruptibly, telling `mode`'s progress handler once - for
+    /// a free slot.
+    fn acquire(
+        &self,
+        ctrl_c_rx: &Option<Arc<Mutex<mpsc::Receiver<()>>>>,
+        mode: &ResponseMode,
+        start_time: Instant,
+    ) -> Result<RequestSlot<'_>, Box<dyn Error>> {
+        let mut reported = false;
+        loop {
+            {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.0 == 0 {
+                    return Ok(RequestSlot(None));
+                }
+                if state.1 < state.0 {
+                    state.1 += 1;
+                    return Ok(RequestSlot(Some(self)));
+                }
+                if reported {
+                    let _ = self
+                        .changed
+                        .wait_timeout(state, Duration::from_millis(100))
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+            }
+            if !reported {
+                reported = true;
+                if let ResponseMode::Streaming {
+                    progress_handler, ..
+                } = mode
+                {
+                    progress_handler(&ProgressInfo {
+                        status: StatusUpdate::WaitingForSlot,
+                        elapsed_ms: start_time.elapsed().as_millis() as u64,
+                    })?;
+                }
+            }
+            check_ctrl_c_signal(ctrl_c_rx)?;
+        }
+    }
+}
+
+/// The process's `RequestLimiter`.
+fn request_limiter() -> &'static RequestLimiter {
+    static LIMITER: std::sync::OnceLock<RequestLimiter> = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| RequestLimiter::new(0))
+}
+
+/// Sets how many model requests may be in flight at once in this process
+/// (0: unlimited).
+pub fn set_max_parallel_requests(limit: usize) {
+    request_limiter().set_limit(limit);
+}
+
 /// Runs a blocking call - sending a request, reading a whole response -
 /// on a helper thread, checking for Ctrl-C every 100ms meanwhile, so the
 /// user isn't stuck waiting for a slow or hung server. If interrupted, the
@@ -370,6 +462,9 @@ pub enum StatusUpdate {
     ToolBatchStart {
         names: Vec<String>,
     },
+    /// Waiting for another request to finish first: no more may be in
+    /// flight at once (see `set_max_parallel_requests`).
+    WaitingForSlot,
     /// About to send a request and wait for the response - reported once
     /// per turn (the first request and every one that follows a tool call),
     /// with the size of the outgoing request body, so a long wait on a
@@ -1219,6 +1314,9 @@ fn post_request_with_mode_and_recursion(
             .timeout(Duration::from_secs(1000))
             .build()?;
 
+        // Held until this round trip's response has been read in full.
+        let _slot = request_limiter().acquire(&ctrl_c_rx, &mode, start_time)?;
+
         let max_retries = opts.max_retries.unwrap_or(5);
         let base_delay_secs = opts.retry_base_delay_secs.unwrap_or(1);
         let mut response = None;
@@ -1315,6 +1413,7 @@ fn post_request_with_mode_and_recursion(
             trace!("Got response {:?}", response_text);
             serde_json::from_str(&response_text)?
         };
+        drop(_slot);
         accumulate_usage(&mut turn_usage, openai_response.usage.as_ref());
 
         if let Some(mut err) = openai_response.error {
@@ -1813,6 +1912,50 @@ fn handle_streaming_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_request_limiter_limits_concurrency_and_stays_interruptible() {
+        // Its own limiter: the process-wide one is shared with every other
+        // test making requests.
+        let limiter: &'static RequestLimiter = Box::leak(Box::new(RequestLimiter::new(1)));
+        let acquire = |ctrl_c: &Option<Arc<Mutex<mpsc::Receiver<()>>>>| {
+            limiter.acquire(ctrl_c, &ResponseMode::Complete, Instant::now())
+        };
+        let first = acquire(&None).unwrap();
+        // A second request waits for the first...
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let slot = limiter
+                .acquire(&None, &ResponseMode::Complete, Instant::now())
+                .unwrap();
+            done_tx.send(()).unwrap();
+            drop(slot);
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "should wait"
+        );
+        drop(first);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("got the slot once freed");
+        waiter.join().unwrap();
+
+        // ...and Ctrl-C stops the wait.
+        let held = acquire(&None).unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(()).unwrap();
+        let err = acquire(&Some(Arc::new(Mutex::new(rx))))
+            .err()
+            .expect("interrupted");
+        assert!(err.downcast_ref::<InterruptedError>().is_some());
+        drop(held);
+
+        // No limit: never waits.
+        limiter.set_limit(0);
+        let _a = acquire(&None).unwrap();
+        let _b = acquire(&None).unwrap();
+    }
 
     #[test]
     fn test_interruptible_returns_the_result_or_stops_on_ctrl_c() {

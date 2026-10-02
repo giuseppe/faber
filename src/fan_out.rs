@@ -180,6 +180,7 @@ fn run_worker(
                     StatusUpdate::Thinking => "Thinking".to_string(),
                     StatusUpdate::ToolStart { name, .. } => format!("Running {}", name),
                     StatusUpdate::SendingRequest { .. } => "Waiting for response".to_string(),
+                    StatusUpdate::WaitingForSlot => "Waiting for a free request slot".to_string(),
                     _ => return Ok(()),
                 };
                 status_bar.set_agent_status(&key, &status, false);
