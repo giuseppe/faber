@@ -7248,6 +7248,267 @@ fn gc_command(opts: &Opts) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Reads a timestamp as stored in the database: RFC 3339 (`next_run_at`,
+/// `last_run_at`, ...) or SQLite's `datetime('now')` UTC format
+/// (`created_at`).
+fn parse_db_time(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Some(t.with_timezone(&chrono::Utc));
+    }
+    chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|t| t.and_utc())
+}
+
+/// `--since`: a duration back from `now` (`45s`, `30m`, `2h`, `3d`, `1w`),
+/// or a date/time - RFC 3339, or `YYYY-MM-DD[ HH:MM]` in local time.
+fn parse_since(
+    text: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let text = text.trim();
+    if let Some(unit) = text.chars().last() {
+        if let Ok(n) = text[..text.len() - unit.len_utf8()].parse::<i64>() {
+            let seconds = match unit {
+                's' => Some(n),
+                'm' => Some(n * 60),
+                'h' => Some(n * 3600),
+                'd' => Some(n * 86_400),
+                'w' => Some(n * 7 * 86_400),
+                _ => None,
+            };
+            if let Some(seconds) = seconds {
+                return Ok(now - chrono::Duration::seconds(seconds));
+            }
+        }
+    }
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Ok(t.with_timezone(&chrono::Utc));
+    }
+    let local = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M").or_else(|_| {
+        chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+            .map(|d| d.and_hms_opt(0, 0, 0).unwrap_or_default())
+    });
+    match local {
+        Ok(t) => t
+            .and_local_timezone(chrono::Local)
+            .earliest()
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .ok_or_else(|| format!("'{}' doesn't exist in the local time zone", text)),
+        Err(_) => Err(format!(
+            "can't read --since '{}': use a duration like 30m, 2h, 3d, 1w, or a date like 2026-10-01",
+            text
+        )),
+    }
+}
+
+/// `t` relative to `now`, compactly: "in 5m", "3h ago", "now"; a date
+/// once it's more than a week away.
+fn format_relative(t: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> String {
+    let seconds = (t - now).num_seconds();
+    let magnitude = seconds.unsigned_abs();
+    let amount = match magnitude {
+        0..=4 => return "now".to_string(),
+        5..=59 => format!("{}s", magnitude),
+        60..=3599 => format!("{}m", magnitude / 60),
+        3600..=86_399 => format!("{}h", magnitude / 3600),
+        86_400..=604_799 => format!("{}d", magnitude / 86_400),
+        _ => {
+            return t
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d")
+                .to_string();
+        }
+    };
+    if seconds > 0 {
+        format!("in {}", amount)
+    } else {
+        format!("{} ago", amount)
+    }
+}
+
+/// When a task last did anything: created, started or finished a run.
+fn task_activity(task: &db::TaskRow) -> Option<chrono::DateTime<chrono::Utc>> {
+    [
+        Some(&task.created_at),
+        task.started_at.as_ref(),
+        task.last_run_at.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|t| parse_db_time(t))
+    .max()
+}
+
+/// The tasks `faber tasks` shows: active since `since`, most recent first,
+/// at most `last` of them.
+fn select_tasks(
+    mut tasks: Vec<db::TaskRow>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    last: Option<usize>,
+) -> Vec<db::TaskRow> {
+    if let Some(since) = since {
+        tasks.retain(|t| task_activity(t).is_some_and(|a| a >= since));
+    }
+    tasks.sort_by(|a, b| {
+        task_activity(b)
+            .cmp(&task_activity(a))
+            .then(b.id.cmp(&a.id))
+    });
+    if let Some(last) = last {
+        tasks.truncate(last);
+    }
+    tasks
+}
+
+/// The first line of `text`, at most `max` characters.
+fn first_line(text: &str, max: usize) -> String {
+    let line = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if line.chars().count() > max {
+        format!("{}…", line.chars().take(max - 1).collect::<String>())
+    } else {
+        line.to_string()
+    }
+}
+
+/// One row of the `faber tasks` table.
+fn task_table_row(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> Row {
+    let when = |t: &Option<String>| {
+        t.as_deref()
+            .and_then(parse_db_time)
+            .map(|t| format_relative(t, now))
+            .unwrap_or_else(|| "-".to_string())
+    };
+    let schedule = match (&task.cron_expression, &task.run_at) {
+        (Some(cron), _) => cron.clone(),
+        (None, Some(_)) => "once".to_string(),
+        (None, None) => "-".to_string(),
+    };
+    let status = match task.status.as_str() {
+        db::TaskStatus::RUNNING => Cell::new(&format!(
+            "running ({})",
+            when(&task.started_at).trim_end_matches(" ago")
+        ))
+        .style_spec("Fy"),
+        status => Cell::new(status),
+    };
+    let next = if task.status == db::TaskStatus::SCHEDULED {
+        when(&task.next_run_at)
+    } else {
+        "-".to_string()
+    };
+    let result = match task.last_outcome.as_deref() {
+        Some(outcome) => {
+            let mark = if outcome == "succeeded" { "✓" } else { "✗" };
+            let code = task
+                .last_exit_code
+                .map(|c| format!(" {}", c))
+                .unwrap_or_default();
+            let text = first_line(task.last_result.as_deref().unwrap_or(""), 40);
+            Cell::new(format!("{}{} {}", mark, code, text).trim_end())
+                .style_spec(if outcome == "succeeded" { "Fg" } else { "Fr" })
+        }
+        None => Cell::new("-"),
+    };
+    let runs = match task.max_runs {
+        Some(max) => format!("{}/{}", task.run_count, max),
+        None => task.run_count.to_string(),
+    };
+    Row::new(vec![
+        Cell::new(&task.id.to_string()),
+        Cell::new(&task.name),
+        Cell::new(task.agent_name.as_deref().unwrap_or("-")),
+        Cell::new(&schedule),
+        status,
+        Cell::new(&next),
+        Cell::new(&when(&task.last_run_at)),
+        Cell::new(&runs),
+        result,
+    ])
+}
+
+/// Prints the tasks `select_tasks` picks as a table, as of `now`.
+fn print_tasks_table(
+    db: &dyn DbBackend,
+    since: Option<&str>,
+    last: Option<usize>,
+    agent: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Box<dyn Error>> {
+    let since = since.map(|s| parse_since(s, now)).transpose()?;
+    let tasks = select_tasks(db.list_tasks(agent)?, since, last);
+    if tasks.is_empty() {
+        println!("No tasks.");
+        return Ok(());
+    }
+    let mut table = Table::new();
+    table.set_format(*format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
+    table.set_titles(Row::new(
+        [
+            "ID",
+            "Name",
+            "Agent",
+            "Schedule",
+            "Status",
+            "Next run",
+            "Last run",
+            "Runs",
+            "Last result",
+        ]
+        .iter()
+        .map(|t| Cell::new(t))
+        .collect(),
+    ));
+    for task in &tasks {
+        table.add_row(task_table_row(task, now));
+    }
+    table.printstd();
+    Ok(())
+}
+
+/// `faber tasks`: prints scheduled tasks as a table - once, or with
+/// `watch` every that many seconds until interrupted.
+fn tasks_command(
+    db: &Option<Arc<dyn DbBackend>>,
+    since: Option<&str>,
+    last: Option<usize>,
+    agent: Option<&str>,
+    watch: Option<u64>,
+) -> Result<(), Box<dyn Error>> {
+    let db = db.as_ref().ok_or(
+        "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
+    )?;
+    let Some(interval) = watch else {
+        return print_tasks_table(db.as_ref(), since, last, agent, chrono::Utc::now());
+    };
+    // Fail on a bad --since right away rather than on every refresh.
+    if let Some(since) = since {
+        parse_since(since, chrono::Utc::now())?;
+    }
+    let interval = Duration::from_secs(interval.max(1));
+    loop {
+        let now = chrono::Utc::now();
+        // Home the cursor and clear the screen, then redraw.
+        print!("\x1b[H\x1b[2J");
+        println!(
+            "Every {}s - {} (Ctrl-C to quit)\n",
+            interval.as_secs(),
+            now.with_timezone(&chrono::Local).format("%H:%M:%S")
+        );
+        // A failed refresh (e.g. a dropped --server connection) is shown
+        // and retried, not fatal.
+        if let Err(e) = print_tasks_table(db.as_ref(), since, last, agent, now) {
+            println!("Error: {}", e);
+        }
+        std::io::stdout().flush()?;
+        std::thread::sleep(interval);
+    }
+}
+
 fn list_tools_command(
     mcp_manager: &Option<Arc<faber::mcp::McpManager>>,
 ) -> Result<(), Box<dyn Error>> {
@@ -7709,6 +7970,25 @@ enum CliCommand {
     /// Remove dormant agents (no active session)
     Gc {},
 
+    /// Show scheduled tasks: their status, schedule and how their last run went
+    Tasks {
+        /// Only tasks created, started or run since then: how long ago
+        /// (e.g. 30m, 2h, 3d, 1w) or a date/time (2026-10-01,
+        /// "2026-10-01 14:00", 2026-10-01T14:00:00Z)
+        #[clap(long)]
+        since: Option<String>,
+        /// Only the N most recently active tasks
+        #[clap(long)]
+        last: Option<usize>,
+        /// Only this agent's tasks
+        #[clap(long)]
+        agent: Option<String>,
+        /// Keep the table on screen, refreshed every 2 seconds (or every
+        /// N with --watch=N), until Ctrl-C
+        #[clap(long, value_name = "N", num_args = 0..=1, require_equals = true, default_missing_value = "2")]
+        watch: Option<u64>,
+    },
+
     /// Start a server exposing the DB API over TCP
     Serve {
         /// Address to bind to
@@ -7790,8 +8070,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(Arc::new(remote))
     } else if let Some(ref db_path) = opts.db_path {
         debug!("Opening SQLite database at: {}", db_path);
-        let conn = rusqlite::Connection::open(db_path)?;
-        db::initialize_db(&conn)?;
+        let conn = if matches!(opts.command, CliCommand::Tasks { .. }) {
+            // Only looks: never create or migrate a database for it.
+            db::open_read_only(db_path)?
+        } else {
+            let conn = rusqlite::Connection::open(db_path)?;
+            db::initialize_db(&conn)?;
+            conn
+        };
         let conn = Arc::new(Mutex::new(conn));
         db_conn_for_history = Some(conn.clone());
         Some(Arc::new(LocalDb::new(conn)))
@@ -7829,6 +8115,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Models {} => list_models_command(&opts),
         CliCommand::ListTools {} => list_tools_command(&mcp_manager),
         CliCommand::Gc {} => gc_command(&opts),
+        CliCommand::Tasks {
+            since,
+            last,
+            agent,
+            watch,
+        } => tasks_command(
+            &db_connection,
+            since.as_deref(),
+            *last,
+            agent.as_deref(),
+            *watch,
+        ),
         CliCommand::Serve {
             bind,
             auth_key,
@@ -8336,6 +8634,98 @@ mod tests {
         assert_eq!(bad.last_outcome.as_deref(), Some("failed"));
         // Only the real tool call produced a message for the agent's chat.
         assert_eq!(rx.try_iter().count(), 1);
+    }
+
+    fn utc(text: &str) -> chrono::DateTime<chrono::Utc> {
+        parse_db_time(text).unwrap()
+    }
+
+    #[test]
+    fn test_parse_db_time_reads_both_stored_formats() {
+        assert_eq!(utc("2026-10-01 12:30:00"), utc("2026-10-01T12:30:00+00:00"));
+        assert!(parse_db_time("yesterday").is_none());
+    }
+
+    #[test]
+    fn test_parse_since_durations_and_dates() {
+        let now = utc("2026-10-02T12:00:00Z");
+        assert_eq!(
+            parse_since("30m", now).unwrap(),
+            utc("2026-10-02T11:30:00Z")
+        );
+        assert_eq!(parse_since("2h", now).unwrap(), utc("2026-10-02T10:00:00Z"));
+        assert_eq!(parse_since("3d", now).unwrap(), utc("2026-09-29T12:00:00Z"));
+        assert_eq!(parse_since("1w", now).unwrap(), utc("2026-09-25T12:00:00Z"));
+        assert_eq!(
+            parse_since("2026-10-01T08:00:00Z", now).unwrap(),
+            utc("2026-10-01T08:00:00Z")
+        );
+        // Plain dates and times are local.
+        let local_midnight = chrono::NaiveDate::from_ymd_opt(2026, 10, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(parse_since("2026-10-01", now).unwrap(), local_midnight);
+        assert!(parse_since("2026-10-01 14:00", now).is_ok());
+        assert!(parse_since("soon", now).is_err());
+        assert!(parse_since("5y", now).is_err());
+    }
+
+    #[test]
+    fn test_format_relative() {
+        let now = utc("2026-10-02T12:00:00Z");
+        assert_eq!(format_relative(utc("2026-10-02T12:00:02Z"), now), "now");
+        assert_eq!(format_relative(utc("2026-10-02T12:05:00Z"), now), "in 5m");
+        assert_eq!(format_relative(utc("2026-10-02T09:00:00Z"), now), "3h ago");
+        assert_eq!(format_relative(utc("2026-09-30T12:00:00Z"), now), "2d ago");
+        assert_eq!(format_relative(utc("2026-10-02T11:59:30Z"), now), "30s ago");
+    }
+
+    fn task_row(id: i64, created: &str, last_run: Option<&str>) -> db::TaskRow {
+        db::TaskRow {
+            id,
+            agent_name: None,
+            name: format!("t{}", id),
+            description: String::new(),
+            task_type: "oneshot".to_string(),
+            cron_expression: None,
+            run_at: Some(created.to_string()),
+            next_run_at: Some(created.to_string()),
+            last_run_at: last_run.map(String::from),
+            status: "scheduled".to_string(),
+            created_at: created.to_string(),
+            command: String::new(),
+            max_runs: None,
+            run_count: 0,
+            claimed_by: None,
+            started_at: None,
+            last_outcome: None,
+            last_exit_code: None,
+            last_result: None,
+        }
+    }
+
+    #[test]
+    fn test_select_tasks_orders_by_activity_and_filters() {
+        let tasks = vec![
+            task_row(1, "2026-09-01 10:00:00", Some("2026-10-02T11:00:00Z")),
+            task_row(2, "2026-10-01 10:00:00", None),
+            task_row(3, "2026-09-20 10:00:00", None),
+        ];
+        let ids = |tasks: Vec<db::TaskRow>| tasks.iter().map(|t| t.id).collect::<Vec<_>>();
+        assert_eq!(ids(select_tasks(tasks.clone(), None, None)), vec![1, 2, 3]);
+        assert_eq!(ids(select_tasks(tasks.clone(), None, Some(2))), vec![1, 2]);
+        let since = Some(utc("2026-09-30T00:00:00Z"));
+        assert_eq!(ids(select_tasks(tasks, since, None)), vec![1, 2]);
+    }
+
+    #[test]
+    fn test_first_line() {
+        assert_eq!(first_line("\n  hello world\nmore", 40), "hello world");
+        assert_eq!(first_line("abcdefgh", 5), "abcd…");
     }
 
     #[test]

@@ -32,7 +32,7 @@ pub struct AgentRow {
     pub heartbeat_at: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TaskRow {
     pub id: i64,
     pub agent_name: Option<String>,
@@ -194,6 +194,34 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
     let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN heartbeat_at TEXT DEFAULT NULL;");
 
     Ok(())
+}
+
+/// Opens an existing database without changing it in any way: no file is
+/// created if it's missing, no schema is created or migrated, and nothing
+/// can be written. For commands that only look (`faber tasks`), so that
+/// pointing one at the wrong path is an error instead of quietly creating
+/// an empty database that then looks like there's nothing in it.
+pub fn open_read_only(path: &str) -> Result<Connection, Box<dyn Error>> {
+    let shown = std::path::absolute(path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path.to_string());
+    if !std::path::Path::new(path).is_file() {
+        return Err(format!("no database at {}", shown).into());
+    }
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let not_faber = || format!("{} isn't a faber database", shown);
+    // A file that isn't SQLite at all only fails once it's read.
+    if !table_has_column(&conn, "scheduled_tasks", "id").map_err(|_| not_faber())? {
+        return Err(not_faber().into());
+    }
+    if !table_has_column(&conn, "scheduled_tasks", "status")? {
+        return Err(format!(
+            "{} is from an older version of faber: open it once with `faber chat` to upgrade it",
+            shown
+        )
+        .into());
+    }
+    Ok(conn)
 }
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, rusqlite::Error> {
@@ -1291,6 +1319,71 @@ mod tests {
             get_task(&conn, id).unwrap().unwrap().status,
             TaskStatus::DONE
         );
+    }
+
+    fn temp_db_path(name: &str) -> String {
+        let path =
+            std::env::temp_dir().join(format!("faber_test_{}_{}.db", name, std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn test_open_read_only_never_creates_a_database() {
+        let path = temp_db_path("missing");
+        let err = open_read_only(&path).unwrap_err().to_string();
+        assert!(err.starts_with("no database at "), "{err}");
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn test_open_read_only_reads_but_cannot_write() {
+        let path = temp_db_path("current");
+        let conn = Connection::open(&path).unwrap();
+        initialize_db(&conn).unwrap();
+        create_oneshot_task(&conn, "t", "", &chrono::Utc::now().to_rfc3339(), "", None).unwrap();
+        drop(conn);
+
+        let conn = open_read_only(&path).unwrap();
+        assert_eq!(list_tasks(&conn, None).unwrap().len(), 1);
+        assert!(conn.execute("DELETE FROM scheduled_tasks", []).is_err());
+        drop(conn);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_open_read_only_leaves_old_and_foreign_databases_alone() {
+        let path = temp_db_path("old");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE scheduled_tasks (id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1);",
+        )
+        .unwrap();
+        drop(conn);
+        let err = open_read_only(&path).unwrap_err().to_string();
+        assert!(err.contains("older version of faber"), "{err}");
+        let conn = Connection::open(&path).unwrap();
+        assert!(
+            !table_has_column(&conn, "scheduled_tasks", "status").unwrap(),
+            "not migrated"
+        );
+        drop(conn);
+        std::fs::remove_file(&path).unwrap();
+
+        let path = temp_db_path("foreign");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE notes (body TEXT);")
+            .unwrap();
+        let err = open_read_only(&path).unwrap_err().to_string();
+        assert!(err.contains("isn't a faber database"), "{err}");
+        std::fs::remove_file(&path).unwrap();
+
+        let path = temp_db_path("text");
+        std::fs::write(&path, "just some text, not SQLite\n".repeat(100)).unwrap();
+        let err = open_read_only(&path).unwrap_err().to_string();
+        assert!(err.contains("isn't a faber database"), "{err}");
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

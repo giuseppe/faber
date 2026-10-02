@@ -250,8 +250,53 @@ Tasks execute tool calls (JSON format) when they fire:
 {"tool": "run_command", "arguments": {"command": "echo", "args": ["hello"]}}
 ```
 
-Tasks support `max_runs` to auto-disable after N executions. A background
-scheduler thread checks for pending tasks every second.
+Tasks support `max_runs` to stop after N executions. Every `faber chat`
+session runs a scheduler that checks for due tasks every second.
+
+Each task has a status:
+
+| Status | Meaning |
+|---|---|
+| `scheduled` | waiting for its next run |
+| `running` | claimed by one session, which is running it |
+| `done` | a one-shot task that ran, or a cron task that reached `max_runs` |
+| `disabled` | switched off with `task_set_enabled` (switching it back on makes it `scheduled`) |
+
+A session claims a due task atomically before running it, so when several
+sessions share a database (e.g. through `faber serve`) each run happens
+exactly once. If the session running a task dies, its claim is abandoned
+once it stops heartbeating (after ~30 seconds) and the task runs again.
+How the last run went is recorded separately - `last_outcome`
+(`succeeded`/`failed`), `last_exit_code` and the start of its output - so a
+cron task whose last run failed is still `scheduled` for the next one. A
+task whose command isn't a valid tool call fails with an explanation.
+
+### Listing tasks
+
+```bash
+faber --db-path state.db tasks              # every task, most recently active first
+faber --db-path state.db tasks --last 10    # the 10 most recently active
+faber --db-path state.db tasks --since 2h   # active in the last 2 hours (also 30m, 3d, 1w)
+faber --db-path state.db tasks --since 2026-10-01 --agent mybot
+faber --db-path state.db tasks --watch      # redraw every 2s until Ctrl-C (--watch=N for N seconds)
+```
+
+```
+ ID | Name           | Agent | Schedule        | Status    | Next run | Last run | Runs | Last result
+----+----------------+-------+-----------------+-----------+----------+----------+------+--------------------------
+ 3  | check every 2s | -     | */2 * * * * * * | done      | -        | 6s ago   | 3/3  | ✓ src/main.rs:7966:fn main…
+ 2  | broken command | -     | once            | done      | -        | 10s ago  | 1    | ✗ the task's command isn't…
+ 4  | nightly report | -     | 0 0 3 * * * *   | scheduled | in 13h   | -        | 0    | -
+```
+
+`faber tasks` only reads: it never creates a database (a wrong path is an
+error, not an empty table) and never upgrades or changes one - open a
+database from an older faber once with `faber chat` first. A relative
+`db_path` in a config file is relative to the current directory.
+
+A task is "active" when it was created, started or finished a run.
+`--since` also takes a date or `"YYYY-MM-DD HH:MM"` in local time, or an
+RFC 3339 timestamp. It works with `--server` too.
 
 ## Tools
 
