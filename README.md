@@ -222,6 +222,31 @@ with `/cancel NAME` in the chat. A stopped sub-agent still reports back,
 saying why: "Stopped: timed out after 60s", "Stopped: cancelled by the
 user", and so on.
 
+A finished sub-agent is kept, with its conversation, until `faber gc`
+removes it (it then has no live session), so you can see what it did.
+
+### Watching agents
+
+```bash
+faber agents                 # the agents as a tree by who spawned whom, with what each is doing
+faber agents --watch         # redraw every 2s (--watch=N for N seconds)
+faber agents show scout      # one agent in detail, with its conversation (--full for whole messages)
+```
+
+```
+ Agent        | Session | Activity                        | Since | Model
+--------------+---------+---------------------------------+-------+-------
+ default      | live    | fan_out: 120/500 done           | 3s ago| -
+ ├─ planner   | live    | running grep_in_current_directory | now | -
+ │  └─ scout  | -       | finished: found the manifest    | 2m ago| -
+ └─ checker   | -       | stopped: timed out after 60s    | 5m ago| -
+```
+
+Each agent's activity - thinking, running a tool, waiting for the model or
+for a free request slot (see `--max-parallel-requests`), idle, or finished
+/stopped/failed with the start of its result - is kept in the database,
+so this works from any terminal, and with `--server` too.
+
 The terminal status bar cycles through active sub-agents, showing each
 one's name, status, and elapsed time. A `(+N more)` suffix indicates
 how many additional agents are running.
@@ -442,7 +467,7 @@ that agent.
 | `agent_get` | Get an agent's details, including its configuration |
 | `agent_configure` | Set or clear an agent's model, endpoint or system prompt |
 | `lsp` | Ask a language server about code: `definition`, `references`, `hover`, `symbols` (a file's outline), `workspace_symbols` or `diagnostics`. The server is picked by file extension - rust-analyzer (`.rs`), clangd (C/C++), pyright-langserver or pylsp (`.py`), gopls (`.go`), typescript-language-server (JS/TS) - whichever is installed, started on first use and kept running. A symbol is given by `line` plus its text on that line (`symbol`). Files are re-synced on every call, so edits are picked up. Language servers can run project code (e.g. rust-analyzer builds `build.rs` and proc macros), so unless `--unsafe-tools` is set they run sandboxed with [bubblewrap](https://github.com/containers/bubblewrap): the whole filesystem read-only (so toolchains under `$HOME` still work), only the current directory writable, and no network |
-| `plan_update` | Set the agent's plan for the current multi-step task (full list of items, each `pending`/`in_progress`/`completed`). Stored per agent in the DB under the `state:plan` key, shown in the status bar as progress, and cleared once every item is completed, on `/clear`, or when the agent is deleted (including a sub-agent when it finishes) |
+| `plan_update` | Set the agent's plan for the current multi-step task (full list of items, each `pending`/`in_progress`/`completed`). Stored per agent in the DB under the `state:plan` key, shown in the status bar as progress, and cleared once every item is completed, on `/clear`, or when the agent is deleted |
 | `plan_get` | Get the agent's current plan |
 | `task_create` | Create a task: on a cron schedule, once after a delay or at a time, or right away |
 | `task_delete` | Delete a scheduled task |

@@ -33,6 +33,13 @@ pub struct AgentRow {
     /// The agent that spawned this one, for a sub-agent.
     #[serde(default)]
     pub parent: Option<String>,
+    /// What it's doing, or last did: "thinking", "running read_file",
+    /// "idle", "finished: ...", ...
+    #[serde(default)]
+    pub activity: Option<String>,
+    /// When `activity` last changed.
+    #[serde(default)]
+    pub activity_at: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -329,6 +336,8 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
         "ALTER TABLE agents ADD COLUMN parent TEXT DEFAULT NULL
              REFERENCES agents(name) ON DELETE SET NULL;",
     );
+    let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN activity TEXT DEFAULT NULL;");
+    let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN activity_at TEXT DEFAULT NULL;");
 
     initialize_kb(conn)?;
     Ok(())
@@ -396,6 +405,7 @@ pub fn open_read_only(path: &str) -> Result<Connection, Box<dyn Error>> {
     }
     if !table_has_column(&conn, "scheduled_tasks", "status")?
         || !table_has_column(&conn, "scheduled_tasks", "kind")?
+        || !table_has_column(&conn, "agents", "activity")?
     {
         return Err(format!(
             "{} is from an older version of faber: open it once with `faber chat` to upgrade it",
@@ -574,10 +584,13 @@ fn row_to_agent(row: &rusqlite::Row) -> rusqlite::Result<AgentRow> {
         session_id: row.get(3)?,
         heartbeat_at: row.get(4)?,
         parent: row.get(5)?,
+        activity: row.get(6)?,
+        activity_at: row.get(7)?,
     })
 }
 
-const AGENT_COLUMNS: &str = "name, description, created_at, session_id, heartbeat_at, parent";
+const AGENT_COLUMNS: &str =
+    "name, description, created_at, session_id, heartbeat_at, parent, activity, activity_at";
 
 pub fn list_agents(conn: &Connection) -> Result<Vec<AgentRow>, Box<dyn Error>> {
     let sql = format!("SELECT {} FROM agents ORDER BY name", AGENT_COLUMNS);
@@ -1056,6 +1069,19 @@ pub fn finish_task(
         ],
     )?;
     Ok(rows > 0)
+}
+
+/// Records what `agent` is doing now (see `AgentRow::activity`).
+pub fn set_agent_activity(
+    conn: &Connection,
+    agent: &str,
+    activity: &str,
+) -> Result<(), Box<dyn Error>> {
+    conn.execute(
+        "UPDATE agents SET activity = ?2, activity_at = datetime('now') WHERE name = ?1",
+        params![agent, activity],
+    )?;
+    Ok(())
 }
 
 /// SQL for `agent` (bound to `?1`) and its ancestors, nearest first, as

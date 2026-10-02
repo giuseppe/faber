@@ -3033,6 +3033,7 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     active_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let sub_status_bar = sa_ctx.status_bar.clone();
+    let sub_status_bar_for_progress = sa_ctx.status_bar.clone();
     let agent_name_for_status = agent_name.clone();
     sub_status_bar.set_agent_status(&agent_name_for_status, "Running", true);
     sub_status_bar.set_agent_color(
@@ -3114,14 +3115,45 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         sub_ctx.context_window = context_window;
         sub_ctx.extra = extra_for_sub;
         sub_ctx.max_requests = max_requests;
+        let activity = ActivityRecorder::new(db.clone(), &agent_name);
+        activity.set("thinking");
+        // Streamed, though nothing is shown: its progress keeps the status
+        // bar and `faber agents` current.
+        let mode = {
+            let activity = activity.clone();
+            let status_bar = sub_status_bar_for_progress.clone();
+            let name = agent_name.clone();
+            ResponseMode::Streaming {
+                stream_handler: Box::new(|_: &str| Ok(())),
+                reasoning_handler: Box::new(|_: &str| Ok(())),
+                progress_handler: Box::new(move |progress: &ProgressInfo| {
+                    activity.follow(&progress.status);
+                    if let StatusUpdate::ToolStart { name: tool, .. } = &progress.status {
+                        status_bar.set_agent_status(&name, &format!("Running {}", tool), false);
+                    }
+                    Ok(())
+                }),
+            }
+        };
+        let transcript_start = messages.clone();
         let result = post_request_with_mode(
             messages,
             &tools,
             &agent_opts,
-            ResponseMode::Complete,
+            mode,
             &sub_ctx,
             Some(Arc::new(Mutex::new(cancel_rx))),
         );
+        // Kept, with the agent, until `faber gc`: `faber agents show` reads it.
+        let transcript = match &result {
+            Ok(response) => response.history.clone(),
+            Err(_) => transcript_start,
+        };
+        let values: Vec<serde_json::Value> = transcript
+            .iter()
+            .filter_map(|m| serde_json::to_value(m).ok())
+            .collect();
+        let _ = db.save_agent_messages(&agent_name, &values);
         if let Some(usage) = result.as_ref().ok().and_then(|r| r.turn_usage.as_ref()) {
             session_usage
                 .lock()
@@ -3139,6 +3171,16 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
             ),
             result => final_response_text(result).unwrap_or_else(|e| format!("Error: {}", e)),
         };
+        let first_line = first_line(&response_text, 80);
+        activity.set(
+            &if let Some(reason) = first_line.strip_prefix("Stopped: ") {
+                format!("stopped: {}", reason)
+            } else if let Some(error) = first_line.strip_prefix("Error: ") {
+                format!("failed: {}", error)
+            } else {
+                format!("finished: {}", first_line)
+            },
+        );
         let notification = serde_json::json!({
             "type": "subagent_result",
             "agent": agent_name,
@@ -5625,6 +5667,56 @@ fn latex_aware_line_streamer(
     }
 }
 
+/// Keeps an agent's `activity` in the database up to date - for `faber
+/// agents` - writing only when it changes, so progress updates that keep
+/// saying the same thing cost nothing.
+struct ActivityRecorder {
+    db: Arc<dyn DbBackend>,
+    agent: String,
+    last: Mutex<String>,
+}
+
+impl ActivityRecorder {
+    fn new(db: Arc<dyn DbBackend>, agent: &str) -> Arc<Self> {
+        Arc::new(Self {
+            db,
+            agent: agent.to_string(),
+            last: Mutex::new(String::new()),
+        })
+    }
+
+    fn set(&self, activity: &str) {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if *last != activity {
+            *last = activity.to_string();
+            let _ = self.db.set_agent_activity(&self.agent, activity);
+        }
+    }
+
+    /// Records the activity a progress update means, if any.
+    fn follow(&self, status: &StatusUpdate) {
+        let activity = match status {
+            StatusUpdate::Thinking => "thinking".to_string(),
+            StatusUpdate::ToolStart { name, .. } => format!("running {}", name),
+            StatusUpdate::WaitingForSlot => "waiting for a free request slot".to_string(),
+            StatusUpdate::SendingRequest { .. } => "waiting for the model".to_string(),
+            _ => return,
+        };
+        self.set(&activity);
+    }
+}
+
+/// Marks the agent idle when dropped - however its turn ended.
+struct IdleWhenDone(Option<Arc<ActivityRecorder>>);
+
+impl Drop for IdleWhenDone {
+    fn drop(&mut self) {
+        if let Some(activity) = &self.0 {
+            activity.set("idle");
+        }
+    }
+}
+
 fn create_response_mode(
     printer: ChatPrinter,
     status_bar: Arc<status_bar::StatusBar>,
@@ -5632,6 +5724,7 @@ fn create_response_mode(
     pending_complete_message: Arc<Mutex<Option<String>>>,
     graphics_mode: Option<DisplayGraphicsMode>,
     reasoning_accumulator: Arc<Mutex<String>>,
+    activity: Option<Arc<ActivityRecorder>>,
 ) -> ResponseMode {
     let tool_active = Arc::new(AtomicBool::new(false));
     let completed = Arc::new(AtomicBool::new(false));
@@ -5698,6 +5791,9 @@ fn create_response_mode(
         }),
         reasoning_handler: Box::new(move |chunk: &str| reasoning(chunk)),
         progress_handler: Box::new(move |progress_info: &ProgressInfo| {
+            if let Some(activity) = &activity {
+                activity.follow(&progress_info.status);
+            }
             if completed_for_progress.load(Ordering::Relaxed) {
                 return Ok(());
             }
@@ -6810,12 +6906,10 @@ fn chat_command(
                     {
                         if obj.get("type").and_then(|v| v.as_str()) == Some("subagent_result") {
                             if let Some(agent) = obj.get("agent").and_then(|v| v.as_str()) {
+                                // Kept, with its transcript, for `faber
+                                // agents` until `faber gc`.
                                 status_bar.clear_agent_status(agent);
                                 status_bar.set_agent_plan(agent, None);
-                                let _ = db.delete_agent(agent);
-                                if let Ok(mut names) = agent_names.lock() {
-                                    names.retain(|n| n != agent);
-                                }
                             }
                             obj.get("response")
                                 .and_then(|v| v.as_str())
@@ -6966,6 +7060,13 @@ fn chat_command(
                     active_agent
                         .messages
                         .push(make_message("user", user_message));
+                    let activity = db
+                        .as_ref()
+                        .map(|db| ActivityRecorder::new(db.clone(), &active_agent.name));
+                    if let Some(activity) = &activity {
+                        activity.set("thinking");
+                    }
+                    let _idle_when_done = IdleWhenDone(activity.clone());
 
                     let mut tool_context = ToolContext::new(|_: &str| {});
                     tool_context.db = db.clone();
@@ -7138,6 +7239,7 @@ fn chat_command(
                                     pending_complete_message.clone(),
                                     graphics_mode,
                                     reasoning_accumulator.clone(),
+                                    activity.clone(),
                                 );
                                 status_bar.set_agent_status(
                                     &agent_name,
@@ -7846,6 +7948,227 @@ fn describe_task(task: &db::TaskRow, now: chrono::DateTime<chrono::Utc>) -> Stri
         out.push_str(&format!("\nLast result:\n{}\n", indent(result.trim())));
     }
     out
+}
+
+/// Whether an agent's chat session (or the session running it, for a
+/// sub-agent) is still heartbeating.
+fn agent_session_is_live(agent: &db::AgentRow, now: chrono::DateTime<chrono::Utc>) -> bool {
+    agent.session_id.is_some()
+        && agent
+            .heartbeat_at
+            .as_deref()
+            .and_then(db::parse_db_time)
+            .is_some_and(|t| now - t < chrono::Duration::seconds(30))
+}
+
+/// The agents in tree order - each followed by the ones it spawned - with
+/// the tree drawing to put before each name.
+fn agent_tree(agents: &[db::AgentRow]) -> Vec<(String, &db::AgentRow)> {
+    let names: std::collections::HashSet<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+    let mut children: HashMap<&str, Vec<&db::AgentRow>> = HashMap::new();
+    let mut roots = Vec::new();
+    for agent in agents {
+        match agent.parent.as_deref().filter(|p| names.contains(p)) {
+            Some(parent) => children.entry(parent).or_default().push(agent),
+            None => roots.push(agent),
+        }
+    }
+    fn walk<'a>(
+        agent: &'a db::AgentRow,
+        prefix: &str,
+        branch: &str,
+        children: &HashMap<&str, Vec<&'a db::AgentRow>>,
+        out: &mut Vec<(String, &'a db::AgentRow)>,
+        depth: usize,
+    ) {
+        out.push((format!("{}{}", prefix, branch), agent));
+        if depth > 64 {
+            return;
+        }
+        let kids = children
+            .get(agent.name.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let continuation = match branch {
+            "├─ " => format!("{}│  ", prefix),
+            "└─ " => format!("{}   ", prefix),
+            _ => prefix.to_string(),
+        };
+        for (i, kid) in kids.iter().enumerate() {
+            let branch = if i + 1 == kids.len() {
+                "└─ "
+            } else {
+                "├─ "
+            };
+            walk(kid, &continuation, branch, children, out, depth + 1);
+        }
+    }
+    let mut out = Vec::new();
+    for root in roots {
+        walk(root, "", "", &children, &mut out, 0);
+    }
+    out
+}
+
+fn print_agents_tree(
+    db: &dyn DbBackend,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Box<dyn Error>> {
+    let agents = db.list_agents()?;
+    if agents.is_empty() {
+        println!("No agents.");
+        return Ok(());
+    }
+    let mut table = Table::new();
+    table.set_format(*format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
+    table.set_titles(Row::new(
+        ["Agent", "Session", "Activity", "Since", "Model"]
+            .iter()
+            .map(|t| Cell::new(t))
+            .collect(),
+    ));
+    for (prefix, agent) in agent_tree(&agents) {
+        let since = agent
+            .activity_at
+            .as_deref()
+            .and_then(db::parse_db_time)
+            .map(|t| format_relative(t, now))
+            .unwrap_or_else(|| "-".to_string());
+        let activity = agent.activity.as_deref().unwrap_or("-");
+        let activity_cell = if activity.starts_with("stopped") || activity.starts_with("failed") {
+            Cell::new(&first_line(activity, 60)).style_spec("Fr")
+        } else if activity == "idle" || activity.starts_with("finished") || activity == "-" {
+            Cell::new(&first_line(activity, 60))
+        } else {
+            Cell::new(&first_line(activity, 60)).style_spec("Fy")
+        };
+        let model = db
+            .get_agent_config(&agent.name)?
+            .model
+            .unwrap_or_else(|| "-".to_string());
+        table.add_row(Row::new(vec![
+            Cell::new(&format!("{}{}", prefix, agent.name)),
+            Cell::new(if agent_session_is_live(agent, now) {
+                "live"
+            } else {
+                "-"
+            }),
+            activity_cell,
+            Cell::new(&since),
+            Cell::new(&model),
+        ]));
+    }
+    table.printstd();
+    Ok(())
+}
+
+/// One message of a transcript, for `faber agents show`.
+fn format_transcript_message(message: &Message, full: bool) -> String {
+    let cut = |text: &str| {
+        if full || text.chars().count() <= 400 {
+            text.to_string()
+        } else {
+            format!("{}…", text.chars().take(400).collect::<String>())
+        }
+    };
+    let mut out = format!("[{}]", message.role);
+    if let Some(name) = &message.name {
+        out.push_str(&format!(" {}", name));
+    }
+    if let Some(content) = message.content.as_deref().filter(|c| !c.trim().is_empty()) {
+        out.push_str(&format!("\n{}", cut(content.trim())));
+    }
+    for call in message.tool_calls.iter().flatten() {
+        out.push_str(&format!(
+            "\n→ {}({})",
+            call.function.name,
+            cut(&call.function.arguments)
+        ));
+    }
+    out
+}
+
+/// `faber agents`: the agents as a tree, once or with `watch` every that
+/// many seconds - or, with `show`, one agent and its transcript.
+fn agents_command(
+    db: &Option<Arc<dyn DbBackend>>,
+    action: Option<&AgentsAction>,
+    watch: Option<u64>,
+) -> Result<(), Box<dyn Error>> {
+    let db = db.as_ref().ok_or(
+        "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
+    )?;
+    if let Some(AgentsAction::Show { name, full }) = action {
+        let agent = db
+            .get_agent(name)?
+            .ok_or_else(|| format!("no agent named '{}'", name))?;
+        let now = chrono::Utc::now();
+        let children: Vec<String> = db
+            .list_agents()?
+            .into_iter()
+            .filter(|a| a.parent.as_deref() == Some(name.as_str()))
+            .map(|a| a.name)
+            .collect();
+        let config = db.get_agent_config(name)?;
+        println!("Agent {}", agent.name);
+        println!("  Description:  {}", agent.description);
+        println!("  Parent:       {}", agent.parent.as_deref().unwrap_or("-"));
+        println!(
+            "  Sub-agents:   {}",
+            if children.is_empty() {
+                "-".to_string()
+            } else {
+                children.join(", ")
+            }
+        );
+        println!(
+            "  Session:      {}",
+            if agent_session_is_live(&agent, now) {
+                "live"
+            } else {
+                "-"
+            }
+        );
+        println!(
+            "  Activity:     {}{}",
+            agent.activity.as_deref().unwrap_or("-"),
+            agent
+                .activity_at
+                .as_deref()
+                .and_then(db::parse_db_time)
+                .map(|t| format!(" ({})", format_relative(t, now)))
+                .unwrap_or_default()
+        );
+        println!("  Model:        {}", config.model.as_deref().unwrap_or("-"));
+        let messages: Vec<Message> = db
+            .load_agent_messages(name)?
+            .into_iter()
+            .filter_map(|v| serde_json::from_value(v).ok())
+            .collect();
+        println!("\nConversation ({} messages):", messages.len());
+        for message in &messages {
+            println!("\n{}", format_transcript_message(message, *full));
+        }
+        return Ok(());
+    }
+    let Some(interval) = watch else {
+        return print_agents_tree(db.as_ref(), chrono::Utc::now());
+    };
+    let interval = Duration::from_secs(interval.max(1));
+    loop {
+        let now = chrono::Utc::now();
+        print!("\x1b[H\x1b[2J");
+        println!(
+            "Every {}s - {} (Ctrl-C to quit)\n",
+            interval.as_secs(),
+            now.with_timezone(&chrono::Local).format("%H:%M:%S")
+        );
+        if let Err(e) = print_agents_tree(db.as_ref(), now) {
+            println!("Error: {}", e);
+        }
+        std::io::stdout().flush()?;
+        std::thread::sleep(interval);
+    }
 }
 
 /// `faber kb`: lists, searches, shows, adds or deletes knowledge base
@@ -8727,6 +9050,18 @@ enum TasksAction {
 }
 
 #[derive(Debug, Subcommand)]
+enum AgentsAction {
+    /// Show one agent in detail, with the conversation it had (a finished
+    /// sub-agent's is kept until `faber gc`)
+    Show {
+        name: String,
+        /// Show every message in full instead of its start
+        #[clap(long)]
+        full: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum KbAction {
     /// Ranked full-text search over the notes
     Search {
@@ -8786,6 +9121,17 @@ enum CliCommand {
 
     /// Remove dormant agents (no active session)
     Gc {},
+
+    /// Show the agents as a tree by who spawned whom, with what each is
+    /// doing - or, with `show`, one agent and its conversation
+    Agents {
+        #[clap(subcommand)]
+        action: Option<AgentsAction>,
+        /// Keep the tree on screen, refreshed every 2 seconds (or every N
+        /// with --watch=N), until Ctrl-C
+        #[clap(long, value_name = "N", num_args = 0..=1, require_equals = true, default_missing_value = "2")]
+        watch: Option<u64>,
+    },
 
     /// Show the knowledge base the agents keep (kb_* tools) - or, with a
     /// subcommand, search, show, add or delete notes
@@ -8861,6 +9207,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         opts.command,
         CliCommand::Tasks { .. }
             | CliCommand::Kb { .. }
+            | CliCommand::Agents { .. }
             | CliCommand::Models {}
             | CliCommand::ListTools {}
             | CliCommand::Gc {}
@@ -8940,7 +9287,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             } | CliCommand::Kb {
                 action: None | Some(KbAction::Search { .. }) | Some(KbAction::Show { .. }),
                 ..
-            }
+            } | CliCommand::Agents { .. }
         ) {
             // Only looks: never create or migrate a database for it.
             db::open_read_only(db_path)?
@@ -8986,6 +9333,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Models {} => list_models_command(&opts),
         CliCommand::ListTools {} => list_tools_command(&mcp_manager),
         CliCommand::Gc {} => gc_command(&opts),
+        CliCommand::Agents { action, watch } => {
+            agents_command(&db_connection, action.as_ref(), *watch)
+        }
         CliCommand::Kb { action, tag, last } => {
             kb_command(&db_connection, action.as_ref(), tag.as_deref(), *last)
         }
@@ -10727,6 +11077,93 @@ mod tests {
             parse_chat_command("/cancel"),
             ChatCommand::Invalid(_)
         ));
+    }
+
+    fn agent_row(name: &str, parent: Option<&str>) -> db::AgentRow {
+        db::AgentRow {
+            name: name.to_string(),
+            description: String::new(),
+            created_at: String::new(),
+            session_id: None,
+            heartbeat_at: None,
+            parent: parent.map(String::from),
+            activity: None,
+            activity_at: None,
+        }
+    }
+
+    #[test]
+    fn test_agent_tree_draws_children_under_their_parent() {
+        let agents = vec![
+            agent_row("boss", None),
+            agent_row("a", Some("boss")),
+            agent_row("a1", Some("a")),
+            agent_row("b", Some("boss")),
+            agent_row("orphan", Some("gone")),
+        ];
+        let lines: Vec<String> = agent_tree(&agents)
+            .into_iter()
+            .map(|(prefix, agent)| format!("{}{}", prefix, agent.name))
+            .collect();
+        assert_eq!(lines, ["boss", "├─ a", "│  └─ a1", "└─ b", "orphan"]);
+    }
+
+    #[test]
+    fn test_finished_sub_agent_keeps_its_activity_and_transcript() {
+        let (db, ctx) = spawning_setup(
+            "transcript",
+            serde_json::json!([
+                {"if": "look around", "tool": "glob", "arguments": {"pattern": "Cargo.toml"}},
+                {"if": "Cargo.toml", "reply": "found the manifest"},
+            ]),
+        );
+        tool_spawn_agent(
+            &serde_json::json!({"name": "scout", "prompt": "look around"}).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(sub_agent_result(&db, "boss", "scout"), "found the manifest");
+        let scout = db
+            .get_agent("scout")
+            .unwrap()
+            .expect("kept after finishing");
+        assert_eq!(
+            scout.activity.as_deref(),
+            Some("finished: found the manifest")
+        );
+        let transcript = db.load_agent_messages("scout").unwrap();
+        // system, user, tool call, tool result, answer.
+        assert_eq!(transcript.len(), 5, "{transcript:?}");
+        assert_eq!(transcript[2]["tool_calls"][0]["function"]["name"], "glob");
+        agents_command(
+            &Some(db.clone()),
+            Some(&AgentsAction::Show {
+                name: "scout".to_string(),
+                full: false,
+            }),
+            None,
+        )
+        .unwrap();
+        agents_command(&Some(db), None, None).unwrap();
+    }
+
+    #[test]
+    fn test_fan_out_shows_progress_as_the_callers_activity() {
+        let model = model_script(
+            "progress",
+            serde_json::json!([{"if": "check", "reply": "ok"}]),
+        );
+        let db = local_db_with_agents(&["boss"]);
+        let ctx = chat_ctx_with_model(db.clone(), "boss", &model);
+        fan_out::tool_fan_out(
+            &serde_json::json!({"items": ["a", "b", "c"], "prompt": "check {item}"}).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_agent("boss").unwrap().unwrap().activity.as_deref(),
+            Some("fan_out: 3/3 done")
+        );
     }
 
     #[test]

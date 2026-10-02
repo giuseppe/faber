@@ -37,7 +37,7 @@ use crate::openai::{
     self, ContextLengthError, InterruptedError, ProgressInfo, ResponseMode, StatusUpdate,
     ToolsCollection, make_message, post_request_with_mode,
 };
-use crate::{SubAgentContext, final_response_text};
+use crate::{ActivityRecorder, SubAgentContext, final_response_text};
 use faber::ToolContext;
 
 const MAX_ITEMS: usize = 1000;
@@ -273,6 +273,14 @@ pub(crate) fn tool_fan_out(
         "Fanning out to {} items, {} at a time...",
         total, parallel
     ));
+    // The caller's activity follows the workers' progress.
+    let activity = match (&ctx.db, &ctx.agent_name) {
+        (Some(db), Some(agent)) => Some(ActivityRecorder::new(db.clone(), agent)),
+        _ => None,
+    };
+    if let Some(activity) = &activity {
+        activity.set(&format!("fan_out: 0/{} done", total));
+    }
 
     std::thread::scope(|scope| {
         scope.spawn(|| {
@@ -332,6 +340,9 @@ pub(crate) fn tool_fan_out(
                             other => other.map_err(|e| e.to_string()),
                         };
                         let done = done_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        if let Some(activity) = &activity {
+                            activity.set(&format!("fan_out: {}/{} done", done, total));
+                        }
                         ctx.println(&format!(
                             "[{}/{}] {} {}",
                             done,
