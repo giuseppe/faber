@@ -1201,6 +1201,7 @@ fn tool_read_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
             let mut contents = String::new();
             match file.read_to_string(&mut contents) {
                 Ok(_) => {
+                    ctx.note_file_version(&params.path, contents.as_bytes());
                     // Each element keeps its own trailing newline, so joining
                     // a slice of them back together exactly reproduces the
                     // original bytes for that range.
@@ -1458,6 +1459,9 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
         }
         Err(_) => None,
     };
+    if let Some(existing) = &existing_content {
+        ctx.check_file_unchanged(&params.path, existing)?;
+    }
 
     let (created, mut file) =
         match root.open_subpath(&params.path, OpenFlags::O_WRONLY | OpenFlags::O_TRUNC) {
@@ -1498,6 +1502,7 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
     debug!("Writing {} bytes to file: {}", bytes_written, params.path);
 
     file.write_all(params.content.as_bytes())?;
+    ctx.note_file_version(&params.path, params.content.as_bytes());
 
     let result = WriteFileResult {
         path: params.path.clone(),
@@ -3735,6 +3740,12 @@ fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
     (&file).read_to_end(&mut original)?;
     let mut text = String::from_utf8(original.clone())
         .map_err(|_| format!("File '{}' contains invalid UTF-8", params.path))?;
+    // Text edits only apply where old_content still matches, wherever the
+    // file has changed; line numbers mean nothing in a file that changed
+    // since it was read.
+    if params.edits.iter().any(|e| e.start_line.is_some()) {
+        ctx.check_file_unchanged(&params.path, &original)?;
+    }
 
     // Byte span of each edit's replacement text, tracked through the loop so
     // it stays correct in the final `text` even as later edits shift things
@@ -3858,6 +3869,7 @@ fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
     if new_bytes.len() != original.len() {
         file.set_len(new_bytes.len() as u64)?;
     }
+    ctx.note_file_version(&params.path, new_bytes);
 
     let previews: Vec<EditPreview> = edit_spans
         .iter()
@@ -4032,7 +4044,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create a file, or replace a file's whole content. To change part of an existing file, use patch_file instead.",
+                "description": "Create a file, or replace a file's whole content. To replace an existing file you must have read it first, and it's refused if it changed since (someone else edited it) - read it again then. To change part of an existing file, use patch_file instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -6929,6 +6941,8 @@ fn execute_scheduled_command(
 
     let mut tool_context = ToolContext::new(|_: &str| {});
     tool_context.db = db.clone();
+    // A fixed tool call, with no model to read files first.
+    tool_context.file_versions = None;
 
     let tool_msg = match tool_call(tools, &tc, &tool_context) {
         Ok(msg) => msg,
@@ -7165,6 +7179,8 @@ fn chat_command(
     let active_subagents = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let running_subagents: RunningSubAgents = Arc::new(Mutex::new(HashMap::new()));
     let sub_agent_runs: Arc<SubAgentRuns> = Arc::new(SubAgentRuns::default());
+    // What the chat's agent has read of each file, across its turns.
+    let file_versions = Arc::new(Mutex::new(HashMap::new()));
     let initial_agent_name = opts.agent.clone().unwrap_or_else(|| "default".to_string());
 
     let agent_config = if let Some(ref db) = db {
@@ -7570,6 +7586,7 @@ fn chat_command(
                         session_usage: session_usage.clone(),
                     }));
                     tool_context.interrupt = Some(ctrl_c_rx.clone());
+                    tool_context.file_versions = Some(file_versions.clone());
                     // A prompt task's turn can report its outcome.
                     let task_result_slot = Arc::new(Mutex::new(None));
                     if running_prompt_task.is_some() {
@@ -13247,9 +13264,12 @@ mod tests {
         assert!(!tools.contains_key("glob"));
     }
 
+    /// Patches `path` as an agent that has just read it.
     fn patch(path: &str, edits: serde_json::Value) -> Result<serde_json::Value, Box<dyn Error>> {
+        let ctx = test_ctx();
+        let _ = tool_read_file(&serde_json::json!({ "path": path }).to_string(), &ctx);
         let params = serde_json::json!({ "path": path, "edits": edits });
-        tool_patch_file(&params.to_string(), &test_ctx()).map(|r| serde_json::from_str(&r).unwrap())
+        tool_patch_file(&params.to_string(), &ctx).map(|r| serde_json::from_str(&r).unwrap())
     }
 
     #[test]
@@ -14279,12 +14299,87 @@ mod tests {
             "path": path,
             "content": "new content\n"
         });
-        let result = tool_write_file(&params.to_string(), &test_ctx()).unwrap();
+        let ctx = test_ctx();
+        tool_read_file(&serde_json::json!({ "path": path }).to_string(), &ctx).unwrap();
+        let result = tool_write_file(&params.to_string(), &ctx).unwrap();
         let res: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(res["created"], false);
         assert_eq!(res["operation"], "overwrite");
         assert_eq!(read_test_file(path), "new content\n");
         cleanup(path);
+    }
+
+    #[test]
+    fn test_writes_are_refused_when_the_file_changed_since_it_was_read() {
+        let path = "_test_wf_optimistic.tmp";
+        write_test_file(path, "one\ntwo\n");
+        let alice = test_ctx();
+        let bob = test_ctx();
+        let read = |ctx: &ToolContext| {
+            tool_read_file(&serde_json::json!({ "path": path }).to_string(), ctx).unwrap();
+        };
+        let write = |ctx: &ToolContext, content: &str| {
+            tool_write_file(
+                &serde_json::json!({ "path": path, "content": content }).to_string(),
+                ctx,
+            )
+        };
+        let line_edit = |ctx: &ToolContext| {
+            tool_patch_file(
+                &serde_json::json!({"path": path, "edits": [{"start_line": 1, "end_line": 1, "new_content": "ONE"}]})
+                    .to_string(),
+                ctx,
+            )
+        };
+
+        // Never read: refused, rather than overwriting it blind.
+        let err = write(&alice, "x").unwrap_err().to_string();
+        assert!(err.contains("haven't read it"), "{err}");
+
+        // Both read it; Alice writes first; Bob's stale write is refused.
+        read(&alice);
+        read(&bob);
+        write(&alice, "alice's version\n").unwrap();
+        let err = write(&bob, "bob's version\n").unwrap_err().to_string();
+        assert!(err.contains("changed since you read it"), "{err}");
+        assert!(
+            line_edit(&bob)
+                .unwrap_err()
+                .to_string()
+                .contains("changed since you read it")
+        );
+        assert_eq!(read_test_file(path), "alice's version\n");
+        // Alice's own later writes are fine: she saw what she wrote.
+        write(&alice, "alice again\n").unwrap();
+        // Text edits apply wherever the file has changed, read or not.
+        let fresh = test_ctx();
+        tool_patch_file(
+            &serde_json::json!({"path": path, "edits": [{"old_content": "again", "new_content": "once more"}]})
+                .to_string(),
+            &fresh,
+        )
+        .unwrap();
+        // Bob re-reads, and can write again.
+        read(&bob);
+        write(&bob, "bob's version\n").unwrap();
+        cleanup(path);
+
+        // A new file needs no read; a scheduled tool call isn't checked.
+        let new_path = "_test_wf_optimistic_new.tmp";
+        cleanup(new_path);
+        tool_write_file(
+            &serde_json::json!({ "path": new_path, "content": "hi" }).to_string(),
+            &test_ctx(),
+        )
+        .unwrap();
+        let mut scheduled = test_ctx();
+        scheduled.file_versions = None;
+        tool_write_file(
+            &serde_json::json!({ "path": new_path, "content": "bye" }).to_string(),
+            &scheduled,
+        )
+        .unwrap();
+        cleanup(new_path);
     }
 
     #[test]
