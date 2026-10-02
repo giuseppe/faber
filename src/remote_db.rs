@@ -160,6 +160,11 @@ impl DbBackend for RemoteDb {
         Ok(serde_json::from_value(v)?)
     }
 
+    fn agent_lineage(&self, agent: &str) -> Result<Vec<String>, Box<dyn Error>> {
+        let v = self.call("agent_lineage", serde_json::json!({"agent": agent}))?;
+        Ok(serde_json::from_value(v)?)
+    }
+
     fn set_agent_parent(&self, agent: &str, parent: Option<&str>) -> Result<(), Box<dyn Error>> {
         self.call(
             "set_agent_parent",
