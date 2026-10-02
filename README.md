@@ -624,7 +624,19 @@ faber --server 127.0.0.1:9090 --server-key mysecret chat
     --server <ADDR>          Connect to a remote faber server
     --server-key <KEY>       Pre-shared key for server authentication
     --server-key-file <PATH> Read server key from file
+    --max-parallel-requests <N>  At most N model requests in flight at once (see below)
+    --task-retention <DURATION>  Prune done tasks older than this while chatting
 ```
+
+`--max-parallel-requests` (or `"max_parallel_requests"` in the config file)
+caps how many requests to the model are in flight at once across
+everything one faber process does - the chat, sub-agents, `fan_out`
+workers and scheduled task turns. Set it to the number of requests your
+server can serve at once, e.g. llama.cpp's `--parallel`: with more, they
+queue there anyway, and each llama.cpp slot only gets its share of the
+context. Requests over the limit wait their turn, shown in the status bar
+("Waiting for other requests to the model to finish"); Ctrl-C still
+interrupts them. Unlimited unless set.
 
 ### Displaying LaTeX as images
 
