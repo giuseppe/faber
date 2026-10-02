@@ -730,6 +730,29 @@ faber --parameter temperature=0.2 --parameter top_p=0.9 chat
 Parameter types are auto-detected: numbers, booleans (`true`/`false`),
 `null`, or strings.
 
+## Scripted model, for testing workflows
+
+`--model script:PATH` replaces the model with a script, to try agent
+workflows - sub-agents, `fan_out`, scheduled tasks - deterministically and
+without a model server. The script is a JSON list of rules; for each
+request, the first rule whose `if` text appears in the latest message (a
+user turn, an injected message, or a tool's result) gives the response, as
+`reply` text or a `tool` call:
+
+```json
+[
+  {"if": "triage", "tool": "fan_out",
+   "arguments": {"items": ["101", "102"], "prompt": "check issue {item}"}},
+  {"if": "check issue", "reply": "looks fine", "delay_ms": 200},
+  {"if": "## 1.", "reply": "triaged both"}
+]
+```
+
+Rules match on content rather than order, so agents running concurrently
+stay deterministic. `once: true` makes a rule apply only the first time it
+matches, and `delay_ms` makes a response slow (Ctrl-C still interrupts
+it). A request no rule matches is answered with a note quoting the message.
+
 ## Building
 
 ```bash
