@@ -8218,6 +8218,239 @@ fn describe_task(
     out
 }
 
+/// Runs one claimed prompt task headlessly, in a fresh conversation, and
+/// records how it went. Returns that outcome.
+fn run_prompt_task_headless(
+    task: &db::TaskRow,
+    agent: &str,
+    db: &Arc<dyn DbBackend>,
+    session_id: &str,
+    tools: &Arc<ToolsCollection>,
+    opts: &Opts,
+    extra: Arc<SubAgentContext>,
+    mcp_manager: &Option<Arc<faber::mcp::McpManager>>,
+    cancel: mpsc::Receiver<()>,
+) -> db::TaskOutcome {
+    let agent_config = db.get_agent_config(agent).unwrap_or(db::AgentConfig {
+        model: None,
+        endpoint: None,
+        system_prompt: None,
+    });
+    let openai_opts = build_openai_opts(opts, &agent_config);
+    let mut messages = initialize_agent_messages(tools, opts, &agent_config);
+    messages.push(make_message(
+        "user",
+        format!(
+            "[Scheduled task #{} \"{}\"]: {}",
+            task.id, task.name, task.command
+        ),
+    ));
+    let mut ctx = ToolContext::new(|_: &str| {});
+    ctx.db = Some(db.clone());
+    ctx.agent_name = Some(agent.to_string());
+    ctx.mcp_manager = mcp_manager.clone();
+    ctx.context_window = opts.context_window;
+    ctx.extra = Some(extra);
+    let activity = ActivityRecorder::new(db.clone(), agent);
+    let mode = {
+        let activity = activity.clone();
+        ResponseMode::Streaming {
+            stream_handler: Box::new(|_: &str| Ok(())),
+            reasoning_handler: Box::new(|_: &str| Ok(())),
+            progress_handler: Box::new(move |progress: &ProgressInfo| {
+                activity.follow(&progress.status);
+                Ok(())
+            }),
+        }
+    };
+    let result = post_request_with_mode(
+        messages,
+        tools,
+        &openai_opts,
+        mode,
+        &ctx,
+        Some(Arc::new(Mutex::new(cancel))),
+    );
+    if let Ok(response) = &result {
+        let values: Vec<serde_json::Value> = response
+            .history
+            .iter()
+            .filter_map(|m| serde_json::to_value(m).ok())
+            .collect();
+        let _ = db.save_agent_messages(agent, &values);
+    }
+    let outcome = prompt_task_outcome(result.as_ref());
+    if let Err(e) = db.finish_task(task.id, session_id, &outcome) {
+        warn!("Couldn't record the outcome of task {}: {}", task.id, e);
+    }
+    outcome
+}
+
+/// `faber worker`: works through scheduled tasks as `agent`, headlessly,
+/// up to `parallel` prompt tasks at once, until Ctrl-C.
+fn worker_command(
+    opts: &Opts,
+    db: Option<Arc<dyn DbBackend>>,
+    mcp_manager: Option<Arc<faber::mcp::McpManager>>,
+    agent: Option<String>,
+    parallel: usize,
+) -> Result<(), Box<dyn Error>> {
+    let db = db.ok_or(
+        "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
+    )?;
+    let agent = agent.unwrap_or_else(|| format!("worker-{}", std::process::id()));
+    let session_id = format!(
+        "{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_millis()
+    );
+    if db.get_agent(&agent)?.is_none() {
+        db.create_agent(&agent, "Headless worker")?;
+    }
+    if !db.claim_agent(&agent, &session_id)? {
+        return Err(format!("agent '{}' is in use by another session", agent).into());
+    }
+    let parallel = parallel.max(1);
+    let tools = Arc::new(if opts.no_tools {
+        ToolsCollection::new()
+    } else {
+        let allowed = (!opts.tools.is_empty()).then(|| opts.tools.clone());
+        initialize_tools(opts.unsafe_tools, allowed.as_deref())
+    });
+    let log = |line: String| {
+        println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), line);
+    };
+
+    // Ctrl-C: stop picking up tasks and interrupt the running ones.
+    let stopping = Arc::new(AtomicBool::new(false));
+    let cancels: Arc<Mutex<HashMap<i64, mpsc::Sender<()>>>> = Arc::new(Mutex::new(HashMap::new()));
+    {
+        let stopping = stopping.clone();
+        let cancels = cancels.clone();
+        ctrlc::set_handler(move || {
+            stopping.store(true, Ordering::Relaxed);
+            for cancel in cancels.lock().unwrap_or_else(|e| e.into_inner()).values() {
+                let _ = cancel.send(());
+            }
+        })?;
+    }
+    {
+        let db = db.clone();
+        let session_id = session_id.clone();
+        std::thread::spawn(move || {
+            loop {
+                let _ = db.heartbeat_all(&session_id);
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+    }
+    // Tool tasks, as any chat session runs them; their results only get
+    // logged here.
+    let (task_tx, task_rx) = mpsc::channel::<(Option<String>, String, Message, Message)>();
+    {
+        let db = db.clone();
+        let session_id = session_id.clone();
+        let tools = tools.clone();
+        std::thread::spawn(move || scheduler_loop(db, session_id, tools, task_tx));
+    }
+
+    let model = opts
+        .model
+        .clone()
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    log(format!(
+        "Working as '{}' ({} task{} at a time, model {}); Ctrl-C to stop",
+        agent,
+        parallel,
+        if parallel == 1 { "" } else { "s" },
+        model
+    ));
+    let extra = Arc::new(SubAgentContext {
+        runs: Arc::new(SubAgentRuns::default()),
+        tools: tools.clone(),
+        opts: build_openai_opts(opts, &db.get_agent_config(&agent)?),
+        session_id: session_id.clone(),
+        active_subagents: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        running_subagents: Arc::new(Mutex::new(HashMap::new())),
+        status_bar: Arc::new(status_bar::StatusBar::new()),
+        session_usage: Arc::new(Mutex::new(SessionUsage::default())),
+    });
+    let activity = ActivityRecorder::new(db.clone(), &agent);
+    activity.set("idle");
+    let running = std::sync::atomic::AtomicUsize::new(0);
+    // Task threads borrow from here, so they live in a scope that ends
+    // only once every one of them has.
+    std::thread::scope(|scope| {
+        while !stopping.load(Ordering::Relaxed) {
+            while let Ok((_, command, _, tool_msg)) = task_rx.try_recv() {
+                log(format!(
+                    "tool task ran: {} -> {}",
+                    first_line(&command, 60),
+                    first_line(tool_msg.content.as_deref().unwrap_or(""), 80)
+                ));
+            }
+            if running.load(Ordering::Relaxed) < parallel {
+                if let Some(task) = claim_prompt_task(db.as_ref(), &session_id, &agent) {
+                    let (cancel_tx, cancel_rx) = mpsc::channel();
+                    cancels
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(task.id, cancel_tx);
+                    running.fetch_add(1, Ordering::Relaxed);
+                    log(format!("#{} \"{}\" started", task.id, task.name));
+                    let (db, session_id, tools, extra, mcp_manager, agent) = (
+                        &db,
+                        &session_id,
+                        &tools,
+                        extra.clone(),
+                        &mcp_manager,
+                        &agent,
+                    );
+                    let (running, cancels, activity) = (&running, &cancels, &activity);
+                    scope.spawn(move || {
+                        let started = std::time::Instant::now();
+                        let outcome = run_prompt_task_headless(
+                            &task,
+                            agent,
+                            db,
+                            session_id,
+                            tools,
+                            opts,
+                            extra,
+                            mcp_manager,
+                            cancel_rx,
+                        );
+                        cancels
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&task.id);
+                        log(format!(
+                            "#{} {} ({:.0}s): {}",
+                            task.id,
+                            if outcome.succeeded {
+                                "done ✓"
+                            } else {
+                                "failed ✗"
+                            },
+                            started.elapsed().as_secs_f64(),
+                            first_line(&outcome.result, 100)
+                        ));
+                        if running.fetch_sub(1, Ordering::Relaxed) == 1 {
+                            activity.set("idle");
+                        }
+                    });
+                    continue; // there may be more ready right away
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        log("Stopping...".to_string());
+    });
+    let _ = db.release_all_agents(&session_id);
+    activity.set("stopped");
+    Ok(())
+}
+
 /// Whether an agent's chat session (or the session running it, for a
 /// sub-agent) is still heartbeating.
 fn agent_session_is_live(agent: &db::AgentRow, now: chrono::DateTime<chrono::Utc>) -> bool {
@@ -9414,6 +9647,19 @@ enum CliCommand {
     /// Remove dormant agents (no active session)
     Gc {},
 
+    /// Work through scheduled tasks headlessly, as an agent: prompt tasks
+    /// for it (or for any agent), and tool tasks - like an idle `faber chat`,
+    /// without a terminal. Run several, e.g. next to `faber serve`, to work
+    /// through a queue in parallel
+    Worker {
+        /// The agent to work as (created if needed); default: worker-<pid>
+        #[clap(long)]
+        agent: Option<String>,
+        /// How many prompt tasks to work on at once
+        #[clap(long, default_value = "1")]
+        parallel: usize,
+    },
+
     /// Show the agents as a tree by who spawned whom, with what each is
     /// doing - or, with `show`, one agent and its conversation
     Agents {
@@ -9625,6 +9871,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         CliCommand::Models {} => list_models_command(&opts),
         CliCommand::ListTools {} => list_tools_command(&mcp_manager),
         CliCommand::Gc {} => gc_command(&opts),
+        CliCommand::Worker { agent, parallel } => worker_command(
+            &opts,
+            db_connection.clone(),
+            mcp_manager.clone(),
+            agent.clone(),
+            *parallel,
+        ),
         CliCommand::Agents { action, watch } => {
             agents_command(&db_connection, action.as_ref(), *watch)
         }
@@ -11416,6 +11669,53 @@ mod tests {
         let err = tool_agent_wait(&r#"{"names": ["nobody"]}"#.to_string(), &ctx).unwrap_err();
         assert!(err.to_string().contains("none of nobody"), "{err}");
         tool_agent_cancel(&r#"{"name":"slow"}"#.to_string(), &ctx).unwrap();
+    }
+
+    #[test]
+    fn test_headless_task_run_records_its_outcome_and_transcript() {
+        let model = model_script(
+            "headless",
+            serde_json::json!([{"if": "summarize", "reply": "all quiet"}]),
+        );
+        let db = local_db_with_agents(&["w"]);
+        assert!(db.claim_agent("w", "worker-session").unwrap());
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let id = db
+            .create_oneshot_task("check", "", &past, "summarize the logs", None)
+            .unwrap();
+        let task = claim_prompt_task(db.as_ref(), "worker-session", "w").expect("claimable");
+        assert_eq!(task.id, id);
+        let ctx = chat_ctx_with_model(db.clone(), "w", &model);
+        let extra = ctx
+            .extra
+            .clone()
+            .unwrap()
+            .downcast::<SubAgentContext>()
+            .ok()
+            .unwrap();
+        let mut opts = Opts::default();
+        opts.model = Some(model.clone());
+        let (_cancel_tx, cancel_rx) = mpsc::channel();
+        let outcome = run_prompt_task_headless(
+            &task,
+            "w",
+            &db,
+            "worker-session",
+            &extra.tools,
+            &opts,
+            extra.clone(),
+            &None,
+            cancel_rx,
+        );
+        assert!(outcome.succeeded);
+        assert_eq!(outcome.result, "all quiet");
+        let task = db.get_task(id).unwrap().unwrap();
+        assert_eq!(
+            (task.status.as_str(), task.last_result.as_deref()),
+            ("done", Some("all quiet"))
+        );
+        let transcript = db.load_agent_messages("w").unwrap();
+        assert!(transcript.last().unwrap()["content"] == "all quiet");
     }
 
     #[test]
