@@ -65,8 +65,8 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "kb_list",
 ];
 
-/// Tools a worker can never have: no nested agents, and no plan (workers
-/// have no agent identity to keep one under).
+/// Tools a worker can never have: no nested agents, and no plan - workers
+/// act as their caller, so they'd overwrite its plan.
 const NEVER_FOR_WORKERS: &[&str] = &["spawn_agent", "fan_out", "plan_update", "plan_get"];
 
 const WORKER_INSTRUCTIONS: &str = "You are a worker in a fan-out: the same task is being run for many items in parallel, \
@@ -157,6 +157,9 @@ fn run_worker(
 ) -> Result<String, Box<dyn Error>> {
     let mut worker_ctx = ToolContext::new(|_: &str| {});
     worker_ctx.db = ctx.db.clone();
+    // Workers act as their caller, e.g. seeing its private knowledge base
+    // notes.
+    worker_ctx.agent_name = ctx.agent_name.clone();
     worker_ctx.context_window = ctx.context_window;
     // Streamed, although nothing is shown, so Ctrl-C is noticed between
     // chunks rather than only once a whole response has arrived.

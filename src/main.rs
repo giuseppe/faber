@@ -2909,6 +2909,9 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         if db.get_agent(&agent_name)?.is_none() {
             db.create_agent(&agent_name, &format!("Sub-agent: {}", agent_name))?;
         }
+        // Lets it see the knowledge base notes private to its parent (and
+        // so on up), while what it saves privately stays below.
+        db.set_agent_parent(&agent_name, Some(&parent_agent))?;
         let _ = db.claim_agent(&agent_name, &sa_ctx.session_id);
         db.get_agent_config(&agent_name)?
     };
@@ -3929,14 +3932,14 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "kb_write",
-                "description": "Save something worth knowing beyond this conversation to the knowledge base: facts about the project, decisions and the reasons for them, how-tos, conventions, gotchas, the user's preferences. Keep one topic per note under a clear title. Writing a note whose title already exists replaces it, so search first and update an existing note (with its full new text) rather than adding a near-duplicate. Notes are shared with every agent unless private.",
+                "description": "Save something worth knowing beyond this conversation to the knowledge base: facts about the project, decisions and the reasons for them, how-tos, conventions, gotchas, the user's preferences. Keep one topic per note under a clear title. Writing a note whose title already exists replaces it, so search first and update an existing note (with its full new text) rather than adding a near-duplicate. Notes are shared with every agent unless private. You also see the private notes of the agent that started you, if any, and of the one that started it, and so on.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "title": {"type": "string", "description": "A short, specific title, e.g. \"Deploying to staging\""},
                         "body": {"type": "string", "description": "The note's full text (Markdown)"},
                         "tags": {"type": "array", "items": {"type": "string"}, "description": "A few tags to group notes by, e.g. [\"ops\", \"deploy\"]"},
-                        "private": {"type": "boolean", "description": "Only you (this agent) will see it"}
+                        "private": {"type": "boolean", "description": "Only you and the sub-agents you start (and theirs) will see it - not the agent that started you, nor anyone else"}
                     },
                     "required": ["title", "body"],
                     "additionalProperties": false

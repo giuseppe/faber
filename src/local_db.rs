@@ -77,6 +77,11 @@ impl DbBackend for LocalDb {
         db::list_agents(&conn)
     }
 
+    fn set_agent_parent(&self, agent: &str, parent: Option<&str>) -> Result<(), Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::set_agent_parent(&conn, agent, parent)
+    }
+
     fn get_agent(&self, name: &str) -> Result<Option<AgentRow>, Box<dyn Error>> {
         let conn = self.lock()?;
         db::get_agent(&conn, name)
