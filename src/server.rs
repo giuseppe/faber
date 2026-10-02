@@ -381,6 +381,10 @@ fn dispatch_inner(
                 _ => serde_json::to_value(db::kb_delete(&conn, i64_param!("id"), &viewer)?)?,
             })
         }
+        "fail_tasks_with_failed_dependencies" => {
+            let v = db::fail_tasks_with_failed_dependencies(&conn)?;
+            Ok(serde_json::to_value(v)?)
+        }
         "claim_task" => {
             let v = db::claim_task(&conn, i64_param!("task_id"), str_param!("session_id"))?;
             Ok(serde_json::to_value(v)?)

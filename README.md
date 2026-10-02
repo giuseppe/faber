@@ -344,6 +344,21 @@ that created it, carried out once its chat is idle again.
 With no `--in`, `--at` or `--cron`, a task is due right away. `--max-runs N`
 limits a `--cron` task.
 
+A task can depend on others: it only becomes due once they're all done,
+successfully, and fails as soon as one of them fails (or is deleted),
+which in turn fails whatever depends on it. That's enough for a planner
+agent to lay out a whole job as a chain or graph of tasks for agents to
+work through:
+
+```bash
+faber tasks add "Write the release notes"                # 1
+faber tasks add "Bump the version" --after 1             # 2
+faber tasks add "Tag and publish" --after 1 --after 2    # 3
+```
+
+The model's `task_create` takes `depends_on` for the same. Until its
+dependencies are done, `faber tasks` shows a task as "after #1, #2".
+
 A task can be put on hold, so that nobody picks it up - e.g. to create
 work ahead of time and start it on a signal:
 

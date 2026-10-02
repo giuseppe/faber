@@ -473,6 +473,11 @@ impl DbBackend for RemoteDb {
         Ok(serde_json::from_value(v)?)
     }
 
+    fn fail_tasks_with_failed_dependencies(&self) -> Result<Vec<i64>, Box<dyn Error>> {
+        let v = self.call("fail_tasks_with_failed_dependencies", serde_json::json!({}))?;
+        Ok(serde_json::from_value(v)?)
+    }
+
     fn claim_task(&self, task_id: i64, session_id: &str) -> Result<bool, Box<dyn Error>> {
         let v = self.call(
             "claim_task",

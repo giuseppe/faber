@@ -255,6 +255,11 @@ impl DbBackend for LocalDb {
         db::prune_tasks(&conn, older_than, dry_run)
     }
 
+    fn fail_tasks_with_failed_dependencies(&self) -> Result<Vec<i64>, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::fail_tasks_with_failed_dependencies(&conn)
+    }
+
     fn claim_task(&self, task_id: i64, session_id: &str) -> Result<bool, Box<dyn Error>> {
         let conn = self.lock()?;
         db::claim_task(&conn, task_id, session_id)

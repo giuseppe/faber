@@ -102,6 +102,8 @@ pub trait DbBackend: Send + Sync {
     fn get_pending_tasks(&self) -> Result<Vec<TaskRow>, Box<dyn Error>>;
     /// See `db::prune_tasks`; `older_than` is RFC 3339.
     fn prune_tasks(&self, older_than: &str, dry_run: bool) -> Result<Vec<TaskRow>, Box<dyn Error>>;
+    /// See `db::fail_tasks_with_failed_dependencies`.
+    fn fail_tasks_with_failed_dependencies(&self) -> Result<Vec<i64>, Box<dyn Error>>;
     /// See `db::claim_task`.
     fn claim_task(&self, task_id: i64, session_id: &str) -> Result<bool, Box<dyn Error>>;
     /// See `db::finish_task`.
