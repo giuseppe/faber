@@ -31,7 +31,6 @@ pub mod github;
 pub mod local_db;
 pub mod mcp;
 pub mod openai;
-#[allow(dead_code)]
 pub mod protocol;
 pub mod scripted_llm;
 

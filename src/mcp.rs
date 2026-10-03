@@ -47,10 +47,6 @@ struct JsonRpcNotification {
 
 #[derive(Deserialize, Debug)]
 struct JsonRpcResponse {
-    #[allow(dead_code)]
-    jsonrpc: Option<String>,
-    #[allow(dead_code)]
-    id: Option<u64>,
     result: Option<serde_json::Value>,
     error: Option<serde_json::Value>,
 }

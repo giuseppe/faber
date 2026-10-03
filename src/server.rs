@@ -250,10 +250,6 @@ fn dispatch_inner(
             let v = db::delete_agent_data(&conn, str_param!("agent"), str_param!("key"))?;
             Ok(serde_json::to_value(v)?)
         }
-        "list_agent_data" => {
-            let v = db::list_agent_data(&conn, str_param!("agent"))?;
-            Ok(serde_json::to_value(v)?)
-        }
         "get_agent_config" => {
             let v = db::get_agent_config(&conn, str_param!("agent_name"))?;
             Ok(serde_json::to_value(v)?)
@@ -303,29 +299,6 @@ fn dispatch_inner(
             drop(conn);
             let conn = db.lock().map_err(|e| format!("DB lock: {}", e))?;
             let v = db::poll_notifications_for_session(&conn, str_param!("session_id"))?;
-            Ok(serde_json::to_value(v)?)
-        }
-        "create_cron_task" => {
-            let v = db::create_cron_task(
-                &conn,
-                str_param!("name"),
-                str_param!("description"),
-                str_param!("cron_expression"),
-                str_param!("command"),
-                opt_str_param!("agent_name"),
-                p["max_runs"].as_i64(),
-            )?;
-            Ok(serde_json::to_value(v)?)
-        }
-        "create_oneshot_task" => {
-            let v = db::create_oneshot_task(
-                &conn,
-                str_param!("name"),
-                str_param!("description"),
-                str_param!("run_at"),
-                str_param!("command"),
-                opt_str_param!("agent_name"),
-            )?;
             Ok(serde_json::to_value(v)?)
         }
         "delete_task" => {

@@ -1632,7 +1632,23 @@ mod tests {
         let old = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();
         let id = {
             let conn = db.lock().unwrap();
-            let id = db::create_oneshot_task(&conn, "t", "", &old, "x", None).unwrap();
+            let id = db::create_task(
+                &conn,
+                &db::NewTask {
+                    name: "t".to_string(),
+                    description: String::new(),
+                    kind: db::TaskKind::PROMPT.to_string(),
+                    command: "x".to_string(),
+                    agent_name: None,
+                    schedule: db::TaskSchedule::Once { at: old.clone() },
+                    held: false,
+                    depends_on: Vec::new(),
+                    profile: None,
+                    run_safe: false,
+                    cwd: None,
+                },
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE scheduled_tasks SET status = 'done', last_run_at = ?2 WHERE id = ?1",
                 rusqlite::params![id, old],

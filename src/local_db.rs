@@ -118,11 +118,6 @@ impl DbBackend for LocalDb {
         db::delete_agent_data(&conn, agent, key)
     }
 
-    fn list_agent_data(&self, agent: &str) -> Result<Vec<(String, String)>, Box<dyn Error>> {
-        let conn = self.lock()?;
-        db::list_agent_data(&conn, agent)
-    }
-
     fn get_agent_config(&self, agent_name: &str) -> Result<AgentConfig, Box<dyn Error>> {
         let conn = self.lock()?;
         db::get_agent_config(&conn, agent_name)
@@ -189,39 +184,6 @@ impl DbBackend for LocalDb {
     ) -> Result<Vec<NotificationRow>, Box<dyn Error>> {
         let conn = self.lock()?;
         db::poll_notifications_for_session(&conn, session_id)
-    }
-
-    fn create_cron_task(
-        &self,
-        name: &str,
-        description: &str,
-        cron_expr: &str,
-        command: &str,
-        agent_name: Option<&str>,
-        max_runs: Option<i64>,
-    ) -> Result<i64, Box<dyn Error>> {
-        let conn = self.lock()?;
-        db::create_cron_task(
-            &conn,
-            name,
-            description,
-            cron_expr,
-            command,
-            agent_name,
-            max_runs,
-        )
-    }
-
-    fn create_oneshot_task(
-        &self,
-        name: &str,
-        description: &str,
-        run_at: &str,
-        command: &str,
-        agent_name: Option<&str>,
-    ) -> Result<i64, Box<dyn Error>> {
-        let conn = self.lock()?;
-        db::create_oneshot_task(&conn, name, description, run_at, command, agent_name)
     }
 
     fn delete_task(&self, task_id: i64) -> Result<bool, Box<dyn Error>> {

@@ -18,7 +18,7 @@
  */
 
 mod fan_out;
-mod github;
+use faber::github;
 mod latex_kitty;
 mod lsp;
 use faber::openai;
@@ -13264,6 +13264,57 @@ fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use rustyline::history::{History, SearchDirection};
+
+    /// A one-shot task, the short way: a tool call runs as one, anything
+    /// else is an instruction for an agent; with no command, the
+    /// description is it.
+    trait OneshotTasks {
+        fn create_oneshot_task(
+            &self,
+            name: &str,
+            description: &str,
+            run_at: &str,
+            command: &str,
+            agent_name: Option<&str>,
+        ) -> Result<i64, Box<dyn Error>>;
+    }
+
+    impl OneshotTasks for dyn DbBackend {
+        fn create_oneshot_task(
+            &self,
+            name: &str,
+            description: &str,
+            run_at: &str,
+            command: &str,
+            agent_name: Option<&str>,
+        ) -> Result<i64, Box<dyn Error>> {
+            let command = if command.trim().is_empty() {
+                description
+            } else {
+                command
+            };
+            let kind = if command.trim().is_empty() || db::is_tool_call(command) {
+                db::TaskKind::TOOL
+            } else {
+                db::TaskKind::PROMPT
+            };
+            self.create_task(&db::NewTask {
+                name: name.to_string(),
+                description: description.to_string(),
+                kind: kind.to_string(),
+                command: command.to_string(),
+                agent_name: agent_name.map(String::from),
+                schedule: db::TaskSchedule::Once {
+                    at: run_at.to_string(),
+                },
+                held: false,
+                depends_on: Vec::new(),
+                profile: None,
+                run_safe: false,
+                cwd: None,
+            })
+        }
+    }
 
     #[test]
     fn test_models_endpoint_from_chat_completions_suffix() {

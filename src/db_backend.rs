@@ -44,7 +44,6 @@ pub trait DbBackend: Send + Sync {
     fn set_agent_data(&self, agent: &str, key: &str, value: &str) -> Result<(), Box<dyn Error>>;
     fn get_agent_data(&self, agent: &str, key: &str) -> Result<Option<String>, Box<dyn Error>>;
     fn delete_agent_data(&self, agent: &str, key: &str) -> Result<bool, Box<dyn Error>>;
-    fn list_agent_data(&self, agent: &str) -> Result<Vec<(String, String)>, Box<dyn Error>>;
     fn get_agent_config(&self, agent_name: &str) -> Result<AgentConfig, Box<dyn Error>>;
     /// See `db::set_agent_config`.
     fn set_agent_config(
@@ -81,23 +80,6 @@ pub trait DbBackend: Send + Sync {
         session_id: &str,
     ) -> Result<Vec<NotificationRow>, Box<dyn Error>>;
 
-    fn create_cron_task(
-        &self,
-        name: &str,
-        description: &str,
-        cron_expr: &str,
-        command: &str,
-        agent_name: Option<&str>,
-        max_runs: Option<i64>,
-    ) -> Result<i64, Box<dyn Error>>;
-    fn create_oneshot_task(
-        &self,
-        name: &str,
-        description: &str,
-        run_at: &str,
-        command: &str,
-        agent_name: Option<&str>,
-    ) -> Result<i64, Box<dyn Error>>;
     /// See `db::create_task`.
     fn create_task(&self, task: &NewTask) -> Result<i64, Box<dyn Error>>;
     fn delete_task(&self, task_id: i64) -> Result<bool, Box<dyn Error>>;
