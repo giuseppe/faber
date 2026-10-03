@@ -12,16 +12,26 @@ at a file containing the key.
 
 ### Configuration file
 
-Settings can be stored in a JSON file. By default `config.json` in the
-current directory is loaded automatically. Use `-c`/`--config` to specify
-a different path. CLI arguments override config file values.
+Settings can be stored in a JSON file. By default
+`~/.config/faber/config.json` (under `$XDG_CONFIG_HOME` when it's set) is
+loaded if it exists - never one in the current directory, where agents
+work and could write one. Use `-c`/`--config` to specify a different path.
+CLI arguments override config file values.
+
+Neither the config file nor the database may be inside a directory agents
+work in: `faber chat`, `prompt`, `worker` and `serve` refuse to start
+there, and an agent's or a task's working directory can't be set to one.
+An agent without the unsafe tools can write where it works, and could
+otherwise give itself the unsafe tools in the database, add a command to
+run to the config file, or read every agent's conversation. Keep them
+elsewhere, e.g. `"db_path": "~/.local/share/faber/faber.db"`.
 
 ```json
 {
   "model": "google/gemini-2.5-pro",
   "endpoint": "http://localhost:8080",
   "api_key": "~/.keys/openai",
-  "db_path": "state.db",
+  "db_path": "~/.local/share/faber/faber.db",
   "unsafe_tools": true,
   "parameter": ["temperature=0.7"],
   "mcp_servers": {

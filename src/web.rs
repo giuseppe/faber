@@ -547,11 +547,9 @@ fn absolute_dir(dir: &str) -> Result<String, String> {
     if !path.is_absolute() {
         return Err(format!("'{}': give an absolute path", dir));
     }
-    Ok(path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .into_owned())
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    crate::check_no_faber_files(&path)?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 fn non_empty(value: &Option<String>) -> Option<String> {
