@@ -692,7 +692,7 @@ that agent.
 | `agent_delete` | Delete an agent |
 | `agent_list` | List all agents |
 | `agent_get` | Get an agent's details, including its configuration |
-| `agent_configure` | Set or clear an agent's model, endpoint or system prompt |
+| `agent_configure` | Set or clear an agent's model, endpoint (unsafe agents only) or system prompt |
 | `lsp` | Ask a language server about code: `definition`, `references`, `hover`, `symbols` (a file's outline), `workspace_symbols` or `diagnostics`. The server is picked by file extension - rust-analyzer (`.rs`), clangd (C/C++), pyright-langserver or pylsp (`.py`), gopls (`.go`), typescript-language-server (JS/TS) - whichever is installed, started on first use and kept running. A symbol is given by `line` plus its text on that line (`symbol`). Files are re-synced on every call, so edits are picked up. Language servers can run project code (e.g. rust-analyzer builds `build.rs` and proc macros), so unless `--unsafe-tools` is set they run sandboxed with [bubblewrap](https://github.com/containers/bubblewrap): the whole filesystem read-only (so toolchains under `$HOME` still work), the environment cleared but for what toolchains need (`HOME`, `PATH`, locale, `CARGO_HOME`, `RUSTUP_HOME`, Go's, `JAVA_HOME`, ...), only the current directory writable, and no network. An agent without the unsafe tools never shares a server with one that has them, and the files it asks about are read inside its directory: a symlink out of it reads nothing |
 | `plan_update` | Set the agent's plan for the current multi-step task (full list of items, each `pending`/`in_progress`/`completed`). Stored per agent in the DB under the `state:plan` key, shown in the status bar as progress, and cleared once every item is completed, on `/clear`, or when the agent is deleted |
 | `plan_get` | Get the agent's current plan |
@@ -730,9 +730,15 @@ Whether an agent has them is up to each agent, not the whole session:
 - An agent an agent makes - `spawn_agent`, `agent_create` - is like its
   maker unless it asks otherwise (`unsafe_tools`). Only an agent that has
   the unsafe tools can give them, so a safe agent can only make safe
-  ones; an unsafe one can make either. A safe agent can't change an
-  unsafe agent either (`agent_configure`, or reusing its name), and a
-  profile never gives or takes them.
+  ones; an unsafe one can make either. A safe agent can only change,
+  delete or run (`agent_configure`, `agent_delete`, `spawn_agent` on an
+  existing agent) the agents it made and theirs - not itself, the user's
+  agents, other sessions', nor any agent with the unsafe tools - and can't
+  set an endpoint at all: an agent pointed at a server of its choosing
+  would send it its conversation and the API key, and run the tool calls
+  it answers with. It sees only its own agents' endpoint, key file, system
+  prompt and request parameters in `agent_get`. A profile never gives or
+  takes the unsafe tools.
 - A task a safe agent creates (`task_create`) runs without them, whoever
   picks it up: a worker that has them runs it on a safe agent of its own,
   and a tool task gets the safe tools.

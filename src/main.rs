@@ -1294,6 +1294,27 @@ fn parse_parameters(
     Ok(parameters)
 }
 
+/// Takes `params` out of `tool`'s schema: its properties, and the list of
+/// required ones.
+fn drop_tool_params(tools: &mut ToolsCollection, tool: &str, params: &[&str]) {
+    let Some(item) = tools.get_mut(tool) else {
+        return;
+    };
+    let Ok(mut schema) = serde_json::from_str::<serde_json::Value>(&item.schema) else {
+        return;
+    };
+    let parameters = &mut schema["function"]["parameters"];
+    if let Some(properties) = parameters["properties"].as_object_mut() {
+        for param in params {
+            properties.remove(*param);
+        }
+    }
+    if let Some(required) = parameters["required"].as_array_mut() {
+        required.retain(|r| r.as_str().is_none_or(|r| !params.contains(&r)));
+    }
+    item.schema = schema.to_string();
+}
+
 fn append_tool(tools: &mut ToolsCollection, name: String, callback: ToolCallback, schema: String) {
     let item = ToolItem {
         callback: callback,
@@ -2923,8 +2944,14 @@ fn tool_agent_create(params_str: &String, ctx: &ToolContext) -> Result<String, B
     let unsafe_tools = child_unsafe(ctx.unsafe_tools, params.unsafe_tools)?;
     let cwd = child_cwd(ctx, params.cwd.as_deref())?;
     db.create_agent(&params.name, params.description.as_deref().unwrap_or(""))?;
+    // Its maker's: so that the maker, and only it, may change it later.
+    let parent = ctx.agent_name.as_deref();
     if let Err(e) = set_agent_unsafe(db, &params.name, unsafe_tools)
         .and_then(|()| set_agent_cwd(db, &params.name, cwd))
+        .and_then(|()| match parent {
+            Some(parent) => db.set_agent_parent(&params.name, Some(parent)),
+            None => Ok(()),
+        })
     {
         let _ = db.delete_agent(&params.name);
         return Err(e);
@@ -2952,6 +2979,9 @@ fn tool_agent_delete(params_str: &String, ctx: &ToolContext) -> Result<String, B
     }
     let params: Params = serde_json::from_str(params_str)?;
     let db = ctx.db()?;
+    if db.get_agent(&params.name)?.is_some() {
+        check_may_change(ctx, db, &params.name)?;
+    }
     let deleted = db.delete_agent(&params.name)?;
     if deleted {
         ctx.println(&format!("Agent '{}' deleted", params.name));
@@ -2984,7 +3014,26 @@ const AGENT_CONFIG_KEYS: &[(&str, &str)] = &[
 
 /// entrypoint for the agent_configure tool: sets or clears an agent's own
 /// model, endpoint and system prompt - and nothing else of its stored data.
+/// agent_configure for an agent with the unsafe tools.
 fn tool_agent_configure(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    agent_configure(params_str, ctx, true)
+}
+
+/// agent_configure for one without: no `endpoint`. Pointed at a server of
+/// its choosing, an agent would send it its conversation and the API key,
+/// and take its replies - tool calls included - as the model's.
+fn tool_agent_configure_safe(
+    params_str: &String,
+    ctx: &ToolContext,
+) -> Result<String, Box<dyn Error>> {
+    agent_configure(params_str, ctx, false)
+}
+
+fn agent_configure(
+    params_str: &String,
+    ctx: &ToolContext,
+    may_set_endpoint: bool,
+) -> Result<String, Box<dyn Error>> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Params {
@@ -3003,6 +3052,11 @@ fn tool_agent_configure(params_str: &String, ctx: &ToolContext) -> Result<String
         cwd: Option<String>,
     }
     let mut params: Params = serde_json::from_str(params_str)?;
+    if params.endpoint.is_some() && !may_set_endpoint {
+        return Err(
+            "unknown field `endpoint`: only an agent with the unsafe tools can set one".into(),
+        );
+    }
     params.profile = requested_profile(&ctx_profiles(ctx), params.profile.take());
     let db = ctx.db()?;
     if db.get_agent(&params.agent)?.is_none() {
@@ -3067,7 +3121,18 @@ fn tool_agent_get(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
         Some(agent) => {
             ctx.println(&format!("Agent '{}': {}", agent.name, agent.description));
             let mut result = serde_json::to_value(&agent)?;
-            result["config"] = serde_json::to_value(db.get_agent_config(&agent.name)?)?;
+            let mut config = db.get_agent_config(&agent.name)?;
+            // Where another agent's requests go, with which key, and what
+            // it was told is the user's business, not a safe agent's.
+            let own = ctx.agent_name.as_deref() == Some(agent.name.as_str())
+                || made_by(db, &agent.name, ctx.agent_name.as_deref())?;
+            if !ctx.unsafe_tools && !own {
+                config.endpoint = None;
+                config.api_key = None;
+                config.system_prompt = None;
+                config.parameters = None;
+            }
+            result["config"] = serde_json::to_value(config)?;
             Ok(result.to_string())
         }
         None => {
@@ -4046,6 +4111,9 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
 
     let agent_config = {
         let existing = db.get_agent(&agent_name)?;
+        if existing.is_some() && !db.claim_agent(&agent_name, &sa_ctx.session_id)? {
+            return Err(format!("'{}' is in use by another session", agent_name).into());
+        }
         let unsafe_tools = match &existing {
             Some(_) => {
                 check_may_change(ctx, db.as_ref(), &agent_name)?;
@@ -4105,7 +4173,9 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         db.set_agent_parent(&agent_name, Some(&parent_agent))?;
         set_agent_unsafe(db.as_ref(), &agent_name, unsafe_tools)?;
         set_agent_cwd(db.as_ref(), &agent_name, cwd)?;
-        let _ = db.claim_agent(&agent_name, &sa_ctx.session_id);
+        if !db.claim_agent(&agent_name, &sa_ctx.session_id)? {
+            return Err(format!("'{}' is in use by another session", agent_name).into());
+        }
         db.get_agent_config(&agent_name)?
     };
     let sub_unsafe = agent_config.unsafe_tools == Some(true);
@@ -5156,34 +5226,49 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
         .to_string(),
     );
 
+    let (agent_configure, endpoint_param, who_may) = if unsafe_tools {
+        (
+            tool_agent_configure as ToolCallback,
+            r#""endpoint": {"type": "string", "description": "API endpoint for this agent"},"#,
+            "",
+        )
+    } else {
+        (
+            tool_agent_configure_safe as ToolCallback,
+            "",
+            " Only agents you made (and theirs) can be changed.",
+        )
+    };
     append_tool(
         &mut tools,
         "agent_configure".to_string(),
-        tool_agent_configure,
-        r#"
-        {
+        agent_configure,
+        format!(
+            r#"
+        {{
             "type": "function",
-            "function": {
+            "function": {{
                 "name": "agent_configure",
-                "description": "Set an agent's own model, API endpoint or system prompt, used from its next turn on - or replace all its settings with a copy of a profile's. An empty string clears that setting, so the agent goes back to the default. agent_get shows the current configuration.",
-                "parameters": {
+                "description": "Set an agent's own model, {endpoint_word}system prompt, used from its next turn on - or replace all its settings with a copy of a profile's. An empty string clears that setting, so the agent goes back to the default. agent_get shows the current configuration.{who_may}",
+                "parameters": {{
                     "type": "object",
-                    "properties": {
-                        "agent": {"type": "string", "description": "Name of the agent"},
-                        "profile": {"type": "string", "description": "Replace its settings with this profile's (other fields given are then set over them)"},
-                        "model": {"type": "string", "description": "Model to use for this agent"},
-                        "endpoint": {"type": "string", "description": "API endpoint for this agent"},
-                        "system_prompt": {"type": "string", "description": "System prompt for this agent"},
-                        "unsafe_tools": {"type": "boolean", "description": "Give it the unsafe tools (unsandboxed commands, web access), or take them away. Only an agent that has them can do either, or change an agent that has them"},
-                        "cwd": {"type": "string", "description": "Set the directory it works in (an existing directory). Only an agent with the unsafe tools can"}
-                    },
+                    "properties": {{
+                        "agent": {{"type": "string", "description": "Name of the agent"}},
+                        "profile": {{"type": "string", "description": "Replace its settings with this profile's (other fields given are then set over them)"}},
+                        "model": {{"type": "string", "description": "Model to use for this agent"}},
+                        {endpoint_param}
+                        "system_prompt": {{"type": "string", "description": "System prompt for this agent"}},
+                        "unsafe_tools": {{"type": "boolean", "description": "Give it the unsafe tools (unsandboxed commands, web access), or take them away. Only an agent that has them can do either, or change an agent that has them"}},
+                        "cwd": {{"type": "string", "description": "Set the directory it works in (an existing directory). Only an agent with the unsafe tools can"}}
+                    }},
                     "required": ["agent"],
                     "additionalProperties": false
-                }
-            }
-        }
-"#
-        .to_string(),
+                }}
+            }}
+        }}
+"#,
+            endpoint_word = if unsafe_tools { "API endpoint or " } else { "" },
+        ),
     );
 
     append_tool(
@@ -5921,6 +6006,16 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
     }
 
     if !unsafe_tools {
+        // What only an agent with the unsafe tools may ask for isn't
+        // offered: a model shown `unsafe_tools` sets it.
+        for name in [
+            "agent_create",
+            "agent_configure",
+            "spawn_agent",
+            "task_create",
+        ] {
+            drop_tool_params(&mut tools, name, &["unsafe_tools", "cwd"]);
+        }
         if let Some(allowed_list) = allowed {
             tools.retain(|name, _| allowed_list.iter().any(|a| a == name));
         }
@@ -6376,14 +6471,48 @@ fn mark_session_unsafe(db: &dyn DbBackend, agent: &str, session_id: &str) {
 /// Refuses if a safe agent (`ctx`) would change or take over `agent`, one
 /// with the unsafe tools - that would be a way to get them.
 fn check_may_change(ctx: &ToolContext, db: &dyn DbBackend, agent: &str) -> Result<(), String> {
-    let target_unsafe = agent_is_unsafe(db, agent).map_err(|e| e.to_string())?;
-    if target_unsafe && !ctx.unsafe_tools {
+    if ctx.unsafe_tools {
+        return Ok(());
+    }
+    if agent_is_unsafe(db, agent).map_err(|e| e.to_string())? {
         return Err(format!(
             "'{}' has unsafe tools: an agent without them can't change it",
             agent
         ));
     }
+    // Only its own sub-agents: any other may be the user's, another
+    // session's, or one that runs with the unsafe tools when it's next
+    // started - which a planted setting would then turn to its maker's.
+    if !made_by(db, agent, ctx.agent_name.as_deref()).map_err(|e| e.to_string())? {
+        return Err(format!(
+            "'{}' isn't one of the agents you made: an agent without the unsafe tools can only \
+             change, delete or run those",
+            agent
+        ));
+    }
     Ok(())
+}
+
+/// Whether `agent` is `maker`'s sub-agent, or one of theirs, and so on.
+fn made_by(db: &dyn DbBackend, agent: &str, maker: Option<&str>) -> Result<bool, Box<dyn Error>> {
+    let Some(maker) = maker else {
+        return Ok(false);
+    };
+    Ok(db.agent_lineage(agent)?.iter().skip(1).any(|a| a == maker))
+}
+
+/// For an agent faber makes on a task's or a fan-out's behalf: refuses a
+/// `name` already taken by an agent `parent` didn't make, which would
+/// otherwise have its settings, parent and history overwritten.
+fn check_name_free_for(db: &dyn DbBackend, name: &str, parent: &str) -> Result<(), Box<dyn Error>> {
+    match db.get_agent(name)? {
+        Some(agent) if agent.parent.as_deref() != Some(parent) => Err(format!(
+            "an agent named '{}' already exists, not made by '{}'",
+            name, parent
+        )
+        .into()),
+        _ => Ok(()),
+    }
 }
 
 /// `path` as a working directory: absolute (relative ones taken from
@@ -10265,6 +10394,7 @@ fn profile_task_agent(
 ) -> Result<String, Box<dyn Error>> {
     let settings = find_profile(profiles, profile)?;
     let name = format!("{}-{}", profile, task.id);
+    check_name_free_for(db, &name, parent)?;
     apply_profile(db, &name, profile, settings)?;
     set_agent_unsafe(db, &name, unsafe_tools)?;
     // It works where the task says, or else where the worker does.
@@ -10287,6 +10417,7 @@ pub(crate) fn make_worker_agent(
     ctx: &ToolContext,
     session_id: &str,
 ) -> Result<(), Box<dyn Error>> {
+    check_name_free_for(db, name, caller)?;
     if db.get_agent(name)?.is_none() {
         db.create_agent(name, &format!("fan_out worker of {}", caller))?;
     }
@@ -10375,6 +10506,7 @@ fn own_task_agent(
     session_id: &str,
 ) -> Result<String, Box<dyn Error>> {
     let name = format!("task-{}", task.id);
+    check_name_free_for(db, &name, parent)?;
     if db.get_agent(&name)?.is_none() {
         db.create_agent(&name, &format!("Runs task #{}", task.id))?;
     }
@@ -14790,8 +14922,102 @@ mod tests {
     }
 
     #[test]
+    fn test_a_safe_agent_isnt_offered_what_only_unsafe_ones_may_ask_for() {
+        let safe = initialize_tools(false, None);
+        let all = initialize_tools(true, None);
+        for name in [
+            "agent_create",
+            "agent_configure",
+            "spawn_agent",
+            "task_create",
+        ] {
+            let params = |tools: &ToolsCollection| -> serde_json::Value {
+                serde_json::from_str::<serde_json::Value>(&tools[name].schema).unwrap()["function"]
+                    ["parameters"]["properties"]
+                    .clone()
+            };
+            assert!(params(&safe).get("unsafe_tools").is_none(), "{name}");
+            assert!(params(&safe).get("cwd").is_none(), "{name}");
+            assert!(params(&all).get("cwd").is_some(), "{name}");
+            let description = serde_json::from_str::<serde_json::Value>(&safe[name].schema)
+                .unwrap()["function"]["description"]
+                .to_string();
+            assert!(
+                !description.contains("unsafe_tools"),
+                "{name}: {description}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_safe_agent_changes_only_the_agents_it_made() {
+        let db = local_db_with_agents(&["boss", "user-agent"]);
+        let ctx = chat_ctx(db.clone(), "boss");
+        let call = |f: ToolCallback, params: serde_json::Value| f(&params.to_string(), &ctx);
+        // What it makes is its own: it may change, run and delete it.
+        call(tool_agent_create, serde_json::json!({"name": "helper"})).unwrap();
+        assert_eq!(
+            db.get_agent("helper").unwrap().unwrap().parent.as_deref(),
+            Some("boss")
+        );
+        call(
+            tool_agent_configure_safe,
+            serde_json::json!({"agent": "helper", "model": "m"}),
+        )
+        .unwrap();
+        // But never where its requests go.
+        let err = call(
+            tool_agent_configure_safe,
+            serde_json::json!({"agent": "helper", "endpoint": "http://evil.example/v1"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("endpoint"), "{err}");
+        assert_eq!(db.get_agent_config("helper").unwrap().endpoint, None);
+        // Nor anything about agents it didn't make, nor itself: it may be
+        // run with the unsafe tools later, by the user.
+        for agent in ["user-agent", "boss"] {
+            let err = call(
+                tool_agent_configure_safe,
+                serde_json::json!({"agent": agent, "model": "m"}),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("isn't one of the agents you made"),
+                "{agent}: {err}"
+            );
+            assert!(call(tool_agent_delete, serde_json::json!({"name": agent})).is_err());
+            assert!(db.get_agent(agent).unwrap().is_some());
+        }
+        // Another agent's endpoint, key and prompt are hidden from it.
+        let mut config = db.get_agent_config("user-agent").unwrap();
+        config.endpoint = Some("http://private/v1".to_string());
+        config.system_prompt = Some("secret plans".to_string());
+        db.set_agent_config("user-agent", &config).unwrap();
+        let shown = call(tool_agent_get, serde_json::json!({"name": "user-agent"})).unwrap();
+        assert!(
+            !shown.contains("private") && !shown.contains("secret plans"),
+            "{shown}"
+        );
+        call(tool_agent_delete, serde_json::json!({"name": "helper"})).unwrap();
+
+        // The name of an agent faber makes for a task or a fan-out isn't
+        // taken from one that exists already, made by someone else.
+        assert!(check_name_free_for(db.as_ref(), "user-agent", "worker").is_err());
+        assert!(check_name_free_for(db.as_ref(), "task-99", "worker").is_ok());
+        db.create_agent("task-7", "").unwrap();
+        db.set_agent_parent("task-7", Some("boss")).unwrap();
+        assert!(check_name_free_for(db.as_ref(), "task-7", "boss").is_ok());
+        assert!(check_name_free_for(db.as_ref(), "task-7", "worker").is_err());
+    }
+
+    #[test]
     fn test_agent_configure_sets_and_clears_only_the_config() {
-        let ctx = plan_test_ctx();
+        // As the user's own agent, with the unsafe tools: it may change
+        // itself (see test_a_safe_agent_changes_only_the_agents_it_made).
+        let mut ctx = plan_test_ctx();
+        ctx.unsafe_tools = true;
         let configure = |params: serde_json::Value| tool_agent_configure(&params.to_string(), &ctx);
         configure(
             serde_json::json!({"agent": "default", "model": "m1", "system_prompt": "be brief"}),
@@ -15319,7 +15545,7 @@ mod tests {
         let err = tool_spawn_agent(&r#"{"name": "other", "prompt": "go"}"#.to_string(), &ctx)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("works in /"), "{err}");
+        assert!(err.contains("isn't one of the agents you made"), "{err}");
         // An unsafe agent can.
         ctx.unsafe_tools = true;
         assert_eq!(child_cwd(&ctx, Some("/")), Ok(Some("/".to_string())));
@@ -16935,7 +17161,7 @@ mod tests {
         );
         // An agent can't spawn itself or one of the agents above it.
         let err = spawn("intern", "boss").unwrap_err().to_string();
-        assert!(err.contains("can't be a sub-agent"), "{err}");
+        assert!(err.contains("isn't one of the agents you made"), "{err}");
         assert!(spawn("boss", "boss").is_err());
         assert_eq!(
             db.get_agent("boss").unwrap().unwrap().parent,
