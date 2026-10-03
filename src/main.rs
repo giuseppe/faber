@@ -4398,7 +4398,7 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     let max_requests = params.max_requests;
 
     let session_id_for_sub = sa_ctx.session_id.clone();
-    let mcp_for_sub = ctx.mcp_manager.clone();
+    let mcp_manager = ctx.mcp.as_ref().map(|m| m.manager().clone());
     // The sub-agent gets the same machinery, so it can spawn its own -
     // which start from its settings and tools.
     let extra_for_sub: Arc<dyn std::any::Any + Send + Sync> = Arc::new(SubAgentContext {
@@ -4445,7 +4445,7 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         sub_ctx.cwd = sub_cwd;
         sub_ctx.task_id = task_id;
         sub_ctx.agent_name = Some(agent_name_for_ctx);
-        sub_ctx.mcp_manager = mcp_for_sub;
+        sub_ctx.mcp = agent_mcp(mcp_manager.as_ref(), &agent_config);
         sub_ctx.context_window = context_window;
         sub_ctx.extra = Some(extra_for_sub);
         sub_ctx.max_requests = max_requests;
@@ -6253,6 +6253,9 @@ struct Profile {
     /// profile can't add unsafe tools to a session without them.
     #[serde(default)]
     tools: Option<Vec<String>>,
+    /// The MCP servers whose tools it gets, by name (see "mcp_servers").
+    #[serde(default)]
+    mcp_servers: Option<Vec<String>>,
 }
 
 impl Profile {
@@ -6272,6 +6275,7 @@ impl Profile {
             // pick where an agent works (see `child_cwd`).
             unsafe_tools: None,
             cwd: None,
+            mcp_servers: self.mcp_servers.clone(),
         }
     }
 }
@@ -6557,6 +6561,61 @@ fn apply_profile(
 /// chat's, a worker's - has the unsafe tools: if its config says so, or
 /// the session was started with `--unsafe-tools`. Agents made by others
 /// (`spawn_agent`, a worker's task agents) always have it set.
+/// The MCP servers' tools a session's own agent gets - a chat's, a
+/// worker's, `faber prompt`'s: those its config lists, else every server
+/// the session defines; and those `--mcp-server` named either way. None
+/// with `--no-tools`.
+fn session_mcp(
+    manager: &Option<Arc<faber::mcp::McpManager>>,
+    config: &db::AgentConfig,
+    opts: &Opts,
+) -> Option<faber::mcp::McpAccess> {
+    let manager = manager.as_ref()?;
+    let mut servers = match (&config.mcp_servers, opts.no_tools) {
+        (_, true) => Vec::new(),
+        (Some(listed), false) => listed.clone(),
+        (None, false) => manager.server_names(),
+    };
+    if !opts.no_tools {
+        for name in &opts.mcp_granted {
+            if !servers.contains(name) {
+                servers.push(name.clone());
+            }
+        }
+    }
+    Some(mcp_access(manager, servers))
+}
+
+/// The MCP servers' tools any other agent gets - a sub-agent, a task's or
+/// a fan-out's: only those its config lists (from its profile, or set by
+/// the user).
+fn agent_mcp(
+    manager: Option<&Arc<faber::mcp::McpManager>>,
+    config: &db::AgentConfig,
+) -> Option<faber::mcp::McpAccess> {
+    let manager = manager?;
+    Some(mcp_access(
+        manager,
+        config.mcp_servers.clone().unwrap_or_default(),
+    ))
+}
+
+fn mcp_access(
+    manager: &Arc<faber::mcp::McpManager>,
+    servers: Vec<String>,
+) -> faber::mcp::McpAccess {
+    let defined = manager.server_names();
+    for name in &servers {
+        if !defined.contains(name) {
+            warn!(
+                "No MCP server '{}' is defined here: its tools are left out",
+                name
+            );
+        }
+    }
+    faber::mcp::McpAccess::new(manager.clone(), servers)
+}
+
 fn session_agent_unsafe(opts: &Opts, config: &db::AgentConfig) -> bool {
     opts.unsafe_tools || config.unsafe_tools == Some(true)
 }
@@ -6987,7 +7046,7 @@ fn post_request_and_print_output(
         println!("{}", msg);
     });
     tool_context.db = db;
-    tool_context.mcp_manager = mcp_manager;
+    tool_context.mcp = session_mcp(&mcp_manager, &db::AgentConfig::default(), opts);
     tool_context.unsafe_tools = opts.unsafe_tools;
 
     let response: OpenAIResponse = post_request(messages, &tools, &openai_opts, &tool_context)?;
@@ -9663,7 +9722,7 @@ fn chat_command(
                     let mut tool_context = ToolContext::new(|_: &str| {});
                     tool_context.db = db.clone();
                     tool_context.agent_name = Some(active_agent.name.clone());
-                    tool_context.mcp_manager = mcp_manager.clone();
+                    tool_context.mcp = session_mcp(&mcp_manager, &turn_config, opts);
                     tool_context.unsafe_tools = turn_unsafe;
                     tool_context.task_id = running_prompt_task;
                     if turn_unsafe && turn_config.unsafe_tools != Some(true) {
@@ -10974,7 +11033,12 @@ fn run_prompt_task_headless(
     ctx.task_id = Some(task.id);
     ctx.cwd = run_cwd.map(PathBuf::from);
     ctx.agent_name = Some(agent.to_string());
-    ctx.mcp_manager = mcp_manager.clone();
+    // The worker's own agent, or one made for the task.
+    ctx.mcp = if agent == worker {
+        session_mcp(mcp_manager, &agent_config, opts)
+    } else {
+        agent_mcp(mcp_manager.as_ref(), &agent_config)
+    };
     ctx.context_window = agent_config.context_window.or(opts.context_window);
     let runs = extra.runs.clone();
     let running = extra.running_subagents.clone();
@@ -12733,11 +12797,17 @@ struct Opts {
 
     #[clap(long = "mcp-server")]
     #[serde(skip)]
-    /// Add a remote MCP server: NAME=URL for HTTP transport, or
-    /// NAME=sse:URL for SSE transport (can be repeated). Merged with any
-    /// servers already defined in the config file's "mcp_servers", and
-    /// takes precedence over a config file entry with the same name.
+    /// Give the session's own agent an MCP server's tools: NAME=URL (or
+    /// NAME=sse:URL) adds a remote one, over a config file entry with the
+    /// same name; NAME alone, one the config file's "mcp_servers" defines.
+    /// Can be repeated. Other agents only get the servers their own
+    /// settings or profile list
     mcp_server: Vec<String>,
+
+    #[clap(skip)]
+    #[serde(skip)]
+    /// The servers --mcp-server named, for the session's own agent.
+    mcp_granted: Vec<String>,
 
     #[clap(subcommand)]
     #[serde(skip)]
@@ -12774,6 +12844,7 @@ impl Default for Opts {
             task_retention: None,
             max_parallel_requests: None,
             mcp_server: Vec::new(),
+            mcp_granted: Vec::new(),
             command: CliCommand::Chat {},
             args: Vec::new(),
         }
@@ -12884,8 +12955,21 @@ impl Opts {
     /// values elsewhere in `Opts`.
     fn apply_mcp_server_flags(&mut self) -> Result<(), Box<dyn Error>> {
         for spec in &self.mcp_server {
-            let (name, config) = parse_mcp_server_flag(spec)?;
-            self.mcp_servers.insert(name, config);
+            let name = if spec.contains('=') {
+                let (name, config) = parse_mcp_server_flag(spec)?;
+                self.mcp_servers.insert(name.clone(), config);
+                name
+            } else if self.mcp_servers.contains_key(spec) {
+                spec.clone()
+            } else {
+                return Err(format!(
+                    "--mcp-server {}: no MCP server '{}' in the config file's \"mcp_servers\" \
+                     (give NAME=URL to add a remote one)",
+                    spec, spec
+                )
+                .into());
+            };
+            self.mcp_granted.push(name);
         }
         Ok(())
     }
@@ -13193,6 +13277,11 @@ struct SettingsArgs {
     /// Request parameters, as a JSON object, e.g. '{"temperature": 0.2}'
     #[clap(long, value_name = "JSON")]
     parameters: Option<String>,
+    /// The MCP servers whose tools it gets, comma-separated; "none" for
+    /// none, empty for the default (none, but every one for a session's
+    /// own agent)
+    #[clap(long, value_name = "LIST")]
+    mcp_servers: Option<String>,
 }
 
 impl SettingsArgs {
@@ -13206,6 +13295,7 @@ impl SettingsArgs {
             &self.context_window,
             &self.tools,
             &self.parameters,
+            &self.mcp_servers,
         ]
         .iter()
         .all(|v| v.is_none())
@@ -13253,6 +13343,9 @@ impl SettingsArgs {
                 }
             };
         }
+        if let Some(servers) = &self.mcp_servers {
+            profile.mcp_servers = parse_mcp_servers_setting(servers);
+        }
         if let Some(parameters) = &self.parameters {
             profile.parameters = match parameters.trim() {
                 "" => None,
@@ -13280,6 +13373,22 @@ fn agent_settings(config: &db::AgentConfig, description: &str) -> Profile {
         parameters: config.parameters.clone(),
         system_prompt: config.system_prompt.clone(),
         tools: config.tools.clone(),
+        mcp_servers: config.mcp_servers.clone(),
+    }
+}
+
+/// An `mcp_servers` setting as given: empty for the default, "none" for
+/// none, else the servers' names, comma-separated.
+fn parse_mcp_servers_setting(text: &str) -> Option<Vec<String>> {
+    match text.trim() {
+        "" => None,
+        "none" => Some(Vec::new()),
+        list => Some(
+            list.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        ),
     }
 }
 
@@ -13294,6 +13403,7 @@ fn apply_settings(mut config: db::AgentConfig, settings: &Profile) -> db::AgentC
     config.parameters = settings.parameters.clone();
     config.system_prompt = settings.system_prompt.clone();
     config.tools = settings.tools.clone();
+    config.mcp_servers = settings.mcp_servers.clone();
     config
 }
 
@@ -13827,6 +13937,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                         }
                     });
                 }
+                let mut mcp_servers: Vec<String> = opts.mcp_servers.keys().cloned().collect();
+                mcp_servers.sort();
+                let _ = web::MCP_SERVERS.set(mcp_servers);
                 server::serve_command(bind, conn, key.as_deref(), profiles)
             })
         }
@@ -13993,6 +14106,110 @@ mod tests {
     #[test]
     fn test_parse_mcp_server_flag_empty_url_is_an_error() {
         assert!(parse_mcp_server_flag("search=").is_err());
+    }
+
+    /// A stdio MCP server with one tool, named by $TOOL.
+    fn fake_mcp_server(tool: &str) -> Option<faber::mcp::McpServerConfig> {
+        let python = latex_kitty::resolve_on_path("python3")?;
+        let script = r#"import sys, json, os
+for line in sys.stdin:
+    m = json.loads(line)
+    if "id" not in m: continue
+    r = {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "f", "version": "1"}}
+    if m["method"] == "tools/list": r = {"tools": [{"name": os.environ["TOOL"], "inputSchema": {"type": "object"}}]}
+    print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r}), flush=True)
+"#;
+        Some(faber::mcp::McpServerConfig {
+            command: Some(python.display().to_string()),
+            args: Some(vec!["-c".to_string(), script.to_string()]),
+            env: Some(HashMap::from([("TOOL".to_string(), tool.to_string())])),
+            url: None,
+            sse: None,
+            headers: None,
+        })
+    }
+
+    #[test]
+    fn test_the_sessions_agent_gets_every_mcp_server_and_others_only_theirs() {
+        let (Some(github), Some(jira)) = (fake_mcp_server("issues"), fake_mcp_server("tickets"))
+        else {
+            eprintln!("python3 not installed, skipping");
+            return;
+        };
+        let manager = Some(Arc::new(
+            faber::mcp::McpManager::new(HashMap::from([
+                ("github".to_string(), github),
+                ("jira".to_string(), jira),
+            ]))
+            .unwrap(),
+        ));
+        let servers = |access: Option<faber::mcp::McpAccess>| {
+            let mut names = access.unwrap().servers().to_vec();
+            names.sort();
+            names
+        };
+        let unset = db::AgentConfig::default();
+        let listed = db::AgentConfig {
+            mcp_servers: Some(vec!["jira".to_string()]),
+            ..Default::default()
+        };
+        let mut opts = Opts::default();
+        // The session's own agent: every server, unless its config lists.
+        assert_eq!(
+            servers(session_mcp(&manager, &unset, &opts)),
+            ["github", "jira"]
+        );
+        assert_eq!(servers(session_mcp(&manager, &listed, &opts)), ["jira"]);
+        // --mcp-server NAME adds to what it lists.
+        opts.mcp_granted = vec!["github".to_string()];
+        assert_eq!(
+            servers(session_mcp(&manager, &listed, &opts)),
+            ["github", "jira"]
+        );
+        // --no-tools: none at all.
+        opts.no_tools = true;
+        assert!(servers(session_mcp(&manager, &unset, &opts)).is_empty());
+        // Any other agent: only what its config lists.
+        assert!(servers(agent_mcp(manager.as_ref(), &unset)).is_empty());
+        let access = agent_mcp(manager.as_ref(), &listed).unwrap();
+        assert!(access.has_tool("mcp_jira_tickets") && !access.has_tool("mcp_github_issues"));
+        // With no MCP servers at all, no access.
+        assert!(session_mcp(&None, &unset, &Opts::default()).is_none());
+        manager.unwrap().shutdown();
+    }
+
+    #[test]
+    fn test_mcp_server_flag_names_a_defined_server_or_adds_one() {
+        let mut opts = Opts::default();
+        opts.mcp_servers.insert(
+            "github".to_string(),
+            faber::mcp::McpServerConfig {
+                command: Some("gh-mcp".to_string()),
+                args: None,
+                env: None,
+                url: None,
+                sse: None,
+                headers: None,
+            },
+        );
+        opts.mcp_server = vec![
+            "github".to_string(),
+            "docs=http://docs.example/mcp".to_string(),
+        ];
+        opts.apply_mcp_server_flags().unwrap();
+        assert_eq!(opts.mcp_granted, ["github", "docs"]);
+        assert!(opts.mcp_servers.contains_key("docs"));
+        let mut opts = Opts::default();
+        opts.mcp_server = vec!["nowhere".to_string()];
+        let err = opts.apply_mcp_server_flags().unwrap_err().to_string();
+        assert!(err.contains("no MCP server 'nowhere'"), "{err}");
+        // The setting: empty for the default, "none" for none.
+        assert_eq!(parse_mcp_servers_setting(""), None);
+        assert_eq!(parse_mcp_servers_setting("none"), Some(vec![]));
+        assert_eq!(
+            parse_mcp_servers_setting("github, jira"),
+            Some(vec!["github".to_string(), "jira".to_string()])
+        );
     }
 
     #[test]

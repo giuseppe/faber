@@ -78,7 +78,8 @@ pub struct ToolContext {
     pub db: Option<Arc<dyn db_backend::DbBackend>>,
     pub agent_name: Option<String>,
     pub extra: Option<Arc<dyn Any + Send + Sync>>,
-    pub mcp_manager: Option<Arc<mcp::McpManager>>,
+    /// The MCP servers' tools this agent gets (see `mcp::McpAccess`).
+    pub mcp: Option<mcp::McpAccess>,
     /// Set around a tool's own execution (see `openai::tool_call`'s caller)
     /// so a `println` closure that wants to visually box a tool's output
     /// can tell "this line came from inside a running tool" apart from any
@@ -161,7 +162,7 @@ impl ToolContext {
             db: None,
             agent_name: None,
             extra: None,
-            mcp_manager: None,
+            mcp: None,
             boxed: Arc::new(AtomicBool::new(false)),
             max_tool_output_chars: None,
             context_window: None,

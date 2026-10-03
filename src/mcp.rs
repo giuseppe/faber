@@ -587,7 +587,7 @@ impl McpManager {
     }
 
     pub fn refresh(&self) -> Result<usize, Box<dyn Error>> {
-        let mut new_tools = HashMap::new();
+        let mut new_tools: HashMap<String, McpToolInfo> = HashMap::new();
 
         for (idx, server) in self.servers.iter().enumerate() {
             match server.list_tools() {
@@ -609,6 +609,15 @@ impl McpManager {
                             prefixed_name, server.name
                         );
 
+                        // Server "a_b"'s tool "c" and server "a"'s "b_c" are
+                        // both mcp_a_b_c: neither may shadow the other.
+                        if let Some(other) = new_tools.get(&prefixed_name) {
+                            return Err(format!(
+                                "MCP servers '{}' and '{}' both have a tool named {}: rename one of the servers",
+                                self.servers[other.server_index].name, server.name, prefixed_name
+                            )
+                            .into());
+                        }
                         new_tools.insert(
                             prefixed_name,
                             McpToolInfo {
@@ -675,9 +684,170 @@ impl McpManager {
             .unwrap_or_default()
     }
 
+    /// The names of the servers it runs.
+    pub fn server_names(&self) -> Vec<String> {
+        self.servers.iter().map(|s| s.name.clone()).collect()
+    }
+
     pub fn shutdown(&self) {
         for server in &self.servers {
             server.shutdown();
         }
+    }
+}
+
+/// What one agent may use of a session's MCP servers: the manager running
+/// them, and the servers - by name - whose tools it gets. Everything an
+/// agent does with MCP goes through it, so a tool of another server is,
+/// for it, no tool at all.
+#[derive(Clone)]
+pub struct McpAccess {
+    manager: Arc<McpManager>,
+    servers: Arc<Vec<String>>,
+}
+
+impl McpAccess {
+    pub fn new(manager: Arc<McpManager>, servers: Vec<String>) -> Self {
+        Self {
+            manager,
+            servers: Arc::new(servers),
+        }
+    }
+
+    /// The manager, to give another agent its own access.
+    pub fn manager(&self) -> &Arc<McpManager> {
+        &self.manager
+    }
+
+    pub fn servers(&self) -> &[String] {
+        &self.servers
+    }
+
+    fn allows(&self, info: &McpToolInfo) -> bool {
+        let server = &self.manager.servers[info.server_index].name;
+        self.servers.iter().any(|s| s == server)
+    }
+
+    pub fn has_tools(&self) -> bool {
+        self.manager
+            .tools
+            .read()
+            .map(|t| t.values().any(|info| self.allows(info)))
+            .unwrap_or(false)
+    }
+
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.manager
+            .tools
+            .read()
+            .map(|t| t.get(name).is_some_and(|info| self.allows(info)))
+            .unwrap_or(false)
+    }
+
+    pub fn call_tool(&self, name: &str, arguments: &str) -> Result<String, Box<dyn Error>> {
+        if !self.has_tool(name) {
+            return Err(format!("MCP tool '{}' not found", name).into());
+        }
+        self.manager.call_tool(name, arguments)
+    }
+
+    pub fn get_tool_schemas(&self) -> Vec<serde_json::Value> {
+        self.manager
+            .tools
+            .read()
+            .map(|t| {
+                t.values()
+                    .filter(|info| self.allows(info))
+                    .map(|info| info.schema.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stdio MCP server with one tool, named by $TOOL, that answers with
+    /// what it was called as.
+    const FAKE_SERVER: &str = r#"import sys, json, os
+for line in sys.stdin:
+    m = json.loads(line)
+    if "id" not in m: continue
+    method, result = m.get("method"), {}
+    if method == "initialize":
+        result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": os.environ["TOOL"], "description": "d", "inputSchema": {"type": "object"}}]}
+    elif method == "tools/call":
+        result = {"content": [{"type": "text", "text": "called " + m["params"]["name"]}]}
+    print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": result}), flush=True)
+"#;
+
+    fn fake(tool: &str) -> Option<McpServerConfig> {
+        let python = ["/usr/bin/python3", "/usr/local/bin/python3"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())?;
+        Some(McpServerConfig {
+            command: Some(python.to_string()),
+            args: Some(vec!["-c".to_string(), FAKE_SERVER.to_string()]),
+            env: Some(HashMap::from([("TOOL".to_string(), tool.to_string())])),
+            url: None,
+            sse: None,
+            headers: None,
+        })
+    }
+
+    #[test]
+    fn test_an_agent_gets_only_its_servers_tools() {
+        let (Some(one), Some(two)) = (fake("ping"), fake("pong")) else {
+            eprintln!("python3 not installed, skipping");
+            return;
+        };
+        let manager = Arc::new(
+            McpManager::new(HashMap::from([
+                ("one".to_string(), one),
+                ("two".to_string(), two),
+            ]))
+            .unwrap(),
+        );
+        let access = McpAccess::new(manager.clone(), vec!["one".to_string()]);
+        assert!(access.has_tool("mcp_one_ping"));
+        assert!(!access.has_tool("mcp_two_pong"), "another server's tool");
+        let names: Vec<_> = access
+            .get_tool_schemas()
+            .iter()
+            .map(|s| s["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["mcp_one_ping"]);
+        assert!(
+            access
+                .call_tool("mcp_one_ping", "{}")
+                .unwrap()
+                .contains("called ping")
+        );
+        assert!(access.call_tool("mcp_two_pong", "{}").is_err());
+        let none = McpAccess::new(manager.clone(), Vec::new());
+        assert!(!none.has_tools() && none.get_tool_schemas().is_empty());
+        manager.shutdown();
+    }
+
+    #[test]
+    fn test_servers_whose_tool_names_collide_are_refused() {
+        // Server "a_b"'s tool "c" and server "a"'s tool "b_c" are both
+        // mcp_a_b_c.
+        let (Some(first), Some(second)) = (fake("c"), fake("b_c")) else {
+            eprintln!("python3 not installed, skipping");
+            return;
+        };
+        let err = McpManager::new(HashMap::from([
+            ("a_b".to_string(), first),
+            ("a".to_string(), second),
+        ]))
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("both have a tool named mcp_a_b_c"), "{err}");
     }
 }

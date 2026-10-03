@@ -67,6 +67,10 @@ const MAX_BODY_BYTES: usize = 1 << 20;
 /// The most header lines accepted.
 const MAX_HEADERS: usize = 100;
 
+/// The MCP servers this `faber serve` defines - those its agents (and
+/// `--run-agent` workers) can be given - for the web UI to offer.
+pub static MCP_SERVERS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
 /// Most bytes of a request's line and headers.
 const MAX_HEADER_BYTES: usize = 64 << 10;
 
@@ -383,6 +387,7 @@ fn editable_config(config: &db::AgentConfig) -> serde_json::Value {
         "context_window": config.context_window,
         "parameters": config.parameters,
         "tools": config.tools,
+        "mcp_servers": config.mcp_servers,
         "unsafe_tools": config.unsafe_tools == Some(true),
         "cwd": config.cwd,
         "profile": config.profile,
@@ -456,6 +461,23 @@ fn apply_config(
                         Some(tools)
                     }
                     _ => return Err("'tools' must be a list of tool names, or null".to_string()),
+                }
+            }
+            "mcp_servers" => {
+                config.mcp_servers = match value {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::Array(names) => Some(
+                        names
+                            .iter()
+                            .map(|n| n.as_str().map(String::from))
+                            .collect::<Option<Vec<_>>>()
+                            .ok_or("'mcp_servers' must list server names")?,
+                    ),
+                    _ => {
+                        return Err(
+                            "'mcp_servers' must be a list of server names, or null".to_string()
+                        );
+                    }
                 }
             }
             other => {
@@ -1153,6 +1175,7 @@ fn api(
         }
         ("GET", ["info"]) => Response::ok(serde_json::json!({
             "cwd": std::env::current_dir().ok(),
+            "mcp_servers": MCP_SERVERS.get().cloned().unwrap_or_default(),
         })),
         (
             _,
@@ -1769,6 +1792,21 @@ mod tests {
         assert_eq!(config["model"], "qwen");
         assert_eq!(config["unsafe_tools"], true);
         assert_eq!(config["tools"], serde_json::json!(["read_file", "glob"]));
+        // Which MCP servers' tools it gets: the user's to say.
+        let r = call(
+            &db,
+            "PATCH",
+            "/api/agents/boss/config",
+            r#"{"mcp_servers": ["github"]}"#,
+        );
+        assert_eq!(json(&r)["mcp_servers"], serde_json::json!(["github"]));
+        let r = call(
+            &db,
+            "PATCH",
+            "/api/agents/boss/config",
+            r#"{"mcp_servers": "github"}"#,
+        );
+        assert_eq!(r.status, 400);
         let r = call(
             &db,
             "PATCH",

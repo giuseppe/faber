@@ -841,7 +841,7 @@ pub fn tool_call(
 
     info!("Requesting tool {}", tool_name);
 
-    if let Some(ref mcp) = ctx.mcp_manager {
+    if let Some(ref mcp) = ctx.mcp {
         if mcp.has_tool(tool_name) {
             info!("Dispatching to MCP tool {}", tool_name);
             let content = match mcp.call_tool(tool_name, &req.function.arguments) {
@@ -1115,7 +1115,7 @@ fn run_tool_call_group(
                     buffered.db = ctx.db.clone();
                     buffered.agent_name = ctx.agent_name.clone();
                     buffered.extra = ctx.extra.clone();
-                    buffered.mcp_manager = ctx.mcp_manager.clone();
+                    buffered.mcp = ctx.mcp.clone();
                     buffered.max_tool_output_chars = ctx.max_tool_output_chars;
                     buffered.context_window = ctx.context_window;
                     buffered.interrupt = ctx.interrupt.clone();
@@ -1184,7 +1184,7 @@ pub fn run_tool_calls(
             // tool_call dispatches to MCP first, even for a name that
             // shadows a built-in, and MCP tools are opaque.
             let is_mcp = ctx
-                .mcp_manager
+                .mcp
                 .as_ref()
                 .is_some_and(|m| m.has_tool(&tc.function.name));
             if is_mcp {
@@ -1245,7 +1245,7 @@ fn request_tools(
     for name in names {
         tools.push(serde_json::from_str(&tools_collection[name].schema)?);
     }
-    if let Some(ref mcp) = ctx.mcp_manager {
+    if let Some(ref mcp) = ctx.mcp {
         let mut mcp_tools = mcp.get_tool_schemas();
         mcp_tools.sort_by(|a, b| {
             let name =
@@ -1513,7 +1513,7 @@ fn post_request_with_mode_and_recursion(
                     .clone()
                     .unwrap_or_else(|| "".to_string());
                 let has_tools = !tools_collection.is_empty()
-                    || ctx.mcp_manager.as_ref().map_or(false, |m| m.has_tools());
+                    || ctx.mcp.as_ref().map_or(false, |m| m.has_tools());
                 finish = finish_reason != "" && (finish_reason != "tool_calls" || !has_tools);
                 if finish_reason == "error" {
                     let native_finish_reason = choice

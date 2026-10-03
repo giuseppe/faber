@@ -136,6 +136,11 @@
       <label class="inline"><input type="checkbox" name="all_tools" id="all-tools"> every tool the session has</label>
       <div id="tool-list" class="tool-list"></div>
     </fieldset>
+    <fieldset>
+      <legend>MCP servers</legend>
+      <label class="inline"><input type="checkbox" id="mcp-default"> the default: none - or, for a session's own agent, every one it defines</label>
+      <div id="mcp-list" class="tool-list"></div>
+    </fieldset>
     <label>Request parameters (JSON) <textarea name="parameters" rows="2" spellcheck="false" placeholder='e.g. {"temperature": 0.2}'></textarea></label>
     <p class="hint">Changes apply from its next turn or task. A session started with --unsafe-tools gives its own agent the unsafe tools either way.</p>
     <p id="agent-error" class="error" hidden></p>
@@ -216,6 +221,11 @@
       <legend>Tools</legend>
       <label class="inline"><input type="checkbox" id="profile-all-tools"> every tool the session has</label>
       <div id="profile-tool-list" class="tool-list"></div>
+    </fieldset>
+    <fieldset>
+      <legend>MCP servers</legend>
+      <label class="inline"><input type="checkbox" id="profile-mcp-default"> not set: the default (none - or every one, for a session's own agent)</label>
+      <div id="profile-mcp-list" class="tool-list"></div>
     </fieldset>
     <label>Request parameters (JSON) <textarea name="parameters" rows="2" spellcheck="false" placeholder='e.g. {"reasoning_effort": "low"}'></textarea></label>
     <p class="hint">A profile never gives the unsafe tools, nor picks a working directory.</p>

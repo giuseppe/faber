@@ -719,7 +719,7 @@ mod tests {
         assert_eq!(worker.agent_name.as_deref(), Some("boss"));
         assert_eq!(worker.context_window, Some(32_000));
         assert!(worker.extra.is_none(), "workers can't spawn agents");
-        assert!(worker.mcp_manager.is_none());
+        assert!(worker.mcp.is_none());
     }
 
     #[test]

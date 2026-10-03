@@ -884,10 +884,35 @@ The format is `NAME=URL` for HTTP, or `NAME=sse:URL` for SSE. Can be
 repeated for multiple servers, and adds to (rather than replaces) any
 `mcp_servers` from the config file; a name that matches a config file entry
 overrides it. There's no CLI shortcut for stdio servers or per-server
-headers - use the config file for those.
+headers - use the config file for those. `--mcp-server NAME`, with no URL,
+names a server the config file defines.
 
-MCP tools are prefixed with `mcp_<server>_<tool>` to avoid name collisions.
-Use `/mcp-refresh` in chat to reload tool definitions.
+MCP tools are prefixed with `mcp_<server>_<tool>`; servers whose tools
+would end up with the same name (server `a_b`'s `c`, server `a`'s `b_c`)
+are refused at startup. Use `/mcp-refresh` in chat to reload tool
+definitions.
+
+### Which agents get which servers
+
+The config file and `--mcp-server` define the servers a faber process
+runs; each agent gets the tools of some of them:
+
+- The session's own agent - the chat's, a worker's, `faber prompt`'s - gets
+  the servers its settings list, or else every one the session defines,
+  plus those `--mcp-server` names. None with `--no-tools`.
+- Every other agent - sub-agents, the agents tasks and fan-outs run on -
+  only gets those its own settings list, from its profile or set by the
+  user: none by default.
+
+An agent's list is `"mcp_servers": ["github", ...]`, in a profile or an
+agent's settings: `faber agents set NAME --mcp-servers github,jira`
+(`none` for none, empty for the default), `faber profiles set`, or the
+web UI. Agents can't change it - an MCP server runs with the user's
+rights - so what a server may do is the user's choice, made with whom
+they give it to. Servers run in the process that runs the agent: one
+given on `faber chat`'s command line doesn't exist in a separate
+`faber worker`, and an agent listing a server its process doesn't define
+gets the others' tools only (with a warning in the log).
 
 ## Persistence
 
@@ -1045,7 +1070,7 @@ name it controls.
     --tool-choice <MODE>     Tool usage mode: auto, none, required
     --api-key <PATH>         File containing the API key
     --parameter <K=V>        Model parameter (can be repeated)
-    --mcp-server <N=URL>     Add a remote MCP server (can be repeated); see MCP section
+    --mcp-server <N[=URL]>   Give the session's agent an MCP server, adding a remote one with =URL (can be repeated); see MCP section
     --db-path <PATH>         SQLite database for persistent storage
     --agent <NAME>           Start chat as this agent instead of 'default'
     --profile <NAME>         Make the chat's agent from this profile (see Profiles)
