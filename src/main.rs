@@ -8521,11 +8521,7 @@ fn run_scheduled_task(
     tools: Arc<ToolTaskTools>,
     tx: mpsc::Sender<(Option<String>, String, Message, Message)>,
 ) {
-    let command = if task.command.is_empty() {
-        task.description.clone()
-    } else {
-        task.command.clone()
-    };
+    let command = task.command.clone();
 
     let db_opt: Option<Arc<dyn DbBackend>> = Some(db.clone());
     let executed = execute_scheduled_command(&command, tools.for_task(&task), &db_opt);

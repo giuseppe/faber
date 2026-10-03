@@ -595,9 +595,8 @@ column. `--since`, `--last` and `--agent` work with it too.
  4  | nightly report | -       | 0 0 3 * * * *   | scheduled | in 13h   | -        | 0    | -
 ```
 
-`faber tasks` only reads: it never creates a database (a wrong path is an
-error, not an empty table) and never upgrades or changes one - open a
-database from an older faber once with `faber chat` first. A relative
+`faber tasks` only reads: it never creates or changes a database (a
+wrong path is an error, not an empty table). A relative
 `db_path` in a config file is relative to the current directory.
 
 A task is "active" when it was created, started or finished a run.

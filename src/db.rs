@@ -199,8 +199,7 @@ const CLAIM_ABANDONED: &str = "claimed_by IS NULL OR claimed_by NOT IN (
     SELECT session_id FROM agents
     WHERE session_id IS NOT NULL AND heartbeat_at >= datetime('now', '-30 seconds'))";
 
-/// The columns and constraints of `scheduled_tasks`, as created fresh and
-/// as rebuilt by `rebuild_task_table_if_needed`.
+/// The columns and constraints of `scheduled_tasks`.
 const TASK_TABLE_DEFINITION: &str = "
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_name TEXT,
@@ -231,54 +230,6 @@ const TASK_TABLE_DEFINITION: &str = "
     CHECK(agent_name IS NULL OR profile IS NULL),
     FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE SET NULL";
 
-/// Every column of `TASK_TABLE_DEFINITION`, for copying rows across.
-const TASK_TABLE_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, kind, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, depends_on, profile, run_safe, cwd, stop_requested";
-
-/// Brings an existing `scheduled_tasks` table to `TASK_TABLE_DEFINITION`
-/// when its constraints are older: its `status` one predates the `held`
-/// state, or it lacks the one keeping `agent_name` and `profile` apart. SQLite can't
-/// change a CHECK constraint in place, so the table is rebuilt: a new one
-/// is created, the rows copied over, and it takes the old one's place, all
-/// in one transaction. The id counter is carried over too, so ids of
-/// deleted tasks are never handed out again.
-fn rebuild_task_table_if_needed(conn: &Connection) -> Result<(), rusqlite::Error> {
-    let sql: String = conn.query_row(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'scheduled_tasks'",
-        [],
-        |row| row.get(0),
-    )?;
-    if sql.contains("'held'") && sql.contains("profile IS NULL") {
-        return Ok(());
-    }
-    let next_id: i64 = conn
-        .query_row(
-            "SELECT seq FROM sqlite_sequence WHERE name = 'scheduled_tasks'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    // Foreign key enforcement can't change inside a transaction, and has
-    // to be off while the table is swapped.
-    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-    let result = conn.execute_batch(&format!(
-        "BEGIN;
-         CREATE TABLE scheduled_tasks_new ({definition});
-         INSERT INTO scheduled_tasks_new ({columns}) SELECT {columns} FROM scheduled_tasks;
-         DROP TABLE scheduled_tasks;
-         ALTER TABLE scheduled_tasks_new RENAME TO scheduled_tasks;
-         UPDATE sqlite_sequence SET seq = MAX(seq, {next_id}) WHERE name = 'scheduled_tasks';
-         COMMIT;",
-        definition = TASK_TABLE_DEFINITION,
-        columns = TASK_TABLE_COLUMNS,
-        next_id = next_id,
-    ));
-    if result.is_err() {
-        let _ = conn.execute_batch("ROLLBACK;");
-    }
-    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-    result
-}
-
 pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     conn.execute_batch(&format!(
@@ -292,7 +243,15 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
         CREATE TABLE IF NOT EXISTS agents (
             name TEXT PRIMARY KEY NOT NULL,
             description TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            session_id TEXT DEFAULT NULL,
+            heartbeat_at TEXT DEFAULT NULL,
+            -- A sub-agent whose parent is deleted (sub-agents are, once
+            -- done) becomes a top-level agent rather than going too: its
+            -- own sub-agents may still be running.
+            parent TEXT DEFAULT NULL REFERENCES agents(name) ON DELETE SET NULL,
+            activity TEXT DEFAULT NULL,
+            activity_at TEXT DEFAULT NULL
         );
 
         CREATE TABLE IF NOT EXISTS agent_data (
@@ -336,64 +295,10 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
         ",
     )?;
 
-    let _ = conn
-        .execute_batch("ALTER TABLE scheduled_tasks ADD COLUMN command TEXT NOT NULL DEFAULT '';");
-    let _ =
-        conn.execute_batch("ALTER TABLE scheduled_tasks ADD COLUMN max_runs INTEGER DEFAULT NULL;");
-    let _ = conn.execute_batch(
-        "ALTER TABLE scheduled_tasks ADD COLUMN run_count INTEGER NOT NULL DEFAULT 0;",
-    );
-
-    for column in [
-        "claimed_by TEXT DEFAULT NULL",
-        "started_at TEXT DEFAULT NULL",
-        "last_outcome TEXT DEFAULT NULL",
-        "last_exit_code INTEGER DEFAULT NULL",
-        "last_result TEXT DEFAULT NULL",
-        "depends_on TEXT DEFAULT NULL",
-        "profile TEXT DEFAULT NULL",
-        "run_safe INTEGER NOT NULL DEFAULT 0",
-        "cwd TEXT DEFAULT NULL",
-        "stop_requested INTEGER NOT NULL DEFAULT 0",
-        "kind TEXT NOT NULL DEFAULT 'tool' CHECK(kind IN ('tool', 'prompt'))",
-    ] {
-        let _ = conn.execute_batch(&format!(
-            "ALTER TABLE scheduled_tasks ADD COLUMN {};",
-            column
-        ));
-    }
-    migrate_task_enabled_to_status(conn)?;
-    rebuild_task_table_if_needed(conn)?;
-    // Tasks made before prompt tasks existed whose command is plain text
-    // could only fail; they're instructions for an agent. Ones that already
-    // ran are left as they were.
-    conn.execute_batch(
-        "UPDATE scheduled_tasks
-         SET kind = 'prompt',
-             command = CASE WHEN trim(command) = '' THEN description ELSE command END
-         WHERE kind = 'tool' AND status IN ('scheduled', 'disabled')
-           AND trim(CASE WHEN trim(command) = '' THEN description ELSE command END) != ''
-           AND COALESCE(
-                 CASE WHEN json_valid(CASE WHEN trim(command) = '' THEN description ELSE command END)
-                      THEN json_type(CASE WHEN trim(command) = '' THEN description ELSE command END, '$.tool')
-                 END, '') != 'text';",
-    )?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_tasks_due ON scheduled_tasks(status, next_run_at);
          CREATE INDEX IF NOT EXISTS idx_tasks_agent ON scheduled_tasks(agent_name);",
     )?;
-
-    let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN session_id TEXT DEFAULT NULL;");
-    let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN heartbeat_at TEXT DEFAULT NULL;");
-    // A sub-agent whose parent is deleted (sub-agents are, once done)
-    // becomes a top-level agent rather than going too: its own sub-agents
-    // may still be running.
-    let _ = conn.execute_batch(
-        "ALTER TABLE agents ADD COLUMN parent TEXT DEFAULT NULL
-             REFERENCES agents(name) ON DELETE SET NULL;",
-    );
-    let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN activity TEXT DEFAULT NULL;");
-    let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN activity_at TEXT DEFAULT NULL;");
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS profiles (
@@ -462,7 +367,7 @@ fn initialize_kb(conn: &Connection) -> Result<(), rusqlite::Error> {
 }
 
 /// Opens an existing database without changing it in any way: no file is
-/// created if it's missing, no schema is created or migrated, and nothing
+/// created if it's missing, no schema is created, and nothing
 /// can be written. For commands that only look (`faber tasks`), so that
 /// pointing one at the wrong path is an error instead of quietly creating
 /// an empty database that then looks like there's nothing in it.
@@ -479,17 +384,6 @@ pub fn open_read_only(path: &str) -> Result<Connection, Box<dyn Error>> {
     if !table_has_column(&conn, "scheduled_tasks", "id").map_err(|_| not_faber())? {
         return Err(not_faber().into());
     }
-    if !table_has_column(&conn, "scheduled_tasks", "status")?
-        || !table_has_column(&conn, "scheduled_tasks", "kind")?
-        || !table_has_column(&conn, "agents", "activity")?
-        || !table_has_column(&conn, "scheduled_tasks", "profile")?
-    {
-        return Err(format!(
-            "{} is from an older version of faber: open it once with `faber chat` to upgrade it",
-            shown
-        )
-        .into());
-    }
     Ok(conn)
 }
 
@@ -502,29 +396,6 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
         }
     }
     Ok(false)
-}
-
-/// Replaces the old `enabled` flag of databases created before tasks had a
-/// `status`: enabled tasks are `scheduled`; disabled ones are `done` if
-/// they had run their course (a one-shot that ran, a cron task at its
-/// `max_runs`), `disabled` otherwise.
-fn migrate_task_enabled_to_status(conn: &Connection) -> Result<(), rusqlite::Error> {
-    if !table_has_column(conn, "scheduled_tasks", "enabled")? {
-        return Ok(());
-    }
-    conn.execute_batch(
-        "BEGIN;
-         ALTER TABLE scheduled_tasks ADD COLUMN status TEXT NOT NULL DEFAULT 'scheduled'
-             CHECK(status IN ('scheduled', 'running', 'done', 'disabled'));
-         UPDATE scheduled_tasks SET status = CASE
-             WHEN enabled = 1 THEN 'scheduled'
-             WHEN run_count > 0 AND (task_type = 'oneshot'
-                 OR (max_runs IS NOT NULL AND run_count >= max_runs)) THEN 'done'
-             ELSE 'disabled' END;
-         DROP INDEX IF EXISTS idx_tasks_next_run;
-         ALTER TABLE scheduled_tasks DROP COLUMN enabled;
-         COMMIT;",
-    )
 }
 
 // --- Session ownership ---
@@ -746,23 +617,6 @@ pub fn delete_agent_data(
     Ok(rows > 0)
 }
 
-#[cfg(test)]
-pub fn list_agent_data(
-    conn: &Connection,
-    agent: &str,
-) -> Result<Vec<(String, String)>, Box<dyn Error>> {
-    let mut stmt =
-        conn.prepare("SELECT key, value FROM agent_data WHERE agent_name = ?1 ORDER BY key")?;
-    let rows = stmt.query_map(params![agent], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let mut data = Vec::new();
-    for row in rows {
-        data.push(row?);
-    }
-    Ok(data)
-}
-
 // --- Scheduled Tasks ---
 
 fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
@@ -800,71 +654,12 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
 
 const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, kind, depends_on, profile, run_safe, cwd, stop_requested";
 
-#[cfg(test)]
-pub fn create_cron_task(
-    conn: &Connection,
-    name: &str,
-    description: &str,
-    cron_expr: &str,
-    command: &str,
-    agent_name: Option<&str>,
-    max_runs: Option<i64>,
-) -> Result<i64, Box<dyn Error>> {
-    let schedule = Schedule::from_str(cron_expr)
-        .map_err(|e| format!("Invalid cron expression '{}': {}", cron_expr, e))?;
-
-    let next_run = schedule
-        .upcoming(chrono::Utc)
-        .next()
-        .map(|dt| dt.to_rfc3339());
-
-    conn.execute(
-        "INSERT INTO scheduled_tasks (name, description, task_type, cron_expression, next_run_at, agent_name, command, max_runs, kind)
-         VALUES (?1, ?2, 'cron', ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            name,
-            description,
-            cron_expr,
-            next_run,
-            agent_name,
-            effective_command(command, description),
-            max_runs,
-            kind_for_command(effective_command(command, description))
-        ],
-    )?;
-
-    Ok(conn.last_insert_rowid())
-}
-
 /// Whether `command` is a `{"tool": "<name>", ...}` call.
 pub fn is_tool_call(command: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(command)
         .ok()
         .and_then(|v| v.get("tool")?.as_str().map(|t| !t.is_empty()))
         .unwrap_or(false)
-}
-
-/// The kind of task `command` makes: a tool call runs as one, anything else
-/// is an instruction for an agent. An empty command stays a `tool` task,
-/// which fails saying so when it runs.
-#[cfg(test)]
-fn kind_for_command(command: &str) -> &'static str {
-    if command.trim().is_empty() || is_tool_call(command) {
-        TaskKind::TOOL
-    } else {
-        TaskKind::PROMPT
-    }
-}
-
-/// What a task runs: its command, or its description if the command is
-/// empty (as the scheduler has always done).
-#[cfg(test)]
-fn effective_command<'a>(command: &'a str, description: &'a str) -> &'a str {
-    if command.trim().is_empty() {
-        description
-    } else {
-        command
-    }
 }
 
 /// A task's schedule and dependencies, checked, as they're stored.
@@ -1104,34 +899,6 @@ pub fn set_task_target(
         params![task_id, agent, profile],
     )?;
     Ok(rows > 0)
-}
-
-#[cfg(test)]
-pub fn create_oneshot_task(
-    conn: &Connection,
-    name: &str,
-    description: &str,
-    run_at: &str,
-    command: &str,
-    agent_name: Option<&str>,
-) -> Result<i64, Box<dyn Error>> {
-    chrono::DateTime::parse_from_rfc3339(run_at)
-        .map_err(|e| format!("Invalid RFC 3339 datetime '{}': {}", run_at, e))?;
-
-    conn.execute(
-        "INSERT INTO scheduled_tasks (name, description, task_type, run_at, next_run_at, agent_name, command, kind)
-         VALUES (?1, ?2, 'oneshot', ?3, ?3, ?4, ?5, ?6)",
-        params![
-            name,
-            description,
-            run_at,
-            agent_name,
-            effective_command(command, description),
-            kind_for_command(effective_command(command, description))
-        ],
-    )?;
-
-    Ok(conn.last_insert_rowid())
 }
 
 pub fn delete_task(conn: &Connection, task_id: i64) -> Result<bool, Box<dyn Error>> {
@@ -2318,6 +2085,160 @@ pub fn gc_agents(conn: &Connection) -> Result<Vec<String>, Box<dyn Error>> {
 mod tests {
     use super::*;
 
+    fn list_agent_data(
+        conn: &Connection,
+        agent: &str,
+    ) -> Result<Vec<(String, String)>, Box<dyn Error>> {
+        let mut stmt =
+            conn.prepare("SELECT key, value FROM agent_data WHERE agent_name = ?1 ORDER BY key")?;
+        let rows = stmt.query_map(params![agent], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut data = Vec::new();
+        for row in rows {
+            data.push(row?);
+        }
+        Ok(data)
+    }
+
+    fn create_cron_task(
+        conn: &Connection,
+        name: &str,
+        description: &str,
+        cron_expr: &str,
+        command: &str,
+        agent_name: Option<&str>,
+        max_runs: Option<i64>,
+    ) -> Result<i64, Box<dyn Error>> {
+        let schedule = Schedule::from_str(cron_expr)
+            .map_err(|e| format!("Invalid cron expression '{}': {}", cron_expr, e))?;
+
+        let next_run = schedule
+            .upcoming(chrono::Utc)
+            .next()
+            .map(|dt| dt.to_rfc3339());
+
+        conn.execute(
+            "INSERT INTO scheduled_tasks (name, description, task_type, cron_expression, next_run_at, agent_name, command, max_runs, kind)
+             VALUES (?1, ?2, 'cron', ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                name,
+                description,
+                cron_expr,
+                next_run,
+                agent_name,
+                effective_command(command, description),
+                max_runs,
+                kind_for_command(effective_command(command, description))
+            ],
+        )?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// The kind of task `command` makes: a tool call runs as one, anything else
+    /// is an instruction for an agent. An empty command stays a `tool` task,
+    /// which fails saying so when it runs.
+    fn kind_for_command(command: &str) -> &'static str {
+        if command.trim().is_empty() || is_tool_call(command) {
+            TaskKind::TOOL
+        } else {
+            TaskKind::PROMPT
+        }
+    }
+
+    /// What a task runs: its command, or its description if the command is
+    /// empty (as the scheduler has always done).
+    fn effective_command<'a>(command: &'a str, description: &'a str) -> &'a str {
+        if command.trim().is_empty() {
+            description
+        } else {
+            command
+        }
+    }
+
+    fn create_oneshot_task(
+        conn: &Connection,
+        name: &str,
+        description: &str,
+        run_at: &str,
+        command: &str,
+        agent_name: Option<&str>,
+    ) -> Result<i64, Box<dyn Error>> {
+        chrono::DateTime::parse_from_rfc3339(run_at)
+            .map_err(|e| format!("Invalid RFC 3339 datetime '{}': {}", run_at, e))?;
+
+        conn.execute(
+            "INSERT INTO scheduled_tasks (name, description, task_type, run_at, next_run_at, agent_name, command, kind)
+             VALUES (?1, ?2, 'oneshot', ?3, ?3, ?4, ?5, ?6)",
+            params![
+                name,
+                description,
+                run_at,
+                agent_name,
+                effective_command(command, description),
+                kind_for_command(effective_command(command, description))
+            ],
+        )?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    fn agent(name: &str) -> KbViewer {
+        KbViewer::Agent(Some(name.to_string()))
+    }
+
+    fn due_task_after(conn: &Connection, name: &str, depends_on: Vec<i64>) -> i64 {
+        create_task(
+            conn,
+            &NewTask {
+                name: name.to_string(),
+                description: String::new(),
+                kind: TaskKind::PROMPT.to_string(),
+                command: format!("do {}", name),
+                agent_name: None,
+                schedule: TaskSchedule::Once {
+                    at: (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339(),
+                },
+                held: false,
+                depends_on,
+                profile: None,
+                run_safe: false,
+                cwd: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn pending_names(conn: &Connection) -> Vec<String> {
+        get_pending_tasks(conn)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    }
+
+    fn run_task(conn: &Connection, id: i64, succeeded: bool) {
+        assert!(
+            claim_task(conn, id, "s").unwrap(),
+            "task {id} should be claimable"
+        );
+        let outcome = TaskOutcome {
+            succeeded,
+            exit_code: None,
+            result: String::new(),
+        };
+        assert!(finish_task(conn, id, "s", &outcome).unwrap());
+    }
+
+    fn tags(list: &[&str]) -> Vec<String> {
+        list.iter().map(|t| t.to_string()).collect()
+    }
+
+    fn titles(hits: &[KbHit]) -> Vec<&str> {
+        hits.iter().map(|h| h.note.title.as_str()).collect()
+    }
+
     fn test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         initialize_db(&conn).unwrap();
@@ -2920,24 +2841,7 @@ mod tests {
     }
 
     #[test]
-    fn test_open_read_only_leaves_old_and_foreign_databases_alone() {
-        let path = temp_db_path("old");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE scheduled_tasks (id INTEGER PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1);",
-        )
-        .unwrap();
-        drop(conn);
-        let err = open_read_only(&path).unwrap_err().to_string();
-        assert!(err.contains("older version of faber"), "{err}");
-        let conn = Connection::open(&path).unwrap();
-        assert!(
-            !table_has_column(&conn, "scheduled_tasks", "status").unwrap(),
-            "not migrated"
-        );
-        drop(conn);
-        std::fs::remove_file(&path).unwrap();
-
+    fn test_open_read_only_refuses_foreign_databases() {
         let path = temp_db_path("foreign");
         Connection::open(&path)
             .unwrap()
@@ -3024,38 +2928,6 @@ mod tests {
         );
         assert!(!is_tool_call(r#"{"tool": ""}"#));
         assert!(!is_tool_call("[1, 2]"));
-    }
-
-    #[test]
-    fn test_scheduled_plain_text_tool_tasks_become_prompt_tasks() {
-        let conn = test_db();
-        let at = chrono::Utc::now().to_rfc3339();
-        let insert = |name: &str, command: &str, status: &str| {
-            conn.execute(
-                "INSERT INTO scheduled_tasks (name, description, task_type, run_at, next_run_at, command, kind, status)
-                 VALUES (?1, 'from the description', 'oneshot', ?2, ?2, ?3, 'tool', ?4)",
-                params![name, at, command, status],
-            )
-            .unwrap();
-        };
-        insert("text", "Tell a joke", "scheduled");
-        insert("empty", "", "disabled");
-        insert("call", r#"{"tool":"glob"}"#, "scheduled");
-        insert("ran", "Tell a joke", "done");
-        initialize_db(&conn).unwrap();
-        let kinds: Vec<(String, String, String)> = list_tasks(&conn, None)
-            .unwrap()
-            .into_iter()
-            .map(|t| (t.name, t.kind, t.command))
-            .collect();
-        let expected = [
-            ("text", "prompt", "Tell a joke"),
-            ("empty", "prompt", "from the description"),
-            ("call", "tool", r#"{"tool":"glob"}"#),
-            ("ran", "tool", "Tell a joke"),
-        ]
-        .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()));
-        assert_eq!(kinds, expected);
     }
 
     #[test]
@@ -3167,77 +3039,6 @@ mod tests {
             get_task(&conn, held).unwrap().unwrap().status,
             TaskStatus::HELD
         );
-    }
-
-    #[test]
-    fn test_task_table_rebuilt_to_allow_held() {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_db(&conn).unwrap();
-        // Recreate the table as it was before `held`: same columns, but a
-        // status constraint without it.
-        conn.execute_batch(&format!(
-            "PRAGMA foreign_keys = OFF;
-             DROP TABLE scheduled_tasks;
-             CREATE TABLE scheduled_tasks ({});
-             PRAGMA foreign_keys = ON;",
-            TASK_TABLE_DEFINITION.replace("'scheduled', 'held',", "'scheduled',")
-        ))
-        .unwrap();
-        create_agent(&conn, "bob", "").unwrap();
-        let at = chrono::Utc::now().to_rfc3339();
-        let keep = create_oneshot_task(&conn, "keep", "d", &at, "say hi", Some("bob")).unwrap();
-        let gone = create_oneshot_task(&conn, "gone", "", &at, "x", None).unwrap();
-        delete_task(&conn, gone).unwrap();
-        assert!(
-            set_task_held(&conn, keep, true).is_err(),
-            "old constraint rejects held"
-        );
-
-        initialize_db(&conn).unwrap();
-
-        let task = get_task(&conn, keep).unwrap().unwrap();
-        assert_eq!(
-            (task.name.as_str(), task.agent_name.as_deref()),
-            ("keep", Some("bob"))
-        );
-        assert_eq!(task.kind, TaskKind::PROMPT);
-        assert!(set_task_held(&conn, keep, true).unwrap());
-        // Ids of deleted tasks aren't handed out again.
-        let next = create_oneshot_task(&conn, "next", "", &at, "x", None).unwrap();
-        assert!(next > gone, "{next} <= {gone}");
-        // Indexes and the agent foreign key are back.
-        let indexes: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'scheduled_tasks'")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert!(
-            indexes.contains(&"idx_tasks_due".to_string()),
-            "{indexes:?}"
-        );
-        assert!(
-            indexes.contains(&"idx_tasks_agent".to_string()),
-            "{indexes:?}"
-        );
-        delete_agent(&conn, "bob").unwrap();
-        assert!(
-            get_task(&conn, keep).unwrap().is_none(),
-            "deleting an agent still deletes its tasks"
-        );
-    }
-
-    fn tags(list: &[&str]) -> Vec<String> {
-        list.iter().map(|t| t.to_string()).collect()
-    }
-
-    fn agent(name: &str) -> KbViewer {
-        KbViewer::Agent(Some(name.to_string()))
-    }
-
-    fn titles(hits: &[KbHit]) -> Vec<&str> {
-        hits.iter().map(|h| h.note.title.as_str()).collect()
     }
 
     #[test]
@@ -3545,49 +3346,6 @@ mod tests {
         assert_eq!(agent_lineage(&conn, "leaf").unwrap(), ["leaf"]);
     }
 
-    fn due_task_after(conn: &Connection, name: &str, depends_on: Vec<i64>) -> i64 {
-        create_task(
-            conn,
-            &NewTask {
-                name: name.to_string(),
-                description: String::new(),
-                kind: TaskKind::PROMPT.to_string(),
-                command: format!("do {}", name),
-                agent_name: None,
-                schedule: TaskSchedule::Once {
-                    at: (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339(),
-                },
-                held: false,
-                depends_on,
-                profile: None,
-                run_safe: false,
-                cwd: None,
-            },
-        )
-        .unwrap()
-    }
-
-    fn pending_names(conn: &Connection) -> Vec<String> {
-        get_pending_tasks(conn)
-            .unwrap()
-            .into_iter()
-            .map(|t| t.name)
-            .collect()
-    }
-
-    fn run_task(conn: &Connection, id: i64, succeeded: bool) {
-        assert!(
-            claim_task(conn, id, "s").unwrap(),
-            "task {id} should be claimable"
-        );
-        let outcome = TaskOutcome {
-            succeeded,
-            exit_code: None,
-            result: String::new(),
-        };
-        assert!(finish_task(conn, id, "s", &outcome).unwrap());
-    }
-
     #[test]
     fn test_dependent_tasks_wait_for_their_dependencies() {
         let conn = test_db();
@@ -3666,61 +3424,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("no task #999"), "{err}");
-    }
-
-    #[test]
-    fn test_migration_from_enabled_flag() {
-        let conn = Connection::open_in_memory().unwrap();
-        // The table as it was before tasks had a status.
-        conn.execute_batch(
-            "CREATE TABLE scheduled_tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                agent_name TEXT,
-                name TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                task_type TEXT NOT NULL CHECK(task_type IN ('cron', 'oneshot')),
-                cron_expression TEXT,
-                run_at TEXT,
-                next_run_at TEXT,
-                last_run_at TEXT,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                command TEXT NOT NULL DEFAULT '',
-                max_runs INTEGER DEFAULT NULL,
-                run_count INTEGER NOT NULL DEFAULT 0
-             );
-             CREATE INDEX idx_tasks_next_run ON scheduled_tasks(next_run_at) WHERE enabled = 1;
-             INSERT INTO scheduled_tasks (name, task_type, enabled, run_count)
-                 VALUES ('active', 'cron', 1, 3);
-             INSERT INTO scheduled_tasks (name, task_type, enabled, run_count)
-                 VALUES ('ran once', 'oneshot', 0, 1);
-             INSERT INTO scheduled_tasks (name, task_type, enabled, run_count, max_runs)
-                 VALUES ('used up', 'cron', 0, 5, 5);
-             INSERT INTO scheduled_tasks (name, task_type, enabled, run_count)
-                 VALUES ('switched off', 'cron', 0, 1);",
-        )
-        .unwrap();
-
-        initialize_db(&conn).unwrap();
-        // Running it again on the migrated database is a no-op.
-        initialize_db(&conn).unwrap();
-
-        let statuses: Vec<(String, String)> = list_tasks(&conn, None)
-            .unwrap()
-            .into_iter()
-            .map(|t| (t.name, t.status))
-            .collect();
-        assert_eq!(
-            statuses,
-            [
-                ("active", "scheduled"),
-                ("ran once", "done"),
-                ("used up", "done"),
-                ("switched off", "disabled"),
-            ]
-            .map(|(n, s)| (n.to_string(), s.to_string()))
-        );
-        assert!(!table_has_column(&conn, "scheduled_tasks", "enabled").unwrap());
     }
 
     #[test]
@@ -3836,44 +3539,6 @@ mod tests {
         };
         assert!(finish_task(&conn, id, "s", &outcome).unwrap());
         assert!(!set_task_target(&conn, id, None, None).unwrap(), "done");
-    }
-
-    #[test]
-    fn test_task_table_rebuilt_to_keep_agent_and_profile_apart() {
-        let conn = Connection::open_in_memory().unwrap();
-        initialize_db(&conn).unwrap();
-        // The table as it was before profiles: no column, no constraint.
-        conn.execute_batch(&format!(
-            "PRAGMA foreign_keys = OFF;
-             DROP TABLE scheduled_tasks;
-             CREATE TABLE scheduled_tasks ({});
-             PRAGMA foreign_keys = ON;",
-            TASK_TABLE_DEFINITION
-                .replace("    profile TEXT DEFAULT NULL,\n", "")
-                .replace("    CHECK(agent_name IS NULL OR profile IS NULL),\n", "")
-        ))
-        .unwrap();
-        assert!(!table_has_column(&conn, "scheduled_tasks", "profile").unwrap());
-        create_agent(&conn, "bob", "").unwrap();
-        let at = chrono::Utc::now().to_rfc3339();
-        let keep = create_oneshot_task(&conn, "keep", "", &at, "say hi", Some("bob")).unwrap();
-
-        initialize_db(&conn).unwrap();
-
-        let task = get_task(&conn, keep).unwrap().unwrap();
-        assert_eq!(
-            (task.agent_name.as_deref(), task.profile),
-            (Some("bob"), None)
-        );
-        assert!(
-            conn.execute(
-                "UPDATE scheduled_tasks SET profile = 'fast' WHERE id = ?1",
-                params![keep]
-            )
-            .is_err(),
-            "the constraint is in place"
-        );
-        assert!(set_task_target(&conn, keep, None, Some("fast")).unwrap());
     }
 
     #[test]
