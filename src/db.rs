@@ -1686,9 +1686,15 @@ pub struct AgentConfig {
     /// its maker does.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The MCP servers whose tools it gets, by the name they're defined
+    /// under (the config file's "mcp_servers", `--mcp-server`). Unset: none
+    /// - or, for a session's own agent, every one the session defines.
+    /// Only the user sets it: an MCP server runs with the user's rights.
+    #[serde(default)]
+    pub mcp_servers: Option<Vec<String>>,
 }
 
-const AGENT_CONFIG_FIELDS: [&str; 11] = [
+const AGENT_CONFIG_FIELDS: [&str; 12] = [
     "model",
     "endpoint",
     "system_prompt",
@@ -1700,6 +1706,7 @@ const AGENT_CONFIG_FIELDS: [&str; 11] = [
     "profile",
     "unsafe_tools",
     "cwd",
+    "mcp_servers",
 ];
 
 pub fn get_agent_config(
@@ -1714,12 +1721,11 @@ pub fn get_agent_config(
         // Strings are stored as they are, everything else as JSON; a value
         // that doesn't parse as what the field takes is ignored.
         let value = match field {
-            "max_tokens" | "context_window" | "parameters" | "tools" | "unsafe_tools" => {
-                match serde_json::from_str(&text) {
-                    Ok(value) => value,
-                    Err(_) => continue,
-                }
-            }
+            "max_tokens" | "context_window" | "parameters" | "tools" | "unsafe_tools"
+            | "mcp_servers" => match serde_json::from_str(&text) {
+                Ok(value) => value,
+                Err(_) => continue,
+            },
             _ => serde_json::Value::String(text),
         };
         fields.insert(field.to_string(), value);
@@ -1749,6 +1755,7 @@ fn merge_agent_config(base: AgentConfig, over: AgentConfig) -> AgentConfig {
         profile: over.profile.or(base.profile),
         unsafe_tools: over.unsafe_tools.or(base.unsafe_tools),
         cwd: over.cwd.or(base.cwd),
+        mcp_servers: over.mcp_servers.or(base.mcp_servers),
     }
 }
 
@@ -3478,6 +3485,7 @@ mod tests {
             profile: Some("fast".to_string()),
             unsafe_tools: Some(true),
             cwd: Some("/work".to_string()),
+            mcp_servers: Some(vec!["github".to_string()]),
         };
         set_agent_config(&conn, "alice", &config).unwrap();
         assert_eq!(get_agent_config(&conn, "alice").unwrap(), config);

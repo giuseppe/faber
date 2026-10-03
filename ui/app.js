@@ -872,6 +872,7 @@ async function openAgentDialog(name, from) {
     $("tool-list").replaceChildren(...state.tools.map((tool) => el("label", { class: "inline" },
       el("input", { type: "checkbox", name: "tool", value: tool, checked: chosen.has(tool) }), tool)));
     $("tool-list").classList.toggle("disabled", !config.tools);
+    fillMcp("mcp-default", "mcp-list", config.mcp_servers);
   } catch (e) {
     toast(e.message);
     return;
@@ -900,6 +901,7 @@ $("agent-profile").addEventListener("change", (e) => {
   $("all-tools").checked = !settings.tools;
   for (const box of form.querySelectorAll("input[name=tool]")) box.checked = chosen.has(box.value);
   $("tool-list").classList.toggle("disabled", !settings.tools);
+  fillMcp("mcp-default", "mcp-list", settings.mcp_servers);
 });
 $("new-agent-button").addEventListener("click", () => openAgentDialog(null));
 $("agent-cancel").addEventListener("click", () => $("agent-dialog").close());
@@ -940,6 +942,7 @@ $("agent-form").addEventListener("submit", async (e) => {
     parameters,
     tools: $("all-tools").checked ? null
       : [...form.querySelectorAll("input[name=tool]:checked")].map((c) => c.value),
+    mcp_servers: readMcp("mcp-default", "mcp-list"),
   };
   if (config.cwd && !config.cwd.startsWith("/")) return showAgentError("The working directory must be an absolute path.");
   // Made from a profile: recorded, with what the form says over it.
@@ -961,6 +964,28 @@ $("agent-form").addEventListener("submit", async (e) => {
     showAgentError(err.message);
   }
 });
+
+// The MCP server checkboxes of a settings form: `list` the chosen ones,
+// or null for the default (the "default" box ticked). Servers listed but
+// not defined by this faber serve are shown too, so saving keeps them.
+function fillMcp(defaultBox, box, list) {
+  const chosen = new Set(list || []);
+  const names = [...new Set([...(state.mcpServers || []), ...chosen])].sort();
+  $(defaultBox).checked = !list;
+  $(box).replaceChildren(...(names.length ? names.map((name) => el("label", { class: "inline" },
+    el("input", { type: "checkbox", name: "mcp", value: name, checked: chosen.has(name) }), name))
+    : [el("span", { class: "hint" }, "faber serve defines no MCP servers")]));
+  $(box).classList.toggle("disabled", !list);
+}
+
+function readMcp(defaultBox, box) {
+  if ($(defaultBox).checked) return null;
+  return [...$(box).querySelectorAll("input[name=mcp]:checked")].map((c) => c.value);
+}
+
+for (const [defaultBox, box] of [["mcp-default", "mcp-list"], ["profile-mcp-default", "profile-mcp-list"]]) {
+  $(defaultBox).addEventListener("change", (e) => $(box).classList.toggle("disabled", e.target.checked));
+}
 
 function uniqueName(base) {
   let name = base;
@@ -1310,6 +1335,7 @@ async function openProfileEditor(profile) {
   $("profile-tool-list").replaceChildren(...state.tools.map((tool) => el("label", { class: "inline" },
     el("input", { type: "checkbox", name: "tool", value: tool, checked: chosen.has(tool) }), tool)));
   $("profile-tool-list").classList.toggle("disabled", !s.tools);
+  fillMcp("profile-mcp-default", "profile-mcp-list", s.mcp_servers);
   // Kept as they were: what this form doesn't show.
   form.dataset.kept = JSON.stringify(s.api_key ? { api_key: s.api_key } : {});
   $("profile-dialog").showModal();
@@ -1343,6 +1369,7 @@ $("profile-form").addEventListener("submit", async (e) => {
     parameters,
     tools: $("profile-all-tools").checked ? undefined
       : [...form.querySelectorAll("input[name=tool]:checked")].map((c) => c.value),
+    mcp_servers: readMcp("profile-mcp-default", "profile-mcp-list") ?? undefined,
   };
   const name = value("name");
   if (!name) return showError("Give it a name.");
@@ -1540,7 +1567,11 @@ async function refresh() {
     const [agents, tasks, profiles] = await Promise.all([
       api("GET", "agents"), api("GET", "tasks"), api("GET", "profiles"),
     ]);
-    if (state.serverCwd === null) state.serverCwd = (await api("GET", "info")).cwd || "";
+    if (state.serverCwd === null) {
+      const info = await api("GET", "info");
+      state.serverCwd = info.cwd || "";
+      state.mcpServers = info.mcp_servers || [];
+    }
     state.agents = agents;
     state.tasks = tasks;
     state.profiles = profiles;
