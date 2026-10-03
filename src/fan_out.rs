@@ -164,6 +164,9 @@ fn worker_context(ctx: &ToolContext) -> ToolContext {
     worker_ctx.db = ctx.db.clone();
     worker_ctx.agent_name = ctx.agent_name.clone();
     worker_ctx.context_window = ctx.context_window;
+    // Its tools are the caller's own (see `worker_tools`), unsafe or not.
+    worker_ctx.unsafe_tools = ctx.unsafe_tools;
+    worker_ctx.cwd = ctx.cwd.clone();
     worker_ctx
 }
 

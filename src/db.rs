@@ -79,6 +79,11 @@ pub struct TaskRow {
     /// agent. Never set together with `agent_name`.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Made by an agent without unsafe tools: it runs on one without them
+    /// too, whoever picks it up - so a safe agent can't get work done by
+    /// an unsafe one through a task.
+    #[serde(default)]
+    pub run_safe: bool,
 }
 
 /// What a task's `command` is:
@@ -127,6 +132,9 @@ pub struct NewTask {
     /// not together with `agent_name`).
     #[serde(default)]
     pub profile: Option<String>,
+    /// See `TaskRow::run_safe`.
+    #[serde(default)]
+    pub run_safe: bool,
 }
 
 /// A task's lifecycle:
@@ -207,11 +215,12 @@ const TASK_TABLE_DEFINITION: &str = "
     last_result TEXT DEFAULT NULL,
     depends_on TEXT DEFAULT NULL,
     profile TEXT DEFAULT NULL,
+    run_safe INTEGER NOT NULL DEFAULT 0,
     CHECK(agent_name IS NULL OR profile IS NULL),
     FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE SET NULL";
 
 /// Every column of `TASK_TABLE_DEFINITION`, for copying rows across.
-const TASK_TABLE_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, kind, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, depends_on, profile";
+const TASK_TABLE_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, kind, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, depends_on, profile, run_safe";
 
 /// Brings an existing `scheduled_tasks` table to `TASK_TABLE_DEFINITION`
 /// when its constraints are older: its `status` one predates the `held`
@@ -331,6 +340,7 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
         "last_result TEXT DEFAULT NULL",
         "depends_on TEXT DEFAULT NULL",
         "profile TEXT DEFAULT NULL",
+        "run_safe INTEGER NOT NULL DEFAULT 0",
         "kind TEXT NOT NULL DEFAULT 'tool' CHECK(kind IN ('tool', 'prompt'))",
     ] {
         let _ = conn.execute_batch(&format!(
@@ -747,10 +757,11 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
             .and_then(|deps| serde_json::from_str(&deps).ok())
             .unwrap_or_default(),
         profile: row.get(21)?,
+        run_safe: row.get(22)?,
     })
 }
 
-const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, kind, depends_on, profile";
+const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, kind, depends_on, profile, run_safe";
 
 pub fn create_cron_task(
     conn: &Connection,
@@ -862,8 +873,8 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
     conn.execute(
         "INSERT INTO scheduled_tasks
              (name, description, kind, task_type, cron_expression, run_at, next_run_at,
-              agent_name, command, max_runs, status, depends_on, profile)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              agent_name, command, max_runs, status, depends_on, profile, run_safe)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             task.name,
             task.description,
@@ -881,7 +892,8 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
                 TaskStatus::SCHEDULED
             },
             depends_on,
-            task.profile
+            task.profile,
+            task.run_safe
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -1655,9 +1667,21 @@ pub struct AgentConfig {
     /// settings were copied when it was made.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Whether it gets the unsafe tools (see `--unsafe-tools`). An agent
+    /// made by another always has it set; one that doesn't is unsafe only
+    /// in a session started with `--unsafe-tools`.
+    #[serde(default)]
+    pub unsafe_tools: Option<bool>,
+    /// The directory it works in, absolute: what its tools' relative paths
+    /// mean, where its commands run, all its sandbox can write to. Unset,
+    /// the process's. Only the user - or an agent with the unsafe tools -
+    /// can point an agent somewhere else; one an agent makes works where
+    /// its maker does.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
-const AGENT_CONFIG_FIELDS: [&str; 9] = [
+const AGENT_CONFIG_FIELDS: [&str; 11] = [
     "model",
     "endpoint",
     "system_prompt",
@@ -1667,6 +1691,8 @@ const AGENT_CONFIG_FIELDS: [&str; 9] = [
     "parameters",
     "tools",
     "profile",
+    "unsafe_tools",
+    "cwd",
 ];
 
 pub fn get_agent_config(
@@ -1681,7 +1707,7 @@ pub fn get_agent_config(
         // Strings are stored as they are, everything else as JSON; a value
         // that doesn't parse as what the field takes is ignored.
         let value = match field {
-            "max_tokens" | "context_window" | "parameters" | "tools" => {
+            "max_tokens" | "context_window" | "parameters" | "tools" | "unsafe_tools" => {
                 match serde_json::from_str(&text) {
                     Ok(value) => value,
                     Err(_) => continue,
@@ -1714,6 +1740,8 @@ fn merge_agent_config(base: AgentConfig, over: AgentConfig) -> AgentConfig {
         parameters: over.parameters.or(base.parameters),
         tools: over.tools.or(base.tools),
         profile: over.profile.or(base.profile),
+        unsafe_tools: over.unsafe_tools.or(base.unsafe_tools),
+        cwd: over.cwd.or(base.cwd),
     }
 }
 
@@ -2617,6 +2645,7 @@ mod tests {
             held: false,
             depends_on: Vec::new(),
             profile: None,
+            run_safe: false,
         };
         let id = create_task(&conn, &task("prompt")).unwrap();
         let row = get_task(&conn, id).unwrap().unwrap();
@@ -2805,6 +2834,7 @@ mod tests {
                 held: true,
                 depends_on: Vec::new(),
                 profile: None,
+                run_safe: false,
             },
         )
         .unwrap();
@@ -3205,6 +3235,7 @@ mod tests {
                 held: false,
                 depends_on,
                 profile: None,
+                run_safe: false,
             },
         )
         .unwrap()
@@ -3303,6 +3334,7 @@ mod tests {
                 held: false,
                 depends_on: vec![999],
                 profile: None,
+                run_safe: false,
             },
         )
         .unwrap_err();
@@ -3403,6 +3435,8 @@ mod tests {
             parameters: Some(parameters),
             tools: Some(vec!["read_file".to_string()]),
             profile: Some("fast".to_string()),
+            unsafe_tools: Some(true),
+            cwd: Some("/work".to_string()),
         };
         set_agent_config(&conn, "alice", &config).unwrap();
         assert_eq!(get_agent_config(&conn, "alice").unwrap(), config);
@@ -3433,6 +3467,7 @@ mod tests {
             held: false,
             depends_on: Vec::new(),
             profile: profile.map(String::from),
+            run_safe: false,
         };
         let id = create_task(&conn, &task(TaskKind::PROMPT, None, Some("fast"))).unwrap();
         assert_eq!(

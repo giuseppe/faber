@@ -434,6 +434,7 @@ const CHAT_COMMANDS: &[&str] = &[
     "/mcp-refresh",
     "/tools",
     "/chdir",
+    "/cwd",
     "/pwd",
     "/cost",
     "/plan",
@@ -1090,7 +1091,7 @@ fn append_tool(tools: &mut ToolsCollection, name: String, callback: ToolCallback
 }
 
 /// entrypoint for the delete_path tool
-fn tool_delete_path(params_str: &String, _ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+fn tool_delete_path(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     #[derive(Deserialize)]
     struct Params {
         path: String,
@@ -1098,7 +1099,7 @@ fn tool_delete_path(params_str: &String, _ctx: &ToolContext) -> Result<String, B
     let params: Params = serde_json::from_str::<Params>(&params_str)?;
 
     debug!("Remove path: {}", params.path);
-    let root = Root::open(".")?;
+    let root = Root::open(ctx.cwd())?;
 
     let path = PathBuf::from(&params.path);
 
@@ -1195,7 +1196,7 @@ fn tool_read_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
         return Ok(serde_json::to_string(&result)?);
     }
 
-    let root = Root::open(".")?;
+    let root = Root::open(ctx.cwd())?;
     let path = PathBuf::from(&params.path);
     let file = root.open_subpath(path, OpenFlags::O_RDONLY);
 
@@ -1449,7 +1450,7 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
 
     debug!("Parsed file mode: {} (octal: {:o})", file_mode, file_mode);
 
-    let root = Root::open(".")?;
+    let root = Root::open(ctx.cwd())?;
     let path_buf = PathBuf::from(&params.path);
 
     let existing_content = match root.open_subpath(&params.path, OpenFlags::O_RDONLY) {
@@ -1561,7 +1562,7 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
 }
 
 /// entrypoint for the glob tool
-fn tool_glob(params_str: &String, _ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+fn tool_glob(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     use serde::Deserialize;
 
     #[derive(Deserialize)]
@@ -1579,16 +1580,20 @@ fn tool_glob(params_str: &String, _ctx: &ToolContext) -> Result<String, Box<dyn 
 
     trace!("Executing glob pattern: {}", glob_pattern);
 
+    // Matched under the agent's directory, and listed relative to it.
+    let cwd = ctx.cwd();
+    let current_dir = cwd.canonicalize().unwrap_or(cwd.clone());
+    let base = glob::Pattern::escape(&cwd.to_string_lossy());
     let mut files = Vec::new();
-    for entry in glob::glob(glob_pattern)? {
+    for entry in glob::glob(&format!("{}/{}", base, glob_pattern))? {
         match entry {
             Ok(path) => {
                 // Additional security check: ensure resolved path is within current directory
                 let canonical_path = path.canonicalize().unwrap_or(path.clone());
-                let current_dir = std::env::current_dir()?;
 
                 if canonical_path.starts_with(&current_dir) {
-                    files.push(path.to_string_lossy().to_string());
+                    let shown = path.strip_prefix(&cwd).unwrap_or(&path);
+                    files.push(shown.to_string_lossy().to_string());
                 } else {
                     debug!("Skipping file outside current directory: {:?}", path);
                 }
@@ -2007,7 +2012,7 @@ fn tool_run_command(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     debug!("run_command received params: {}", params_str);
     let params: RunCommandParams = serde_json::from_str(params_str)?;
 
-    let cmd = if params.args.is_some() || !params.command.contains(' ') {
+    let mut cmd = if params.args.is_some() || !params.command.contains(' ') {
         let mut c = Command::new(&params.command);
         if let Some(ref args) = params.args {
             c.args(args);
@@ -2018,6 +2023,7 @@ fn tool_run_command(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         c.arg("-c").arg(&params.command);
         c
     };
+    cmd.current_dir(ctx.cwd());
 
     run_command_and_report(cmd, ctx, &params.command, false)
 }
@@ -2098,7 +2104,7 @@ fn tool_run_command_sandboxed(
     debug!("run_command (sandboxed) received params: {}", params_str);
     let params: RunCommandParams = serde_json::from_str(params_str)?;
 
-    let cwd = std::env::current_dir()?;
+    let cwd = ctx.cwd();
 
     // Defense in depth on top of the "--" separator in bwrap_args(): command
     // and args come straight from the model's tool call, unvalidated, so a
@@ -2130,6 +2136,7 @@ fn tool_run_command_sandboxed(
 
     let mut cmd = Command::new("bwrap");
     cmd.args(bwrap_args(cwd, &command, params.args.as_deref()));
+    cmd.current_dir(cwd);
     // run_command is a one-shot exec-and-capture-output tool, never
     // interactive, so it never needs stdin - and not inheriting it means
     // there's no open file descriptor to faber's own controlling terminal
@@ -2369,8 +2376,8 @@ fn search_in_current_directory(
             grep_search_args(&params, &path),
         ),
     };
+    let cwd = ctx.cwd();
     let mut cmd = if sandboxed {
-        let cwd = std::env::current_dir()?;
         let cwd = cwd.to_str().ok_or("current directory is not valid UTF-8")?;
         let program = program
             .to_str()
@@ -2383,6 +2390,7 @@ fn search_in_current_directory(
         cmd.args(&args);
         cmd
     };
+    cmd.current_dir(&cwd);
     cmd.stdin(Stdio::null());
     trace!("Executing search command: {:?}", cmd);
     let output = cmd.output().map_err(|e| {
@@ -2533,10 +2541,22 @@ fn tool_agent_create(params_str: &String, ctx: &ToolContext) -> Result<String, B
         description: Option<String>,
         #[serde(default)]
         profile: Option<String>,
+        #[serde(default)]
+        unsafe_tools: Option<bool>,
+        #[serde(default)]
+        cwd: Option<String>,
     }
     let params: Params = serde_json::from_str(params_str)?;
     let db = ctx.db()?;
+    let unsafe_tools = child_unsafe(ctx.unsafe_tools, params.unsafe_tools)?;
+    let cwd = child_cwd(ctx, params.cwd.as_deref())?;
     db.create_agent(&params.name, params.description.as_deref().unwrap_or(""))?;
+    if let Err(e) = set_agent_unsafe(db, &params.name, unsafe_tools)
+        .and_then(|()| set_agent_cwd(db, &params.name, cwd))
+    {
+        let _ = db.delete_agent(&params.name);
+        return Err(e);
+    }
     let mut result = serde_json::json!({"status": "created", "name": params.name});
     if let Some(name) = &params.profile {
         let profiles = ctx_profiles(ctx);
@@ -2605,13 +2625,34 @@ fn tool_agent_configure(params_str: &String, ctx: &ToolContext) -> Result<String
         endpoint: Option<String>,
         #[serde(default)]
         system_prompt: Option<String>,
+        #[serde(default)]
+        unsafe_tools: Option<bool>,
+        #[serde(default)]
+        cwd: Option<String>,
     }
     let params: Params = serde_json::from_str(params_str)?;
     let db = ctx.db()?;
     if db.get_agent(&params.agent)?.is_none() {
         return Err(format!("no agent named '{}'", params.agent).into());
     }
+    check_may_change(ctx, db, &params.agent)?;
     let mut changed = Vec::new();
+    if let Some(requested) = params.unsafe_tools {
+        set_agent_unsafe(
+            db,
+            &params.agent,
+            child_unsafe(ctx.unsafe_tools, Some(requested))?,
+        )?;
+        changed.push(format!(
+            "unsafe tools {}",
+            if requested { "given" } else { "taken away" }
+        ));
+    }
+    if let Some(path) = &params.cwd {
+        let cwd = child_cwd(ctx, Some(path))?;
+        changed.push(format!("works in {}", cwd.as_deref().unwrap_or("-")));
+        set_agent_cwd(db, &params.agent, cwd)?;
+    }
     if let Some(name) = &params.profile {
         let profiles = ctx_profiles(ctx);
         apply_profile(db, &params.agent, name, find_profile(&profiles, name)?)?;
@@ -2632,7 +2673,10 @@ fn tool_agent_configure(params_str: &String, ctx: &ToolContext) -> Result<String
         }
     }
     if changed.is_empty() {
-        return Err("give at least one of profile, model, endpoint, system_prompt".into());
+        return Err(
+            "give at least one of profile, model, endpoint, system_prompt, unsafe_tools, cwd"
+                .into(),
+        );
     }
     ctx.println(&format!("Agent '{}': {}", params.agent, changed.join(", ")));
     let config = db.get_agent_config(&params.agent)?;
@@ -3061,6 +3105,8 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         held: false,
         depends_on: params.depends_on,
         profile: params.profile,
+        // Whoever picks it up, it can't do more than its maker could.
+        run_safe: !ctx.unsafe_tools,
     };
     let id = ctx.db()?.create_task(&task)?;
     let next_run = ctx.db()?.get_task(id)?.and_then(|t| t.next_run_at);
@@ -3390,6 +3436,12 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         /// Make it from this profile.
         #[serde(default)]
         profile: Option<String>,
+        /// Give it the unsafe tools, or not; default: as the caller.
+        #[serde(default)]
+        unsafe_tools: Option<bool>,
+        /// Where it works; default: where the caller does.
+        #[serde(default)]
+        cwd: Option<String>,
     }
     let params: Params = serde_json::from_str(params_str)?;
 
@@ -3420,6 +3472,31 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
 
     let agent_config = {
         let existing = db.get_agent(&agent_name)?;
+        let unsafe_tools = match &existing {
+            Some(_) => {
+                check_may_change(ctx, db.as_ref(), &agent_name)?;
+                let stored = db.get_agent_config(&agent_name)?.unsafe_tools;
+                child_unsafe(ctx.unsafe_tools, params.unsafe_tools.or(stored))?
+            }
+            None => child_unsafe(ctx.unsafe_tools, params.unsafe_tools)?,
+        };
+        let mut cwd = child_cwd(ctx, params.cwd.as_deref())?;
+        if existing.is_some() && params.cwd.is_none() {
+            let stored = db.get_agent_config(&agent_name)?.cwd;
+            if stored.is_some() && stored != cwd {
+                // Another directory, set by the user: only an agent that
+                // could have chosen it itself may run it there.
+                if !ctx.unsafe_tools {
+                    return Err(format!(
+                        "'{}' works in {}, not where you do: pick another name",
+                        agent_name,
+                        stored.unwrap_or_default()
+                    )
+                    .into());
+                }
+                cwd = stored;
+            }
+        }
         if let (Some(_), Some((name, _))) = (&existing, profile) {
             let current = db.get_agent_config(&agent_name)?.profile;
             if current.as_deref() != Some(name) {
@@ -3452,12 +3529,16 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         // Lets it see the knowledge base notes private to its parent (and
         // so on up), while what it saves privately stays below.
         db.set_agent_parent(&agent_name, Some(&parent_agent))?;
+        set_agent_unsafe(db.as_ref(), &agent_name, unsafe_tools)?;
+        set_agent_cwd(db.as_ref(), &agent_name, cwd)?;
         let _ = db.claim_agent(&agent_name, &sa_ctx.session_id);
         db.get_agent_config(&agent_name)?
     };
+    let sub_unsafe = agent_config.unsafe_tools == Some(true);
+    let sub_cwd = agent_config.cwd.clone().map(PathBuf::from);
 
     let agent_opts = with_agent_config(&sa_ctx.opts, &agent_config);
-    let tools = Arc::new(effective_tools(&sa_ctx.tools, &agent_config));
+    let tools = Arc::new(agent_tools(&sa_ctx.tools, sub_unsafe, &agent_config));
 
     let mut messages: Vec<Message> = vec![make_message(
         "system",
@@ -3570,6 +3651,8 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
 
         let mut sub_ctx = ToolContext::new(|_: &str| {});
         sub_ctx.db = Some(db.clone());
+        sub_ctx.unsafe_tools = sub_unsafe;
+        sub_ctx.cwd = sub_cwd;
         sub_ctx.agent_name = Some(agent_name_for_ctx);
         sub_ctx.mcp_manager = mcp_for_sub;
         sub_ctx.context_window = context_window;
@@ -3838,7 +3921,7 @@ fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
         return Err("edits must contain at least one edit".into());
     }
 
-    let root = Root::open(".")?;
+    let root = Root::open(ctx.cwd())?;
     let file = root
         .open_subpath(&params.path, OpenFlags::O_RDWR)
         .map_err(|e| {
@@ -4371,6 +4454,14 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "profile": {
                             "type": "string",
                             "description": "Make it from this profile: it gets a copy of the profile's settings"
+                        },
+                        "unsafe_tools": {
+                            "type": "boolean",
+                            "description": "Give it the unsafe tools (unsandboxed commands, web access) or not. Default: as you. Only an agent that has them can give them"
+                        },
+                        "cwd": {
+                            "type": "string",
+                            "description": "Where it works (an existing directory). Default: where you do. Only an agent with the unsafe tools can choose another"
                         }
                     },
                     "required": [
@@ -4481,7 +4572,9 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "profile": {"type": "string", "description": "Replace its settings with this profile's (other fields given are then set over them)"},
                         "model": {"type": "string", "description": "Model to use for this agent"},
                         "endpoint": {"type": "string", "description": "API endpoint for this agent"},
-                        "system_prompt": {"type": "string", "description": "System prompt for this agent"}
+                        "system_prompt": {"type": "string", "description": "System prompt for this agent"},
+                        "unsafe_tools": {"type": "boolean", "description": "Give it the unsafe tools (unsandboxed commands, web access), or take them away. Only an agent that has them can do either, or change an agent that has them"},
+                        "cwd": {"type": "string", "description": "Set the directory it works in (an existing directory). Only an agent with the unsafe tools can"}
                     },
                     "required": ["agent"],
                     "additionalProperties": false
@@ -4949,6 +5042,14 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                             "type": "string",
                             "description": "Make a new sub-agent from this profile (one listed in your system prompt): its model, endpoint, parameters such as reasoning effort, and tools"
                         },
+                        "unsafe_tools": {
+                            "type": "boolean",
+                            "description": "Give it the unsafe tools (unsandboxed commands, web access) or not. Default: as you. Only an agent that has them can give them"
+                        },
+                        "cwd": {
+                            "type": "string",
+                            "description": "Where it works (an existing directory). Default: where you do. Only an agent with the unsafe tools can choose another"
+                        },
                         "result_schema": {
                             "type": "object",
                             "description": "Ask for a structured result: the data fields it must report, with their types, e.g. {\"severity\": \"string\", \"files\": \"array\"}"
@@ -5303,6 +5404,10 @@ impl Profile {
             parameters: self.parameters.clone(),
             tools: self.tools.clone(),
             profile: Some(name.to_string()),
+            // Profiles never grant unsafe tools (see `child_unsafe`), nor
+            // pick where an agent works (see `child_cwd`).
+            unsafe_tools: None,
+            cwd: None,
         }
     }
 }
@@ -5337,6 +5442,13 @@ fn agent_config_lines(config: &db::AgentConfig) -> Vec<(&'static str, String)> {
             }),
         ),
         ("Tools", config.tools.as_ref().map(|t| t.join(", "))),
+        ("Working dir", config.cwd.clone()),
+        (
+            "Unsafe tools",
+            config
+                .unsafe_tools
+                .map(|u| if u { "yes" } else { "no" }.to_string()),
+        ),
         (
             "System prompt",
             config.system_prompt.as_deref().map(|p| first_line(p, 80)),
@@ -5462,9 +5574,136 @@ fn apply_profile(
             .unwrap_or_else(|| format!("Made from profile '{}'", name));
         db.create_agent(agent, &description)?;
     }
-    let config = profile.agent_config(name);
+    let mut config = profile.agent_config(name);
+    // Not a profile's to give or take: see `child_unsafe`, `child_cwd`.
+    let current = db.get_agent_config(agent)?;
+    config.unsafe_tools = current.unsafe_tools;
+    config.cwd = current.cwd;
     db.set_agent_config(agent, &config)?;
     Ok(config)
+}
+
+/// Whether an agent with `config` that a session runs as its own - a
+/// chat's, a worker's - has the unsafe tools: if its config says so, or
+/// the session was started with `--unsafe-tools`. Agents made by others
+/// (`spawn_agent`, a worker's task agents) always have it set.
+fn session_agent_unsafe(opts: &Opts, config: &db::AgentConfig) -> bool {
+    opts.unsafe_tools || config.unsafe_tools == Some(true)
+}
+
+/// Whether an agent made by one that's `parent_unsafe` - asking for
+/// `requested`, or else like its parent - gets the unsafe tools. Only an
+/// agent that has them can hand them on.
+fn child_unsafe(parent_unsafe: bool, requested: Option<bool>) -> Result<bool, String> {
+    match requested {
+        Some(true) if !parent_unsafe => Err(
+            "an agent without unsafe tools can't make one with them: only the user, or an agent \
+             that has them, can"
+                .to_string(),
+        ),
+        Some(requested) => Ok(requested),
+        None => Ok(parent_unsafe),
+    }
+}
+
+/// Refuses if a safe agent (`ctx`) would change or take over `agent`, one
+/// with the unsafe tools - that would be a way to get them.
+fn check_may_change(ctx: &ToolContext, db: &dyn DbBackend, agent: &str) -> Result<(), String> {
+    let target_unsafe = db
+        .get_agent_config(agent)
+        .map_err(|e| e.to_string())?
+        .unsafe_tools
+        == Some(true);
+    if target_unsafe && !ctx.unsafe_tools {
+        return Err(format!(
+            "'{}' has unsafe tools: an agent without them can't change it",
+            agent
+        ));
+    }
+    Ok(())
+}
+
+/// `path` as a working directory: absolute (relative ones taken from
+/// `base`), symlinks resolved, and an existing directory.
+fn resolve_cwd(base: &std::path::Path, path: &str) -> Result<String, String> {
+    let path = std::path::Path::new(path.trim());
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    let resolved = full
+        .canonicalize()
+        .map_err(|e| format!("can't work in '{}': {}", full.display(), e))?;
+    if !resolved.is_dir() {
+        return Err(format!(
+            "can't work in '{}': not a directory",
+            resolved.display()
+        ));
+    }
+    resolved
+        .to_str()
+        .map(String::from)
+        .ok_or_else(|| format!("'{}' is not valid UTF-8", resolved.display()))
+}
+
+/// Where an agent made by `ctx`'s agent works: `requested` - which only
+/// an agent with the unsafe tools may ask for - or where its maker works.
+fn child_cwd(ctx: &ToolContext, requested: Option<&str>) -> Result<Option<String>, String> {
+    match requested {
+        Some(_) if !ctx.unsafe_tools => Err(
+            "only the user, or an agent with the unsafe tools, can choose where an agent works: \
+             an agent you make works where you do"
+                .to_string(),
+        ),
+        Some(path) => resolve_cwd(&ctx.cwd(), path).map(Some),
+        None => Ok(ctx.cwd.as_ref().and_then(|c| c.to_str()).map(String::from)),
+    }
+}
+
+/// Records where `agent` works (`None`: the process's directory).
+fn set_agent_cwd(
+    db: &dyn DbBackend,
+    agent: &str,
+    cwd: Option<String>,
+) -> Result<(), Box<dyn Error>> {
+    let mut config = db.get_agent_config(agent)?;
+    config.cwd = cwd;
+    db.set_agent_config(agent, &config)
+}
+
+/// Records whether `agent` has the unsafe tools.
+fn set_agent_unsafe(
+    db: &dyn DbBackend,
+    agent: &str,
+    unsafe_tools: bool,
+) -> Result<(), Box<dyn Error>> {
+    let mut config = db.get_agent_config(agent)?;
+    config.unsafe_tools = Some(unsafe_tools);
+    db.set_agent_config(agent, &config)
+}
+
+/// The tools of an agent with `config`, unsafe or not: those of `within`
+/// (by name - an agent never gets a tool its maker lacks), in their safe
+/// or unsafe version, narrowed by its config's list.
+fn agent_tools(
+    within: &ToolsCollection,
+    unsafe_tools: bool,
+    config: &db::AgentConfig,
+) -> ToolsCollection {
+    let mut tools = initialize_tools(unsafe_tools, None);
+    tools.retain(|name, _| within.contains_key(name));
+    effective_tools(&tools, config)
+}
+
+/// Every tool a session's agents could get - the unsafe ones too, which
+/// `agent_tools` then picks from per agent.
+fn session_tools(opts: &Opts) -> ToolsCollection {
+    if opts.no_tools {
+        return ToolsCollection::new();
+    }
+    let allowed = (!opts.tools.is_empty()).then(|| opts.tools.clone());
+    initialize_tools(true, allowed.as_deref())
 }
 
 /// The tools an agent with `config` gets of `available`: all of them, or
@@ -5543,6 +5782,7 @@ fn post_request_and_print_output(
     });
     tool_context.db = db;
     tool_context.mcp_manager = mcp_manager;
+    tool_context.unsafe_tools = opts.unsafe_tools;
 
     let response: OpenAIResponse = post_request(messages, &tools, &openai_opts, &tool_context)?;
 
@@ -5594,6 +5834,8 @@ enum ChatCommand {
     McpRefresh,
     Tools,
     Chdir(String),
+    /// Show (`None`), set or clear (`-`) where the current agent works.
+    Cwd(Option<String>),
     Pwd,
     Cost,
     Plan,
@@ -5714,6 +5956,12 @@ fn parse_chat_command(line: &str) -> ChatCommand {
     if normalized == "/pwd" {
         return ChatCommand::Pwd;
     }
+    if normalized == "/cwd" {
+        return ChatCommand::Cwd(None);
+    }
+    if let Some(path) = normalized.strip_prefix("/cwd ") {
+        return ChatCommand::Cwd(Some(path.trim().to_string()).filter(|p| !p.is_empty()));
+    }
     if normalized == "/cost" {
         return ChatCommand::Cost;
     }
@@ -5823,6 +6071,9 @@ fn handle_chat_command(
             chat_pb.println("  /mcp-refresh           Refresh MCP tool definitions");
             chat_pb.println("  /tools                 List all available tools");
             chat_pb.println("  /chdir <path>          Change the current working directory");
+            chat_pb.println(
+                "  /cwd [<path>|-]        Show, set or clear (-) where this agent works, for it only",
+            );
             chat_pb.println("  /pwd                   Show the current working directory");
             chat_pb.println("  /cost                  Show session token usage and estimated cost");
             chat_pb.println("  /plan                  Show the current agent's plan");
@@ -6161,6 +6412,43 @@ fn handle_chat_command(
             match std::env::current_dir() {
                 Ok(cwd) => chat_pb.println(&cwd.display().to_string()),
                 Err(e) => chat_pb.println(&format!("Failed to get current directory: {}", e)),
+            }
+            if let Some(cwd) = db
+                .as_ref()
+                .and_then(|db| db.get_agent_config(&active_agent.name).ok())
+                .and_then(|c| c.cwd)
+            {
+                chat_pb.println(&format!("('{}' works in {})", active_agent.name, cwd));
+            }
+            Ok(true)
+        }
+        ChatCommand::Cwd(path) => {
+            // The user's to choose, unlike an agent's (see `child_cwd`).
+            let db = db
+                .as_ref()
+                .ok_or("an agent's own working directory needs a database")?;
+            let current = db.get_agent_config(&active_agent.name)?.cwd;
+            match path.as_deref() {
+                None => chat_pb.println(&match current {
+                    Some(cwd) => format!("'{}' works in {}", active_agent.name, cwd),
+                    None => format!(
+                        "'{}' works in the current directory, {}",
+                        active_agent.name,
+                        std::env::current_dir()?.display()
+                    ),
+                }),
+                Some("-") => {
+                    set_agent_cwd(db.as_ref(), &active_agent.name, None)?;
+                    chat_pb.println(&format!(
+                        "'{}' works in the current directory again",
+                        active_agent.name
+                    ));
+                }
+                Some(path) => {
+                    let cwd = resolve_cwd(&std::env::current_dir()?, path)?;
+                    set_agent_cwd(db.as_ref(), &active_agent.name, Some(cwd.clone()))?;
+                    chat_pb.println(&format!("'{}' now works in {}", active_agent.name, cwd));
+                }
             }
             Ok(true)
         }
@@ -7437,11 +7725,38 @@ fn task_outcome(tool_msg: Option<&Message>) -> db::TaskOutcome {
 /// forwarding its result (if any) over `tx`, then recording how it went
 /// with `finish_task` either way. Split out of `scheduler_loop` so each due
 /// task can run on its own thread instead of blocking every other one.
+/// The tools tool tasks run with: the session's, or - for one a safe
+/// agent made (`run_safe`) - the safe ones, so it can't get an unsafe
+/// tool run that way.
+struct ToolTaskTools {
+    session: ToolsCollection,
+    safe: ToolsCollection,
+}
+
+impl ToolTaskTools {
+    fn new(opts: &Opts) -> Self {
+        let available = session_tools(opts);
+        let config = db::AgentConfig::default();
+        Self {
+            session: agent_tools(&available, opts.unsafe_tools, &config),
+            safe: agent_tools(&available, false, &config),
+        }
+    }
+
+    fn for_task(&self, task: &db::TaskRow) -> &ToolsCollection {
+        if task.run_safe {
+            &self.safe
+        } else {
+            &self.session
+        }
+    }
+}
+
 fn run_scheduled_task(
     task: db::TaskRow,
     db: Arc<dyn DbBackend>,
     session_id: &str,
-    tools: Arc<ToolsCollection>,
+    tools: Arc<ToolTaskTools>,
     tx: mpsc::Sender<(Option<String>, String, Message, Message)>,
 ) {
     let command = if task.command.is_empty() {
@@ -7451,7 +7766,7 @@ fn run_scheduled_task(
     };
 
     let db_opt: Option<Arc<dyn DbBackend>> = Some(db.clone());
-    let executed = execute_scheduled_command(&command, &tools, &db_opt);
+    let executed = execute_scheduled_command(&command, tools.for_task(&task), &db_opt);
     let outcome = task_outcome(executed.as_ref().map(|(_, tool_msg)| tool_msg));
     if let Some((assistant_msg, tool_msg)) = executed {
         let _ = tx.send((task.agent_name.clone(), command, assistant_msg, tool_msg));
@@ -7465,23 +7780,28 @@ fn run_scheduled_task(
 /// Claims the next due prompt task (`TaskKind::PROMPT`) that `agent` may
 /// take - one for any agent, for it by name, or for one of `profiles` (to
 /// run on a new agent made from it) - for this idle session.
+#[cfg(test)]
 fn claim_prompt_task(
     db: &dyn DbBackend,
     session_id: &str,
     agent: &str,
     profiles: &[String],
 ) -> Option<db::TaskRow> {
-    claim_prompt_task_but(db, session_id, agent, profiles, false)
+    claim_prompt_task_but(db, session_id, agent, profiles, false, false)
 }
 
 /// `claim_prompt_task`, but with `busy`, none of those for `agent` by
 /// name: it's already running one, and only one can run as it at a time.
+/// With `only_unsafe`, none that must run on an agent without unsafe
+/// tools (`run_safe`): for a chat whose agent has them, which can only
+/// run a task as itself.
 fn claim_prompt_task_but(
     db: &dyn DbBackend,
     session_id: &str,
     agent: &str,
     profiles: &[String],
     busy: bool,
+    only_unsafe: bool,
 ) -> Option<db::TaskRow> {
     let tasks = db.get_pending_tasks().ok()?;
     tasks
@@ -7489,6 +7809,7 @@ fn claim_prompt_task_but(
         .filter(|t| t.kind == db::TaskKind::PROMPT)
         .filter(|t| t.agent_name.as_deref().is_none_or(|a| a == agent))
         .filter(|t| !(busy && task_is_for_worker(t)))
+        .filter(|t| !(only_unsafe && t.run_safe))
         .filter(|t| t.profile.as_ref().is_none_or(|p| profiles.contains(p)))
         .find(|t| db.claim_task(t.id, session_id).unwrap_or(false))
 }
@@ -7543,7 +7864,7 @@ fn prompt_task_outcome(result: Result<&OpenAIResponse, &Box<dyn Error>>) -> db::
 fn scheduler_loop(
     db: Arc<dyn DbBackend>,
     session_id: String,
-    tools: Arc<ToolsCollection>,
+    tools: Arc<ToolTaskTools>,
     tx: mpsc::Sender<(Option<String>, String, Message, Message)>,
 ) {
     loop {
@@ -7604,21 +7925,8 @@ fn chat_command(
     let mut rl = Editor::with_history(config, history)?;
     rl.set_helper(Some(helper));
 
-    let allowed_tools = if opts.tools.is_empty() {
-        None
-    } else {
-        Some(opts.tools.clone())
-    };
-    let tools = match opts.no_tools {
-        true => {
-            debug!("Tools are disabled");
-            ToolsCollection::new()
-        }
-        false => {
-            debug!("Initializing tools for AI request");
-            initialize_tools(opts.unsafe_tools, allowed_tools.as_deref())
-        }
-    };
+    // Each turn's agent gets its own of these (see `agent_tools`).
+    let available_tools = session_tools(opts);
 
     let session_id = format!(
         "{}-{}",
@@ -7660,9 +7968,13 @@ fn chat_command(
             .map(|(name, profile)| profile.agent_config(name))
             .unwrap_or_default()
     };
-    // The agent's own tool list narrows the session's. (Only the starting
-    // agent's: switching agents in the chat keeps these tools.)
-    let tools = effective_tools(&tools, &agent_config);
+    // The starting agent's, for its system prompt and /tools; each turn
+    // works out the tools of the agent it's for.
+    let tools = agent_tools(
+        &available_tools,
+        session_agent_unsafe(opts, &agent_config),
+        &agent_config,
+    );
 
     let initial_messages = if let Some(ref db) = db {
         let vals = db.load_agent_messages(&initial_agent_name)?;
@@ -7753,7 +8065,7 @@ fn chat_command(
 
         let scheduler_db_for_prune = scheduler_db.clone();
         let scheduler_db = scheduler_db.clone();
-        let scheduler_tools = Arc::new(tools.clone());
+        let scheduler_tools = Arc::new(ToolTaskTools::new(opts));
         let scheduler_session = session_id.to_string();
         std::thread::spawn(move || {
             scheduler_loop(scheduler_db, scheduler_session, scheduler_tools, task_tx);
@@ -7782,7 +8094,6 @@ fn chat_command(
         });
     }
 
-    let tools_arc = Arc::new(tools.clone());
     let profiles = Arc::new(opts.profiles.clone());
 
     let (input_tx, input_rx) = mpsc::channel::<Result<String, rustyline::error::ReadlineError>>();
@@ -7895,9 +8206,15 @@ fn chat_command(
         {
             last_prompt_task_poll = std::time::Instant::now();
             if let Some(ref db) = db {
-                if let Some(task) =
-                    claim_prompt_task(db.as_ref(), &session_id, &active_agent.name, &[])
-                {
+                if let Some(task) = claim_prompt_task_but(
+                    db.as_ref(),
+                    &session_id,
+                    &active_agent.name,
+                    &[],
+                    false,
+                    db.get_agent_config(&active_agent.name)
+                        .is_ok_and(|config| session_agent_unsafe(opts, &config)),
+                ) {
                     chat_pb.println(&format!(
                         "Picked up scheduled task #{} \"{}\"",
                         task.id, task.name
@@ -8036,17 +8353,35 @@ fn chat_command(
                     }
                     let _idle_when_done = IdleWhenDone(activity.clone());
 
+                    // This agent's tools: unsafe or not, and narrowed by
+                    // its own list.
+                    let turn_config = db
+                        .as_ref()
+                        .and_then(|db| db.get_agent_config(&active_agent.name).ok())
+                        .unwrap_or_else(|| agent_config.clone());
+                    let turn_unsafe = session_agent_unsafe(opts, &turn_config);
+                    let turn_tools = agent_tools(&available_tools, turn_unsafe, &turn_config);
+
                     let mut tool_context = ToolContext::new(|_: &str| {});
                     tool_context.db = db.clone();
                     tool_context.agent_name = Some(active_agent.name.clone());
                     tool_context.mcp_manager = mcp_manager.clone();
+                    tool_context.unsafe_tools = turn_unsafe;
+                    tool_context.cwd = turn_config.cwd.clone().map(PathBuf::from);
+                    if let Some(cwd) = tool_context.cwd.as_ref().filter(|c| !c.is_dir()) {
+                        chat_pb.println(&format!(
+                            "Warning: '{}' works in {}, which isn't a directory here (/cwd to change it)",
+                            active_agent.name,
+                            cwd.display()
+                        ));
+                    }
                     // Re-read every turn: the window may only have been
                     // found by the background /models lookup since startup.
                     tool_context.context_window =
                         *context_window.lock().unwrap_or_else(|e| e.into_inner());
                     tool_context.extra = Some(Arc::new(SubAgentContext {
                         runs: sub_agent_runs.clone(),
-                        tools: tools_arc.clone(),
+                        tools: Arc::new(turn_tools.clone()),
                         opts: openai_opts.clone(),
                         session_id: session_id.to_string(),
                         active_subagents: active_subagents.clone(),
@@ -8088,7 +8423,7 @@ fn chat_command(
                             |messages| {
                                 execute_ai_request(
                                     messages,
-                                    &tools,
+                                    &turn_tools,
                                     &openai_opts,
                                     recorded_mode(ResponseMode::Complete, &events),
                                     &tool_context,
@@ -8228,7 +8563,7 @@ fn chat_command(
                                 );
                                 execute_ai_request(
                                     messages,
-                                    &tools,
+                                    &turn_tools,
                                     &openai_opts,
                                     mode,
                                     &tool_context,
@@ -8905,6 +9240,7 @@ fn new_task_from_cli(
         held: *hold,
         depends_on: depends_on.clone(),
         profile: profile.clone(),
+        run_safe: false,
     })
 }
 
@@ -9006,6 +9342,7 @@ fn profile_task_agent(
     task: &db::TaskRow,
     profile: &str,
     parent: &str,
+    unsafe_tools: bool,
     db: &dyn DbBackend,
     session_id: &str,
     profiles: &Profiles,
@@ -9013,6 +9350,9 @@ fn profile_task_agent(
     let settings = find_profile(profiles, profile)?;
     let name = format!("{}-{}", profile, task.id);
     apply_profile(db, &name, profile, settings)?;
+    set_agent_unsafe(db, &name, unsafe_tools)?;
+    // It works where the worker does.
+    set_agent_cwd(db, &name, db.get_agent_config(parent)?.cwd)?;
     db.set_agent_parent(&name, Some(parent))?;
     if !db.claim_agent(&name, session_id)? {
         return Err(format!("agent '{}' is in use by another session", name).into());
@@ -9027,6 +9367,7 @@ fn profile_task_agent(
 fn own_task_agent(
     task: &db::TaskRow,
     parent: &str,
+    unsafe_tools: bool,
     db: &dyn DbBackend,
     session_id: &str,
 ) -> Result<String, Box<dyn Error>> {
@@ -9034,7 +9375,9 @@ fn own_task_agent(
     if db.get_agent(&name)?.is_none() {
         db.create_agent(&name, &format!("Runs task #{}", task.id))?;
     }
-    db.set_agent_config(&name, &db.get_agent_config(parent)?)?;
+    let mut config = db.get_agent_config(parent)?;
+    config.unsafe_tools = Some(unsafe_tools);
+    db.set_agent_config(&name, &config)?;
     db.set_agent_parent(&name, Some(parent))?;
     if !db.claim_agent(&name, session_id)? {
         return Err(format!("agent '{}' is in use by another session", name).into());
@@ -9064,17 +9407,29 @@ fn run_prompt_task_headless(
     cancel: mpsc::Receiver<()>,
 ) -> db::TaskOutcome {
     let worker = agent;
+    let worker_unsafe =
+        session_agent_unsafe(opts, &db.get_agent_config(worker).unwrap_or_default());
+    // A task a safe agent made runs without the unsafe tools, even on an
+    // agent made for it when the worker has them.
+    let task_unsafe = worker_unsafe && !task.run_safe;
     let task_agent = match &task.profile {
         Some(profile) => Some(profile_task_agent(
             task,
             profile,
             worker,
+            task_unsafe,
             db.as_ref(),
             session_id,
             &opts.profiles,
         )),
-        None if task_is_for_worker(task) => None,
-        None => Some(own_task_agent(task, worker, db.as_ref(), session_id)),
+        None if task_is_for_worker(task) && task_unsafe == worker_unsafe => None,
+        None => Some(own_task_agent(
+            task,
+            worker,
+            task_unsafe,
+            db.as_ref(),
+            session_id,
+        )),
     };
     let agent = match &task_agent {
         None => worker,
@@ -9096,8 +9451,33 @@ fn run_prompt_task_headless(
         }
     };
     let agent_config = db.get_agent_config(agent).unwrap_or_default();
+    if let Some(cwd) = agent_config
+        .cwd
+        .as_deref()
+        .filter(|c| !std::path::Path::new(c).is_dir())
+    {
+        let outcome = db::TaskOutcome {
+            succeeded: false,
+            exit_code: None,
+            result: format!(
+                "'{}' works in {}, which isn't a directory on this machine",
+                agent, cwd
+            ),
+        };
+        record_turn_end(
+            &Some(EventLog::new(db.clone(), agent, Some(task.id))),
+            &outcome,
+        );
+        if let Err(e) = db.finish_task(task.id, session_id, &outcome) {
+            warn!("Couldn't record the outcome of task {}: {}", task.id, e);
+        }
+        if agent != worker {
+            let _ = db.release_agent(agent, session_id);
+        }
+        return outcome;
+    }
     let openai_opts = build_openai_opts(opts, &agent_config);
-    let tools = &effective_tools(tools, &agent_config);
+    let tools = &agent_tools(tools, task_unsafe, &agent_config);
     // Its sub-agents start from its settings and tools, not the worker's.
     let extra = Arc::new(SubAgentContext {
         opts: openai_opts.clone(),
@@ -9118,6 +9498,8 @@ fn run_prompt_task_headless(
     messages.push(make_message("user", input));
     let mut ctx = ToolContext::new(|_: &str| {});
     ctx.db = Some(db.clone());
+    ctx.unsafe_tools = task_unsafe;
+    ctx.cwd = agent_config.cwd.clone().map(PathBuf::from);
     ctx.agent_name = Some(agent.to_string());
     ctx.mcp_manager = mcp_manager.clone();
     ctx.context_window = agent_config.context_window.or(opts.context_window);
@@ -9314,12 +9696,8 @@ fn run_worker(
         }
     }
     let parallel = spec.parallel.map(|p| p.max(1));
-    let tools = Arc::new(if opts.no_tools {
-        ToolsCollection::new()
-    } else {
-        let allowed = (!opts.tools.is_empty()).then(|| opts.tools.clone());
-        initialize_tools(opts.unsafe_tools, allowed.as_deref())
-    });
+    // Each task's agent gets its own of these (see `agent_tools`).
+    let tools = Arc::new(session_tools(opts));
     let cancels = &stop.cancels;
     {
         let db = db.clone();
@@ -9338,7 +9716,7 @@ fn run_worker(
     if spec.tool_tasks {
         let db = db.clone();
         let session_id = session_id.clone();
-        let tools = tools.clone();
+        let tools = Arc::new(ToolTaskTools::new(opts));
         std::thread::spawn(move || scheduler_loop(db, session_id, tools, task_tx));
     }
 
@@ -9405,6 +9783,7 @@ fn run_worker(
                     &agent,
                     profiles,
                     own_busy.load(Ordering::Relaxed),
+                    false,
                 ) {
                     let own = task_is_for_worker(&task);
                     if own {
@@ -9557,8 +9936,13 @@ fn print_agents_tree(
             .get_agent_config(&agent.name)?
             .model
             .unwrap_or_else(|| "-".to_string());
+        let unsafe_mark = if db.get_agent_config(&agent.name)?.unsafe_tools == Some(true) {
+            " (unsafe)"
+        } else {
+            ""
+        };
         table.add_row(Row::new(vec![
-            Cell::new(&format!("{}{}", prefix, agent.name)),
+            Cell::new(&format!("{}{}{}", prefix, agent.name, unsafe_mark)),
             Cell::new(if db::agent_session_is_live(agent, now) {
                 "live"
             } else {
@@ -9609,6 +9993,46 @@ fn agents_command(
     let db = db.as_ref().ok_or(
         "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
     )?;
+    if let Some(AgentsAction::Set {
+        name,
+        r#unsafe,
+        safe,
+        cwd,
+        no_cwd,
+    }) = action
+    {
+        if !*r#unsafe && !*safe && cwd.is_none() && !*no_cwd {
+            return Err("nothing to change: give --unsafe, --safe, --cwd or --no-cwd".into());
+        }
+        let here = std::env::current_dir()?;
+        let cwd = cwd
+            .as_deref()
+            .map(|path| resolve_cwd(&here, path))
+            .transpose()?;
+        if db.get_agent(name)?.is_none() {
+            db.create_agent(name, "")?;
+        }
+        if *r#unsafe || *safe {
+            set_agent_unsafe(db.as_ref(), name, *r#unsafe)?;
+            println!(
+                "Agent '{}' {} the unsafe tools.",
+                name,
+                if *r#unsafe {
+                    "now has"
+                } else {
+                    "no longer has"
+                }
+            );
+        }
+        if cwd.is_some() || *no_cwd {
+            set_agent_cwd(db.as_ref(), name, cwd.clone())?;
+            match cwd {
+                Some(cwd) => println!("Agent '{}' works in {}.", name, cwd),
+                None => println!("Agent '{}' works in the current directory again.", name),
+            }
+        }
+        return Ok(());
+    }
     if let Some(AgentsAction::Show { name, full }) = action {
         let agent = db
             .get_agent(name)?
@@ -10725,6 +11149,26 @@ enum AgentsAction {
         #[clap(long)]
         full: bool,
     },
+    /// Change an agent's settings that only you, not an agent, may change
+    /// (created if needed)
+    Set {
+        name: String,
+        /// Give it the unsafe tools (unsandboxed commands, web access) in
+        /// any session, and let it give them to agents it makes
+        #[clap(long, conflicts_with = "safe")]
+        r#unsafe: bool,
+        /// Take the unsafe tools away (a session started with
+        /// --unsafe-tools still gives them to its own agent)
+        #[clap(long)]
+        safe: bool,
+        /// Work in this directory: its tools' relative paths, its commands,
+        /// all its sandbox can write to. Agents it makes work there too
+        #[clap(long, value_name = "DIR", conflicts_with = "no_cwd")]
+        cwd: Option<String>,
+        /// Work in the current directory of whatever runs it again
+        #[clap(long)]
+        no_cwd: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -10989,7 +11433,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             } | CliCommand::Kb {
                 action: None | Some(KbAction::Search { .. }) | Some(KbAction::Show { .. }),
                 ..
-            } | CliCommand::Agents { .. }
+            } | CliCommand::Agents {
+                action: None | Some(AgentsAction::Show { .. }),
+                ..
+            }
         ) {
             // Only looks: never create or migrate a database for it.
             db::open_read_only(db_path)?
@@ -11670,7 +12117,7 @@ mod tests {
             .unwrap();
         // An empty command (and description) can't be run at all.
         let bad = db.create_oneshot_task("bad", "", &past, "", None).unwrap();
-        let tools = Arc::new(initialize_tools(false, None));
+        let tools = Arc::new(ToolTaskTools::new(&Opts::default()));
         let (tx, rx) = mpsc::channel();
 
         for id in [good, bad] {
@@ -11762,6 +12209,7 @@ mod tests {
             kind: "tool".to_string(),
             depends_on: Vec::new(),
             profile: None,
+            run_safe: false,
         }
     }
 
@@ -11957,6 +12405,7 @@ mod tests {
             held: false,
             depends_on: Vec::new(),
             profile: None,
+            run_safe: false,
         };
         let for_bob = db.create_task(&prompt(Some("bob"))).unwrap();
         assert!(claim_prompt_task(db.as_ref(), "s1", "alice", &[]).is_none());
@@ -12837,6 +13286,226 @@ mod tests {
         (db, ctx)
     }
 
+    /// `chat_ctx_with_model`, for an agent with the unsafe tools.
+    fn unsafe_chat_ctx(db: Arc<dyn DbBackend>, agent: &str, model: &str) -> ToolContext {
+        let mut ctx = chat_ctx_with_model(db, agent, model);
+        let sa_ctx = ctx
+            .extra
+            .as_ref()
+            .unwrap()
+            .downcast_ref::<SubAgentContext>()
+            .unwrap()
+            .clone();
+        ctx.extra = Some(Arc::new(SubAgentContext {
+            tools: Arc::new(initialize_tools(true, None)),
+            ..sa_ctx
+        }));
+        ctx.unsafe_tools = true;
+        ctx
+    }
+
+    #[test]
+    fn test_child_unsafe() {
+        assert_eq!(child_unsafe(false, None), Ok(false));
+        assert_eq!(child_unsafe(true, None), Ok(true));
+        assert_eq!(child_unsafe(true, Some(false)), Ok(false));
+        assert_eq!(child_unsafe(true, Some(true)), Ok(true));
+        assert_eq!(child_unsafe(false, Some(false)), Ok(false));
+        assert!(child_unsafe(false, Some(true)).is_err());
+    }
+
+    #[test]
+    fn test_agent_tools_picks_the_safe_or_unsafe_versions() {
+        let within = initialize_tools(true, None);
+        let config = db::AgentConfig::default();
+        let safe = agent_tools(&within, false, &config);
+        let unsafe_ = agent_tools(&within, true, &config);
+        assert!(!safe.contains_key("fetch_web_content"));
+        assert!(unsafe_.contains_key("fetch_web_content"));
+        // Never more than the maker has, even when unsafe.
+        let narrow = agent_tools(&initialize_tools(false, None), true, &config);
+        assert!(!narrow.contains_key("fetch_web_content"));
+        assert!(narrow.contains_key("run_command"));
+    }
+
+    #[test]
+    fn test_a_safe_agent_cannot_make_or_change_an_unsafe_one() {
+        let (db, ctx) = spawning_setup("safety", serde_json::json!([{"reply": "ok"}]));
+        let spawn = |ctx: &ToolContext, name: &str, unsafe_tools: Option<bool>| {
+            let mut args = serde_json::json!({"name": name, "prompt": "go"});
+            if let Some(u) = unsafe_tools {
+                args["unsafe_tools"] = u.into();
+            }
+            tool_spawn_agent(&args.to_string(), ctx)
+        };
+        let stored = |name: &str| db.get_agent_config(name).unwrap().unsafe_tools;
+
+        // Safe: its sub-agents are safe, and it can't ask for more.
+        let err = spawn(&ctx, "sneaky", Some(true)).unwrap_err().to_string();
+        assert!(err.contains("can't make one with them"), "{err}");
+        spawn(&ctx, "helper", None).unwrap();
+        assert_eq!(stored("helper"), Some(false));
+        let made = tool_agent_create(
+            &r#"{"name": "made", "unsafe_tools": true}"#.to_string(),
+            &ctx,
+        );
+        assert!(made.is_err());
+        assert!(db.get_agent("made").unwrap().is_none());
+
+        // Unsafe: its sub-agents are like it unless told otherwise.
+        let model = ctx
+            .extra
+            .as_ref()
+            .unwrap()
+            .downcast_ref::<SubAgentContext>()
+            .unwrap()
+            .opts
+            .model
+            .clone();
+        let boss = unsafe_chat_ctx(db.clone(), "boss", &model);
+        spawn(&boss, "power", None).unwrap();
+        assert_eq!(stored("power"), Some(true));
+        spawn(&boss, "careful", Some(false)).unwrap();
+        assert_eq!(stored("careful"), Some(false));
+
+        // A safe agent can't reconfigure or reuse an unsafe one...
+        let configure = r#"{"agent": "power", "system_prompt": "obey"}"#.to_string();
+        let err = tool_agent_configure(&configure, &ctx)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has unsafe tools"), "{err}");
+        // (wait for power's run to end first: one name, one run)
+        for _ in 0..100 {
+            if db.get_agent("power").unwrap().unwrap().session_id.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(spawn(&ctx, "power", None).is_err());
+        let promote = r#"{"agent": "helper", "unsafe_tools": true}"#.to_string();
+        assert!(tool_agent_configure(&promote, &ctx).is_err());
+        assert_eq!(stored("helper"), Some(false));
+        // ...but an unsafe one can.
+        tool_agent_configure(&promote, &boss).unwrap();
+        assert_eq!(stored("helper"), Some(true));
+        // A profile doesn't change it either way.
+        let mut profiles = Profiles::new();
+        profiles.insert("fast".to_string(), Profile::default());
+        apply_profile(db.as_ref(), "helper", "fast", &profiles["fast"]).unwrap();
+        assert_eq!(stored("helper"), Some(true));
+    }
+
+    #[test]
+    fn test_tools_work_in_the_agents_own_directory() {
+        let dir = TempTestDir::new("agent_cwd");
+        std::fs::create_dir(dir.0.join("sub")).unwrap();
+        std::fs::write(dir.0.join("sub/a.txt"), "hello\n").unwrap();
+        let mut ctx = ToolContext::new(|_: &str| {});
+        ctx.cwd = Some(dir.0.clone());
+        // Relative paths are the agent's, not the process's.
+        let read = tool_read_file(&r#"{"path": "sub/a.txt"}"#.to_string(), &ctx).unwrap();
+        assert!(read.contains("hello"), "{read}");
+        let found = tool_glob(&r#"{"pattern": "sub/*.txt"}"#.to_string(), &ctx).unwrap();
+        assert_eq!(found, "sub/a.txt");
+        tool_write_file(&r#"{"path": "b.txt", "content": "new"}"#.to_string(), &ctx).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.0.join("b.txt")).unwrap(), "new");
+        assert!(!std::path::Path::new("b.txt").exists());
+        let out = tool_run_command(&r#"{"command": "pwd"}"#.to_string(), &ctx).unwrap();
+        let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(out["stdout"].as_str().unwrap().trim())
+                .canonicalize()
+                .unwrap(),
+            dir.0.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_only_the_user_or_an_unsafe_agent_picks_where_an_agent_works() {
+        let dir = TempTestDir::new("child_cwd");
+        let (db, mut ctx) = spawning_setup("cwd", serde_json::json!([{"reply": "ok"}]));
+        ctx.cwd = Some(dir.0.clone());
+        let here = dir.0.to_str().unwrap().to_string();
+        // An agent's agents work where it does, and it can't send them elsewhere.
+        assert_eq!(child_cwd(&ctx, None), Ok(Some(here.clone())));
+        assert!(child_cwd(&ctx, Some("/tmp")).is_err());
+        tool_spawn_agent(&r#"{"name": "helper", "prompt": "go"}"#.to_string(), &ctx).unwrap();
+        assert_eq!(
+            db.get_agent_config("helper").unwrap().cwd,
+            Some(here.clone())
+        );
+        let made = tool_agent_create(&r#"{"name": "elsewhere", "cwd": "/"}"#.to_string(), &ctx);
+        assert!(made.is_err());
+        let moved = r#"{"agent": "helper", "cwd": "/"}"#.to_string();
+        assert!(tool_agent_configure(&moved, &ctx).is_err());
+        // Nor can it run one the user set to work elsewhere.
+        db.create_agent("other", "").unwrap();
+        set_agent_cwd(db.as_ref(), "other", Some("/".to_string())).unwrap();
+        let err = tool_spawn_agent(&r#"{"name": "other", "prompt": "go"}"#.to_string(), &ctx)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("works in /"), "{err}");
+        // An unsafe agent can.
+        ctx.unsafe_tools = true;
+        assert_eq!(child_cwd(&ctx, Some("/")), Ok(Some("/".to_string())));
+        tool_agent_configure(&moved, &ctx).unwrap();
+        assert_eq!(
+            db.get_agent_config("helper").unwrap().cwd.as_deref(),
+            Some("/")
+        );
+        // A profile leaves it alone.
+        apply_profile(db.as_ref(), "helper", "p", &Profile::default()).unwrap();
+        assert_eq!(
+            db.get_agent_config("helper").unwrap().cwd.as_deref(),
+            Some("/")
+        );
+    }
+
+    #[test]
+    fn test_parse_chat_command_cwd() {
+        assert!(matches!(parse_chat_command("/cwd"), ChatCommand::Cwd(None)));
+        assert!(matches!(
+            parse_chat_command("/cwd  "),
+            ChatCommand::Cwd(None)
+        ));
+        match parse_chat_command("/cwd ../x ") {
+            ChatCommand::Cwd(Some(p)) => assert_eq!(p, "../x"),
+            _ => panic!("expected Cwd"),
+        }
+    }
+
+    #[test]
+    fn test_tasks_a_safe_agent_makes_run_safe() {
+        let db = local_db_with_agents(&["boss"]);
+        let mut ctx = ToolContext::new(|_: &str| {});
+        ctx.db = Some(db.clone());
+        ctx.agent_name = Some("boss".to_string());
+        let create = |ctx: &ToolContext| {
+            let out = tool_task_create(
+                &r#"{"name": "t", "command": "{\"tool\": \"glob\", \"arguments\": {}}", "run_at": "2099-01-01T00:00:00Z"}"#
+                    .to_string(),
+                ctx,
+            )
+            .unwrap();
+            let id = db.list_tasks(None).unwrap().last().unwrap().id;
+            (out, db.get_task(id).unwrap().unwrap())
+        };
+        let (_, task) = create(&ctx);
+        assert!(task.run_safe);
+        ctx.unsafe_tools = true;
+        let (_, task) = create(&ctx);
+        assert!(!task.run_safe);
+
+        // Run as tool tasks, a safe one gets the safe tools only.
+        let mut opts = Opts::default();
+        opts.unsafe_tools = true;
+        let tools = ToolTaskTools::new(&opts);
+        let mut safe = task.clone();
+        safe.run_safe = true;
+        assert!(tools.for_task(&task).contains_key("fetch_web_content"));
+        assert!(!tools.for_task(&safe).contains_key("fetch_web_content"));
+    }
+
     #[test]
     fn test_agent_wait_collects_results_together() {
         // Coordinator rules first: spawn_agent's results echo the prompts.
@@ -13127,6 +13796,7 @@ mod tests {
                 held: false,
                 depends_on: Vec::new(),
                 profile: Some("fast".to_string()),
+                run_safe: false,
             })
             .unwrap();
         // A chat, or a worker without the profile, leaves it alone.
@@ -13252,6 +13922,7 @@ mod tests {
                 held: false,
                 depends_on: Vec::new(),
                 profile: Some("fast".to_string()),
+                run_safe: false,
             })
             .unwrap();
         let mut opts = Opts::default();
@@ -13384,7 +14055,8 @@ mod tests {
             .create_oneshot_task("mine", "", &past, "x", Some("w"))
             .unwrap();
         let anyone = db.create_oneshot_task("any", "", &past, "x", None).unwrap();
-        let claim = |busy| claim_prompt_task_but(db.as_ref(), "s", "w", &[], busy).map(|t| t.id);
+        let claim =
+            |busy| claim_prompt_task_but(db.as_ref(), "s", "w", &[], busy, false).map(|t| t.id);
         // Busy with one of its own, it can still take tasks for anyone.
         assert_eq!(claim(true), Some(anyone));
         assert_eq!(claim(true), None);

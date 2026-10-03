@@ -1098,6 +1098,8 @@ fn run_tool_call_group(
                     buffered.context_window = ctx.context_window;
                     buffered.interrupt = ctx.interrupt.clone();
                     buffered.file_versions = ctx.file_versions.clone();
+                    buffered.unsafe_tools = ctx.unsafe_tools;
+                    buffered.cwd = ctx.cwd.clone();
                     let tool_start_time = Instant::now();
                     let result =
                         tool_call(tools_collection, req, &buffered).map_err(|e| e.to_string());

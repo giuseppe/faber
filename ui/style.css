@@ -188,6 +188,7 @@ body[data-view="board"] #board-panel { order: -1; }
   margin-right: 6px;
 }
 /* A play triangle, drawn rather than a glyph some fonts lack. */
+.badge.danger { color: var(--bad); }
 .card .run::before, button.play::before {
   content: "";
   display: inline-block;

@@ -791,7 +791,7 @@ fn clients() -> &'static Mutex<HashMap<(String, PathBuf), Arc<Client>>> {
 
 /// The running client for `path`'s language in the current directory's
 /// project, started if needed (or restarted if it died).
-fn client_for(path: &Path, sandboxed: bool) -> Result<Arc<Client>, Box<dyn Error>> {
+fn client_for(path: &Path, root: &Path, sandboxed: bool) -> Result<Arc<Client>, Box<dyn Error>> {
     let spec = find_server(servers(), path).ok_or_else(|| {
         format!(
             "no language server is configured for {} (supported extensions: {}; more can be added with \"lsp_servers\" in the config file)",
@@ -804,7 +804,7 @@ fn client_for(path: &Path, sandboxed: bool) -> Result<Arc<Client>, Box<dyn Error
                 .join(" ")
         )
     })?;
-    let root = std::env::current_dir()?;
+    let root = root.to_path_buf();
     let key = (spec.name.clone(), root.clone());
     let mut clients = clients().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(client) = clients.get(&key) {
@@ -1095,7 +1095,7 @@ struct Params {
 
 /// The file an `lsp` call is about: relative to the current directory,
 /// which it must stay inside (servers are rooted there).
-fn project_file(path: &str) -> Result<PathBuf, String> {
+fn project_file(cwd: &Path, path: &str) -> Result<PathBuf, String> {
     let relative = Path::new(path);
     if relative.is_absolute()
         || relative
@@ -1107,7 +1107,6 @@ fn project_file(path: &str) -> Result<PathBuf, String> {
             path
         ));
     }
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     Ok(cwd.join(relative))
 }
 
@@ -1117,8 +1116,9 @@ pub(crate) fn run(
     sandboxed: bool,
 ) -> Result<String, Box<dyn Error>> {
     let params: Params = serde_json::from_str(params_str)?;
-    let path = project_file(&params.path)?;
-    let client = client_for(&path, sandboxed)?;
+    let cwd = ctx.cwd();
+    let path = project_file(&cwd, &params.path)?;
+    let client = client_for(&path, &cwd, sandboxed)?;
     let root = client.root.clone();
     let before = client.diagnostics_generation(&path_to_uri(&path));
     let (uri, text, sent) = client.sync(&path)?;
@@ -1430,9 +1430,13 @@ mod tests {
 
     #[test]
     fn test_project_file_stays_inside_current_directory() {
-        assert!(project_file("src/main.rs").is_ok());
-        assert!(project_file("/etc/passwd").is_err());
-        assert!(project_file("../x.rs").is_err());
+        let cwd = Path::new("/proj");
+        assert_eq!(
+            project_file(cwd, "src/main.rs"),
+            Ok(PathBuf::from("/proj/src/main.rs"))
+        );
+        assert!(project_file(cwd, "/etc/passwd").is_err());
+        assert!(project_file(cwd, "../x.rs").is_err());
     }
 
     /// End to end against a real server, when clangd is installed (it's

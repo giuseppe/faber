@@ -112,16 +112,22 @@ pub struct ToolContext {
     /// `None` turns the check off (a scheduled tool call, with no model to
     /// read anything first).
     pub file_versions: Option<Arc<Mutex<HashMap<PathBuf, u64>>>>,
+    /// Whether the agent these tools run for has the unsafe ones: what
+    /// it may hand on to agents it makes (see `child_unsafe`).
+    pub unsafe_tools: bool,
+    /// The directory the agent works in - its own, if it has one (see
+    /// `AgentConfig::cwd`), else the process's. Every tool goes by it.
+    pub cwd: Option<PathBuf>,
 }
 
-/// A file's key in `ToolContext::file_versions`: absolute, `.` and `..`
-/// folded away.
-fn file_key(path: &str) -> PathBuf {
+/// A file's key in `ToolContext::file_versions`: absolute (relative to
+/// `cwd`), `.` and `..` folded away.
+fn file_key(cwd: &Path, path: &str) -> PathBuf {
     let path = Path::new(path);
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir().unwrap_or_default().join(path)
+        cwd.join(path)
     };
     let mut key = PathBuf::new();
     for component in absolute.components() {
@@ -162,6 +168,16 @@ impl ToolContext {
             result_slot: None,
             result_schema: None,
             file_versions: Some(Arc::new(Mutex::new(HashMap::new()))),
+            unsafe_tools: false,
+            cwd: None,
+        }
+    }
+
+    /// The directory this agent's tools work in.
+    pub fn cwd(&self) -> PathBuf {
+        match &self.cwd {
+            Some(cwd) => cwd.clone(),
+            None => std::env::current_dir().unwrap_or_default(),
         }
     }
 
@@ -171,7 +187,7 @@ impl ToolContext {
             versions
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(file_key(path), content_hash(content));
+                .insert(file_key(&self.cwd(), path), content_hash(content));
         }
     }
 
@@ -184,7 +200,7 @@ impl ToolContext {
             return Ok(());
         };
         let versions = versions.lock().unwrap_or_else(|e| e.into_inner());
-        match versions.get(&file_key(path)) {
+        match versions.get(&file_key(&self.cwd(), path)) {
             None => Err(format!(
                 "'{}' already exists and you haven't read it: read it first, so you don't \
                  overwrite something you haven't seen",

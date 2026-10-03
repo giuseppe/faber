@@ -339,7 +339,8 @@ function renderAgents() {
       el("div", { class: "agent-name" },
         el("span", { class: dot, title: agent.live ? "live session" : "no live session" }),
         agent.name,
-        agent.profile ? el("span", { class: "tag" }, agent.profile) : null),
+        agent.profile ? el("span", { class: "tag" }, agent.profile) : null,
+        agent.unsafe_tools ? el("span", { class: "badge danger", title: "Has the unsafe tools: unsandboxed commands, web access" }, "unsafe") : null),
       el("div", { class: "agent-activity", title: agent.activity || "" },
         agent.activity ? `${firstLine(agent.activity, 60)} · ${relative(agent.activity_at)}` : "-"),
       latest ? el("div", { class: "agent-output", title: latest.line }, latest.line) : null);
@@ -595,6 +596,7 @@ function renderDetail() {
       return;
     }
     actions.append(el("button", { onclick: () => openNewTask(`agent:${agent.name}`) }, "Give it a task"));
+    actions.append(el("button", { onclick: () => changeCwd(agent) }, "Working directory…"));
     const kids = state.agents.filter((a) => a.parent === agent.name).map((a) => a.name);
     const queued = state.tasks.filter((t) => t.agent_name === agent.name && t.status !== "done");
     fields.replaceChildren(
@@ -603,6 +605,8 @@ function renderDetail() {
       ...field("Description", agent.description),
       ...field("Model", agent.model),
       ...field("Profile", agent.profile),
+      ...field("Works in", agent.cwd || "where it's run"),
+      ...field("Unsafe tools", agent.unsafe_tools ? "yes" : null),
       ...field("Parent", agent.parent),
       ...field("Sub-agents", kids.join(", ")),
       ...field("Queued for it", queued.map((t) => `#${t.id}`).join(", ")));
@@ -646,6 +650,22 @@ function renderDetail() {
     ...field("Started", task.started_at ? relative(task.started_at) : null),
     ...field("Command", task.command),
     ...field("Last result", task.last_result));
+}
+
+async function changeCwd(agent) {
+  const answer = prompt(
+    `Where should ${agent.name} work? An absolute path; empty for wherever it's run.\n` +
+    "Its file tools, commands and sandbox are confined to it, and agents it makes work there too.",
+    agent.cwd || "");
+  if (answer === null) return;
+  try {
+    const { exists_here } = await api("POST", `agents/${encodeURIComponent(agent.name)}/cwd`,
+      { cwd: answer.trim() || null });
+    if (!exists_here) toast("Saved - but that directory doesn't exist on this machine.");
+  } catch (e) {
+    toast(e.message);
+  }
+  refresh();
 }
 
 function reassign(task) {
