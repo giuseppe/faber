@@ -168,6 +168,7 @@ fn worker_context(ctx: &ToolContext) -> ToolContext {
     // Its tools are the caller's own (see `worker_tools`), unsafe or not.
     worker_ctx.unsafe_tools = ctx.unsafe_tools;
     worker_ctx.cwd = ctx.cwd.clone();
+    worker_ctx.task_id = ctx.task_id;
     worker_ctx
 }
 
@@ -235,7 +236,9 @@ fn run_worker(
         db.clone()
             .map(|db| (db, agent.to_string(), sa_ctx.session_id.clone())),
     );
-    let events = db.as_ref().map(|db| EventLog::new(db.clone(), agent, None));
+    let events = db
+        .as_ref()
+        .map(|db| EventLog::new(db.clone(), agent, ctx.task_id));
     let activity = db
         .as_ref()
         .map(|db| ActivityRecorder::new(db.clone(), agent));

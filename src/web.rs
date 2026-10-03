@@ -22,8 +22,12 @@
 //! port as the line protocol - `server::serve_command` tells them apart by
 //! the first byte. One request per connection.
 //!
-//! - `GET /api/agents`, `GET /api/agents/<name>`,
-//!   `POST /api/agents/<name>/cwd` (where it works: the user's to set)
+//! - `GET /api/agents`, `GET /api/agents/<name>` (with its settings),
+//!   `POST /api/agents` (make one), `DELETE /api/agents/<name>`,
+//!   `PATCH /api/agents/<name>/config` (change its settings - the user's
+//!   to, unsafe tools and working directory included),
+//!   `POST /api/agents/<name>/cwd`
+//! - `GET /api/tools`: the tools an agent's list can name
 //! - `GET /api/events?agent=&task=&after=&limit=`
 //! - `GET /api/tasks`, `GET /api/tasks/<id>`, `POST /api/tasks`,
 //!   `DELETE /api/tasks/<id>`,
@@ -328,6 +332,102 @@ fn route(
     }
 }
 
+/// The settings of an agent the web UI edits.
+fn editable_config(config: &db::AgentConfig) -> serde_json::Value {
+    serde_json::json!({
+        "model": config.model,
+        "endpoint": config.endpoint,
+        "system_prompt": config.system_prompt,
+        "max_tokens": config.max_tokens,
+        "context_window": config.context_window,
+        "parameters": config.parameters,
+        "tools": config.tools,
+        "unsafe_tools": config.unsafe_tools == Some(true),
+        "cwd": config.cwd,
+        "profile": config.profile,
+    })
+}
+
+/// `config` with `changes` made: each field given is set, or cleared with
+/// `null` (or an empty string); others are left as they are. Coming from
+/// the user, it may give or take the unsafe tools and set the working
+/// directory - which agents can't do to each other.
+fn apply_config(
+    mut config: db::AgentConfig,
+    changes: &serde_json::Map<String, serde_json::Value>,
+) -> Result<db::AgentConfig, String> {
+    let text = |value: &serde_json::Value, field: &str| -> Result<Option<String>, String> {
+        match value {
+            serde_json::Value::Null => Ok(None),
+            serde_json::Value::String(s) if s.trim().is_empty() => Ok(None),
+            serde_json::Value::String(s) => Ok(Some(s.clone())),
+            _ => Err(format!("'{}' must be a string", field)),
+        }
+    };
+    let number = |value: &serde_json::Value, field: &str| -> Result<Option<u32>, String> {
+        match value {
+            serde_json::Value::Null => Ok(None),
+            serde_json::Value::String(s) if s.trim().is_empty() => Ok(None),
+            v => v
+                .as_u64()
+                .filter(|n| *n > 0)
+                .and_then(|n| u32::try_from(n).ok())
+                .map(Some)
+                .ok_or_else(|| format!("'{}' must be a positive number", field)),
+        }
+    };
+    for (field, value) in changes {
+        match field.as_str() {
+            "model" => config.model = text(value, field)?,
+            "endpoint" => config.endpoint = text(value, field)?,
+            "system_prompt" => config.system_prompt = text(value, field)?,
+            "max_tokens" => config.max_tokens = number(value, field)?,
+            "context_window" => config.context_window = number(value, field)?,
+            "cwd" => config.cwd = text(value, field)?.map(|d| absolute_dir(&d)).transpose()?,
+            "unsafe_tools" => {
+                config.unsafe_tools = match value {
+                    serde_json::Value::Bool(b) => Some(*b),
+                    serde_json::Value::Null => None,
+                    _ => return Err("'unsafe_tools' must be true or false".to_string()),
+                }
+            }
+            "parameters" => {
+                config.parameters = match value {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::Object(map) if map.is_empty() => None,
+                    serde_json::Value::Object(map) => Some(map.clone()),
+                    _ => return Err("'parameters' must be an object".to_string()),
+                }
+            }
+            "tools" => {
+                config.tools = match value {
+                    serde_json::Value::Null => None,
+                    serde_json::Value::Array(names) => {
+                        let known = crate::initialize_tools(true, None);
+                        let mut tools = Vec::new();
+                        for name in names {
+                            let name = name.as_str().ok_or("'tools' must list tool names")?;
+                            if !known.contains_key(name) {
+                                return Err(format!("no tool named '{}'", name));
+                            }
+                            tools.push(name.to_string());
+                        }
+                        Some(tools)
+                    }
+                    _ => return Err("'tools' must be a list of tool names, or null".to_string()),
+                }
+            }
+            other => {
+                return Err(format!(
+                    "'{}' isn't a setting that can be changed here",
+                    other
+                ));
+            }
+        }
+    }
+    Ok(config)
+}
+
 /// Whether a `Host` header names this machine by IP address or as
 /// `localhost` - no name someone else's DNS could point here.
 fn is_local_host(host: Option<&str>) -> bool {
@@ -560,9 +660,68 @@ fn api(
                 "children": children,
                 "system_prompt": config.system_prompt,
                 "tools": config.tools,
+                "config": editable_config(&config),
                 "messages": db::agent_message_count(conn, name)?,
             }))
         }
+        ("POST", ["agents"]) => {
+            #[derive(Deserialize)]
+            struct Body {
+                name: String,
+                #[serde(default)]
+                description: String,
+                #[serde(default)]
+                config: serde_json::Map<String, serde_json::Value>,
+            }
+            let body: Body = body_json(request)?;
+            let name = body.name.trim();
+            if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c == '/') {
+                return Err("give the agent a name without spaces or slashes".into());
+            }
+            if db::get_agent(conn, name)?.is_some() {
+                return Err(format!("there is already an agent named '{}'", name).into());
+            }
+            // The settings first: a bad one makes nothing.
+            let config = apply_config(db::AgentConfig::default(), &body.config)?;
+            db::create_agent(conn, name, body.description.trim())?;
+            db::set_agent_config(conn, name, &config)?;
+            Response::json(201, &serde_json::json!({ "name": name }))
+        }
+        ("PATCH", ["agents", name, "config"]) => {
+            if db::get_agent(conn, name)?.is_none() {
+                return Ok(Response::error(404, &format!("no agent named '{}'", name)));
+            }
+            let mut changes: serde_json::Map<String, serde_json::Value> = body_json(request)?;
+            // Not a setting, but the user's to change too.
+            let description = match changes.remove("description") {
+                None => None,
+                Some(serde_json::Value::String(d)) => Some(d.trim().to_string()),
+                Some(serde_json::Value::Null) => Some(String::new()),
+                Some(_) => return Err("'description' must be a string".into()),
+            };
+            let config = apply_config(db::get_agent_config(conn, name)?, &changes)?;
+            db::set_agent_config(conn, name, &config)?;
+            if let Some(description) = description {
+                db::set_agent_description(conn, name, &description)?;
+            }
+            Response::ok(editable_config(&config))
+        }
+        ("DELETE", ["agents", name]) => {
+            let Some(agent) = db::get_agent(conn, name)? else {
+                return Ok(Response::error(404, &format!("no agent named '{}'", name)));
+            };
+            if db::agent_session_is_live(&agent, now) {
+                return Err(format!("'{}' is running: stop it first", name).into());
+            }
+            db::delete_agent(conn, name)?;
+            Response::ok(true)
+        }
+        ("GET", ["tools"]) => {
+            let mut names: Vec<String> = crate::initialize_tools(true, None).into_keys().collect();
+            names.sort();
+            Response::ok(names)
+        }
+
         ("POST", ["agents", name, "cwd"]) => {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -707,9 +866,13 @@ fn api(
         ("GET", ["info"]) => Response::ok(serde_json::json!({
             "cwd": std::env::current_dir().ok(),
         })),
-        (_, ["agents" | "events" | "tasks" | "profiles" | "info", ..]) => {
-            Response::error(405, "method not allowed")
-        }
+        (
+            _,
+            [
+                "agents" | "events" | "tasks" | "profiles" | "info" | "tools",
+                ..,
+            ],
+        ) => Response::error(405, "method not allowed"),
         _ => Response::error(404, "not found"),
     })
 }
@@ -957,6 +1120,62 @@ mod tests {
             json(&call(&db, "GET", &format!("/api/tasks/{}", id), ""))["name"],
             "glob"
         );
+    }
+
+    #[test]
+    fn test_agents_are_made_and_configured_by_the_user() {
+        let db = test_db();
+        db::create_agent(&db.lock().unwrap(), "boss", "").unwrap();
+        // Settings, unsafe tools and all, are the user's to change here.
+        let r = call(
+            &db,
+            "PATCH",
+            "/api/agents/boss/config",
+            r#"{"model": "qwen", "unsafe_tools": true, "max_tokens": 512, "tools": ["read_file", "glob"]}"#,
+        );
+        assert_eq!(r.status, 200, "{:?}", json(&r));
+        let config = &json(&call(&db, "GET", "/api/agents/boss", ""))["config"];
+        assert_eq!(config["model"], "qwen");
+        assert_eq!(config["unsafe_tools"], true);
+        assert_eq!(config["tools"], serde_json::json!(["read_file", "glob"]));
+        let r = call(
+            &db,
+            "PATCH",
+            "/api/agents/boss/config",
+            r#"{"model": null, "tools": null, "description": "runs things"}"#,
+        );
+        let boss = json(&call(&db, "GET", "/api/agents/boss", ""));
+        assert_eq!(boss["agent"]["description"], "runs things");
+        assert_eq!(json(&r)["model"], serde_json::Value::Null);
+        assert_eq!(json(&r)["max_tokens"], 512, "left alone");
+        for bad in [
+            r#"{"tools": ["nope"]}"#,
+            r#"{"max_tokens": -1}"#,
+            r#"{"cwd": "relative"}"#,
+            r#"{"api_key": "/k"}"#,
+        ] {
+            let r = call(&db, "PATCH", "/api/agents/boss/config", bad);
+            assert_eq!(r.status, 400, "{bad}");
+        }
+        let r = call(
+            &db,
+            "POST",
+            "/api/agents",
+            r#"{"name": "reviewer", "description": "reviews", "config": {"model": "big"}}"#,
+        );
+        assert_eq!(r.status, 201, "{:?}", json(&r));
+        let reviewer = json(&call(&db, "GET", "/api/agents/reviewer", ""));
+        assert_eq!(reviewer["config"]["model"], "big");
+        let again = r#"{"name": "reviewer"}"#;
+        assert_eq!(call(&db, "POST", "/api/agents", again).status, 400);
+        assert_eq!(
+            call(&db, "POST", "/api/agents", r#"{"name": "a b"}"#).status,
+            400
+        );
+        assert_eq!(call(&db, "DELETE", "/api/agents/reviewer", "").status, 200);
+        assert_eq!(call(&db, "GET", "/api/agents/reviewer", "").status, 404);
+        let tools = json(&call(&db, "GET", "/api/tools", ""));
+        assert!(tools.as_array().unwrap().iter().any(|t| t == "run_command"));
     }
 
     #[test]

@@ -20,7 +20,10 @@
 
 <main>
   <section id="agents-panel" class="panel">
-    <h2>Agents <span id="agents-count" class="count"></span></h2>
+    <h2>Agents <span id="agents-count" class="count"></span>
+      <span class="spacer"></span>
+      <button id="new-agent-button" class="ghost small" title="Make a new agent">+ New agent</button>
+    </h2>
     <ul id="agents" class="tree"></ul>
   </section>
 
@@ -82,6 +85,41 @@
     <div class="actions">
       <button type="button" id="new-task-cancel" class="ghost">Cancel</button>
       <button type="submit" class="primary">Create</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="agent-dialog">
+  <form id="agent-form" method="dialog">
+    <h2 id="agent-dialog-title">Agent</h2>
+    <p class="hint" id="agent-source" hidden></p>
+    <div id="agent-new-fields">
+      <label>Name <input name="name" spellcheck="false" placeholder="e.g. reviewer"></label>
+    </div>
+    <label>Description <input name="description" placeholder="what it's for"></label>
+    <label>Model <input name="model" spellcheck="false" placeholder="the session's"></label>
+    <label>Endpoint <input name="endpoint" spellcheck="false" placeholder="the session's"></label>
+    <label>System prompt <textarea name="system_prompt" rows="4" placeholder="added to its instructions"></textarea></label>
+    <div class="row">
+      <label>Max tokens <input name="max_tokens" type="number" min="1" placeholder="default"></label>
+      <label>Context window <input name="context_window" type="number" min="1" placeholder="default"></label>
+    </div>
+    <label>Working directory <input name="cwd" spellcheck="false" placeholder="wherever it's run"></label>
+    <label class="inline danger-option"><input type="checkbox" name="unsafe_tools">
+      unsafe tools: commands run unsandboxed, with your access, and it can fetch from the web; agents it makes may get them too</label>
+    <fieldset>
+      <legend>Tools</legend>
+      <label class="inline"><input type="checkbox" name="all_tools" id="all-tools"> every tool the session has</label>
+      <div id="tool-list" class="tool-list"></div>
+    </fieldset>
+    <label>Request parameters (JSON) <textarea name="parameters" rows="2" spellcheck="false" placeholder='e.g. {"temperature": 0.2}'></textarea></label>
+    <p class="hint">Changes apply from its next turn or task. A session started with --unsafe-tools gives its own agent the unsafe tools either way.</p>
+    <p id="agent-error" class="error" hidden></p>
+    <div class="actions">
+      <button type="button" id="agent-delete" class="danger" hidden>Delete agent</button>
+      <span class="spacer"></span>
+      <button type="button" id="agent-cancel" class="ghost">Cancel</button>
+      <button type="submit" class="primary">Save</button>
     </div>
   </form>
 </dialog>

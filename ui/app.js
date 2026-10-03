@@ -4,6 +4,8 @@
 "use strict";
 
 const POLL_MS = 1500;
+// Sub-agents listed under an agent before "N more".
+const SHOWN_CHILDREN = 8;
 // Most events kept for the all-agents feed.
 const MAX_FEED_ROWS = 3000;
 // Finished tasks shown per board column until "show all".
@@ -30,6 +32,10 @@ const state = {
   // The server's own directory, a new task's default one.
   serverCwd: null,
   showAllDone: new Set(),
+  // Agents whose every sub-agent is listed, not just the first few.
+  expanded: new Set(),
+  // Every tool an agent's list can name.
+  tools: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -349,11 +355,20 @@ function agentTree(agents) {
       roots.push(agent);
     }
   }
+  // task-1-item-2 before task-1-item-10.
+  for (const kids of children.values()) {
+    kids.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  }
   const out = [];
   const walk = (agent, depth) => {
     out.push([agent, depth]);
     if (depth > 32) return;
-    for (const kid of children.get(agent.name) || []) walk(kid, depth + 1);
+    const kids = children.get(agent.name) || [];
+    // A fan-out's hundreds of workers: the first few, until asked.
+    const shown = state.expanded.has(agent.name) || kids.length <= SHOWN_CHILDREN
+      ? kids : kids.slice(0, SHOWN_CHILDREN - 1);
+    for (const kid of shown) walk(kid, depth + 1);
+    if (shown.length < kids.length) out.push([{ more: kids.length - shown.length, parent: agent.name }, depth + 1]);
   };
   roots.forEach((r) => walk(r, 0));
   return out;
@@ -368,6 +383,13 @@ function renderAgents() {
     return;
   }
   list.replaceChildren(...agentTree(state.agents).map(([agent, depth]) => {
+    if (agent.more) {
+      return el("li", {
+        class: "more",
+        style: `margin-left: ${depth * 14}px`,
+        onclick: () => { state.expanded.add(agent.parent); renderAgents(); },
+      }, `+ ${agent.more} more`);
+    }
     const selected = state.selected?.kind === "agent" && state.selected.name === agent.name;
     const dot = agent.live ? (busy(agent.activity) ? "dot busy" : "dot live") : "dot";
     const latest = state.latestByAgent.get(agent.name);
@@ -672,7 +694,8 @@ function renderDetail() {
       return;
     }
     actions.append(el("button", { onclick: () => openNewTask(`agent:${agent.name}`) }, "Give it a task"));
-    actions.append(el("button", { onclick: () => changeCwd(agent) }, "Working directory…"));
+    actions.append(el("button", { onclick: () => openAgentDialog(agent.name) }, "Edit…"));
+    actions.append(el("button", { onclick: () => openAgentDialog(null, agent.name) }, "Clone…"));
     const kids = state.agents.filter((a) => a.parent === agent.name).map((a) => a.name);
     const queued = state.tasks.filter((t) => t.agent_name === agent.name && t.status !== "done");
     fields.replaceChildren(
@@ -736,20 +759,126 @@ function renderDetail() {
     ...field("Last result", task.last_result));
 }
 
-async function changeCwd(agent) {
-  const answer = prompt(
-    `Where should ${agent.name} work? An absolute path; empty for wherever it's run.\n` +
-    "Its file tools, commands and sandbox are confined to it, and agents it makes work there too.",
-    agent.cwd || "");
-  if (answer === null) return;
+// --- Agent settings: the user's to change, unsafe tools included --------
+
+let editing = null; // the agent being edited, or null for a new one
+
+// The agent a new one starts from: the last one made here, else "default".
+function templateAgent() {
+  let last = null;
+  try { last = localStorage.getItem("faber-last-agent"); } catch { /* fine */ }
+  for (const name of [last, "default"]) {
+    if (name && state.agents.some((a) => a.name === name)) return name;
+  }
+  return null;
+}
+
+// Edits agent `name`, or - with none - makes a new one, starting from
+// `from`'s settings (a clone), or else the template agent's.
+async function openAgentDialog(name, from) {
+  editing = name;
+  const form = $("agent-form");
+  form.reset();
+  $("agent-error").hidden = true;
+  $("agent-new-fields").hidden = !!name;
+  $("agent-delete").hidden = !name;
+  const source = name || from || templateAgent();
+  $("agent-dialog-title").textContent = name ? `Agent ${name}` : from ? `Clone ${from}` : "New agent";
+  $("agent-source").hidden = !!name || !source;
+  $("agent-source").textContent = source ? `Starting from ${source}'s settings.` : "";
   try {
-    const { exists_here } = await api("POST", `agents/${encodeURIComponent(agent.name)}/cwd`,
-      { cwd: answer.trim() || null });
-    if (!exists_here) toast("Saved - but that directory doesn't exist on this machine.");
+    if (!state.tools) state.tools = await api("GET", "tools");
+    const detail = source ? await api("GET", `agents/${encodeURIComponent(source)}`) : null;
+    const config = detail?.config || {};
+    form.elements.description.value = (name || from) ? detail?.agent.description || "" : "";
+    if (from) form.elements.name.value = uniqueName(`${from}-copy`);
+    for (const field of ["model", "endpoint", "system_prompt", "max_tokens", "context_window", "cwd"]) {
+      form.elements[field].value = config[field] ?? "";
+    }
+    form.elements.unsafe_tools.checked = !!config.unsafe_tools;
+    form.elements.parameters.value = config.parameters ? JSON.stringify(config.parameters) : "";
+    const chosen = new Set(config.tools || []);
+    $("all-tools").checked = !config.tools;
+    $("tool-list").replaceChildren(...state.tools.map((tool) => el("label", { class: "inline" },
+      el("input", { type: "checkbox", name: "tool", value: tool, checked: chosen.has(tool) }), tool)));
+    $("tool-list").classList.toggle("disabled", !config.tools);
   } catch (e) {
     toast(e.message);
+    return;
   }
-  refresh();
+  $("agent-dialog").showModal();
+}
+
+$("all-tools").addEventListener("change", (e) =>
+  $("tool-list").classList.toggle("disabled", e.target.checked));
+$("new-agent-button").addEventListener("click", () => openAgentDialog(null));
+$("agent-cancel").addEventListener("click", () => $("agent-dialog").close());
+
+$("agent-delete").addEventListener("click", async () => {
+  if (!editing || !confirm(`Delete agent ${editing}, with its conversation and the tasks only it would run?`)) return;
+  try {
+    await api("DELETE", `agents/${encodeURIComponent(editing)}`);
+    $("agent-dialog").close();
+    if (state.selected?.kind === "agent" && state.selected.name === editing) select(null);
+    refresh();
+  } catch (e) {
+    showAgentError(e.message);
+  }
+});
+
+$("agent-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const value = (field) => form.elements[field].value.trim() || null;
+  const number = (field) => (value(field) === null ? null : Number(value(field)));
+  let parameters = null;
+  if (value("parameters")) {
+    try {
+      parameters = JSON.parse(value("parameters"));
+    } catch {
+      return showAgentError("Request parameters must be JSON, e.g. {\"temperature\": 0.2}");
+    }
+  }
+  const config = {
+    model: value("model"),
+    endpoint: value("endpoint"),
+    system_prompt: value("system_prompt"),
+    max_tokens: number("max_tokens"),
+    context_window: number("context_window"),
+    cwd: value("cwd"),
+    unsafe_tools: form.elements.unsafe_tools.checked,
+    parameters,
+    tools: $("all-tools").checked ? null
+      : [...form.querySelectorAll("input[name=tool]:checked")].map((c) => c.value),
+  };
+  if (config.cwd && !config.cwd.startsWith("/")) return showAgentError("The working directory must be an absolute path.");
+  try {
+    if (editing) {
+      await api("PATCH", `agents/${encodeURIComponent(editing)}/config`,
+        { ...config, description: value("description") || "" });
+    } else {
+      const name = value("name");
+      if (!name) return showAgentError("Give it a name.");
+      await api("POST", "agents", { name, description: value("description") || "", config });
+      try { localStorage.setItem("faber-last-agent", name); } catch { /* fine */ }
+      select({ kind: "agent", name });
+    }
+    $("agent-dialog").close();
+    refresh();
+  } catch (err) {
+    showAgentError(err.message);
+  }
+});
+
+function uniqueName(base) {
+  let name = base;
+  for (let i = 2; state.agents.some((a) => a.name === name); i++) name = `${base}-${i}`;
+  return name;
+}
+
+function showAgentError(message) {
+  $("agent-error").textContent = message;
+  $("agent-error").hidden = false;
 }
 
 function reassign(task) {

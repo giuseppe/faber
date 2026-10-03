@@ -635,6 +635,19 @@ pub fn create_agent(
     Ok(())
 }
 
+/// Changes what an agent is described as; false if there's no such agent.
+pub fn set_agent_description(
+    conn: &Connection,
+    name: &str,
+    description: &str,
+) -> Result<bool, Box<dyn Error>> {
+    let rows = conn.execute(
+        "UPDATE agents SET description = ?2 WHERE name = ?1",
+        params![name, description],
+    )?;
+    Ok(rows > 0)
+}
+
 pub fn delete_agent(conn: &Connection, name: &str) -> Result<bool, Box<dyn Error>> {
     let tx = conn.unchecked_transaction()?;
     tx.execute(

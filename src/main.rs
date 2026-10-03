@@ -3653,6 +3653,7 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     };
     let sub_unsafe = agent_config.unsafe_tools == Some(true);
     let sub_cwd = agent_config.cwd.clone().map(PathBuf::from);
+    let task_id = ctx.task_id;
 
     let agent_opts = with_agent_config(&sa_ctx.opts, &agent_config);
     let tools = Arc::new(agent_tools(&sa_ctx.tools, sub_unsafe, &agent_config));
@@ -3777,6 +3778,7 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         sub_ctx.db = Some(db.clone());
         sub_ctx.unsafe_tools = sub_unsafe;
         sub_ctx.cwd = sub_cwd;
+        sub_ctx.task_id = task_id;
         sub_ctx.agent_name = Some(agent_name_for_ctx);
         sub_ctx.mcp_manager = mcp_for_sub;
         sub_ctx.context_window = context_window;
@@ -3787,7 +3789,7 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         sub_ctx.result_schema = result_schema.clone();
         let activity = ActivityRecorder::new(db.clone(), &agent_name);
         activity.set("thinking");
-        let events = Some(EventLog::new(db.clone(), &agent_name, None));
+        let events = Some(EventLog::new(db.clone(), &agent_name, task_id));
         if let Some(events) = &events {
             events.emit(AgentEvent::Input {
                 text: prompt.clone(),
@@ -8560,6 +8562,7 @@ fn chat_command(
                     tool_context.agent_name = Some(active_agent.name.clone());
                     tool_context.mcp_manager = mcp_manager.clone();
                     tool_context.unsafe_tools = turn_unsafe;
+                    tool_context.task_id = running_prompt_task;
                     // A task's own directory, else the agent's.
                     let task_cwd = running_prompt_task
                         .and_then(|id| db.as_ref()?.get_task(id).ok()?)
@@ -9769,6 +9772,7 @@ fn run_prompt_task_headless(
     let mut ctx = ToolContext::new(|_: &str| {});
     ctx.db = Some(db.clone());
     ctx.unsafe_tools = task_unsafe;
+    ctx.task_id = Some(task.id);
     ctx.cwd = run_cwd.map(PathBuf::from);
     ctx.agent_name = Some(agent.to_string());
     ctx.mcp_manager = mcp_manager.clone();
@@ -14934,12 +14938,23 @@ mod tests {
             serde_json::json!([{"if": "check", "reply": "ok"}]),
         );
         let db = local_db_with_agents(&["boss"]);
-        let ctx = chat_ctx_with_model(db.clone(), "boss", &model);
+        let mut ctx = chat_ctx_with_model(db.clone(), "boss", &model);
+        // Fanning out for a task: the workers' events are the task's too.
+        ctx.task_id = Some(7);
         fan_out::tool_fan_out(
             &serde_json::json!({"items": ["a", "b"], "prompt": "check {item}"}).to_string(),
             &ctx,
         )
         .unwrap();
+        let of_task = db
+            .agent_events(&faber::agent_io::EventFilter {
+                task_id: Some(7),
+                limit: 100,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(of_task.iter().any(|r| r.agent == "boss-item-1"));
+        assert!(of_task.iter().any(|r| r.agent == "boss-item-2"));
         for (i, item) in ["a", "b"].iter().enumerate() {
             let name = format!("boss-item-{}", i + 1);
             let agent = db.get_agent(&name).unwrap().expect("a worker agent");
