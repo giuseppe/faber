@@ -694,9 +694,16 @@ impl Client {
     /// opening it the first time, and sending the new text whenever it has
     /// changed since (the model may have edited it in between). Returns the
     /// file's URI and text, and whether anything was sent.
+    ///
+    /// The file is read by faber itself, not the sandboxed server, so it's
+    /// opened inside the root as the file tools do: a symlink out of the
+    /// project reads nothing.
     fn sync(&self, path: &Path) -> Result<(String, String, bool), Box<dyn Error>> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("can't read {}: {}", path.display(), e))?;
+        let relative = path.strip_prefix(&self.root).unwrap_or(path);
+        let mut text = String::new();
+        crate::open_regular_in_root(&self.root, relative)
+            .and_then(|mut file| Ok(std::io::Read::read_to_string(&mut file, &mut text)?))
+            .map_err(|e| format!("can't read {}: {}", relative.display(), e))?;
         let uri = path_to_uri(path);
         let mut documents = self.documents.lock().unwrap_or_else(|e| e.into_inner());
         let sent = match documents.get_mut(&uri) {
@@ -784,8 +791,9 @@ impl Drop for Client {
 }
 
 /// Running clients, by (server command, project root).
-fn clients() -> &'static Mutex<HashMap<(String, PathBuf), Arc<Client>>> {
-    static CLIENTS: OnceLock<Mutex<HashMap<(String, PathBuf), Arc<Client>>>> = OnceLock::new();
+fn clients() -> &'static Mutex<HashMap<(String, PathBuf, bool), Arc<Client>>> {
+    static CLIENTS: OnceLock<Mutex<HashMap<(String, PathBuf, bool), Arc<Client>>>> =
+        OnceLock::new();
     CLIENTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -804,8 +812,20 @@ fn client_for(path: &Path, root: &Path, sandboxed: bool) -> Result<Arc<Client>, 
                 .join(" ")
         )
     })?;
+    client_with(spec, root, sandboxed)
+}
+
+/// The running client for `spec` in `root`, started if needed.
+fn client_with(
+    spec: &ServerSpec,
+    root: &Path,
+    sandboxed: bool,
+) -> Result<Arc<Client>, Box<dyn Error>> {
     let root = root.to_path_buf();
-    let key = (spec.name.clone(), root.clone());
+    // A sandboxed server and an unsandboxed one are never shared: a safe
+    // agent handed an unsafe agent's server would run the project's build
+    // scripts with the user's full rights.
+    let key = (spec.name.clone(), root.clone(), sandboxed);
     let mut clients = clients().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(client) = clients.get(&key) {
         if client.is_alive() {
@@ -833,14 +853,11 @@ pub(crate) fn position_in(
         .nth(line.checked_sub(1).ok_or("line is 1-based")? as usize)
         .ok_or_else(|| format!("line {} is past the end of the file", line))?;
     let byte = match (symbol, column) {
-        (Some(symbol), _) => line_text.find(symbol).ok_or_else(|| {
-            format!(
-                "'{}' does not appear on line {}: {}",
-                symbol,
-                line,
-                line_text.trim()
-            )
-        })?,
+        // The line's own text isn't quoted back: the model can read the
+        // file, and an error that echoes lines would read it for it.
+        (Some(symbol), _) => line_text
+            .find(symbol)
+            .ok_or_else(|| format!("'{}' does not appear on line {}", symbol, line))?,
         (None, Some(column)) => line_text
             .char_indices()
             .nth(column.checked_sub(1).ok_or("column is 1-based")? as usize)
@@ -1343,7 +1360,7 @@ mod tests {
             json!({"line": 0, "character": 3})
         );
         let err = position_in(text, 2, Some("bar"), None).unwrap_err();
-        assert!(err.contains("let é = foo(1);"), "{err}");
+        assert!(!err.contains("foo(1)"), "the line is not echoed: {err}");
         assert!(position_in(text, 9, Some("foo"), None).is_err());
         assert!(position_in(text, 1, None, None).is_err());
     }
@@ -1442,6 +1459,96 @@ mod tests {
     /// End to end against a real server, when clangd is installed (it's
     /// quick to start and needs no project setup). Runs unsandboxed so it
     /// doesn't also depend on bubblewrap.
+    /// A language server that answers every request with an empty result,
+    /// and counts its starts in `starts` next to it.
+    const FAKE_SERVER: &str = r#"import sys, json, os
+open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "starts"), "a").write("x\n")
+inp, out = sys.stdin.buffer, sys.stdout.buffer
+while True:
+    n = None
+    while True:
+        l = inp.readline()
+        if not l: sys.exit(0)
+        l = l.strip()
+        if not l: break
+        if l.lower().startswith(b"content-length:"): n = int(l.split(b":")[1])
+    m = json.loads(inp.read(n))
+    if "id" in m and "method" in m:
+        b = json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": {"capabilities": {}} if m["method"] == "initialize" else []}).encode()
+        out.write(b"Content-Length: %d\r\n\r\n" % len(b) + b); out.flush()
+"#;
+
+    #[test]
+    fn test_sandboxed_and_unsandboxed_servers_are_never_shared() {
+        let Some(python) = crate::latex_kitty::resolve_on_path("python3") else {
+            eprintln!("python3 not installed, skipping");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("faber_test_lsp_share_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("proj")).unwrap();
+        let script = dir.join("fake.py");
+        std::fs::write(&script, FAKE_SERVER).unwrap();
+        let spec = ServerSpec {
+            name: "fake-share".to_string(),
+            commands: vec![vec![
+                python.display().to_string(),
+                script.display().to_string(),
+            ]],
+            extensions: vec!["fk".to_string()],
+            language_id: None,
+            settings: Value::Null,
+        };
+        let root = dir.join("proj");
+        let unsandboxed = client_with(&spec, &root, false).unwrap();
+        assert!(Arc::ptr_eq(
+            &unsandboxed,
+            &client_with(&spec, &root, false).unwrap()
+        ));
+        // A sandboxed caller gets a server of its own (or, with no
+        // bubblewrap here, none) - never the unsandboxed one.
+        if let Ok(sandboxed) = client_with(&spec, &root, true) {
+            assert!(!Arc::ptr_eq(&unsandboxed, &sandboxed));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_files_are_read_inside_the_project_only() {
+        let dir = std::env::temp_dir().join(format!("faber_test_lsp_read_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("proj")).unwrap();
+        std::fs::write(dir.join("secret"), "TOPSECRET\n").unwrap();
+        std::fs::write(dir.join("proj/ok.rs"), "fn ok() {}\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("secret"), dir.join("proj/link.rs")).unwrap();
+        std::os::unix::fs::symlink("../secret", dir.join("proj/rel.rs")).unwrap();
+        let root = dir.join("proj");
+        let read = |name: &str| {
+            let mut text = String::new();
+            crate::open_regular_in_root(&root, Path::new(name))
+                .and_then(|mut f| Ok(std::io::Read::read_to_string(&mut f, &mut text)?))
+                .map(|_| text)
+        };
+        assert_eq!(read("ok.rs").unwrap(), "fn ok() {}\n");
+        assert!(read("link.rs").is_err(), "absolute symlink out");
+        assert!(read("rel.rs").is_err(), "relative symlink out");
+        // A FIFO is refused rather than blocking forever.
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(root.join("pipe.rs"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            read("pipe.rs")
+                .unwrap_err()
+                .to_string()
+                .contains("regular file")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn test_clangd_end_to_end() {
         if crate::latex_kitty::resolve_on_path("clangd").is_none() {
