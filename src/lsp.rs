@@ -919,8 +919,14 @@ fn format_location(uri: &str, range: &Value, root: &Path) -> String {
     let Some(path) = uri_to_path(uri) else {
         return format!("{}:{}:{}", uri, line + 1, character + 1);
     };
-    let source = std::fs::read_to_string(&path)
+    // Quoted only from a file in the project, read as the file tools read
+    // - faber does this, not the sandboxed server, and a reply naming any
+    // file (~/.ssh/id_ed25519, line 3) would otherwise have it quoted. One
+    // elsewhere (the standard library's) is shown without its line.
+    let source = path
+        .strip_prefix(root)
         .ok()
+        .and_then(|relative| crate::read_text_in_root(root, relative).ok())
         .and_then(|t| t.lines().nth(line as usize).map(|l| l.trim().to_string()))
         .unwrap_or_default();
     format!(
@@ -1363,6 +1369,29 @@ mod tests {
         assert!(!err.contains("foo(1)"), "the line is not echoed: {err}");
         assert!(position_in(text, 9, Some("foo"), None).is_err());
         assert!(position_in(text, 1, None, None).is_err());
+    }
+
+    #[test]
+    fn test_locations_quote_lines_only_from_the_project() {
+        let dir = std::env::temp_dir().join(format!("faber_test_lsp_quote_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("proj")).unwrap();
+        std::fs::write(dir.join("secret"), "TOPSECRET\n").unwrap();
+        std::fs::write(dir.join("proj/a.rs"), "fn a() {}\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("secret"), dir.join("proj/link.rs")).unwrap();
+        let root = dir.join("proj");
+        let at = |path: &Path| {
+            format_location(
+                &path_to_uri(path),
+                &json!({"start": {"line": 0, "character": 0}}),
+                &root,
+            )
+        };
+        assert_eq!(at(&root.join("a.rs")), "a.rs:1:1: fn a() {}");
+        // Outside the project, or through a symlink out of it: no line.
+        assert!(!at(&dir.join("secret")).contains("TOPSECRET"));
+        assert!(!at(&root.join("link.rs")).contains("TOPSECRET"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
