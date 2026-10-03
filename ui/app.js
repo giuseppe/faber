@@ -68,8 +68,16 @@ function toast(message) {
 
 // --- API ------------------------------------------------------------------
 
+// The key, when the link faber serve printed was followed: after "#",
+// so it never reaches a server log. Kept, and taken out of the address bar.
+const linkKey = new URLSearchParams(location.hash.slice(1)).get("key");
+if (linkKey) {
+  try { localStorage.setItem("faber-key", linkKey); } catch { /* this load only */ }
+  history.replaceState(null, "", location.pathname + location.search);
+}
+
 function authKey() {
-  try { return localStorage.getItem("faber-key"); } catch { return null; }
+  try { return localStorage.getItem("faber-key") || linkKey; } catch { return linkKey; }
 }
 
 async function api(method, path, body) {

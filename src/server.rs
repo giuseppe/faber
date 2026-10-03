@@ -24,9 +24,33 @@ use faber::protocol::{RpcRequest, RpcResponse};
 use log::{info, warn};
 use rusqlite::Connection;
 use std::error::Error;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Most connections served at once; more are closed straight away.
+const MAX_CONNECTIONS: usize = 256;
+
+/// How long a client may take to say who it is: an HTTP request, or a
+/// line-protocol client's first line (its `auth`).
+const GREETING_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Longest line-protocol line taken: a whole conversation saved at once
+/// fits, a client streaming without end doesn't.
+const MAX_LINE_BYTES: u64 = 64 << 20;
+
+/// Whether `given` is `expected`, in a time that doesn't depend on where
+/// they differ - so the key can't be guessed a byte at a time by timing.
+pub(crate) fn keys_match(given: &str, expected: &str) -> bool {
+    let (given, expected) = (given.as_bytes(), expected.as_bytes());
+    let mut diff = given.len() ^ expected.len();
+    for (i, b) in expected.iter().enumerate() {
+        diff |= (given.get(i).copied().unwrap_or(0) ^ b) as usize;
+    }
+    diff == 0
+}
 
 /// Serves `db` - already initialized - on `bind` until the process ends.
 pub fn serve_command(
@@ -40,10 +64,21 @@ pub fn serve_command(
     let listener = TcpListener::bind(bind)?;
     info!("Listening on {}", bind);
     println!("faber serve listening on {}", bind);
-    println!("Web UI: http://{}/ui/", bind);
+    match auth_key {
+        // After '#', which the browser keeps to itself: the page reads it.
+        Some(key) => println!("Web UI: http://{}/ui/#key={}", bind, key),
+        None => println!("Web UI: http://{}/ui/", bind),
+    }
+    let open = Arc::new(AtomicUsize::new(0));
 
     for stream in listener.incoming() {
         let stream = stream?;
+        if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+            open.fetch_sub(1, Ordering::SeqCst);
+            warn!("Too many connections: closing a new one");
+            continue;
+        }
+        let open = open.clone();
         let peer = stream
             .peer_addr()
             .map(|a| a.to_string())
@@ -53,6 +88,7 @@ pub fn serve_command(
         let auth_key = auth_key.map(|s| s.to_string());
         let profiles = profiles.clone();
         std::thread::spawn(move || {
+            let _ = stream.set_read_timeout(Some(GREETING_TIMEOUT));
             let result = if is_http(&stream) {
                 web::handle_http(stream, db, auth_key.as_deref(), &profiles)
             } else {
@@ -62,6 +98,7 @@ pub fn serve_command(
                 warn!("Client {} error: {}", peer, e);
             }
             info!("Client {} disconnected", peer);
+            open.fetch_sub(1, Ordering::SeqCst);
         });
     }
     Ok(())
@@ -83,12 +120,15 @@ fn handle_client(
     // Every message is a small request/response exchange; don't let
     // Nagle's algorithm hold any of them back.
     stream.set_nodelay(true)?;
-    let reader = BufReader::new(stream.try_clone()?);
+    let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
     let mut authenticated = auth_key.is_none();
+    if authenticated {
+        // A client may then stay idle as long as it likes.
+        writer.set_read_timeout(None)?;
+    }
 
-    for line in reader.lines() {
-        let line = line?;
+    while let Some(line) = read_line(&mut reader)? {
         if line.trim().is_empty() {
             continue;
         }
@@ -106,8 +146,9 @@ fn handle_client(
         if !authenticated {
             let resp = if request.method == "auth" {
                 let key = request.params["key"].as_str().unwrap_or("");
-                if key == auth_key.unwrap_or("") {
+                if keys_match(key, auth_key.unwrap_or("")) {
                     authenticated = true;
+                    writer.set_read_timeout(None)?;
                     RpcResponse::success(request.id, serde_json::json!(true))
                 } else {
                     let r = RpcResponse::error(Some(request.id), "unauthorized".into());
@@ -127,6 +168,25 @@ fn handle_client(
         send_response(&mut writer, &response)?;
     }
     Ok(())
+}
+
+/// The next line, without its newline (`None` at the end): at most
+/// `MAX_LINE_BYTES` of it.
+fn read_line(reader: &mut impl BufRead) -> Result<Option<String>, Box<dyn Error>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_LINE_BYTES + 1)
+        .read_until(b'\n', &mut bytes)?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() as u64 > MAX_LINE_BYTES {
+        return Err(format!("a line over {} bytes", MAX_LINE_BYTES).into());
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    Ok(Some(String::from_utf8(bytes)?))
 }
 
 /// The `id` of a line that isn't a valid request, if it's JSON with a

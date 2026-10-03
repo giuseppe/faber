@@ -6641,6 +6641,66 @@ fn check_name_free_for(db: &dyn DbBackend, name: &str, parent: &str) -> Result<(
 
 /// `path` as a working directory: absolute (relative ones taken from
 /// `base`), symlinks resolved, and an existing directory.
+/// The key in `file`: its first line, which must not be empty.
+fn read_key_file(file: &str) -> Result<String, Box<dyn Error>> {
+    let content = std::fs::read_to_string(file)
+        .map_err(|e| format!("can't read the key in {}: {}", file, e))?;
+    let key = content.lines().next().unwrap_or("").trim().to_string();
+    if key.is_empty() {
+        return Err(format!("{} holds no key", file).into());
+    }
+    Ok(key)
+}
+
+/// Where `faber serve` on `address`'s port keeps the key it made:
+/// `$XDG_RUNTIME_DIR/faber/serve-<port>.key` (else under
+/// `~/.local/state/faber`), only the user's to read.
+fn server_key_path(address: &str) -> Option<PathBuf> {
+    let port = address.rsplit_once(':')?.1;
+    port.parse::<u16>().ok()?;
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+    Some(dir.join("faber").join(format!("serve-{}.key", port)))
+}
+
+/// Makes a new random key for `faber serve` on `bind`, and writes it
+/// (`server_key_path`) for clients on this machine to find.
+fn write_server_key(bind: &str) -> Result<String, Box<dyn Error>> {
+    use std::io::Read;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let path = server_key_path(bind).ok_or_else(|| format!("no port in '{}'", bind))?;
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let key: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    let dir = path.parent().ok_or("no directory for the key")?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let _ = std::fs::remove_file(&path);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    std::io::Write::write_all(&mut file, format!("{}\n", key).as_bytes())?;
+    println!("Key for clients: {}", path.display());
+    Ok(key)
+}
+
+/// Whether `address` (`host:port`) is on the loopback interface - the only
+/// one a key found on this machine is sent to, or `--no-auth` serves on.
+fn is_loopback_address(address: &str) -> bool {
+    let host = address.rsplit_once(':').map_or(address, |(host, _)| host);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// `$XDG_CONFIG_HOME/faber/config.json` (or `~/.config/...`): the config
 /// file read when none is given.
 fn default_config_file() -> Option<PathBuf> {
@@ -12579,10 +12639,8 @@ struct Opts {
     /// Connect to a remote faber server instead of using a local database
     server: Option<String>,
     #[clap(long)]
-    /// Pre-shared key for server authentication
-    server_key: Option<String>,
-    #[clap(long)]
-    /// Read server key from file (first line)
+    /// Read the server's key from this file (first line). Without it, a
+    /// server on this machine's key is found where it wrote it
     server_key_file: Option<String>,
 
     #[clap(skip)]
@@ -12653,7 +12711,6 @@ impl Default for Opts {
             context_window: None,
             display_graphics: None,
             server: None,
-            server_key: None,
             server_key_file: None,
             mcp_servers: HashMap::new(),
             lsp_servers: HashMap::new(),
@@ -12737,10 +12794,6 @@ impl Opts {
 
         if self.server.is_none() {
             self.server = config.server;
-        }
-
-        if self.server_key.is_none() {
-            self.server_key = config.server_key;
         }
 
         if self.server_key_file.is_none() {
@@ -13351,12 +13404,16 @@ enum CliCommand {
         /// Address to bind to
         #[clap(long, default_value = "127.0.0.1:9090")]
         bind: String,
-        /// Pre-shared key for client authentication
-        #[clap(long)]
-        auth_key: Option<String>,
-        /// Read auth key from file (first line)
+        /// Read the key clients must give from this file (first line).
+        /// Without it, a new key is made each start, and written where
+        /// clients on this machine find it
         #[clap(long)]
         auth_key_file: Option<String>,
+        /// Serve with no key at all: anything on this machine that can
+        /// connect - any user, any process - can then do what the user
+        /// can. Only for a bind address on the loopback interface
+        #[clap(long)]
+        no_auth: bool,
         /// Also work through tasks as this agent, like `faber worker
         /// --agent NAME` running inside the server. Repeat for more agents.
         /// If a chat has the agent, it waits for it to be free
@@ -13459,13 +13516,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let db_connection: Option<Arc<dyn DbBackend>> = if let Some(ref server_addr) = opts.server {
         debug!("Connecting to remote server at: {}", server_addr);
         let remote = remote_db::RemoteDb::connect(server_addr)?;
-        let key = match (&opts.server_key, &opts.server_key_file) {
-            (Some(k), _) => Some(k.clone()),
-            (_, Some(f)) => {
-                let content = std::fs::read_to_string(f)?;
-                Some(content.lines().next().unwrap_or("").to_string())
-            }
-            _ => None,
+        let key = match &opts.server_key_file {
+            Some(file) => Some(read_key_file(file)?),
+            // A server on this machine: the key it wrote for its port.
+            None => server_key_path(server_addr)
+                .filter(|path| is_loopback_address(server_addr) && path.is_file())
+                .map(|path| read_key_file(&path.display().to_string()))
+                .transpose()?,
         };
         if let Some(ref k) = key {
             remote.authenticate(k)?;
@@ -13640,21 +13697,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         ),
         CliCommand::Serve {
             bind,
-            auth_key,
             auth_key_file,
+            no_auth,
             run_agents,
         } => {
             let (Some(conn), Some(db)) = (db_conn_for_history.clone(), db_connection.clone())
             else {
                 return Err("--db-path is required for serve command".into());
             };
-            let key = match (auth_key, auth_key_file) {
-                (Some(k), _) => Some(k.clone()),
-                (_, Some(f)) => {
-                    let content = std::fs::read_to_string(f)?;
-                    Some(content.lines().next().unwrap_or("").to_string())
+            let key = match (auth_key_file, no_auth) {
+                (Some(_), true) => return Err("give --auth-key-file or --no-auth, not both".into()),
+                (Some(file), false) => Some(read_key_file(file)?),
+                (None, true) if !is_loopback_address(bind) => {
+                    return Err(format!(
+                        "--no-auth would let anyone who can reach {} do what you can: only for a \
+                         loopback address (127.0.0.1)",
+                        bind
+                    )
+                    .into());
                 }
-                _ => None,
+                (None, true) => None,
+                (None, false) => Some(write_server_key(bind)?),
             };
             let profiles = opts.profiles.clone();
             let workers = run_agents
@@ -18656,6 +18719,34 @@ mod tests {
 
     fn search_params(json: serde_json::Value) -> SearchParams {
         serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn test_server_keys_stay_on_this_machine() {
+        assert!(server::keys_match("abc", "abc"));
+        assert!(!server::keys_match("abd", "abc"));
+        assert!(!server::keys_match("ab", "abc"));
+        assert!(!server::keys_match("abcd", "abc"));
+        assert!(!server::keys_match("", "abc"));
+        for local in [
+            "127.0.0.1:9090",
+            "localhost:1",
+            "[::1]:9090",
+            "127.1.2.3:80",
+        ] {
+            assert!(is_loopback_address(local), "{local}");
+        }
+        for remote in [
+            "10.0.0.1:9090",
+            "0.0.0.0:9090",
+            "faber-host:9090",
+            "[::]:9090",
+        ] {
+            assert!(!is_loopback_address(remote), "{remote}");
+        }
+        let path = server_key_path("127.0.0.1:9090").unwrap();
+        assert!(path.ends_with("faber/serve-9090.key"), "{}", path.display());
+        assert!(server_key_path("no-port").is_none());
     }
 
     #[test]
