@@ -741,12 +741,24 @@ Whether an agent has them is up to each agent, not the whole session:
   takes the unsafe tools.
 - A task a safe agent creates (`task_create`) runs without them, whoever
   picks it up: a worker that has them runs it on a safe agent of its own,
-  and a tool task gets the safe tools.
+  and a tool task gets the safe tools, in the task's working directory. A
+  tool task only runs a tool its maker has, and a safe agent's tool task
+  never writes into an agent's conversation: its result stays in the task.
+  A safe agent can only enable, move or delete the tasks safe agents made,
+  and sees only the name and state of the others - not their commands,
+  nor their results.
 
 - Like `run_command`, `send_message` comes in two versions: a safe
   agent's can only message agents without the unsafe tools - those that
   have them, for good or for the session running them, can't be asked
-  to use them that way.
+  to use them that way. As a message may wait for its agent, it's checked
+  again when it's delivered: a chat with the unsafe tools drops safe
+  agents' messages, other than from its own sub-agents.
+
+- In the knowledge base, a safe agent doesn't see the private notes of
+  the agents above it past the first one with the unsafe tools (a worker
+  that has them runs its tasks on safe agents), and can't replace or
+  delete a note the user or an unsafe agent wrote.
 
 ### Tool filtering
 
