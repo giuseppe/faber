@@ -1100,6 +1100,7 @@ fn run_tool_call_group(
                     buffered.file_versions = ctx.file_versions.clone();
                     buffered.unsafe_tools = ctx.unsafe_tools;
                     buffered.cwd = ctx.cwd.clone();
+                    buffered.task_id = ctx.task_id;
                     let tool_start_time = Instant::now();
                     let result =
                         tool_call(tools_collection, req, &buffered).map_err(|e| e.to_string());

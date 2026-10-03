@@ -692,8 +692,9 @@ Whether an agent has them is up to each agent, not the whole session:
 - `--unsafe-tools` gives them to the session's own agent: the chat's, a
   worker's, `faber serve --run-agent`'s.
 - `faber agents set NAME --unsafe` gives them to an agent for good, in
-  any session (`--safe` takes them away). `faber agents` marks such
-  agents `(unsafe)`, and so does the web UI.
+  any session (`--safe` takes them away) - as does "unsafe tools" in the
+  agent's Settings in the web UI. `faber agents` marks such agents
+  `(unsafe)`, and so does the web UI.
 - An agent an agent makes - `spawn_agent`, `agent_create` - is like its
   maker unless it asks otherwise (`unsafe_tools`). Only an agent that has
   the unsafe tools can give them, so a safe agent can only make safe
@@ -896,7 +897,8 @@ then the server.
   it - input, streamed answers and reasoning, each tool call with its
   result, how each turn ended - and the tasks. Pick an agent or a task to
   follow only that; a task's feed shows its runs, whichever agent ran
-  them.
+  them, and everything the sub-agents and fan-out workers they started
+  did.
 - A task's panel starts with what went wrong, if anything: why it
   failed, and every tool call that failed along the way. Failed tool
   calls are also red, and open, in the feed, and counted on the task's
@@ -909,6 +911,16 @@ then the server.
   and every running one a stop button (■): whichever chat or worker runs
   it interrupts it, with its sub-agents and fan-out workers, and records
   it as failed ("stopped").
+
+Agents are configured there too: "+ New agent" makes one - starting
+from the settings of the last agent made there, or else `default`'s -
+an agent's Clone makes a copy of it, and its Edit changes its
+description, model, endpoint, system prompt, limits,
+request parameters, tools, working directory and whether it has the
+unsafe tools - the web UI is you, so it may do what agents can't do to
+each other. Changes apply from the agent's next turn or task. A list of
+an agent's sub-agents (a fan-out's workers) shows the first few until
+asked for the rest.
 
 New tasks can be added there too, choosing where they run: on any agent
 (the first free chat or worker takes it - the default), on a given

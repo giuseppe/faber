@@ -118,6 +118,9 @@ pub struct ToolContext {
     /// The directory the agent works in - its own, if it has one (see
     /// `AgentConfig::cwd`), else the process's. Every tool goes by it.
     pub cwd: Option<PathBuf>,
+    /// The task this work is for, if any: what it records is tagged with
+    /// it, the agents it starts included, so a task shows all it did.
+    pub task_id: Option<i64>,
 }
 
 /// A file's key in `ToolContext::file_versions`: absolute (relative to
@@ -170,6 +173,7 @@ impl ToolContext {
             file_versions: Some(Arc::new(Mutex::new(HashMap::new()))),
             unsafe_tools: false,
             cwd: None,
+            task_id: None,
         }
     }
 
