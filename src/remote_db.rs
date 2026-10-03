@@ -17,6 +17,7 @@
  *
  */
 
+use faber::agent_io::{AgentEvent, AgentEventRow, EventFilter};
 use faber::db::{
     AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow, TaskOutcome, TaskRow,
 };
@@ -524,8 +525,31 @@ impl DbBackend for RemoteDb {
         Ok(serde_json::from_value(v)?)
     }
 
+    fn run_task_now(&self, task_id: i64) -> Result<bool, Box<dyn Error>> {
+        let v = self.call("run_task_now", serde_json::json!({"task_id": task_id}))?;
+        Ok(serde_json::from_value(v)?)
+    }
+
     fn gc_agents(&self) -> Result<Vec<String>, Box<dyn Error>> {
         let v = self.call("gc_agents", serde_json::json!({}))?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn append_agent_events(
+        &self,
+        agent: &str,
+        task_id: Option<i64>,
+        events: &[AgentEvent],
+    ) -> Result<(), Box<dyn Error>> {
+        self.call(
+            "append_agent_events",
+            serde_json::json!({"agent": agent, "task_id": task_id, "events": events}),
+        )?;
+        Ok(())
+    }
+
+    fn agent_events(&self, filter: &EventFilter) -> Result<Vec<AgentEventRow>, Box<dyn Error>> {
+        let v = self.call("agent_events", serde_json::json!({"filter": filter}))?;
         Ok(serde_json::from_value(v)?)
     }
 }

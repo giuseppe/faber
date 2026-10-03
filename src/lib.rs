@@ -23,6 +23,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, mpsc};
 
+pub mod agent_io;
 pub mod db;
 pub mod db_backend;
 pub mod dummy_llm;

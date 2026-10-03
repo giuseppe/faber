@@ -465,6 +465,8 @@ pub enum StatusUpdate {
     ToolComplete {
         name: String,
         duration_ms: u64,
+        /// The tool's result, as handed back to the model.
+        output: String,
     },
     /// About to run several tool calls concurrently (see `run_tool_calls`).
     /// Their output is buffered and each is then reported through the
@@ -1051,6 +1053,7 @@ fn run_tool_call_live(
         StatusUpdate::ToolComplete {
             name: req.function.name.clone(),
             duration_ms: tool_start_time.elapsed().as_millis() as u64,
+            output: msg.content.clone().unwrap_or_default(),
         },
         start_time,
     )?;
@@ -1131,6 +1134,7 @@ fn run_tool_call_group(
             StatusUpdate::ToolComplete {
                 name: req.function.name.clone(),
                 duration_ms: duration.as_millis() as u64,
+                output: msg.content.clone().unwrap_or_default(),
             },
             start_time,
         )?;

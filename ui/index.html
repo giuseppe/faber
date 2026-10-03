@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>faber</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body data-view="live">
+<header>
+  <h1>faber</h1>
+  <span id="connection" class="pill">connecting…</span>
+  <nav class="tabs">
+    <button data-view="live" class="tab">Live</button>
+    <button data-view="board" class="tab">Board</button>
+  </nav>
+  <span class="spacer"></span>
+  <button id="new-task-button" class="primary">New task</button>
+</header>
+
+<main>
+  <section id="agents-panel" class="panel">
+    <h2>Agents <span id="agents-count" class="count"></span></h2>
+    <ul id="agents" class="tree"></ul>
+  </section>
+
+  <section id="detail-panel" class="panel">
+    <div class="detail-head">
+      <button id="detail-back" class="ghost" title="Back to all agents" hidden>←</button>
+      <h2 id="detail-title">All agents</h2>
+      <div id="detail-actions" class="actions"></div>
+    </div>
+    <dl id="detail-fields" class="fields"></dl>
+    <div class="feed-options">
+      <label class="toggle"><input type="checkbox" id="show-reasoning"> reasoning</label>
+      <label class="toggle"><input type="checkbox" id="follow" checked> follow</label>
+    </div>
+    <div id="events" class="events"></div>
+    <div id="feed-status" class="feed-status"></div>
+  </section>
+
+  <section id="tasks-panel" class="panel">
+    <h2>Tasks <span id="tasks-count" class="count"></span>
+      <label class="toggle"><input type="checkbox" id="show-finished"> finished</label>
+    </h2>
+    <div id="task-list" class="task-list"></div>
+  </section>
+
+  <section id="board-panel" class="panel">
+    <div id="board" class="board"></div>
+  </section>
+</main>
+
+<dialog id="new-task">
+  <form id="new-task-form" method="dialog">
+    <h2>New task</h2>
+    <label>What to do
+      <textarea name="command" rows="6" required placeholder="Instructions for the agent"></textarea>
+    </label>
+    <label>Name <input name="name" placeholder="default: the first line"></label>
+    <label>Run on
+      <select name="target" id="target-select"></select>
+    </label>
+    <p class="hint" id="target-hint"></p>
+    <fieldset>
+      <legend>When</legend>
+      <label class="inline"><input type="radio" name="when" value="now" checked> now</label>
+      <label class="inline"><input type="radio" name="when" value="at"> at
+        <input type="datetime-local" name="at"></label>
+      <label class="inline"><input type="radio" name="when" value="cron"> cron
+        <input name="cron" placeholder="0 0 9 * * Mon-Fri *"></label>
+    </fieldset>
+    <label>After tasks <input name="depends_on" placeholder="ids, e.g. 3, 5"></label>
+    <label class="inline"><input type="checkbox" name="hold"> put in the backlog (held until released)</label>
+    <label class="inline"><input type="checkbox" name="tool"> command is a tool call (JSON)</label>
+    <p id="new-task-error" class="error" hidden></p>
+    <div class="actions">
+      <button type="button" id="new-task-cancel" class="ghost">Cancel</button>
+      <button type="submit" class="primary">Create</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="auth">
+  <form id="auth-form" method="dialog">
+    <h2>Auth key</h2>
+    <p>This server needs its auth key (<code>faber serve --auth-key</code>).</p>
+    <input name="key" type="password" autocomplete="current-password" required>
+    <div class="actions"><button type="submit" class="primary">Connect</button></div>
+  </form>
+</dialog>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

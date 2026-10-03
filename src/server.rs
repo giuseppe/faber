@@ -17,6 +17,8 @@
  *
  */
 
+use crate::web::{self, UiProfile};
+use faber::agent_io::{AgentEvent, EventFilter};
 use faber::db;
 use faber::protocol::{RpcRequest, RpcResponse};
 use log::{info, warn};
@@ -26,18 +28,19 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
+/// Serves `db` - already initialized - on `bind` until the process ends.
 pub fn serve_command(
     bind: &str,
-    db_path: &str,
+    db: Arc<Mutex<Connection>>,
     auth_key: Option<&str>,
+    profiles: Vec<UiProfile>,
 ) -> Result<(), Box<dyn Error>> {
-    let conn = Connection::open(db_path)?;
-    db::initialize_db(&conn)?;
-    let db = Arc::new(Mutex::new(conn));
+    let profiles = Arc::new(profiles);
 
     let listener = TcpListener::bind(bind)?;
     info!("Listening on {}", bind);
     println!("faber serve listening on {}", bind);
+    println!("Web UI: http://{}/ui/", bind);
 
     for stream in listener.incoming() {
         let stream = stream?;
@@ -48,14 +51,28 @@ pub fn serve_command(
         info!("Client connected: {}", peer);
         let db = db.clone();
         let auth_key = auth_key.map(|s| s.to_string());
+        let profiles = profiles.clone();
         std::thread::spawn(move || {
-            if let Err(e) = handle_client(stream, db, auth_key.as_deref()) {
+            let result = if is_http(&stream) {
+                web::handle_http(stream, db, auth_key.as_deref(), &profiles)
+            } else {
+                handle_client(stream, db, auth_key.as_deref())
+            };
+            if let Err(e) = result {
                 warn!("Client {} error: {}", peer, e);
             }
             info!("Client {} disconnected", peer);
         });
     }
     Ok(())
+}
+
+/// Whether the client speaks HTTP (the web UI and its API) rather than
+/// the line protocol: an HTTP request starts with its method's name, a
+/// line-protocol one with `{`.
+fn is_http(stream: &TcpStream) -> bool {
+    let mut first = [0u8; 1];
+    matches!(stream.peek(&mut first), Ok(1) if first[0].is_ascii_uppercase())
 }
 
 fn handle_client(
@@ -333,6 +350,10 @@ fn dispatch_inner(
             let v = db::set_task_held(&conn, i64_param!("task_id"), held)?;
             Ok(serde_json::to_value(v)?)
         }
+        "run_task_now" => {
+            let v = db::run_task_now(&conn, i64_param!("task_id"))?;
+            Ok(serde_json::to_value(v)?)
+        }
         "set_task_target" => {
             let v = db::set_task_target(
                 &conn,
@@ -417,6 +438,18 @@ fn dispatch_inner(
         }
         "gc_agents" => {
             let v = db::gc_agents(&conn)?;
+            Ok(serde_json::to_value(v)?)
+        }
+        "append_agent_events" => {
+            let events: Vec<AgentEvent> = serde_json::from_value(p["events"].clone())
+                .map_err(|e| format!("bad param 'events': {}", e))?;
+            db::append_agent_events(&conn, str_param!("agent"), p["task_id"].as_i64(), &events)?;
+            Ok(serde_json::json!(true))
+        }
+        "agent_events" => {
+            let filter: EventFilter = serde_json::from_value(p["filter"].clone())
+                .map_err(|e| format!("bad param 'filter': {}", e))?;
+            let v = db::agent_events(&conn, &filter)?;
             Ok(serde_json::to_value(v)?)
         }
         _ => Err(format!("unknown method: {}", req.method).into()),

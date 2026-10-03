@@ -437,6 +437,7 @@ work ahead of time and start it on a signal:
 faber tasks add "Deploy the release notes" --hold   # created held
 faber tasks hold 7 8                                 # hold scheduled tasks
 faber tasks release 7 8                              # picked up again - right away if already due
+faber tasks run 7                                    # now: held, disabled, not due yet, or done (again)
 ```
 
 Only a `scheduled` task can be held (a running one is already assigned)
@@ -454,7 +455,9 @@ A prompt task runs on one of three:
   on a new agent, `<profile>-<task id>`, made from the profile under the
   worker's agent (kept, with its conversation, until `faber gc`). Chats
   don't run these;
-- **any agent** (neither): whichever chat or worker is free first.
+- **any agent** (neither): whichever chat or worker is free first. A
+  worker runs it on a new agent of its own, `task-<task id>`, made with
+  the worker's settings under the worker's agent.
 
 ```bash
 faber tasks add "Review the diff in PR 12" --profile deep
@@ -477,13 +480,20 @@ a `faber chat` sitting idle, picking up prompt tasks for it (or for any
 agent) and running tool tasks:
 
 ```bash
-faber --db-path state.db worker --agent w1 --parallel 8   # up to 8 tasks at once
-faber --server host:9090 worker                           # as worker-<pid>, against a shared server
+faber --db-path state.db worker --agent w1
+faber --server host:9090 worker              # as worker-<pid>, against a shared server
 ```
 
 A worker also takes on tasks bound to a profile in its config file - all
 of them, or only those given with `--profile fast,deep` - each on a new
 agent made from it (see [Choosing where a task runs](#choosing-where-a-task-runs)).
+
+A worker runs any number of tasks at once, each on its own agent - a
+`task-<id>` or `<profile>-<id>` one under the worker's, with its own
+conversation and output - except tasks for the worker's agent by name,
+which run as that agent, one at a time. What limits how many requests
+reach the model at once is `--max-parallel-requests`; `--parallel N` caps
+the tasks themselves, if you want that too.
 
 Each task gets a fresh conversation (the agent's system prompt, then the
 task), with every tool - including `spawn_agent`, `fan_out` and
@@ -799,6 +809,58 @@ use SSH tunneling, WireGuard, or a reverse proxy for encryption:
 ssh -L 9090:localhost:9090 remote-host
 faber --server 127.0.0.1:9090 --server-key mysecret chat
 ```
+
+The server can also run agents itself, each working through tasks like
+a `faber worker` would - any number at once:
+
+```bash
+faber --db-path state.db serve --run-agent default --run-agent reviewer
+```
+
+If a chat already has one of those agents, its worker waits until the
+chat lets go of it. Ctrl-C stops the agents (interrupting their tasks),
+then the server.
+
+### Web UI
+
+`faber serve` also serves a web UI, on the same address, at
+`http://<bind>/ui/`, with two views:
+
+- **Live**: every agent (as a tree, live or not, with what each is doing
+  and the last thing it said), a feed of what all of them do as they do
+  it - input, streamed answers and reasoning, each tool call with its
+  result, how each turn ended - and the tasks. Pick an agent or a task to
+  follow only that; a task's feed shows its runs, whichever agent ran
+  them.
+- **Board**: the tasks as a scrum board - Backlog (held), To do, In
+  progress (with the running agent's latest output), Done, Failed. Drag a
+  card between Backlog and To do to hold or release it; disabled tasks
+  are greyed out in the backlog. Every task not running has a run button
+  (▶) - to start it now, whatever it was waiting for, or run it again.
+
+New tasks can be added there too, choosing where they run: on any agent
+(the first free chat or worker takes it - the default), on a given
+agent, or on a new agent made from one of the profiles in `faber
+serve`'s config file. Tasks can also be held, released, enabled,
+disabled, reassigned and deleted.
+
+What agents do is recorded in the database as it happens (see
+`src/agent_io.rs`), by chats, workers and sub-agents alike, so the UI
+sees agents in every process sharing the database - the last 2000
+events per agent are kept, and go with the agent at `faber gc`.
+
+The UI is built on a JSON API, for scripts too:
+
+```bash
+curl localhost:9090/api/agents
+curl 'localhost:9090/api/events?agent=w1&after=120'        # or ?task=7
+curl -H 'Content-Type: application/json' -d '{"command": "Fix the failing test", "profile": "fast"}' \
+     localhost:9090/api/tasks
+```
+
+With `--auth-key`, API requests need `Authorization: Bearer <key>` (the UI
+asks for it). Without one, the API only answers at `localhost` or an IP
+address, so a web page can't reach it through a name it controls.
 
 ## Options
 

@@ -17,6 +17,7 @@
  *
  */
 
+use crate::agent_io::{AgentEvent, AgentEventRow, EventFilter};
 use crate::db::{
     AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow, TaskOutcome, TaskRow,
 };
@@ -103,6 +104,8 @@ pub trait DbBackend: Send + Sync {
     fn list_tasks(&self, agent_name: Option<&str>) -> Result<Vec<TaskRow>, Box<dyn Error>>;
     fn get_task(&self, task_id: i64) -> Result<Option<TaskRow>, Box<dyn Error>>;
     fn set_task_enabled(&self, task_id: i64, enabled: bool) -> Result<bool, Box<dyn Error>>;
+    /// See `db::run_task_now`.
+    fn run_task_now(&self, task_id: i64) -> Result<bool, Box<dyn Error>>;
     /// See `db::set_task_held`.
     fn set_task_held(&self, task_id: i64, held: bool) -> Result<bool, Box<dyn Error>>;
     /// See `db::set_task_target`.
@@ -128,6 +131,16 @@ pub trait DbBackend: Send + Sync {
     ) -> Result<bool, Box<dyn Error>>;
 
     fn gc_agents(&self) -> Result<Vec<String>, Box<dyn Error>>;
+
+    /// See `db::append_agent_events`.
+    fn append_agent_events(
+        &self,
+        agent: &str,
+        task_id: Option<i64>,
+        events: &[AgentEvent],
+    ) -> Result<(), Box<dyn Error>>;
+    /// See `db::agent_events`.
+    fn agent_events(&self, filter: &EventFilter) -> Result<Vec<AgentEventRow>, Box<dyn Error>>;
 
     /// See `db::kb_write`.
     fn kb_write(
