@@ -17,7 +17,7 @@
  *
  */
 
-use chrono::{Days, SecondsFormat, Utc};
+use chrono::{DateTime, Days, SecondsFormat, Utc};
 use dirs;
 use log::{debug, trace, warn};
 use reqwest::StatusCode;
@@ -635,14 +635,44 @@ fn make_github_api_request(
 }
 
 /// Fetches issues from a GitHub repository that have been updated within the last `days`.
+/// Refuses a `repo` that isn't `owner/name`: it goes into the URL as is,
+/// and `../user/repos?x=` would make it any other API path the token can
+/// read.
+fn check_repo(repo: &str) -> Result<(), String> {
+    let valid_part = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    match repo.split_once('/') {
+        Some((owner, name)) if valid_part(owner) && valid_part(name) => Ok(()),
+        _ => Err(format!(
+            "'{}' isn't a repository: give owner/name, e.g. containers/crun",
+            repo
+        )),
+    }
+}
+
+/// The time `days` ago, for a listing's `since`.
+fn days_ago(days: u64) -> Result<DateTime<Utc>, String> {
+    // GitHub has been around for less than 10000 days.
+    let days = days.min(10_000);
+    Utc::now()
+        .checked_sub_days(Days::new(days))
+        .ok_or_else(|| format!("can't go {} days back", days))
+}
+
 pub fn get_github_issues(repo: &String, days: u64) -> Result<Issues, Box<dyn Error>> {
+    check_repo(repo)?;
     debug!(
         "Fetching issues from repository {} updated in the last {} days",
         repo, days
     );
 
-    let now = Utc::now();
-    let since = now.checked_sub_days(Days::new(days)).unwrap();
+    let since = days_ago(days)?;
     let query = format!("since={}", since.to_rfc3339_opts(SecondsFormat::Secs, true));
     debug!("Using time filter: {}", query);
 
@@ -669,13 +699,13 @@ pub fn get_github_issues(repo: &String, days: u64) -> Result<Issues, Box<dyn Err
 
 /// Fetches pull requests from a GitHub repository that have been updated within the last `days`.
 pub fn get_github_pull_requests(repo: &String, days: u64) -> Result<PullRequests, Box<dyn Error>> {
+    check_repo(repo)?;
     debug!(
         "Fetching pull requests from repository {} updated in the last {} days",
         repo, days
     );
 
-    let now = Utc::now();
-    let since = now.checked_sub_days(Days::new(days)).unwrap();
+    let since = days_ago(days)?;
     let query = format!("since={}", since.to_rfc3339_opts(SecondsFormat::Secs, true));
     debug!("Using time filter: {}", query);
 
@@ -706,6 +736,7 @@ pub fn get_github_pull_requests(repo: &String, days: u64) -> Result<PullRequests
 
 /// Fetches detailed information for a specific pull request from a GitHub repository.
 pub fn get_github_pull_request(repo: &String, pr: u64) -> Result<PullRequest, Box<dyn Error>> {
+    check_repo(repo)?;
     debug!(
         "Fetching details for pull request #{} from repository {}",
         pr, repo
@@ -734,6 +765,7 @@ pub fn get_github_pull_request(repo: &String, pr: u64) -> Result<PullRequest, Bo
 
 /// Fetches the patch content for a specific pull request from a GitHub repository.
 pub fn get_github_pull_request_patch(repo: &String, pr: u64) -> Result<String, Box<dyn Error>> {
+    check_repo(repo)?;
     debug!(
         "Fetching patch for pull request #{} from repository {}",
         pr, repo
@@ -765,6 +797,7 @@ pub fn get_github_pull_request_patch(repo: &String, pr: u64) -> Result<String, B
 
 /// Fetches detailed information for a specific issue from a GitHub repository.
 pub fn get_github_issue(repo: &String, issue: u64) -> Result<Issue, Box<dyn Error>> {
+    check_repo(repo)?;
     debug!(
         "Fetching details for issue #{} from repository {}",
         issue, repo
@@ -793,6 +826,7 @@ pub fn get_github_issue(repo: &String, issue: u64) -> Result<Issue, Box<dyn Erro
 
 /// Fetches all comments for a specific issue from a GitHub repository.
 pub fn get_github_issue_comments(repo: &String, issue: u64) -> Result<Comments, Box<dyn Error>> {
+    check_repo(repo)?;
     debug!(
         "Fetching comments for issue #{} from repository {}",
         issue, repo
@@ -821,4 +855,29 @@ pub fn get_github_issue_comments(repo: &String, issue: u64) -> Result<Comments, 
     trace!("Comments: {:?}", comments);
 
     Ok(comments)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_repo_is_owner_and_name_only() {
+        assert!(check_repo("containers/crun").is_ok());
+        assert!(check_repo("a.b/c-d_e").is_ok());
+        for bad in [
+            "../user/repos?x=",
+            "%2e%2e/user",
+            "a/b/../../../orgs/x",
+            "a",
+            "a/",
+            "/b",
+            "../b",
+            "a/b/c",
+            "a/b?x",
+        ] {
+            assert!(check_repo(bad).is_err(), "{bad}");
+        }
+        assert!(days_ago(u64::MAX).is_ok(), "capped rather than overflowing");
+    }
 }
