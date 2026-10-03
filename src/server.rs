@@ -17,7 +17,7 @@
  *
  */
 
-use crate::web::{self, UiProfile};
+use crate::web;
 use faber::agent_io::{AgentEvent, EventFilter};
 use faber::db;
 use faber::protocol::{RpcRequest, RpcResponse};
@@ -33,7 +33,7 @@ pub fn serve_command(
     bind: &str,
     db: Arc<Mutex<Connection>>,
     auth_key: Option<&str>,
-    profiles: Vec<UiProfile>,
+    profiles: crate::Profiles,
 ) -> Result<(), Box<dyn Error>> {
     let profiles = Arc::new(profiles);
 
@@ -348,6 +348,10 @@ fn dispatch_inner(
         "set_task_held" => {
             let held = p["held"].as_bool().ok_or("missing param 'held'")?;
             let v = db::set_task_held(&conn, i64_param!("task_id"), held)?;
+            Ok(serde_json::to_value(v)?)
+        }
+        "list_profiles" => {
+            let v = db::list_profiles(&conn)?;
             Ok(serde_json::to_value(v)?)
         }
         "request_task_stop" => {

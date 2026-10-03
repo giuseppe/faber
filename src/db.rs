@@ -396,6 +396,13 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
     let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN activity_at TEXT DEFAULT NULL;");
 
     conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS profiles (
+             name TEXT PRIMARY KEY NOT NULL,
+             settings TEXT NOT NULL,
+             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+         );",
+    )?;
+    conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS agent_events (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
              agent TEXT NOT NULL,
@@ -856,8 +863,23 @@ fn effective_command<'a>(command: &'a str, description: &'a str) -> &'a str {
     }
 }
 
-/// Creates a task of either kind (see `TaskKind`), returning its id.
-pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Error>> {
+/// A task's schedule and dependencies, checked, as they're stored.
+struct TaskColumns {
+    task_type: &'static str,
+    cron_expression: Option<String>,
+    run_at: Option<String>,
+    next_run_at: Option<String>,
+    max_runs: Option<i64>,
+    depends_on: Option<String>,
+}
+
+/// Checks `task` - for task `id`, when it's an existing one being changed
+/// - and works out the columns it's stored in.
+fn task_columns(
+    conn: &Connection,
+    task: &NewTask,
+    id: Option<i64>,
+) -> Result<TaskColumns, Box<dyn Error>> {
     if task.kind != TaskKind::TOOL && task.kind != TaskKind::PROMPT {
         return Err(format!("unknown task kind '{}': use tool or prompt", task.kind).into());
     }
@@ -876,16 +898,40 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
             return Err(format!("no task #{} to depend on", dependency).into());
         }
     }
+    if let Some(id) = id {
+        // Waiting on itself, through any chain, it would never run.
+        let mut seen = std::collections::HashSet::new();
+        let mut pending: Vec<i64> = task.depends_on.clone();
+        while let Some(dependency) = pending.pop() {
+            if dependency == id {
+                return Err(
+                    format!("task #{} can't depend on itself, even through others", id).into(),
+                );
+            }
+            if seen.insert(dependency) {
+                if let Some(t) = get_task(conn, dependency)? {
+                    pending.extend(t.depends_on);
+                }
+            }
+        }
+    }
     let depends_on = if task.depends_on.is_empty() {
         None
     } else {
         Some(serde_json::to_string(&task.depends_on)?)
     };
-    let (task_type, cron_expression, run_at, next_run_at, max_runs) = match &task.schedule {
+    Ok(match &task.schedule {
         TaskSchedule::Once { at } => {
             chrono::DateTime::parse_from_rfc3339(at)
                 .map_err(|e| format!("Invalid RFC 3339 datetime '{}': {}", at, e))?;
-            ("oneshot", None, Some(at.clone()), Some(at.clone()), None)
+            TaskColumns {
+                task_type: "oneshot",
+                cron_expression: None,
+                run_at: Some(at.clone()),
+                next_run_at: Some(at.clone()),
+                max_runs: None,
+                depends_on,
+            }
         }
         TaskSchedule::Cron {
             expression,
@@ -896,9 +942,21 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
                 .upcoming(chrono::Utc)
                 .next()
                 .map(|dt| dt.to_rfc3339());
-            ("cron", Some(expression.clone()), None, next, *max_runs)
+            TaskColumns {
+                task_type: "cron",
+                cron_expression: Some(expression.clone()),
+                run_at: None,
+                next_run_at: next,
+                max_runs: *max_runs,
+                depends_on,
+            }
         }
-    };
+    })
+}
+
+/// Creates a task of either kind (see `TaskKind`), returning its id.
+pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Error>> {
+    let columns = task_columns(conn, task, None)?;
     conn.execute(
         "INSERT INTO scheduled_tasks
              (name, description, kind, task_type, cron_expression, run_at, next_run_at,
@@ -908,25 +966,58 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
             task.name,
             task.description,
             task.kind,
-            task_type,
-            cron_expression,
-            run_at,
-            next_run_at,
+            columns.task_type,
+            columns.cron_expression,
+            columns.run_at,
+            columns.next_run_at,
             task.agent_name,
             task.command,
-            max_runs,
+            columns.max_runs,
             if task.held {
                 TaskStatus::HELD
             } else {
                 TaskStatus::SCHEDULED
             },
-            depends_on,
+            columns.depends_on,
             task.profile,
             task.run_safe,
             task.cwd
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Changes what task `id` is - its name, command, kind, where and when it
+/// runs, what it waits for, its directory - as `task` says; its state
+/// (held, disabled, done...), runs and outcomes stay, and so does whether
+/// it must run safe (`run_safe`: who made it doesn't change). A running
+/// task is left alone: returns false for it, or a missing one.
+pub fn update_task(conn: &Connection, id: i64, task: &NewTask) -> Result<bool, Box<dyn Error>> {
+    let columns = task_columns(conn, task, Some(id))?;
+    let rows = conn.execute(
+        "UPDATE scheduled_tasks SET
+             name = ?2, description = ?3, kind = ?4, task_type = ?5, cron_expression = ?6,
+             run_at = ?7, next_run_at = ?8, agent_name = ?9, command = ?10, max_runs = ?11,
+             depends_on = ?12, profile = ?13, cwd = ?14
+         WHERE id = ?1 AND status != 'running'",
+        params![
+            id,
+            task.name,
+            task.description,
+            task.kind,
+            columns.task_type,
+            columns.cron_expression,
+            columns.run_at,
+            columns.next_run_at,
+            task.agent_name,
+            task.command,
+            columns.max_runs,
+            columns.depends_on,
+            task.profile,
+            task.cwd
+        ],
+    )?;
+    Ok(rows > 0)
 }
 
 /// Checks where a task of `kind` is to run: on `agent`, on a new agent made
@@ -1071,6 +1162,46 @@ pub fn set_task_enabled(
         )?
     };
     Ok(rows > 0)
+}
+
+/// The profiles kept in the database - shared by every session using it,
+/// next to those of each one's config file - as name and settings (the
+/// config file's "profiles" format), by name.
+pub fn list_profiles(
+    conn: &Connection,
+) -> Result<Vec<(String, serde_json::Value)>, Box<dyn Error>> {
+    let mut stmt = conn.prepare("SELECT name, settings FROM profiles ORDER BY name")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut profiles = Vec::new();
+    for row in rows {
+        let (name, settings) = row?;
+        if let Ok(settings) = serde_json::from_str(&settings) {
+            profiles.push((name, settings));
+        }
+    }
+    Ok(profiles)
+}
+
+/// Adds profile `name`, or replaces its settings.
+pub fn set_profile(
+    conn: &Connection,
+    name: &str,
+    settings: &serde_json::Value,
+) -> Result<(), Box<dyn Error>> {
+    conn.execute(
+        "INSERT INTO profiles (name, settings) VALUES (?1, ?2)
+         ON CONFLICT(name) DO UPDATE SET settings = ?2, updated_at = datetime('now')",
+        params![name, settings.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Removes profile `name`; false if there was none. Agents made from it
+/// keep their copy of its settings.
+pub fn delete_profile(conn: &Connection, name: &str) -> Result<bool, Box<dyn Error>> {
+    Ok(conn.execute("DELETE FROM profiles WHERE name = ?1", params![name])? > 0)
 }
 
 /// Asks the session running a task to stop it. Returns false if it isn't
@@ -1951,6 +2082,26 @@ pub fn agent_session_is_live(agent: &AgentRow, now: chrono::DateTime<chrono::Utc
             .as_deref()
             .and_then(parse_db_time)
             .is_some_and(|t| now - t < chrono::Duration::seconds(30))
+}
+
+/// The `agent_data` key a session sets on an agent it runs as its own
+/// with the unsafe tools for the session only (`--unsafe-tools`): the
+/// session's id. Its config doesn't say so; this does, while it lasts.
+pub const SESSION_UNSAFE_KEY: &str = "session:unsafe_tools";
+
+/// Whether `agent` has the unsafe tools now: for good (its config says
+/// so), or for the session running it - `marker` (`SESSION_UNSAFE_KEY`'s
+/// value) names that session, which still has it and is still running.
+pub fn has_unsafe_tools(
+    agent: &AgentRow,
+    config: &AgentConfig,
+    marker: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    config.unsafe_tools == Some(true)
+        || marker.is_some_and(|session| {
+            agent.session_id.as_deref() == Some(session) && agent_session_is_live(agent, now)
+        })
 }
 
 /// Each task's dependencies that aren't done successfully yet - among

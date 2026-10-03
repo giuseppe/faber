@@ -3644,6 +3644,30 @@ fn tool_task_assign(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     Ok(result.to_string())
 }
 
+/// send_message as agents without the unsafe tools have it: only to
+/// agents without them too - asking one that has them to use them would
+/// be a way around not having them. Like run_command, which version an
+/// agent gets is decided with its tools (see `initialize_tools`).
+fn tool_send_message_safe(
+    params_str: &String,
+    ctx: &ToolContext,
+) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    struct Params {
+        to: String,
+    }
+    let to = serde_json::from_str::<Params>(params_str)?.to;
+    if agent_is_unsafe(ctx.db()?, &to)? {
+        return Err(format!(
+            "'{}' has the unsafe tools: you can only send messages to agents that don't. Ask \
+             the user instead",
+            to
+        )
+        .into());
+    }
+    tool_send_message(params_str, ctx)
+}
+
 fn tool_send_message(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     #[derive(Deserialize)]
     struct Params {
@@ -5401,16 +5425,26 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
         .to_string(),
     );
 
+    // Like run_command: which version an agent gets depends on whether it
+    // has the unsafe tools - without them, only agents without them too.
+    let send_message_description = if unsafe_tools {
+        "Send a message to another agent. The message will appear in the target agent's session and trigger a response."
+    } else {
+        "Send a message to another agent without the unsafe tools - agents that have them can't be messaged with this. The message will appear in the target agent's session and trigger a response."
+    };
     append_tool(
         &mut tools,
         "send_message".to_string(),
-        tool_send_message,
-        r#"
-        {
+        if unsafe_tools {
+            tool_send_message
+        } else {
+            tool_send_message_safe
+        },
+        serde_json::json!({
             "type": "function",
             "function": {
                 "name": "send_message",
-                "description": "Send a message to another agent. The message will appear in the target agent's session and trigger a response.",
+                "description": send_message_description,
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -5423,15 +5457,11 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                             "description": "The message content to send"
                         }
                     },
-                    "required": [
-                        "to",
-                        "message"
-                    ],
+                    "required": ["to", "message"],
                     "additionalProperties": false
                 }
             }
-        }
-"#
+        })
         .to_string(),
     );
 
@@ -5950,6 +5980,33 @@ fn without_profile_params(mut tools: ToolsCollection) -> ToolsCollection {
     tools
 }
 
+/// The profiles a session can make agents from: the database's, shared by
+/// every session using it, with its own config file's over them.
+fn session_profiles(opts: &Opts, db: Option<&dyn DbBackend>) -> Profiles {
+    let mut profiles = Profiles::new();
+    for (name, settings) in db
+        .and_then(|db| db.list_profiles().ok())
+        .unwrap_or_default()
+    {
+        match serde_json::from_value::<Profile>(settings) {
+            Ok(profile) => {
+                profiles.insert(name, profile);
+            }
+            Err(e) => warn!("Ignoring profile '{}' in the database: {}", name, e),
+        }
+    }
+    profiles.extend(opts.profiles.clone());
+    profiles
+}
+
+/// `opts`, with the database's profiles too (see `session_profiles`), as
+/// a session sees them when it starts.
+fn with_db_profiles(opts: &Opts, db: &Option<Arc<dyn DbBackend>>) -> Opts {
+    let mut opts = opts.clone();
+    opts.profiles = session_profiles(&opts, db.as_deref());
+    opts
+}
+
 fn find_profile<'a>(profiles: &'a Profiles, name: &str) -> Result<&'a Profile, String> {
     profiles.get(name).ok_or_else(|| {
         let mut names: Vec<&str> = profiles.keys().map(String::as_str).collect();
@@ -6060,14 +6117,38 @@ fn child_unsafe(parent_unsafe: bool, requested: Option<bool>) -> Result<bool, St
     }
 }
 
+/// Whether `agent` has the unsafe tools now - for good, or for the
+/// session running it (see `db::has_unsafe_tools`).
+fn agent_is_unsafe(db: &dyn DbBackend, agent: &str) -> Result<bool, Box<dyn Error>> {
+    let Some(row) = db.get_agent(agent)? else {
+        return Ok(false);
+    };
+    let config = db.get_agent_config(agent)?;
+    let marker = db.get_agent_data(agent, db::SESSION_UNSAFE_KEY)?;
+    Ok(db::has_unsafe_tools(
+        &row,
+        &config,
+        marker.as_deref(),
+        chrono::Utc::now(),
+    ))
+}
+
+/// Records that session `session_id` runs `agent` with the unsafe tools,
+/// for as long as it does - so other agents can tell (`agent_is_unsafe`).
+fn mark_session_unsafe(db: &dyn DbBackend, agent: &str, session_id: &str) {
+    let current = db
+        .get_agent_data(agent, db::SESSION_UNSAFE_KEY)
+        .ok()
+        .flatten();
+    if current.as_deref() != Some(session_id) {
+        let _ = db.set_agent_data(agent, db::SESSION_UNSAFE_KEY, session_id);
+    }
+}
+
 /// Refuses if a safe agent (`ctx`) would change or take over `agent`, one
 /// with the unsafe tools - that would be a way to get them.
 fn check_may_change(ctx: &ToolContext, db: &dyn DbBackend, agent: &str) -> Result<(), String> {
-    let target_unsafe = db
-        .get_agent_config(agent)
-        .map_err(|e| e.to_string())?
-        .unsafe_tools
-        == Some(true);
+    let target_unsafe = agent_is_unsafe(db, agent).map_err(|e| e.to_string())?;
     if target_unsafe && !ctx.unsafe_tools {
         return Err(format!(
             "'{}' has unsafe tools: an agent without them can't change it",
@@ -8150,6 +8231,10 @@ fn execute_scheduled_command(
 /// Most of a task's output kept in `last_result`.
 const MAX_TASK_RESULT_CHARS: usize = 2000;
 
+/// Most of a tool task's output kept: its output is what it's run for
+/// (e.g. a knowledge base note, from the web UI's Run a tool).
+const MAX_TOOL_TASK_RESULT_CHARS: usize = 32_000;
+
 /// How a task's run went, from its tool result (`None`: its command isn't
 /// a tool call at all). `run_command` reports success and an exit code;
 /// any other tool failed if its result is an `error: ...`.
@@ -8162,7 +8247,7 @@ fn task_outcome(tool_msg: Option<&Message>) -> db::TaskOutcome {
                 .to_string(),
         };
     };
-    let truncate = |s: &str| openai::truncate_tool_output(s.trim(), MAX_TASK_RESULT_CHARS);
+    let truncate = |s: &str| openai::truncate_tool_output(s.trim(), MAX_TOOL_TASK_RESULT_CHARS);
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
         if let Some(success) = json.get("success").and_then(|s| s.as_bool()) {
             let output = [json["stdout"].as_str(), json["stderr"].as_str()]
@@ -8370,6 +8455,7 @@ fn chat_command(
     mcp_manager: Option<Arc<faber::mcp::McpManager>>,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Executing chat command");
+    let opts = &with_db_profiles(opts, &db);
 
     let status_bar = Arc::new(status_bar::StatusBar::new());
     let chat_pb = ChatPrinter::new();
@@ -8439,6 +8525,11 @@ fn chat_command(
         session_agent_unsafe(opts, &agent_config),
         &agent_config,
     );
+    if let Some(db) = &db {
+        if session_agent_unsafe(opts, &agent_config) {
+            mark_session_unsafe(db.as_ref(), &initial_agent_name, &session_id);
+        }
+    }
 
     let initial_messages = if let Some(ref db) = db {
         let vals = db.load_agent_messages(&initial_agent_name)?;
@@ -8583,8 +8674,6 @@ fn chat_command(
             }
         });
     }
-
-    let profiles = Arc::new(opts.profiles.clone());
 
     let (input_tx, input_rx) = mpsc::channel::<Result<String, rustyline::error::ReadlineError>>();
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
@@ -8860,6 +8949,11 @@ fn chat_command(
                     tool_context.mcp_manager = mcp_manager.clone();
                     tool_context.unsafe_tools = turn_unsafe;
                     tool_context.task_id = running_prompt_task;
+                    if turn_unsafe && turn_config.unsafe_tools != Some(true) {
+                        if let Some(db) = &db {
+                            mark_session_unsafe(db.as_ref(), &active_agent.name, &session_id);
+                        }
+                    }
                     // A task's own directory, else the agent's.
                     let task_cwd = running_prompt_task
                         .and_then(|id| db.as_ref()?.get_task(id).ok()?)
@@ -8898,7 +8992,8 @@ fn chat_command(
                         running_subagents: running_subagents.clone(),
                         status_bar: status_bar.clone(),
                         session_usage: session_usage.clone(),
-                        profiles: profiles.clone(),
+                        // Read again each turn: they may have changed.
+                        profiles: Arc::new(session_profiles(opts, db.as_deref())),
                     }));
                     tool_context.interrupt = Some(ctrl_c_rx.clone());
                     tool_context.file_versions = Some(file_versions.clone());
@@ -9910,6 +10005,40 @@ pub(crate) fn make_worker_agent(
     Ok(())
 }
 
+/// How much of an agent's conversation, in characters, a task carrying it
+/// on keeps when the model's context window isn't known.
+const DEFAULT_HISTORY_CHARS: usize = 200_000;
+
+/// `history`, cut to about `budget` characters to carry on with: its
+/// leading system messages, then as much of the end as fits, starting at
+/// a user message - never halfway through a tool call and its result.
+fn fit_history(history: Vec<Message>, budget: usize) -> Vec<Message> {
+    let size = |m: &Message| serde_json::to_string(m).map_or(0, |s| s.len());
+    let system = history.iter().take_while(|m| m.role == "system").count();
+    let mut kept = 0;
+    let mut start = history.len();
+    let mut used: usize = history[..system].iter().map(size).sum();
+    while start > system && used + size(&history[start - 1]) <= budget {
+        start -= 1;
+        used += size(&history[start]);
+        kept += 1;
+    }
+    if kept == history.len() - system {
+        return history;
+    }
+    // Begin where a turn does.
+    while start < history.len() && history[start].role != "user" {
+        start += 1;
+    }
+    let mut fitted: Vec<Message> = history[..system].to_vec();
+    fitted.push(make_message(
+        "system",
+        "(The start of this conversation was left out, to fit.)".to_string(),
+    ));
+    fitted.extend_from_slice(&history[start..]);
+    fitted
+}
+
 /// Tells an agent it's the one running task `id` - or, seeing the task
 /// "running" in task_list, it may go looking for who runs it, and wait.
 pub(crate) fn running_task_note(id: i64) -> Message {
@@ -10001,7 +10130,7 @@ fn run_prompt_task_headless(
             task_unsafe,
             db.as_ref(),
             session_id,
-            &opts.profiles,
+            &session_profiles(opts, Some(db.as_ref())),
         )),
         None if task_is_for_worker(task) && task_unsafe == worker_unsafe => None,
         None => Some(own_task_agent(
@@ -10064,15 +10193,40 @@ fn run_prompt_task_headless(
     let extra = Arc::new(SubAgentContext {
         opts: openai_opts.clone(),
         tools: Arc::new(tools.clone()),
+        profiles: Arc::new(session_profiles(opts, Some(db.as_ref()))),
         ..(*extra).clone()
     });
-    let mut messages = initialize_agent_messages(tools, opts, &agent_config);
-    messages.push(working_directory_note(
-        &run_cwd
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
-    ));
+    // Run as the agent itself - a task for it by name, a message to it -
+    // it carries on its conversation, as a chat does; on an agent made
+    // for it, it starts one.
+    let saved: Vec<Message> = if task_agent.is_none() {
+        db.load_agent_messages(agent)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| serde_json::from_value(v).ok())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let here = run_cwd
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let mut messages = if saved.is_empty() {
+        let mut messages = initialize_agent_messages(tools, opts, &agent_config);
+        messages.push(working_directory_note(&here));
+        messages
+    } else {
+        let budget = agent_config
+            .context_window
+            .or(opts.context_window)
+            .map_or(DEFAULT_HISTORY_CHARS, |window| window as usize * 2);
+        let mut messages = fit_history(saved, budget);
+        if task.cwd.is_some() {
+            messages.push(working_directory_note(&here));
+        }
+        messages
+    };
     messages.push(running_task_note(task.id));
     let input = format!(
         "[Scheduled task #{} \"{}\"]: {}",
@@ -10209,8 +10363,9 @@ struct WorkerSpec {
     /// its own agent (but those for it by name, one at a time), so there's
     /// no need to - the model's capacity is `--max-parallel-requests`'.
     parallel: Option<usize>,
-    /// The profiles whose tasks it takes on.
-    profiles: Vec<String>,
+    /// The profiles whose tasks it takes on; `None`: all it has, the
+    /// database's included - read again as they change.
+    profiles: Option<Vec<String>>,
     /// If another session has the agent, wait for it to be free instead
     /// of failing.
     wait_for_agent: bool,
@@ -10221,19 +10376,18 @@ struct WorkerSpec {
     label: bool,
 }
 
-/// The profiles a worker takes on: `only` (checked to exist), or all of
-/// the config file's.
-fn worker_profiles(opts: &Opts, only: &[String]) -> Result<Vec<String>, Box<dyn Error>> {
+/// The profiles a worker takes on: `only` (checked to exist), or - with
+/// none given - all it has, as they are when it looks (`None`).
+fn worker_profiles(opts: &Opts, only: &[String]) -> Result<Option<Vec<String>>, Box<dyn Error>> {
+    if only.is_empty() {
+        return Ok(None);
+    }
     for name in only {
         find_profile(&opts.profiles, name)?;
     }
-    let mut profiles: Vec<String> = if only.is_empty() {
-        opts.profiles.keys().cloned().collect()
-    } else {
-        only.to_vec()
-    };
+    let mut profiles = only.to_vec();
     profiles.sort();
-    Ok(profiles)
+    Ok(Some(profiles))
 }
 
 /// `faber worker`: works through scheduled tasks as `agent`, headlessly,
@@ -10249,6 +10403,7 @@ fn worker_command(
     let db = db.ok_or(
         "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
     )?;
+    let opts = &with_db_profiles(opts, &Some(db.clone()));
     let spec = WorkerSpec {
         agent: agent.unwrap_or_else(|| format!("worker-{}", std::process::id())),
         parallel,
@@ -10274,7 +10429,16 @@ fn run_worker(
     stop: &WorkerStop,
 ) -> Result<(), Box<dyn Error>> {
     let agent = spec.agent.clone();
-    let profiles = &spec.profiles;
+    // The profiles whose tasks it takes on, as they are now.
+    let current_profiles = || -> Vec<String> {
+        spec.profiles.clone().unwrap_or_else(|| {
+            let mut names: Vec<String> = session_profiles(opts, Some(db.as_ref()))
+                .into_keys()
+                .collect();
+            names.sort();
+            names
+        })
+    };
     let log = |line: String| {
         println!(
             "[{}] {}{}",
@@ -10315,6 +10479,9 @@ fn run_worker(
             std::thread::sleep(Duration::from_millis(500));
         }
     }
+    if session_agent_unsafe(opts, &db.get_agent_config(&agent)?) {
+        mark_session_unsafe(db.as_ref(), &agent, &session_id);
+    }
     let parallel = spec.parallel.map(|p| p.max(1));
     // Each task's agent gets its own of these (see `agent_tools`).
     let tools = Arc::new(session_tools(opts));
@@ -10353,10 +10520,12 @@ fn run_worker(
             None => String::new(),
         },
         model,
-        if profiles.is_empty() {
-            String::new()
-        } else {
-            format!(", profiles {}", profiles.join(", "))
+        match &spec.profiles {
+            Some(only) => format!(", only profiles {}", only.join(", ")),
+            None => match current_profiles() {
+                all if all.is_empty() => String::new(),
+                all => format!(", profiles {}", all.join(", ")),
+            },
         }
     ));
     let extra = Arc::new(SubAgentContext {
@@ -10423,7 +10592,7 @@ fn run_worker(
                     db.as_ref(),
                     &session_id,
                     &agent,
-                    profiles,
+                    &current_profiles(),
                     own_busy.load(Ordering::Relaxed),
                     false,
                 ) {
@@ -11533,7 +11702,7 @@ enum DisplayGraphicsMode {
     Full,
 }
 
-#[derive(Parser, Debug, Serialize, Deserialize)]
+#[derive(Parser, Debug, Clone, Serialize, Deserialize)]
 #[clap(version = env!("CARGO_PKG_VERSION"))]
 #[serde(default)]
 struct Opts {
@@ -11863,7 +12032,7 @@ fn parse_mcp_server_flag(
     Ok((name.to_string(), config))
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum TasksAction {
     /// Show everything about one task: its full command, schedule, state
     /// and the full result of its last run
@@ -11990,7 +12159,7 @@ enum TasksAction {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum AgentsAction {
     /// Show one agent in detail, with the conversation it had (a finished
     /// sub-agent's is kept until `faber gc`)
@@ -12034,7 +12203,7 @@ enum AgentsAction {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum KbAction {
     /// Ranked full-text search over the notes
     Search {
@@ -12073,7 +12242,7 @@ enum KbAction {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum CliCommand {
     /// Pass a request to the AI model and print its response
     Prompt {
@@ -12460,16 +12629,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 _ => None,
             };
-            let mut profiles: Vec<web::UiProfile> = opts
-                .profiles
-                .iter()
-                .map(|(name, profile)| web::UiProfile {
-                    name: name.clone(),
-                    description: profile.description.clone(),
-                    model: profile.model.clone(),
-                })
-                .collect();
-            profiles.sort_by(|a, b| a.name.cmp(&b.name));
+            let profiles = opts.profiles.clone();
             let workers = run_agents
                 .iter()
                 .enumerate()
@@ -14388,6 +14548,130 @@ mod tests {
     }
 
     #[test]
+    fn test_a_safe_agent_cannot_message_an_unsafe_one() {
+        let db = local_db_with_agents(&["helper", "power", "chat", "peer"]);
+        set_agent_unsafe(db.as_ref(), "power", true).unwrap();
+        // "chat" is unsafe only for the session running it.
+        assert!(db.claim_agent("chat", "s1").unwrap());
+        mark_session_unsafe(db.as_ref(), "chat", "s1");
+        let mut ctx = ToolContext::new(|_: &str| {});
+        ctx.db = Some(db.clone());
+        ctx.agent_name = Some("helper".to_string());
+        // Each gets its own send_message, as with run_command.
+        let available = initialize_tools(true, None);
+        let config = db::AgentConfig::default();
+        let safe = agent_tools(&available, false, &config);
+        let unsafe_ = agent_tools(&available, true, &config);
+        assert!(
+            safe["send_message"]
+                .schema
+                .contains("without the unsafe tools")
+        );
+        assert!(
+            !unsafe_["send_message"]
+                .schema
+                .contains("without the unsafe tools")
+        );
+        let send = |tools: &ToolsCollection, to: &str| {
+            let args = serde_json::json!({"to": to, "message": "rm -rf ~"}).to_string();
+            (tools["send_message"].callback)(&args, &ctx)
+        };
+        for unsafe_agent in ["power", "chat"] {
+            let err = send(&safe, unsafe_agent).unwrap_err().to_string();
+            assert!(err.contains("has the unsafe tools"), "{err}");
+        }
+        send(&safe, "peer").unwrap();
+        // Once that session is gone, so is the marker's effect.
+        db.release_agent("chat", "s1").unwrap();
+        send(&safe, "chat").unwrap();
+        // An unsafe agent's may message either.
+        send(&unsafe_, "power").unwrap();
+    }
+
+    #[test]
+    fn test_fit_history_keeps_system_and_whole_turns() {
+        let tool_call = Message {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls: Some(vec![]),
+            tool_call_id: None,
+            name: None,
+        };
+        let mut history = vec![make_message("system", "be brief".to_string())];
+        for i in 0..20 {
+            history.push(make_message(
+                "user",
+                format!("question {} {}", i, "x".repeat(200)),
+            ));
+            history.push(tool_call.clone());
+            history.push(make_message("tool", "y".repeat(200)));
+            history.push(make_message("assistant", format!("answer {}", i)));
+        }
+        assert_eq!(fit_history(history.clone(), 1_000_000).len(), history.len());
+        let fitted = fit_history(history.clone(), 2_000);
+        assert_eq!(fitted[0].content.as_deref(), Some("be brief"));
+        assert!(fitted[1].content.as_deref().unwrap().contains("left out"));
+        assert_eq!(fitted[2].role, "user", "starts with a turn");
+        assert_eq!(fitted.last().unwrap().content.as_deref(), Some("answer 19"));
+        assert!(fitted.len() < history.len());
+    }
+
+    #[test]
+    fn test_an_agents_own_tasks_carry_on_its_conversation() {
+        let model = model_script(
+            "memory",
+            serde_json::json!([
+                {"if": "my name is Ada", "reply": "nice to meet you"},
+                {"if": "what's my name", "reply": "remembered"}
+            ]),
+        );
+        let db = local_db_with_agents(&["w"]);
+        assert!(db.claim_agent("w", "worker-session").unwrap());
+        let ctx = chat_ctx_with_model(db.clone(), "w", &model);
+        let extra = ctx
+            .extra
+            .clone()
+            .unwrap()
+            .downcast::<SubAgentContext>()
+            .ok()
+            .unwrap();
+        let mut opts = Opts::default();
+        opts.model = Some(model.clone());
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        for text in ["my name is Ada", "what's my name?"] {
+            db.create_oneshot_task("m", "", &past, text, Some("w"))
+                .unwrap();
+            let task = claim_prompt_task(db.as_ref(), "worker-session", "w", &[]).unwrap();
+            let (_tx, rx) = mpsc::channel();
+            run_prompt_task_headless(
+                &task,
+                "w",
+                &db,
+                "worker-session",
+                &extra.tools,
+                &opts,
+                extra.clone(),
+                &None,
+                rx,
+            );
+        }
+        let transcript = db.load_agent_messages("w").unwrap();
+        let said: Vec<&str> = transcript
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert!(
+            said.iter().any(|c| c.contains("my name is Ada")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter().any(|c| c.contains("what's my name")),
+            "{said:?}"
+        );
+        assert!(said.contains(&"remembered"));
+    }
+
+    #[test]
     fn test_tasks_a_safe_agent_makes_run_safe() {
         let db = local_db_with_agents(&["boss"]);
         let mut ctx = ToolContext::new(|_: &str| {});
@@ -15131,6 +15415,36 @@ mod tests {
                 .as_str()
                 .is_some_and(|c| c.starts_with("You are running task #1 now"))
         }));
+    }
+
+    #[test]
+    fn test_sessions_see_the_databases_profiles_under_their_own() {
+        let conn = test_db_conn();
+        {
+            let c = conn.lock().unwrap();
+            db::set_profile(&c, "deep", &serde_json::json!({"model": "big"})).unwrap();
+            db::set_profile(&c, "fast", &serde_json::json!({"model": "db-small"})).unwrap();
+            db::set_profile(&c, "broken", &serde_json::json!({"bogus": 1})).unwrap();
+        }
+        let db: Arc<dyn DbBackend> = Arc::new(LocalDb::new(conn));
+        let mut opts = Opts::default();
+        opts.profiles.insert(
+            "fast".to_string(),
+            serde_json::from_value(serde_json::json!({"model": "config-small"})).unwrap(),
+        );
+        let profiles = session_profiles(&opts, Some(db.as_ref()));
+        assert_eq!(profiles["deep"].model.as_deref(), Some("big"));
+        assert_eq!(
+            profiles["fast"].model.as_deref(),
+            Some("config-small"),
+            "the config file wins"
+        );
+        assert!(!profiles.contains_key("broken"));
+        assert_eq!(
+            worker_profiles(&opts, &[]).unwrap(),
+            None,
+            "all, as they change"
+        );
     }
 
     #[test]

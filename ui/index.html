@@ -15,6 +15,8 @@
     <button data-view="board" class="tab">Board</button>
   </nav>
   <span class="spacer"></span>
+  <button id="run-tool-button" class="ghost">Run a tool…</button>
+  <button id="cleanup-button" class="ghost">Clean up…</button>
   <button id="new-task-button" class="primary">New task</button>
 </header>
 
@@ -22,6 +24,7 @@
   <section id="agents-panel" class="panel">
     <h2>Agents <span id="agents-count" class="count"></span>
       <span class="spacer"></span>
+      <button id="profiles-button" class="ghost small" title="Profiles agents are made from">Profiles…</button>
       <button id="new-agent-button" class="ghost small" title="Make a new agent">+ New agent</button>
     </h2>
     <ul id="agents" class="tree"></ul>
@@ -34,13 +37,28 @@
       <div id="detail-actions" class="actions"></div>
     </div>
     <div id="problems" class="problems" hidden></div>
+    <div id="plan" class="plan" hidden></div>
     <dl id="detail-fields" class="fields"></dl>
-    <div class="feed-options">
-      <label class="toggle"><input type="checkbox" id="show-reasoning"> reasoning</label>
-      <label class="toggle"><input type="checkbox" id="follow" checked> follow</label>
+    <div id="agent-views" class="views" hidden>
+      <button type="button" data-agent-view="activity" class="view">Activity</button>
+      <button type="button" data-agent-view="conversation" class="view">Conversation</button>
     </div>
-    <div id="events" class="events"></div>
-    <div id="feed-status" class="feed-status"></div>
+    <div id="activity-view">
+      <div class="feed-options">
+        <label class="toggle"><input type="checkbox" id="show-reasoning"> reasoning</label>
+        <label class="toggle"><input type="checkbox" id="follow" checked> follow</label>
+      </div>
+      <div id="events" class="events"></div>
+      <div id="feed-status" class="feed-status"></div>
+    </div>
+    <div id="conversation-view" hidden>
+      <p id="conversation-info" class="hint"></p>
+      <div id="conversation" class="conversation"></div>
+    </div>
+    <form id="composer" class="composer" hidden>
+      <textarea name="text" rows="2" placeholder="Message this agent… (Ctrl+Enter to send)"></textarea>
+      <button type="submit" class="primary">Send</button>
+    </form>
   </section>
 
   <section id="tasks-panel" class="panel">
@@ -57,7 +75,7 @@
 
 <dialog id="new-task">
   <form id="new-task-form" method="dialog">
-    <h2>New task</h2>
+    <h2 id="new-task-title">New task</h2>
     <label>What to do
       <textarea name="command" rows="6" required placeholder="Instructions for the agent"></textarea>
     </label>
@@ -79,12 +97,12 @@
         <input name="cron" placeholder="0 0 9 * * Mon-Fri *"></label>
     </fieldset>
     <label>After tasks <input name="depends_on" placeholder="ids, e.g. 3, 5"></label>
-    <label class="inline"><input type="checkbox" name="hold"> put in the backlog (held until released)</label>
+    <label class="inline" id="hold-option"><input type="checkbox" name="hold"> put in the backlog (held until released)</label>
     <label class="inline"><input type="checkbox" name="tool"> command is a tool call (JSON)</label>
     <p id="new-task-error" class="error" hidden></p>
     <div class="actions">
       <button type="button" id="new-task-cancel" class="ghost">Cancel</button>
-      <button type="submit" class="primary">Create</button>
+      <button type="submit" class="primary" id="new-task-submit">Create</button>
     </div>
   </form>
 </dialog>
@@ -93,6 +111,9 @@
   <form id="agent-form" method="dialog">
     <h2 id="agent-dialog-title">Agent</h2>
     <p class="hint" id="agent-source" hidden></p>
+    <label>Start from profile
+      <select id="agent-profile"><option value="">(keep these settings)</option></select>
+    </label>
     <div id="agent-new-fields">
       <label>Name <input name="name" spellcheck="false" placeholder="e.g. reviewer"></label>
     </div>
@@ -119,6 +140,85 @@
       <button type="button" id="agent-delete" class="danger" hidden>Delete agent</button>
       <span class="spacer"></span>
       <button type="button" id="agent-cancel" class="ghost">Cancel</button>
+      <button type="submit" class="primary">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="tool-dialog">
+  <form id="tool-form" method="dialog">
+    <h2>Run a tool</h2>
+    <label>Tool <select id="tool-select"></select></label>
+    <p class="hint" id="tool-description"></p>
+    <div id="tool-fields" class="tool-fields"></div>
+    <label>Record it in agent
+      <select id="tool-agent"><option value="">(none)</option></select>
+    </label>
+    <p class="hint">It runs as a tool task - by whichever chat or worker is running - with that session's tools.</p>
+    <p id="tool-error" class="error" hidden></p>
+    <div id="tool-result" class="tool-result" hidden></div>
+    <div class="actions">
+      <button type="button" id="tool-close" class="ghost">Close</button>
+      <button type="submit" class="primary">Run</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="cleanup-dialog">
+  <div class="dialog-body">
+    <h2>Clean up</h2>
+    <section class="cleanup">
+      <label>Finished tasks that last ran more than
+        <input id="prune-age" value="7d" size="6"> ago</label>
+      <p class="hint" id="prune-preview"></p>
+      <div class="actions"><button type="button" id="prune-button" class="danger">Remove them</button></div>
+    </section>
+    <section class="cleanup">
+      <p>Finished agents that agents made - sub-agents, task agents, fan-out workers - with
+        nothing running them or below them. Agents you made stay.</p>
+      <p class="hint" id="agents-preview"></p>
+      <div class="actions"><button type="button" id="agents-cleanup-button" class="danger">Remove them</button></div>
+    </section>
+    <div class="actions"><button type="button" id="cleanup-close" class="ghost">Close</button></div>
+  </div>
+</dialog>
+
+<dialog id="profiles-dialog">
+  <div class="dialog-body">
+    <h2>Profiles</h2>
+    <p class="hint">Settings agents are made from - by spawn_agent, fan_out, tasks bound to one, or here.
+      Those in the database are shared by every chat and worker using it; a config file's are read-only here.</p>
+    <div id="profile-list" class="profile-list"></div>
+    <div class="actions">
+      <button type="button" id="new-profile-button">+ New profile</button>
+      <span class="spacer"></span>
+      <button type="button" id="profiles-close" class="ghost">Close</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="profile-dialog">
+  <form id="profile-form" method="dialog">
+    <h2 id="profile-dialog-title">Profile</h2>
+    <label>Name <input name="name" spellcheck="false" placeholder="e.g. deep"></label>
+    <label>Description <input name="description" placeholder="what it's for - models choosing one see it"></label>
+    <label>Model <input name="model" spellcheck="false"></label>
+    <label>Endpoint <input name="endpoint" spellcheck="false"></label>
+    <label>System prompt <textarea name="system_prompt" rows="3"></textarea></label>
+    <div class="row">
+      <label>Max tokens <input name="max_tokens" type="number" min="1"></label>
+      <label>Context window <input name="context_window" type="number" min="1"></label>
+    </div>
+    <fieldset>
+      <legend>Tools</legend>
+      <label class="inline"><input type="checkbox" id="profile-all-tools"> every tool the session has</label>
+      <div id="profile-tool-list" class="tool-list"></div>
+    </fieldset>
+    <label>Request parameters (JSON) <textarea name="parameters" rows="2" spellcheck="false" placeholder='e.g. {"reasoning_effort": "low"}'></textarea></label>
+    <p class="hint">A profile never gives the unsafe tools, nor picks a working directory.</p>
+    <p id="profile-error" class="error" hidden></p>
+    <div class="actions">
+      <button type="button" id="profile-cancel" class="ghost">Cancel</button>
       <button type="submit" class="primary">Save</button>
     </div>
   </form>

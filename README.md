@@ -298,6 +298,12 @@ made from a profile by:
 The model is told which profiles there are, with their descriptions,
 models and parameters, so it can pick one.
 
+Profiles can also be kept in the database, made and changed in the web
+UI (Profiles…): every chat and worker using the database has them, next
+to its config file's - which win, if both have a name - and picks up
+changes as they're made. An agent's Edit there can start it from any
+profile.
+
 ### Sub-agents
 
 The `spawn_agent` tool launches a sub-agent in a background thread.
@@ -716,8 +722,10 @@ Whether an agent has them is up to each agent, not the whole session:
   picks it up: a worker that has them runs it on a safe agent of its own,
   and a tool task gets the safe tools.
 
-Messages (`send_message`) aren't restricted: a safe agent can still ask an
-unsafe one to do something, which it may do.
+- Like `run_command`, `send_message` comes in two versions: a safe
+  agent's can only message agents without the unsafe tools - those that
+  have them, for good or for the session running them, can't be asked
+  to use them that way.
 
 ### Tool filtering
 
@@ -933,11 +941,28 @@ each other. Changes apply from the agent's next turn or task. A list of
 an agent's sub-agents (a fan-out's workers) shows the first few until
 asked for the rest.
 
+An agent's panel shows its plan, if it keeps one (`plan_update`), as a
+checklist - and its row, how far along it is. An agent's panel has a
+message box: what you send it reaches it however
+it runs - a chat, a worker - as soon as it's free (it's a task for it),
+and its answer shows in the feed. Its Conversation view shows the
+messages it has kept. An agent a worker runs carries on its
+conversation from one task for it to the next, as a chat does (cut to
+fit the model's context window); agents made for a task start afresh.
+
 New tasks can be added there too, choosing where they run: on any agent
 (the first free chat or worker takes it - the default), on a given
 agent, or on a new agent made from one of the profiles in `faber
-serve`'s config file. Tasks can also be held, released, enabled,
-disabled, reassigned and deleted.
+serve`'s config file. Tasks can also be edited - what they say, where
+and when they run, what they wait for, their directory - until they
+run, and held, released, enabled, disabled, reassigned and deleted.
+Run a tool… runs any tool - the knowledge base's `kb_*`, `glob`,
+`run_command`... - from a form made from its parameters, and shows what
+it returns: it's a tool task, run by whichever chat or worker is running,
+with that session's tools, and kept like any task. Clean up… removes
+finished tasks past an age, and the finished agents
+agents made (sub-agents, task agents, fan-out workers) - never ones you
+made, nor one with work still going on below it - showing what first.
 
 What agents do is recorded in the database as it happens (see
 `src/agent_io.rs`), by chats, workers and sub-agents alike, so the UI
