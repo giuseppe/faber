@@ -98,22 +98,27 @@ fn final_response_text(result: Result<OpenAIResponse, Box<dyn Error>>) -> Result
 }
 
 /// Checks `data` against a `result_schema`: an object mapping each required
-/// field to its JSON type.
+/// field to its JSON type. A value that plainly is what was asked for, in
+/// another form - "853" for a number, "true" for a boolean, 853 for a
+/// string - is taken, converted, rather than failing the call.
 fn validate_result_data(
     schema: &serde_json::Value,
-    data: Option<&serde_json::Value>,
+    data: Option<&mut serde_json::Value>,
 ) -> Result<(), String> {
     let Some(fields) = schema.as_object() else {
         return Err("result_schema must be an object of field names to types".to_string());
     };
     let data = data
-        .and_then(|d| d.as_object())
+        .and_then(|d| d.as_object_mut())
         .ok_or("data must be an object with the fields asked for")?;
     for (field, kind) in fields {
         let kind = kind.as_str().unwrap_or("any");
         let value = data
-            .get(field)
+            .get_mut(field)
             .ok_or_else(|| format!("data is missing '{}' ({})", field, kind))?;
+        if let Some(converted) = convert_result_value(value, kind) {
+            *value = converted;
+        }
         let ok = match kind {
             "string" => value.is_string(),
             "number" => value.is_number(),
@@ -130,8 +135,62 @@ fn validate_result_data(
     Ok(())
 }
 
+/// `value` as a `kind`, when it's that in another form (see
+/// `validate_result_data`); `None` when it's already one, or isn't.
+fn convert_result_value(value: &serde_json::Value, kind: &str) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    match (kind, value) {
+        ("number", Value::String(s)) => {
+            let s = s.trim();
+            s.parse::<i64>().map(Value::from).ok().or_else(|| {
+                s.parse::<f64>()
+                    .ok()
+                    .and_then(|f| serde_json::Number::from_f64(f))
+                    .map(Value::Number)
+            })
+        }
+        ("integer", Value::String(s)) => s.trim().parse::<i64>().ok().map(Value::from),
+        ("integer", Value::Number(n))
+            if n.as_f64().is_some_and(|f| f.fract() == 0.0) && !n.is_i64() && !n.is_u64() =>
+        {
+            n.as_f64().map(|f| Value::from(f as i64))
+        }
+        ("boolean", Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => Some(Value::Bool(true)),
+            "false" => Some(Value::Bool(false)),
+            _ => None,
+        },
+        ("string", Value::Number(n)) => Some(Value::String(n.to_string())),
+        ("string", Value::Bool(b)) => Some(Value::String(b.to_string())),
+        _ => None,
+    }
+}
+
 /// entrypoint for the report_result tool: records the outcome of the work
 /// this agent was given, for whoever's waiting for it.
+enum ReportStatus {
+    /// Done: succeeded, or not.
+    Final(bool),
+    /// Not done yet: a progress update.
+    Progress,
+    Unknown,
+}
+
+/// What a report_result status means, taken generously: models write
+/// "success", "Completed", "in_progress"...
+fn report_status(status: &str) -> ReportStatus {
+    let status = status.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+    match status.as_str() {
+        "succeeded" | "success" | "successful" | "succeed" | "ok" | "done" | "completed"
+        | "complete" => ReportStatus::Final(true),
+        "failed" | "failure" | "fail" | "error" => ReportStatus::Final(false),
+        "in_progress" | "progress" | "running" | "pending" | "working" | "started" | "ongoing" => {
+            ReportStatus::Progress
+        }
+        _ => ReportStatus::Unknown,
+    }
+}
+
 fn tool_report_result(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -141,17 +200,34 @@ fn tool_report_result(params_str: &String, ctx: &ToolContext) -> Result<String, 
         #[serde(default)]
         data: Option<serde_json::Value>,
     }
-    let params: Params = serde_json::from_str(params_str)?;
+    let mut params: Params = serde_json::from_str(params_str)?;
     let slot = ctx.result_slot.as_ref().ok_or(
         "nobody is waiting for a result from you: just answer (report_result is for sub-agents, fan-out workers and tasks)",
     )?;
-    let succeeded = match params.status.as_str() {
-        "succeeded" => true,
-        "failed" => false,
-        other => return Err(format!("status must be succeeded or failed, not '{}'", other).into()),
+    let succeeded = match report_status(&params.status) {
+        ReportStatus::Final(succeeded) => succeeded,
+        // Smaller models report progress with it: not a mistake worth
+        // failing the call over, nor the result - note it and carry on.
+        ReportStatus::Progress => {
+            if let (Some(db), Some(agent)) = (&ctx.db, &ctx.agent_name) {
+                let _ = db.set_agent_activity(agent, &first_line(&params.summary, 120));
+            }
+            return Ok(
+                "Progress noted - but that's not your result yet: carry on with the work, then \
+                 call report_result once, with status succeeded or failed."
+                    .to_string(),
+            );
+        }
+        ReportStatus::Unknown => {
+            return Err(format!(
+                "status must be succeeded or failed, not '{}'",
+                params.status
+            )
+            .into());
+        }
     };
     if let Some(schema) = &ctx.result_schema {
-        validate_result_data(schema, params.data.as_ref())?;
+        validate_result_data(schema, params.data.as_mut())?;
     }
     *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(faber::ReportedResult {
         succeeded,
@@ -1199,6 +1275,10 @@ fn tool_delete_path(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         path: String,
     }
     let params: Params = serde_json::from_str::<Params>(&params_str)?;
+    let params = Params {
+        path: ctx.tool_path(&params.path),
+        ..params
+    };
 
     debug!("Remove path: {}", params.path);
     let root = Root::open(ctx.cwd())?;
@@ -1289,14 +1369,12 @@ fn tool_read_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
         }
     }
 
-    let params: Params = serde_json::from_str::<Params>(&params_str)?;
+    let mut params: Params = serde_json::from_str::<Params>(&params_str)?;
+    params.path = ctx.tool_path(&params.path);
 
     debug!("Reading file: {}", params.path);
-
-    if params.start_line.is_some() != params.end_line.is_some() {
-        let result = error("start_line and end_line must be given together".to_string());
-        return Ok(serde_json::to_string(&result)?);
-    }
+    // Line 0, from a model counting from 0, is the first.
+    params.start_line = params.start_line.map(|start| start.max(1));
 
     let root = Root::open(ctx.cwd())?;
     let path = PathBuf::from(&params.path);
@@ -1317,26 +1395,39 @@ fn tool_read_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
                     // and newlines all grow) and the other fields.
                     let budget = ctx.max_tool_output_chars() * 3 / 4;
 
-                    match (params.start_line, params.end_line) {
-                        (Some(start), Some(end)) => {
-                            if start == 0 {
-                                error("start_line is 1-based, cannot be 0".to_string())
-                            } else if end < start {
+                    // Only one end of the range: from there to the end, or
+                    // from the start to there.
+                    let range = match (params.start_line, params.end_line) {
+                        (Some(start), None) => Some((start, total_lines.max(1) as u64)),
+                        (None, Some(end)) => Some((1, end)),
+                        (Some(start), Some(end)) => Some((start, end)),
+                        (None, None) => None,
+                    };
+                    match range {
+                        Some((start, end)) => {
+                            if end < start {
                                 error(format!(
                                     "end_line ({}) must be >= start_line ({})",
                                     end, start
                                 ))
                             } else if start as usize > total_lines {
-                                error(format!(
-                                    "start_line {} exceeds file line count {}",
-                                    start, total_lines
-                                ))
-                            } else if end as usize > total_lines {
-                                error(format!(
-                                    "end_line {} exceeds file line count {}",
-                                    end, total_lines
-                                ))
+                                // Past the end - models probe for it: nothing
+                                // there, and where it ends, not a failure.
+                                ReadFileResult {
+                                    content: Some(String::new()),
+                                    error: None,
+                                    total_lines: Some(total_lines),
+                                    start_line: None,
+                                    end_line: None,
+                                    note: Some(format!(
+                                        "The file has {} lines: line {} is past its end.",
+                                        total_lines, start
+                                    )),
+                                }
                             } else {
+                                // Past the end: up to the end, said so below.
+                                let past_end = end as usize > total_lines;
+                                let end = end.min(total_lines as u64);
                                 let requested = &full_lines[(start - 1) as usize..end as usize];
                                 let shown = lines_within_budget(requested, budget);
                                 let shown_end = start + shown as u64 - 1;
@@ -1346,13 +1437,25 @@ fn tool_read_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
                                     total_lines: Some(total_lines),
                                     start_line: Some(start),
                                     end_line: Some(shown_end),
-                                    note: (shown < requested.len()).then(|| {
-                                        truncated_read_note(start, shown_end, end, total_lines)
-                                    }),
+                                    note: if shown < requested.len() {
+                                        Some(truncated_read_note(
+                                            start,
+                                            shown_end,
+                                            end,
+                                            total_lines,
+                                        ))
+                                    } else if past_end {
+                                        Some(format!(
+                                            "The file has only {} lines: shown up to the last.",
+                                            total_lines
+                                        ))
+                                    } else {
+                                        None
+                                    },
                                 }
                             }
                         }
-                        _ if lines_within_budget(&full_lines, budget) < total_lines => {
+                        None if lines_within_budget(&full_lines, budget) < total_lines => {
                             let shown = lines_within_budget(&full_lines, budget) as u64;
                             ReadFileResult {
                                 content: Some(full_lines[..shown as usize].concat()),
@@ -1515,7 +1618,7 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
         "0644".to_string()
     }
 
-    let params: Params = serde_json::from_str::<Params>(&params_str).map_err(|e| {
+    let mut params: Params = serde_json::from_str::<Params>(&params_str).map_err(|e| {
         if e.to_string().contains("unknown field") {
             format!(
                 "write_file only writes a whole file (path, content, mode) - {}. \
@@ -1526,6 +1629,7 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
             e.to_string()
         }
     })?;
+    params.path = ctx.tool_path(&params.path);
 
     debug!(
         "write_file received params: path='{}', content_length={}, mode='{}'",
@@ -1672,7 +1776,9 @@ fn tool_glob(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn E
         pattern: String,
     }
 
-    let params: Params = serde_json::from_str::<Params>(&params_str)?;
+    let mut params: Params = serde_json::from_str::<Params>(&params_str)?;
+    // An absolute pattern under where it works is taken as relative.
+    params.pattern = ctx.tool_path(&params.pattern);
     let glob_pattern = &params.pattern;
 
     // Security check: reject patterns that try to escape current directory
@@ -2464,7 +2570,8 @@ fn search_in_current_directory(
     ctx: &ToolContext,
     sandboxed: bool,
 ) -> Result<String, Box<dyn Error>> {
-    let params: SearchParams = serde_json::from_str(params_str)?;
+    let mut params: SearchParams = serde_json::from_str(params_str)?;
+    params.path = params.path.map(|p| ctx.tool_path(&p));
     let path = search_path(params.path.as_deref())?;
     let max_results = params
         .max_results
@@ -3199,17 +3306,30 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     } else {
         db::TaskKind::PROMPT
     };
+    let db = ctx.db()?;
+    // Without a profile, it runs on the agent creating it unless told
+    // otherwise - if that's an agent a session runs (a chat's, a
+    // worker's): a sub-agent's or a task's agent isn't one any session
+    // picks tasks up for, so theirs go to any agent.
+    let creator_runs_tasks = ctx.agent_name.as_deref().is_some_and(|name| {
+        db.get_agent(name)
+            .ok()
+            .flatten()
+            .is_some_and(|a| a.parent.is_none())
+    });
+    let agent_name = match &params.profile {
+        Some(_) => params.agent_name.clone(),
+        None => params
+            .agent_name
+            .clone()
+            .or_else(|| ctx.agent_name.clone().filter(|_| creator_runs_tasks)),
+    };
     let task = db::NewTask {
         name: params.name.clone(),
         description: params.description.unwrap_or_default(),
         kind: kind.to_string(),
         command: params.command,
-        // Without a profile, it runs on the agent creating it unless told
-        // otherwise.
-        agent_name: match params.profile {
-            Some(_) => params.agent_name,
-            None => params.agent_name.or_else(|| ctx.agent_name.clone()),
-        },
+        agent_name,
         schedule,
         held: false,
         depends_on: params.depends_on,
@@ -3218,8 +3338,8 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         run_safe: !ctx.unsafe_tools,
         cwd,
     };
-    let id = ctx.db()?.create_task(&task)?;
-    let next_run = ctx.db()?.get_task(id)?.and_then(|t| t.next_run_at);
+    let id = db.create_task(&task)?;
+    let next_run = db.get_task(id)?.and_then(|t| t.next_run_at);
     ctx.println(&format!(
         "Created {} task '{}' (id={}), next run {}",
         kind,
@@ -3227,7 +3347,138 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         id,
         next_run.as_deref().unwrap_or("-")
     ));
-    Ok(serde_json::json!({"id": id, "kind": kind, "next_run_at": next_run}).to_string())
+    let mut result = serde_json::json!({
+        "id": id,
+        "kind": kind,
+        "next_run_at": next_run,
+        "runs_on": task.agent_name.clone().unwrap_or_else(|| match &task.profile {
+            Some(profile) => format!("a new agent from profile {}", profile),
+            None => "any agent".to_string(),
+        }),
+    });
+    // What a model waiting for it needs to know.
+    let note = match task.agent_name.as_deref() {
+        Some(agent) if Some(agent) == ctx.agent_name.as_deref() => Some(
+            "It runs on you, once you're idle: it can't start while this turn goes on, so \
+             don't wait for it - end your turn."
+                .to_string(),
+        ),
+        Some(agent) => match db.get_agent(agent)? {
+            Some(a) if db::agent_session_is_live(&a, chrono::Utc::now()) => None,
+            _ => Some(format!(
+                "No session is running '{}' now: the task waits until one does.",
+                agent
+            )),
+        },
+        None if kind == db::TaskKind::PROMPT => {
+            Some("Use task_wait to wait for it and get its result.".to_string())
+        }
+        None => None,
+    };
+    if let Some(note) = note {
+        result["note"] = note.into();
+    }
+    Ok(result.to_string())
+}
+
+/// entrypoint for the task_wait tool: waits for tasks to finish their
+/// (next) run and returns how each went.
+fn tool_task_wait(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        ids: Vec<i64>,
+        #[serde(default)]
+        timeout_seconds: Option<u64>,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let db = ctx.db()?;
+    if params.ids.is_empty() {
+        return Err("give the ids of the tasks to wait for".into());
+    }
+    // Where each stands now: done once it's finished a run since.
+    let mut started = HashMap::new();
+    for id in &params.ids {
+        let task = db
+            .get_task(*id)?
+            .ok_or_else(|| format!("no task #{}", id))?;
+        if ctx.task_id == Some(*id) {
+            return Err(format!(
+                "task #{} is the task you are running right now - it shows as running because \
+                 of you, so waiting for it would never end. Do the work yourself, then end your \
+                 turn.",
+                id
+            )
+            .into());
+        }
+        if task.agent_name.is_some()
+            && task.agent_name == ctx.agent_name
+            && task.status != db::TaskStatus::RUNNING
+        {
+            return Err(format!(
+                "task #{} runs on you, once you're idle: it can't start while you wait for it - \
+                 end your turn instead",
+                id
+            )
+            .into());
+        }
+        started.insert(*id, task.run_count);
+    }
+    let finished = |task: &db::TaskRow| {
+        task.status != db::TaskStatus::RUNNING
+            && (task.run_count > started[&task.id] || task.status == db::TaskStatus::DONE)
+    };
+    let deadline =
+        std::time::Instant::now() + Duration::from_secs(params.timeout_seconds.unwrap_or(600));
+    let tasks = loop {
+        let tasks: Vec<db::TaskRow> = params
+            .ids
+            .iter()
+            .filter_map(|id| db.get_task(*id).ok().flatten())
+            .collect();
+        if tasks.iter().all(|t| finished(t)) || std::time::Instant::now() >= deadline {
+            break tasks;
+        }
+        if let Some(db) = &ctx.db {
+            let waiting: Vec<String> = tasks
+                .iter()
+                .filter(|t| !finished(t))
+                .map(|t| format!("#{}", t.id))
+                .collect();
+            let _ = db.set_agent_activity(
+                ctx.agent_name.as_deref().unwrap_or("default"),
+                &format!("waiting for task {}", waiting.join(", ")),
+            );
+        }
+        for _ in 0..10 {
+            let interrupted = ctx.interrupt.as_ref().is_some_and(|rx| {
+                rx.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .try_recv()
+                    .is_ok()
+            });
+            if interrupted {
+                return Err(Box::new(InterruptedError::new(
+                    "Operation interrupted by user",
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let mut out = String::new();
+    for task in &tasks {
+        out.push_str(&format!("## Task #{} \"{}\"\n", task.id, task.name));
+        if finished(task) {
+            out.push_str(&format!(
+                "{}: {}\n\n",
+                task.last_outcome.as_deref().unwrap_or("done"),
+                task.last_result.as_deref().unwrap_or("").trim()
+            ));
+        } else {
+            out.push_str(&format!("(still {} - gave up waiting)\n\n", task.status));
+        }
+    }
+    Ok(out)
 }
 
 /// entrypoint for the task_list tool: tasks (an agent's, or only the due
@@ -3254,7 +3505,7 @@ fn tool_task_list(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
                     "Task [{}]: {} ({})",
                     task.id, task.name, task.status
                 ));
-                Ok(serde_json::to_string(&task)?)
+                Ok(serde_json::to_string(&mark_own_task(&task, ctx)?)?)
             }
             None => Ok(serde_json::json!({"error": format!("no task with id {}", id)}).to_string()),
         };
@@ -3282,7 +3533,27 @@ fn tool_task_list(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
             t.id, t.name, t.kind, t.task_type, t.status, last
         ));
     }
+    let tasks = tasks
+        .iter()
+        .map(|t| mark_own_task(t, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(serde_json::to_string(&tasks)?)
+}
+
+/// A task as task_list shows it - saying so if it's the one the caller is
+/// running: otherwise a model sees it "running", claimed by some session,
+/// and waits for whoever that is - itself.
+fn mark_own_task(
+    task: &db::TaskRow,
+    ctx: &ToolContext,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let mut value = serde_json::to_value(task)?;
+    if ctx.task_id == Some(task.id) {
+        value["note"] = "This is the task you are running right now: it shows as running \
+                         because of you. Do the work yourself; don't wait for it."
+            .into();
+    }
+    Ok(value)
 }
 
 fn tool_task_delete(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
@@ -4037,7 +4308,8 @@ fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
         previews: Vec<EditPreview>,
     }
 
-    let params: Params = serde_json::from_str::<Params>(params_str)?;
+    let mut params: Params = serde_json::from_str::<Params>(params_str)?;
+    params.path = ctx.tool_path(&params.path);
 
     debug!(
         "patch_file received params: path='{}', edits={}",
@@ -4315,11 +4587,11 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         },
                         "start_line": {
                             "type": "integer",
-                            "description": "1-based line number to start reading from (inclusive). Requires end_line. Omit both to read the whole file."
+                            "description": "1-based line number to start reading from (inclusive); alone, reads to the end. Omit both to read the whole file."
                         },
                         "end_line": {
                             "type": "integer",
-                            "description": "1-based line number to stop reading at (inclusive). Requires start_line."
+                            "description": "1-based line number to stop reading at (inclusive); alone, reads from the start."
                         }
                     },
                     "required": [
@@ -4964,7 +5236,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "task_create",
-                "description": "Schedule a task: on a cron schedule (cron_expression), once after a delay (delay_seconds, preferred for relative times) or at a time (run_at), or right away if none is given. The command is either an instruction in plain language (e.g. \"tell the user a joke\", \"summarize today's commits\"), which the agent carries out as a new turn of its conversation as soon as it's idle, or a JSON tool call run directly without the AI, e.g. {\"tool\": \"run_command\", \"arguments\": {\"command\": \"echo hello\"}}.",
+                "description": "Schedule a task: on a cron schedule (cron_expression), once after a delay (delay_seconds, preferred for relative times) or at a time (run_at), or right away if none is given. The command is either an instruction in plain language (e.g. \"tell the user a joke\", \"summarize today's commits\"), which the agent carries out as a new turn of its conversation as soon as it's idle, or a JSON tool call run directly without the AI, e.g. {\"tool\": \"run_command\", \"arguments\": {\"command\": \"echo hello\"}}. To do work now, in parallel, use fan_out or spawn_agent instead: a task waits for an agent to be free. task_wait waits for tasks run by others.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -5036,6 +5308,31 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                     "required": [
                         "id"
                     ],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "task_wait".to_string(),
+        tool_task_wait,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "task_wait",
+                "description": "Wait for tasks to finish their next run, and get how each went - e.g. tasks you created with task_create for other agents. Not for a task that runs on you: it can't start until you're idle.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "ids": {"type": "array", "items": {"type": "integer"}, "description": "IDs of the tasks"},
+                        "timeout_seconds": {"type": "integer", "description": "Give up after this long (default 600)"}
+                    },
+                    "required": ["ids"],
                     "additionalProperties": false
                 }
             }
@@ -5263,7 +5560,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "report_result",
-                "description": "When you're a sub-agent, a fan-out worker or running a scheduled task: report the outcome of the work you were given - whether it succeeded or failed, a summary, and any data asked for. This is what the agent waiting on you (or the task record) gets, so report a failure as failed rather than describing it in a successful answer.",
+                "description": "When you're a sub-agent, a fan-out worker or running a scheduled task: once you're done, report the outcome of the work you were given - whether it succeeded or failed, a summary, and any data asked for. Call it once, at the end - not for progress. This is what the agent waiting on you (or the task record) gets, so report a failure as failed rather than describing it in a successful answer.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -8577,6 +8874,10 @@ fn chat_command(
                             .insert(at, working_directory_note(&here));
                         told_cwd.insert(active_agent.name.clone(), here);
                     }
+                    if let Some(id) = running_prompt_task {
+                        let at = active_agent.messages.len().saturating_sub(1);
+                        active_agent.messages.insert(at, running_task_note(id));
+                    }
                     if let Some(cwd) = tool_context.cwd.as_ref().filter(|c| !c.is_dir()) {
                         chat_pb.println(&format!(
                             "Warning: '{}' works in {}, which isn't a directory here (/cwd to change it)",
@@ -9609,6 +9910,20 @@ pub(crate) fn make_worker_agent(
     Ok(())
 }
 
+/// Tells an agent it's the one running task `id` - or, seeing the task
+/// "running" in task_list, it may go looking for who runs it, and wait.
+pub(crate) fn running_task_note(id: i64) -> Message {
+    make_message(
+        "system",
+        format!(
+            "You are running task #{} now: it's yours to do. In task_list it shows as running, \
+             claimed by your own session - that's you. Do the work (start sub-agents or fan_out \
+             if it helps), then end your turn with the result.",
+            id
+        ),
+    )
+}
+
 /// Tells an agent where it works - otherwise models assume, or make up,
 /// a directory, and hand made-up paths to the agents they start.
 pub(crate) fn working_directory_note(cwd: &std::path::Path) -> Message {
@@ -9758,6 +10073,7 @@ fn run_prompt_task_headless(
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
     ));
+    messages.push(running_task_note(task.id));
     let input = format!(
         "[Scheduled task #{} \"{}\"]: {}",
         task.id, task.name, task.command
@@ -10309,6 +10625,160 @@ fn format_transcript_message(message: &Message, full: bool) -> String {
     out
 }
 
+/// Prints one event, for `faber agents follow`. Streamed text continues
+/// the line it's on; `last` is who printed what last, so a new agent's
+/// text starts a new, labelled block.
+fn print_event(
+    row: &faber::agent_io::AgentEventRow,
+    reasoning: bool,
+    last: &mut Option<(String, &'static str)>,
+) {
+    let style = agent_style(&row.agent);
+    let who = style.apply_to(&row.agent);
+    let continues = |kind: &'static str, last: &Option<(String, &'static str)>| {
+        last.as_ref()
+            .is_some_and(|(agent, k)| agent == &row.agent && *k == kind)
+    };
+    let dim = Style::new().color256(244);
+    match &row.event {
+        AgentEvent::Text { text } | AgentEvent::Reasoning { text } => {
+            let kind = if matches!(row.event, AgentEvent::Text { .. }) {
+                "text"
+            } else {
+                "reasoning"
+            };
+            if kind == "reasoning" && !reasoning {
+                return;
+            }
+            if !continues(kind, last) {
+                // End another stream's line first.
+                if last
+                    .as_ref()
+                    .is_some_and(|(_, k)| *k == "text" || *k == "reasoning")
+                {
+                    println!();
+                }
+                print!("{}: ", who);
+            }
+            if kind == "reasoning" {
+                print!("{}", Style::new().color256(244).italic().apply_to(text));
+            } else {
+                print!("{}", text);
+            }
+            *last = Some((row.agent.clone(), kind));
+            let _ = std::io::stdout().flush();
+            return;
+        }
+        _ => {}
+    }
+    if last
+        .as_ref()
+        .is_some_and(|(_, k)| *k == "text" || *k == "reasoning")
+    {
+        println!();
+    }
+    *last = Some((row.agent.clone(), "line"));
+    let task = row
+        .task_id
+        .map(|id| format!(" (task #{})", id))
+        .unwrap_or_default();
+    match &row.event {
+        AgentEvent::Input { text } => {
+            println!(
+                "{}{} {} {}",
+                who,
+                task,
+                dim.apply_to("<-"),
+                first_line(text, 200)
+            )
+        }
+        AgentEvent::ToolStart { name, arguments } => println!(
+            "{} {}",
+            who,
+            dim.apply_to(format!("> {}({})", name, first_line(arguments, 120)))
+        ),
+        AgentEvent::ToolEnd {
+            name,
+            duration_ms,
+            output,
+            failed,
+        } => {
+            if *failed {
+                println!(
+                    "{} {}",
+                    who,
+                    Style::new().red().apply_to(format!(
+                        "x {} failed: {}",
+                        name,
+                        first_line(&faber::agent_io::tool_error(output), 160)
+                    ))
+                );
+            } else {
+                println!(
+                    "{} {}",
+                    who,
+                    dim.apply_to(format!(
+                        "  {} done in {:.1}s: {}",
+                        name,
+                        *duration_ms as f64 / 1000.0,
+                        first_line(output, 120)
+                    ))
+                );
+            }
+        }
+        AgentEvent::TurnEnd { succeeded, text } => {
+            let line = if *succeeded {
+                Style::new().green().apply_to("finished".to_string())
+            } else {
+                Style::new()
+                    .red()
+                    .apply_to(format!("failed: {}", first_line(text, 160)))
+            };
+            println!("{}{} {}", who, task, line);
+        }
+        AgentEvent::Text { .. } | AgentEvent::Reasoning { .. } => {}
+    }
+}
+
+/// `faber agents follow` / `faber tasks follow`: prints the latest events
+/// of an agent, a task or every agent, then new ones as they're recorded,
+/// until Ctrl-C. They're in the database, so this follows agents in any
+/// process sharing it - other machines' too, through `faber serve`.
+fn follow_events(
+    db: &dyn DbBackend,
+    agent: Option<String>,
+    task: Option<i64>,
+    reasoning: bool,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(name) = &agent {
+        db.get_agent(name)?
+            .ok_or_else(|| format!("no agent named '{}'", name))?;
+    }
+    if let Some(id) = task {
+        db.get_task(id)?.ok_or_else(|| format!("no task #{}", id))?;
+    }
+    let mut filter = faber::agent_io::EventFilter {
+        agent,
+        task_id: task,
+        after: None,
+        limit: 50,
+    };
+    let mut last = None;
+    loop {
+        let rows = db.agent_events(&filter)?;
+        for row in &rows {
+            print_event(row, reasoning, &mut last);
+        }
+        if let Some(row) = rows.last() {
+            filter.after = Some(row.id);
+        } else if filter.after.is_none() {
+            filter.after = Some(0);
+        }
+        filter.limit = 500;
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// `faber agents`: the agents as a tree, once or with `watch` every that
 /// many seconds - or, with `show`, one agent and its transcript.
 fn agents_command(
@@ -10358,6 +10828,14 @@ fn agents_command(
             }
         }
         return Ok(());
+    }
+    if let Some(AgentsAction::Follow {
+        name,
+        task,
+        reasoning,
+    }) = action
+    {
+        return follow_events(db.as_ref(), name.clone(), *task, *reasoning);
     }
     if let Some(AgentsAction::Show { name, full }) = action {
         let agent = db
@@ -11469,6 +11947,15 @@ enum TasksAction {
         #[clap(required = true)]
         ids: Vec<i64>,
     },
+    /// Print what's done for a task as it's done, by whichever agents -
+    /// its sub-agents and fan-out workers too - until Ctrl-C
+    Follow {
+        /// The task's id, as `faber tasks` lists it
+        id: i64,
+        /// Show the reasoning too
+        #[clap(long)]
+        reasoning: bool,
+    },
     /// Stop running tasks: whoever runs them interrupts them, and their
     /// sub-agents (recorded as failed: "stopped")
     Stop {
@@ -11512,6 +11999,18 @@ enum AgentsAction {
         /// Show every message in full instead of its start
         #[clap(long)]
         full: bool,
+    },
+    /// Print what agents do as they do it - every agent's, or only this
+    /// one's - until Ctrl-C: their input, answers, tool calls and how each
+    /// turn ended, wherever they run
+    Follow {
+        name: Option<String>,
+        /// Only what was done for this task, by whichever agents
+        #[clap(long, conflicts_with = "name")]
+        task: Option<i64>,
+        /// Show the reasoning too
+        #[clap(long)]
+        reasoning: bool,
     },
     /// Change an agent's settings that only you, not an agent, may change
     /// (created if needed)
@@ -11798,7 +12297,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 action: None | Some(KbAction::Search { .. }) | Some(KbAction::Show { .. }),
                 ..
             } | CliCommand::Agents {
-                action: None | Some(AgentsAction::Show { .. }),
+                action: None | Some(AgentsAction::Show { .. }) | Some(AgentsAction::Follow { .. }),
+                ..
+            } | CliCommand::Tasks {
+                action: Some(TasksAction::Follow { .. }),
                 ..
             }
         ) {
@@ -11894,6 +12396,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             action: Some(TasksAction::Stop { ids }),
             ..
         } => stop_tasks_command(&db_connection, ids),
+        CliCommand::Tasks {
+            action: Some(TasksAction::Follow { id, reasoning }),
+            ..
+        } => match &db_connection {
+            Some(db) => follow_events(db.as_ref(), None, Some(*id), *reasoning),
+            None => Err("No database configured: set 'db_path' in your config file, or use --db-path or --server.".into()),
+        },
         CliCommand::Tasks {
             action:
                 Some(TasksAction::Assign {
@@ -13767,6 +14276,39 @@ mod tests {
     }
 
     #[test]
+    fn test_absolute_paths_inside_the_agents_directory_are_taken() {
+        let dir = TempTestDir::new("abs_paths");
+        std::fs::create_dir(dir.0.join("src")).unwrap();
+        std::fs::write(dir.0.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let mut ctx = ToolContext::new(|_: &str| {});
+        ctx.cwd = Some(dir.0.clone());
+        let abs = |rel: &str| dir.0.join(rel).to_str().unwrap().to_string();
+        assert_eq!(ctx.tool_path(&abs("src/a.rs")), "src/a.rs");
+        assert_eq!(ctx.tool_path(dir.0.to_str().unwrap()), ".");
+        assert_eq!(ctx.tool_path("/etc/passwd"), "/etc/passwd");
+        assert_eq!(ctx.tool_path("rel/x"), "rel/x");
+        let read = tool_read_file(
+            &serde_json::json!({"path": abs("src/a.rs")}).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert!(read.contains("fn a()"), "{read}");
+        let found = tool_glob(
+            &serde_json::json!({"pattern": abs("src/*.rs")}).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(found, "src/a.rs");
+        // Outside it: still refused.
+        let outside = search_path(Some(&ctx.tool_path("/etc")));
+        assert!(outside.is_err());
+        assert_eq!(
+            search_path(Some(&ctx.tool_path(dir.0.to_str().unwrap()))),
+            Ok(".".to_string())
+        );
+    }
+
+    #[test]
     fn test_tools_work_in_the_agents_own_directory() {
         let dir = TempTestDir::new("agent_cwd");
         std::fs::create_dir(dir.0.join("sub")).unwrap();
@@ -14538,6 +15080,60 @@ mod tests {
     }
 
     #[test]
+    fn test_a_task_never_waits_for_itself() {
+        // Seeing its own task "running", the model waits for it.
+        let model = model_script(
+            "self-wait",
+            serde_json::json!([
+                // Most specific first: task_list's result repeats the command.
+                {"if": "waiting for it would never end", "reply": "counted them myself"},
+                {"if": "This is the task you are running", "tool": "task_wait", "arguments": {"ids": [1]}},
+                {"if": "count the files", "tool": "task_list", "arguments": {"id": 1}}
+            ]),
+        );
+        let db = local_db_with_agents(&["w"]);
+        assert!(db.claim_agent("w", "worker-session").unwrap());
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let id = db
+            .create_oneshot_task("t", "", &past, "count the files", None)
+            .unwrap();
+        assert_eq!(id, 1);
+        let task = claim_prompt_task(db.as_ref(), "worker-session", "w", &[]).unwrap();
+        let ctx = chat_ctx_with_model(db.clone(), "w", &model);
+        let extra = ctx
+            .extra
+            .clone()
+            .unwrap()
+            .downcast::<SubAgentContext>()
+            .ok()
+            .unwrap();
+        let mut opts = Opts::default();
+        opts.model = Some(model.clone());
+        let (_tx, rx) = mpsc::channel();
+        let started = std::time::Instant::now();
+        let outcome = run_prompt_task_headless(
+            &task,
+            "w",
+            &db,
+            "worker-session",
+            &extra.tools,
+            &opts,
+            extra.clone(),
+            &None,
+            rx,
+        );
+        assert_eq!(outcome.result, "counted them myself");
+        assert!(started.elapsed() < Duration::from_secs(5), "it waited");
+        // And it was told, up front, that the task is its own.
+        let transcript = db.load_agent_messages(&format!("task-{}", id)).unwrap();
+        assert!(transcript.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("You are running task #1 now"))
+        }));
+    }
+
+    #[test]
     fn test_models_naming_a_default_profile_get_none() {
         let mut profiles = Profiles::new();
         assert_eq!(requested_profile(&profiles, Some("default".into())), None);
@@ -14594,6 +15190,88 @@ mod tests {
         assert_eq!(claim(true), Some(anyone));
         assert_eq!(claim(true), None);
         assert_eq!(claim(false), Some(mine));
+    }
+
+    #[test]
+    fn test_report_result_takes_data_in_another_plain_form() {
+        let mut ctx = ToolContext::new(|_: &str| {});
+        let slot = Arc::new(Mutex::new(None));
+        ctx.result_slot = Some(slot.clone());
+        ctx.result_schema = Some(serde_json::json!({
+            "lines": "number", "files": "integer", "ok": "boolean", "name": "string"
+        }));
+        // As a fan-out worker sent it: the number as a string.
+        tool_report_result(
+            &r#"{"status":"succeeded","summary":"Counted","data":{"lines": "853", "files": "3", "ok": "True", "name": 7}}"#
+                .to_string(),
+            &ctx,
+        )
+        .unwrap();
+        let reported = slot.lock().unwrap().take().unwrap();
+        assert_eq!(
+            reported.data,
+            Some(serde_json::json!({"lines": 853, "files": 3, "ok": true, "name": "7"}))
+        );
+        // What isn't one in any form still fails.
+        for data in [
+            r#"{"lines": "many"}"#,
+            r#"{"files": "2.5"}"#,
+            r#"{"ok": "yes"}"#,
+        ] {
+            let mut fields: serde_json::Value =
+                serde_json::json!({"lines": 1, "files": 1, "ok": true, "name": "x"});
+            for (k, v) in serde_json::from_str::<serde_json::Map<_, _>>(data).unwrap() {
+                fields[k] = v;
+            }
+            let call = serde_json::json!({"status": "succeeded", "summary": "s", "data": fields});
+            assert!(
+                tool_report_result(&call.to_string(), &ctx).is_err(),
+                "{data}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_report_result_takes_progress_and_loose_statuses() {
+        let db = local_db_with_agents(&["worker"]);
+        let mut ctx = ToolContext::new(|_: &str| {});
+        ctx.db = Some(db.clone());
+        ctx.agent_name = Some("worker".to_string());
+        let slot = Arc::new(Mutex::new(None));
+        ctx.result_slot = Some(slot.clone());
+        // What a small model sent: progress, not a result.
+        let out = tool_report_result(
+            &r#"{"status":"in_progress","summary":"Reading src/agent_io.rs to count lines.","data":{"line_count": 0}}"#
+                .to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert!(out.contains("not your result yet"), "{out}");
+        assert!(slot.lock().unwrap().is_none());
+        assert_eq!(
+            db.get_agent("worker").unwrap().unwrap().activity.as_deref(),
+            Some("Reading src/agent_io.rs to count lines.")
+        );
+        // Then the real one, however it's worded.
+        tool_report_result(
+            &r#"{"status":"Completed","summary":"283 lines"}"#.to_string(),
+            &ctx,
+        )
+        .unwrap();
+        let reported = slot.lock().unwrap().take().unwrap();
+        assert!(reported.succeeded);
+        assert_eq!(reported.summary, "283 lines");
+        assert!(
+            tool_report_result(&r#"{"status":"maybe","summary":"x"}"#.to_string(), &ctx).is_err()
+        );
+        assert!(matches!(
+            report_status("FAILED"),
+            ReportStatus::Final(false)
+        ));
+        assert!(matches!(
+            report_status("in progress"),
+            ReportStatus::Progress
+        ));
     }
 
     #[test]
@@ -14980,6 +15658,95 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn test_fan_out_shows_every_worker_before_it_starts() {
+        let model = model_script(
+            "queued",
+            serde_json::json!([{"if": "check", "reply": "ok", "delay_ms": 400}]),
+        );
+        let db = local_db_with_agents(&["boss"]);
+        let ctx = chat_ctx_with_model(db.clone(), "boss", &model);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                fan_out::tool_fan_out(
+                    &serde_json::json!({"items": ["a", "b", "c"], "prompt": "check {item}", "max_parallel": 1})
+                        .to_string(),
+                    &ctx,
+                )
+                .unwrap();
+            });
+            // One at a time, yet all three are there, the rest queued.
+            assert!(eventually(|| {
+                let agents = db.list_agents().unwrap();
+                let workers: Vec<_> = agents
+                    .iter()
+                    .filter(|a| a.name.starts_with("boss-item-"))
+                    .collect();
+                workers.len() == 3
+                    && workers
+                        .iter()
+                        .filter(|a| a.activity.as_deref() == Some("queued"))
+                        .count()
+                        >= 1
+            }));
+        });
+        for i in 1..=3 {
+            let agent = db.get_agent(&format!("boss-item-{}", i)).unwrap().unwrap();
+            assert_eq!(agent.activity.as_deref(), Some("finished: ok"));
+        }
+    }
+
+    #[test]
+    fn test_task_create_targets_and_task_wait() {
+        let db = local_db_with_agents(&["boss", "helper"]);
+        db.set_agent_parent("helper", Some("boss")).unwrap();
+        let ctx_of = |agent: &str| {
+            let mut ctx = ToolContext::new(|_: &str| {});
+            ctx.db = Some(db.clone());
+            ctx.agent_name = Some(agent.to_string());
+            ctx
+        };
+        let create = |ctx: &ToolContext| -> serde_json::Value {
+            serde_json::from_str(
+                &tool_task_create(&r#"{"name": "t", "command": "do it"}"#.to_string(), ctx)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        // A chat's agent gets its own task, told not to wait for it...
+        let boss = ctx_of("boss");
+        let own = create(&boss);
+        assert_eq!(own["runs_on"], "boss");
+        assert!(
+            own["note"].as_str().unwrap().contains("end your turn"),
+            "{own}"
+        );
+        let err = tool_task_wait(&format!(r#"{{"ids": [{}]}}"#, own["id"]), &boss).unwrap_err();
+        assert!(err.to_string().contains("runs on you"), "{err}");
+        // ...a sub-agent's goes to any agent, as nobody picks up its own.
+        let helper = ctx_of("helper");
+        let any = create(&helper);
+        assert_eq!(any["runs_on"], "any agent");
+        let id = any["id"].as_i64().unwrap();
+        assert!(db.get_task(id).unwrap().unwrap().agent_name.is_none());
+        // task_wait gets its result once someone has run it.
+        assert!(db.claim_agent("boss", "s").unwrap());
+        assert!(db.claim_task(id, "s").unwrap());
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                let outcome = db::TaskOutcome {
+                    succeeded: true,
+                    exit_code: None,
+                    result: "did it".to_string(),
+                };
+                db.finish_task(id, "s", &outcome).unwrap();
+            });
+            let out = tool_task_wait(&format!(r#"{{"ids": [{}]}}"#, id), &helper).unwrap();
+            assert!(out.contains("succeeded: did it"), "{out}");
+        });
     }
 
     #[test]
@@ -16728,31 +17495,35 @@ mod tests {
         let path = "_test_rf_validate.tmp";
         write_test_file(path, "one\ntwo\nthree\n");
 
+        // Line 0 is taken as the first.
         let res = read(serde_json::json!({"path": path, "start_line": 0, "end_line": 1})).unwrap();
-        assert!(res["error"].as_str().unwrap().contains("1-based"));
+        assert_eq!(res["content"], "one\n");
 
         let res = read(serde_json::json!({"path": path, "start_line": 3, "end_line": 1})).unwrap();
         assert!(res["error"].as_str().unwrap().contains("must be >="));
 
+        // Starting past the end: nothing there, and where it ends.
         let res =
             read(serde_json::json!({"path": path, "start_line": 10, "end_line": 12})).unwrap();
+        assert!(res["error"].is_null(), "{res}");
+        assert_eq!(res["content"], "");
         assert!(
-            res["error"]
-                .as_str()
-                .unwrap()
-                .contains("exceeds file line count")
+            res["note"].as_str().unwrap().contains("past its end"),
+            "{res}"
         );
 
+        // An end past the last line reads up to it, and says so.
         let res = read(serde_json::json!({"path": path, "start_line": 1, "end_line": 10})).unwrap();
-        assert!(
-            res["error"]
-                .as_str()
-                .unwrap()
-                .contains("exceeds file line count")
-        );
+        assert!(res["error"].is_null(), "{res}");
+        let total = res["total_lines"].as_u64().unwrap();
+        assert_eq!(res["end_line"].as_u64(), Some(total));
+        assert!(res["note"].as_str().unwrap().contains("only"), "{res}");
 
+        // One end only: to the end, or from the start.
         let res = read(serde_json::json!({"path": path, "start_line": 2})).unwrap();
-        assert!(res["error"].as_str().unwrap().contains("together"));
+        assert_eq!(res["content"], "two\nthree\n");
+        let res = read(serde_json::json!({"path": path, "end_line": 1})).unwrap();
+        assert_eq!(res["content"], "one\n");
 
         cleanup(path);
     }

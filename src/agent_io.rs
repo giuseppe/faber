@@ -127,6 +127,28 @@ pub fn tool_failed(output: &str) -> bool {
     has_error || never_finished
 }
 
+/// Why a failed tool call failed: "error: tool 'x' failed: why" gives
+/// "why"; a JSON result its `error`, or a command's `stderr`.
+pub fn tool_error(output: &str) -> String {
+    let text = output.trim();
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+        for field in ["error", "stderr"] {
+            match json.get(field) {
+                Some(serde_json::Value::String(s)) if !s.trim().is_empty() => return s.clone(),
+                Some(v) if !v.is_null() && !v.is_string() => return v.to_string(),
+                _ => {}
+            }
+        }
+    }
+    let text = text.strip_prefix("error: ").unwrap_or(text);
+    match text.split_once(" failed: ") {
+        Some((tool, why)) if tool.starts_with("tool '") || tool.starts_with("MCP tool '") => {
+            why.to_string()
+        }
+        _ => text.to_string(),
+    }
+}
+
 /// Where an agent's events go.
 pub trait AgentOutput: Send + Sync {
     fn emit(&self, event: AgentEvent);
@@ -404,6 +426,23 @@ mod tests {
         ));
         assert!(!tool_failed("the word error: appears later"));
         assert!(!tool_failed("{not json"));
+    }
+
+    #[test]
+    fn test_tool_error() {
+        assert_eq!(tool_error("error: tool 'agent_wait' failed: nope"), "nope");
+        assert_eq!(
+            tool_error(r#"{"content":null,"error":"File not found"}"#),
+            "File not found"
+        );
+        assert_eq!(
+            tool_error(r#"{"stdout":"","stderr":"no bwrap","exit_code":null,"success":false}"#),
+            "no bwrap"
+        );
+        assert_eq!(
+            tool_error("error: invalid tool requested: 'x'"),
+            "invalid tool requested: 'x'"
+        );
     }
 
     #[test]

@@ -136,9 +136,15 @@ body[data-view="board"] #board-panel { order: -1; }
 }
 .agent-activity { color: var(--muted); }
 .agent-output { color: var(--text); opacity: 0.8; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line); flex: none; }
-.dot.live { background: var(--ok); }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--line); flex: none; }
+.dot.live { background: transparent; box-shadow: inset 0 0 0 2px var(--ok); }
 .dot.busy { background: var(--warn); animation: pulse 1.4s ease-in-out infinite; }
+.dot.queued { background: transparent; box-shadow: inset 0 0 0 2px var(--muted); }
+.dot.finished { background: var(--ok); }
+.dot.failed { background: var(--bad); }
+.agent-activity.finished { color: var(--ok); }
+.agent-activity.failed { color: var(--bad); }
+.agent-activity.busy { color: var(--warn); }
 @keyframes pulse { 50% { opacity: 0.35; } }
 .tag { font-size: 11px; color: var(--muted); font-weight: normal; }
 
@@ -312,9 +318,26 @@ button:disabled { opacity: 0.5; cursor: default; }
 .problems li { color: var(--text); word-break: break-word; }
 .problem-title { font-weight: 600; }
 .event.tool pre { margin: 6px 0 0; white-space: pre-wrap; max-height: 300px; overflow: auto; }
-.event.end { font-size: 12px; font-weight: 600; }
-.event.end.ok { color: var(--ok); }
-.event.end.bad { color: var(--bad); }
+.event.end {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border-left: 4px solid;
+}
+.event.end.ok { color: var(--ok); border-color: var(--ok); background: color-mix(in srgb, var(--ok) 10%, transparent); }
+.event.end.bad { color: var(--bad); border-color: var(--bad); background: color-mix(in srgb, var(--bad) 10%, transparent); }
+.event.end .end-text { font-weight: normal; color: var(--text); margin-top: 2px; }
+/* A check or cross, drawn: some fonts lack the glyphs. */
+.end-mark {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: currentColor;
+  margin-right: 6px;
+  vertical-align: baseline;
+}
 body:not(.show-reasoning) .event.reasoning { display: none; }
 .feed-status { margin-top: 8px; font-size: 12px; color: var(--warn); }
 .feed-status:empty { display: none; }

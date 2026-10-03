@@ -185,6 +185,29 @@ impl ToolContext {
         }
     }
 
+    /// `path` as the tools take it: an absolute path inside the directory
+    /// this agent works in becomes relative to it (models often give one);
+    /// anything else is left as it is, for the tool to accept or refuse.
+    pub fn tool_path(&self, path: &str) -> String {
+        let given = Path::new(path);
+        if !given.is_absolute() {
+            return path.to_string();
+        }
+        let cwd = self.cwd();
+        let bases = [cwd.clone(), cwd.canonicalize().unwrap_or(cwd)];
+        for base in &bases {
+            if let Ok(rest) = given.strip_prefix(base) {
+                let rest = rest.to_string_lossy();
+                return if rest.is_empty() {
+                    ".".to_string()
+                } else {
+                    rest.into_owned()
+                };
+            }
+        }
+        path.to_string()
+    }
+
     /// Remembers `content` as what this agent last saw of `path`.
     pub fn note_file_version(&self, path: &str, content: &[u8]) {
         if let Some(versions) = &self.file_versions {

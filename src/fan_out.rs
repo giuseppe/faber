@@ -409,12 +409,36 @@ pub(crate) fn tool_fan_out(
     }
     let handoff =
         crate::handoff_message(ctx, params.context.as_ref().unwrap_or(&Default::default()))?;
+    // No more at once than may be sent to the model at once: the rest
+    // would only queue, and taking turns, evict each other's prompts from
+    // the server's cache (see --max-parallel-requests).
+    let slots = match openai::max_parallel_requests() {
+        0 => MAX_PARALLEL,
+        n => n,
+    };
     let parallel = params
         .max_parallel
         .unwrap_or(DEFAULT_MAX_PARALLEL)
         .clamp(1, MAX_PARALLEL)
+        .min(slots)
         .min(params.items.len());
     let total = params.items.len();
+    let worker_name = |index: usize| {
+        format!(
+            "{}-item-{}",
+            ctx.agent_name.as_deref().unwrap_or("default"),
+            index + 1
+        )
+    };
+    // Every worker's agent, made up front: they all show, queued, even
+    // those that have to wait their turn to start.
+    if let (Some(db), Some(caller)) = (&ctx.db, &ctx.agent_name) {
+        for index in 0..total {
+            let name = worker_name(index);
+            crate::make_worker_agent(db.as_ref(), &name, caller, ctx, &sa_ctx.session_id)?;
+            let _ = db.set_agent_activity(&name, "queued");
+        }
+    }
 
     let queue: Mutex<VecDeque<usize>> = Mutex::new((0..total).collect());
     let results: Mutex<Vec<Option<Result<String, String>>>> = Mutex::new(vec![None; total]);
@@ -483,11 +507,7 @@ pub(crate) fn tool_fan_out(
                         }
                         let item = &params.items[index];
                         let key = format!("fan-out {}/{}", index + 1, total);
-                        let agent = format!(
-                            "{}-item-{}",
-                            ctx.agent_name.as_deref().unwrap_or("default"),
-                            index + 1
-                        );
+                        let agent = worker_name(index);
                         sa_ctx.status_bar.set_agent_status(&key, "Starting", true);
                         let result = run_worker(
                             sa_ctx,
@@ -527,6 +547,22 @@ pub(crate) fn tool_fan_out(
         }
         finished.store(true, Ordering::Relaxed);
     });
+    // Those that never started (stopped first) are let go too.
+    if let Some(db) = &ctx.db {
+        let results = results.lock().unwrap_or_else(|e| e.into_inner());
+        for index in (0..total).filter(|i| results[*i].is_none()) {
+            let name = worker_name(index);
+            let queued = db
+                .get_agent(&name)
+                .ok()
+                .flatten()
+                .is_some_and(|a| a.activity.as_deref() == Some("queued"));
+            if queued {
+                let _ = db.set_agent_activity(&name, "not started: stopped");
+            }
+            let _ = db.release_agent(&name, &sa_ctx.session_id);
+        }
+    }
     // Workers finishing together can record their counts out of order:
     // the last word is the final count.
     if let Some(activity) = &activity {

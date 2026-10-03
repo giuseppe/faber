@@ -249,8 +249,9 @@ function appendEvent(box, row, labelled) {
     }
     case "turn_end":
       node = el("div", { class: `event end ${event.succeeded ? "ok" : "bad"}` },
-        `${event.succeeded ? "✓ finished" : "✗ failed"}${labelled ? ` · ${row.agent}` : ""} · ${relative(row.at)}`,
-        event.succeeded ? null : el("div", {}, event.text));
+        el("span", { class: "end-mark" }),
+        `${event.succeeded ? "Finished" : "Failed"}${labelled ? `: ${row.agent}` : ""} · ${relative(row.at)}`,
+        event.text ? el("div", { class: "end-text" }, firstLine(event.text, 300)) : null);
       break;
     default:
       return;
@@ -340,8 +341,29 @@ async function pollEvents() {
 // --- Agents ---------------------------------------------------------------
 
 function busy(activity) {
-  return !!activity && !/^(idle|stopped|finished|failed)/.test(activity);
+  return !!activity && !/^(idle|stopped|finished|failed|queued|not started)/.test(activity);
 }
+
+// Where an agent stands, from its activity: what its dot and activity
+// line show - a finished one green, a failed or stopped one red.
+function agentState(agent) {
+  const activity = agent.activity || "";
+  if (/^finished/.test(activity)) return "finished";
+  if (/^(failed|stopped|not started)/.test(activity)) return "failed";
+  if (activity === "queued") return "queued";
+  if (agent.live && busy(activity)) return "busy";
+  if (agent.live) return "live";
+  return "";
+}
+
+const STATE_TITLES = {
+  finished: "finished",
+  failed: "failed or stopped",
+  queued: "queued: waiting for its turn",
+  busy: "working",
+  live: "live session, idle",
+  "": "no live session",
+};
 
 function agentTree(agents) {
   const names = new Set(agents.map((a) => a.name));
@@ -391,7 +413,8 @@ function renderAgents() {
       }, `+ ${agent.more} more`);
     }
     const selected = state.selected?.kind === "agent" && state.selected.name === agent.name;
-    const dot = agent.live ? (busy(agent.activity) ? "dot busy" : "dot live") : "dot";
+    const st = agentState(agent);
+    const dot = `dot ${st}`;
     const latest = state.latestByAgent.get(agent.name);
     return el("li", {
       class: selected ? "selected" : "",
@@ -399,11 +422,11 @@ function renderAgents() {
       onclick: () => select({ kind: "agent", name: agent.name }),
     },
       el("div", { class: "agent-name" },
-        el("span", { class: dot, title: agent.live ? "live session" : "no live session" }),
+        el("span", { class: dot, title: STATE_TITLES[st] }),
         agent.name,
         agent.profile ? el("span", { class: "tag" }, agent.profile) : null,
         agent.unsafe_tools ? el("span", { class: "badge danger", title: "Has the unsafe tools: unsandboxed commands, web access" }, "unsafe") : null),
-      el("div", { class: "agent-activity", title: agent.activity || "" },
+      el("div", { class: `agent-activity ${st}`, title: agent.activity || "" },
         agent.activity ? `${firstLine(agent.activity, 60)} · ${relative(agent.activity_at)}` : "-"),
       latest ? el("div", { class: "agent-output", title: latest.line }, latest.line) : null);
   }));

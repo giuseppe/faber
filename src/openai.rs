@@ -219,6 +219,15 @@ pub fn set_max_parallel_requests(limit: usize) {
     request_limiter().set_limit(limit);
 }
 
+/// How many model requests may be in flight at once (0: unlimited).
+pub fn max_parallel_requests() -> usize {
+    request_limiter()
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .0
+}
+
 /// Runs a blocking call - sending a request, reading a whole response -
 /// on a helper thread, checking for Ctrl-C every 100ms meanwhile, so the
 /// user isn't stuck waiting for a slow or hung server. If interrupted, the
@@ -1208,6 +1217,33 @@ pub fn make_message(role: &str, content: String) -> Message {
     }
 }
 
+/// The tools as a request lists them: always in the same order, by name.
+/// The tool definitions are near the start of the prompt the server makes,
+/// so an order that changed between requests - a `HashMap`'s does, from one
+/// collection to the next - would leave nothing of a cached prompt
+/// reusable, for the model to process the whole prompt again every time.
+fn request_tools(
+    tools_collection: &ToolsCollection,
+    ctx: &crate::ToolContext,
+) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
+    let mut names: Vec<&String> = tools_collection.keys().collect();
+    names.sort();
+    let mut tools = Vec::with_capacity(names.len());
+    for name in names {
+        tools.push(serde_json::from_str(&tools_collection[name].schema)?);
+    }
+    if let Some(ref mcp) = ctx.mcp_manager {
+        let mut mcp_tools = mcp.get_tool_schemas();
+        mcp_tools.sort_by(|a, b| {
+            let name =
+                |v: &serde_json::Value| v["function"]["name"].as_str().unwrap_or("").to_string();
+            name(a).cmp(&name(b))
+        });
+        tools.extend(mcp_tools);
+    }
+    Ok(tools)
+}
+
 /// Sends a POST request to the OpenAI API with the given messages and options.
 pub fn post_request(
     messages: Vec<Message>,
@@ -1279,14 +1315,7 @@ fn post_request_with_mode_and_recursion(
             headers.insert(AUTHORIZATION, HeaderValue::from_str(&bearer_auth)?);
         }
 
-        let mut tools: Vec<serde_json::Value> = vec![];
-        for t in tools_collection.values() {
-            let tool_schema: serde_json::Value = serde_json::from_str(&t.schema)?;
-            tools.push(tool_schema);
-        }
-        if let Some(ref mcp) = ctx.mcp_manager {
-            tools.extend(mcp.get_tool_schemas());
-        }
+        let tools = request_tools(tools_collection, ctx)?;
 
         let tool_choice = if tools.len() > 0 {
             // If tools are available, use user's choice or default to "auto"
@@ -2223,6 +2252,35 @@ mod tests {
                 arguments: arguments.to_string(),
             },
         }
+    }
+
+    #[test]
+    fn test_request_tools_are_always_in_the_same_order() {
+        let tool = |name: &str| ToolItem {
+            callback: |_, _| Ok(String::new()),
+            schema: serde_json::json!({"type": "function", "function": {"name": name}}).to_string(),
+        };
+        let names = ["write_file", "glob", "read_file", "agent_wait", "fan_out"];
+        let ctx = crate::ToolContext::new(|_: &str| {});
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..5 {
+            let mut tools = ToolsCollection::new();
+            for name in names {
+                tools.insert(name.to_string(), tool(name));
+            }
+            seen.insert(serde_json::to_string(&request_tools(&tools, &ctx).unwrap()).unwrap());
+        }
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        let first: Vec<serde_json::Value> =
+            serde_json::from_str(seen.iter().next().unwrap()).unwrap();
+        let listed: Vec<&str> = first
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            listed,
+            ["agent_wait", "fan_out", "glob", "read_file", "write_file"]
+        );
     }
 
     #[test]
