@@ -82,7 +82,7 @@ Commands can also use `\` as the prefix (e.g. `\quit`).
 `/chdir` is explicit and user-typed, so unlike `run_command` it isn't
 sandboxed - it changes the real process directory. Every path-resolving
 tool (`read_file`, `write_file`, `patch_file`, `glob`,
-`grep_in_current_directory`, `run_command`'s sandbox bind, ...) re-resolves
+`grep`, `run_command`'s sandbox bind, ...) re-resolves
 the current directory on each call, so they immediately follow a `/chdir`
 with no extra step.
 
@@ -264,7 +264,7 @@ any number of agents with the same endpoint, model, effort and so on:
       "model": "qwen3",
       "parameters": {"reasoning_effort": "low", "temperature": 0.2},
       "max_tokens": 4096,
-      "tools": ["read_file", "glob", "grep_in_current_directory", "report_result"]
+      "tools": ["read_file", "glob", "grep", "report_result"]
     },
     "deep": {
       "model": "deepseek-r1",
@@ -377,7 +377,7 @@ same `--db-path`, or the same `--server`.
  Agent        | Session | Activity                        | Since | Model
 --------------+---------+---------------------------------+-------+-------
  default      | live    | fan_out: 120/500 done           | 3s ago| -
- ├─ planner   | live    | running grep_in_current_directory | now | -
+ ├─ planner   | live    | running grep           | now | -
  │  └─ scout  | -       | finished: found the manifest    | 2m ago| -
  └─ checker   | -       | stopped: timed out after 60s    | 5m ago| -
 ```
@@ -676,7 +676,7 @@ that agent.
 | `patch_file` | Change part of an existing file: a batch of edits, each replacing exact text (`old_content`) or a range of lines (`start_line`..`end_line`), applied in order, all-or-nothing, rewriting only the changed bytes; the result includes a numbered-context preview of where each edit landed, so a follow-up `read_file` usually isn't needed to confirm it |
 | `delete_path` | Delete a file or directory |
 | `glob` | Find files matching a glob pattern |
-| `grep_in_current_directory` | Search file contents with a regex, using [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) if installed and `grep` otherwise. Skips `.gitignore`d, hidden and binary files (the `grep` fallback skips `.git`, `target` and `node_modules` instead); optional `path`, `glob`, `case_insensitive`, `fixed_strings`, `context_lines`, `files_only`, `include_ignored`; output sorted by path and cut off after `max_results` lines (default 200) with a note. Unless `--unsafe-tools` is set, the search runs in a bubblewrap sandbox like `run_command`'s, but with the current directory mounted read-only |
+| `grep` | Search file contents with a regex, using [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`) if installed and `grep` otherwise, in the agent's working directory unless given `path` or `paths`. Skips `.gitignore`d, hidden and binary files (the `grep` fallback skips `.git`, `target` and `node_modules` instead); optional `glob`, `case_insensitive`, `fixed_strings`, `context_lines`, `files_only`, `count` (matching lines per file), `multiline` (ripgrep only), `include_ignored`; output sorted by path and cut off after `max_results` lines (default 200) with a note. For an agent without the unsafe tools it runs in a bubblewrap sandbox in which only the system's binaries and libraries and the working directory, read-only, exist: that alone keeps it in - a path outside the directory, or a symlink out of it, finds nothing - so any path may be given. |
 | `github_issue` | One GitHub issue by number (optionally with its comments), or the issues updated in the last few days |
 | `github_pull_request` | One pull request by number (or its diff, with `patch`), or the pull requests updated in the last few days |
 | `agent_create` | Create a new agent |
@@ -697,7 +697,7 @@ that agent.
 | `agent_wait` | Wait for your sub-agents (all, some, or the first to finish) and get their results together |
 | `task_wait` | Wait for tasks (run by other agents) to finish, and get how each went |
 | `report_result` | For a sub-agent, fan-out worker or task: report the outcome of its work - succeeded/failed, summary, data |
-| `fan_out` | Run the same task for many items (e.g. files) at once, one worker agent each, at most `max_parallel` at a time (default 32, up to 256; up to 1000 items), and return all the results together, in item order, once every worker is done. `{item}` in the prompt is replaced by each worker's item. Workers only get read-only tools (`read_file`, `glob`, `grep_in_current_directory`, `lsp`, web/GitHub reads) unless `tools` names others - workers that write can overwrite each other's changes - and can't spawn agents. Ctrl-C stops every worker. Each result gets a share of the output cap |
+| `fan_out` | Run the same task for many items (e.g. files) at once, one worker agent each, at most `max_parallel` at a time (default 32, up to 256; up to 1000 items), and return all the results together, in item order, once every worker is done. `{item}` in the prompt is replaced by each worker's item. Workers only get read-only tools (`read_file`, `glob`, `grep`, `lsp`, web/GitHub reads) unless `tools` names others - workers that write can overwrite each other's changes - and can't spawn agents. Ctrl-C stops every worker. Each result gets a share of the output cap |
 | `run_command` | Execute a command, sandboxed with [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`): no network access, no capabilities, a cleared environment, a read-only root with only the current directory writable, its own PID/IPC/UTS/cgroup namespaces (no visibility into other processes or the host's hostname), killed if faber itself dies, and detached from the controlling terminal. Requires `bwrap` to be installed; use `--unsafe-tools` for unrestricted execution instead |
 
 ### Unsafe tools
@@ -707,7 +707,7 @@ that agent.
 | `run_command` | Execute a command directly, with the same access as the faber process itself - no sandboxing |
 | `fetch_web_content` | Fetch content from a URL |
 
-(`grep_in_current_directory` and `lsp` also run unsandboxed for an agent
+(`grep` and `lsp` also run unsandboxed for an agent
 with the unsafe tools.)
 
 Whether an agent has them is up to each agent, not the whole session:

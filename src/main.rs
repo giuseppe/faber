@@ -2462,6 +2462,15 @@ struct SearchParams {
     pattern: String,
     #[serde(default)]
     path: Option<String>,
+    /// Several files or directories at once, besides `path`.
+    #[serde(default)]
+    paths: Vec<String>,
+    /// How many matching lines each file has, rather than the lines.
+    #[serde(default)]
+    count: bool,
+    /// Let the pattern match across lines (ripgrep only).
+    #[serde(default)]
+    multiline: bool,
     #[serde(default)]
     glob: Option<String>,
     #[serde(default)]
@@ -2489,22 +2498,10 @@ const GREP_EXCLUDED_DIRS: &[&str] = &[".git", "target", "node_modules"];
 
 /// Checks that a search `path` stays inside the current directory: relative
 /// and without `..`. Defaults to `.`.
-fn search_path(path: Option<&str>) -> Result<String, String> {
-    let path = path.unwrap_or(".");
-    let p = std::path::Path::new(path);
-    if p.is_absolute() || p.components().any(|c| c == std::path::Component::ParentDir) {
-        return Err(format!(
-            "path '{}' must be relative to the current directory, without '..'",
-            path
-        ));
-    }
-    Ok(path.to_string())
-}
-
 /// Arguments for ripgrep. `--sort path` keeps results (and so where they
 /// get cut off) the same from one call to the next; `--max-columns` keeps
 /// one minified line from swallowing the whole result.
-fn rg_search_args(params: &SearchParams, path: &str) -> Vec<String> {
+fn rg_search_args(params: &SearchParams, paths: &[String]) -> Vec<String> {
     let mut a: Vec<String> = [
         "--no-config",
         "--color",
@@ -2527,8 +2524,13 @@ fn rg_search_args(params: &SearchParams, path: &str) -> Vec<String> {
     if params.fixed_strings {
         a.push("-F".to_string());
     }
+    if params.multiline {
+        a.push("-U".to_string());
+    }
     if params.files_only {
         a.push("-l".to_string());
+    } else if params.count {
+        a.push("--count".to_string());
     } else if let Some(n) = params.context_lines.filter(|n| *n > 0) {
         a.push("-C".to_string());
         a.push(n.min(MAX_SEARCH_CONTEXT_LINES).to_string());
@@ -2544,14 +2546,14 @@ fn rg_search_args(params: &SearchParams, path: &str) -> Vec<String> {
     a.push("-e".to_string());
     a.push(params.pattern.clone());
     a.push("--".to_string());
-    a.push(path.to_string());
+    a.extend(paths.iter().cloned());
     a
 }
 
 /// Arguments for the plain `grep` fallback, as close to `rg_search_args` as
 /// grep allows: extended regexes, binary files skipped, and the usual
 /// generated directories excluded instead of honoring `.gitignore`.
-fn grep_search_args(params: &SearchParams, path: &str) -> Vec<String> {
+fn grep_search_args(params: &SearchParams, paths: &[String]) -> Vec<String> {
     let mut a: Vec<String> = ["-r", "-n", "-I", "-H"]
         .into_iter()
         .map(String::from)
@@ -2562,6 +2564,8 @@ fn grep_search_args(params: &SearchParams, path: &str) -> Vec<String> {
     }
     if params.files_only {
         a.push("-l".to_string());
+    } else if params.count {
+        a.push("-c".to_string());
     } else if let Some(n) = params.context_lines.filter(|n| *n > 0) {
         a.push("-C".to_string());
         a.push(n.min(MAX_SEARCH_CONTEXT_LINES).to_string());
@@ -2577,7 +2581,7 @@ fn grep_search_args(params: &SearchParams, path: &str) -> Vec<String> {
     a.push("-e".to_string());
     a.push(params.pattern.clone());
     a.push("--".to_string());
-    a.push(path.to_string());
+    a.extend(paths.iter().cloned());
     a
 }
 
@@ -2648,43 +2652,53 @@ fn bwrap_search_args(cwd: &str, program: &str, args: &[String]) -> Vec<String> {
     a
 }
 
-/// entrypoint for the grep_in_current_directory tool without
+/// entrypoint for the grep tool without
 /// --unsafe-tools: the search runs sandboxed (see `bwrap_search_args`).
-fn tool_grep_in_current_directory(
-    params_str: &String,
-    ctx: &ToolContext,
-) -> Result<String, Box<dyn Error>> {
-    search_in_current_directory(params_str, ctx, true)
+fn tool_grep(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    search_files(params_str, ctx, true)
 }
 
-/// entrypoint for the grep_in_current_directory tool with --unsafe-tools:
+/// entrypoint for the grep tool with --unsafe-tools:
 /// the search runs directly on the host.
-fn tool_grep_in_current_directory_unsandboxed(
-    params_str: &String,
-    ctx: &ToolContext,
-) -> Result<String, Box<dyn Error>> {
-    search_in_current_directory(params_str, ctx, false)
+fn tool_grep_unsandboxed(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    search_files(params_str, ctx, false)
 }
 
 /// Searches with ripgrep when it's installed, plain grep otherwise.
-fn search_in_current_directory(
+/// The grep tool: searches file contents with ripgrep (or grep), in the
+/// agent's directory unless given paths. For a `sandboxed` agent it runs
+/// in bubblewrap, where only the system's binaries and libraries and that
+/// directory exist - that's all that keeps it in: any path it's given
+/// outside the directory, or symlink leading out of it, finds nothing.
+fn search_files(
     params_str: &String,
     ctx: &ToolContext,
     sandboxed: bool,
 ) -> Result<String, Box<dyn Error>> {
-    let mut params: SearchParams = serde_json::from_str(params_str)?;
-    params.path = params.path.map(|p| ctx.tool_path(&p));
-    let path = search_path(params.path.as_deref())?;
+    let params: SearchParams = serde_json::from_str(params_str)?;
+    // Paths inside the directory shown relative to it, as the rest are.
+    let mut paths: Vec<String> = params
+        .path
+        .iter()
+        .chain(params.paths.iter())
+        .map(|p| ctx.tool_path(p))
+        .collect();
+    if paths.is_empty() {
+        paths.push(".".to_string());
+    }
     let max_results = params
         .max_results
         .unwrap_or(DEFAULT_SEARCH_MAX_RESULTS)
         .clamp(1, MAX_SEARCH_MAX_RESULTS);
 
     let (program, args) = match latex_kitty::resolve_on_path("rg") {
-        Some(rg) => (rg, rg_search_args(&params, &path)),
+        Some(rg) => (rg, rg_search_args(&params, &paths)),
+        None if params.multiline => {
+            return Err("multiline needs ripgrep (rg), which isn't installed".into());
+        }
         None => (
             latex_kitty::resolve_on_path("grep").ok_or("neither rg nor grep is installed")?,
-            grep_search_args(&params, &path),
+            grep_search_args(&params, &paths),
         ),
     };
     let cwd = ctx.cwd();
@@ -2718,12 +2732,44 @@ fn search_in_current_directory(
     // an error - but rg also returns 2 when it matched and merely couldn't
     // read some files, so only fail if there's nothing to show.
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // grep -c lists every file, even those without a match.
+    let stdout = if params.count {
+        stdout
+            .lines()
+            .filter(|l| !l.ends_with(":0"))
+            .map(|l| format!("{}\n", l))
+            .collect::<String>()
+            .into()
+    } else {
+        stdout
+    };
     if !output.status.success() && output.status.code() != Some(1) && stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Only the directory exists in the sandbox: say so, rather than
+        // leave "No such file or directory" a puzzle.
+        let outside: Vec<&String> = paths
+            .iter()
+            .filter(|p| std::path::Path::new(p).is_absolute() || p.contains(".."))
+            .collect();
+        let hint = if sandboxed && !outside.is_empty() && stderr.contains("No such file") {
+            format!(
+                " - only {} is visible to the search, and {} isn't in it",
+                cwd.display(),
+                outside
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else {
+            String::new()
+        };
         return Err(format!(
-            "{} failed ({}): {}",
+            "{} failed ({}): {}{}",
             program.display(),
             output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            stderr.trim(),
+            hint
         )
         .into());
     }
@@ -4894,18 +4940,18 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
 
     append_tool(
         &mut tools,
-        "grep_in_current_directory".to_string(),
+        "grep".to_string(),
         if unsafe_tools {
-            tool_grep_in_current_directory_unsandboxed
+            tool_grep_unsandboxed
         } else {
-            tool_grep_in_current_directory
+            tool_grep
         },
         r#"
         {
             "type": "function",
             "function": {
-                "name": "grep_in_current_directory",
-                "description": "Search file contents under the current directory with a regular expression (ripgrep syntax, e.g. `fn \\w+_tool|tool_\\w+`). Files ignored by .gitignore, hidden files and binary files are skipped. Returns matching lines as `path:line:text`, sorted by path; results beyond max_results are cut off with a note.",
+                "name": "grep",
+                "description": "Search file contents with a regular expression (ripgrep syntax, e.g. `fn \\w+_tool|tool_\\w+`), in the directory you work in unless given paths. Files ignored by .gitignore, hidden files and binary files are skipped. Returns matching lines as `path:line:text`, sorted by path; results beyond max_results are cut off with a note.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -4915,7 +4961,20 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         },
                         "path": {
                             "type": "string",
-                            "description": "File or directory to search, relative to the current directory. Defaults to the whole current directory."
+                            "description": "File or directory to search; relative paths are to the directory you work in. Defaults to all of it."
+                        },
+                        "paths": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Several files or directories to search at once."
+                        },
+                        "count": {
+                            "type": "boolean",
+                            "description": "Only how many matching lines each file has, as `path:count`."
+                        },
+                        "multiline": {
+                            "type": "boolean",
+                            "description": "Let the pattern match across lines (e.g. `struct Foo \\{[^}]*bar`)."
                         },
                         "glob": {
                             "type": "string",
@@ -10221,7 +10280,7 @@ pub(crate) fn working_directory_note(cwd: &std::path::Path) -> Message {
         "system",
         format!(
             "You work in the directory {}. Relative paths in your tools (read_file, glob, \
-             grep_in_current_directory, run_command, ...) are relative to it, and so are those of \
+             grep, run_command, ...) are relative to it, and so are those of \
              the agents you start, which work there too: give them relative paths.",
             cwd.display()
         ),
@@ -15076,13 +15135,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(found, "src/a.rs");
-        // Outside it: still refused.
-        let outside = search_path(Some(&ctx.tool_path("/etc")));
-        assert!(outside.is_err());
-        assert_eq!(
-            search_path(Some(&ctx.tool_path(dir.0.to_str().unwrap()))),
-            Ok(".".to_string())
-        );
+        // And grep, unsandboxed here, with the absolute path too.
+        let found = tool_grep_unsandboxed(
+            &serde_json::json!({"pattern": "fn a", "path": abs("src")}).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert!(found.contains("src/a.rs:1:fn a() {}"), "{found}");
     }
 
     #[test]
@@ -17881,11 +17940,60 @@ mod tests {
     }
 
     #[test]
-    fn test_search_path_stays_inside_current_directory() {
-        assert_eq!(search_path(None).unwrap(), ".");
-        assert_eq!(search_path(Some("src")).unwrap(), "src");
-        assert!(search_path(Some("/etc")).is_err());
-        assert!(search_path(Some("src/../../x")).is_err());
+    fn test_grep_takes_several_paths_counts_and_multiline() {
+        let p = search_params(serde_json::json!({
+            "pattern": "x", "count": true, "multiline": true
+        }));
+        let args = rg_search_args(&p, &["src".to_string(), "/abs/lib.rs".to_string()]);
+        assert!(args.contains(&"--count".to_string()));
+        assert!(args.contains(&"-U".to_string()));
+        // The paths, as given - confinement is the sandbox's - after "--".
+        let dash = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&args[dash + 1..], ["src", "/abs/lib.rs"]);
+        let grep = grep_search_args(&p, &["src".to_string()]);
+        assert!(grep.contains(&"-c".to_string()));
+
+        let dir = TempTestDir::new("grep_count");
+        std::fs::write(dir.0.join("a.txt"), "x\nx\ny\n").unwrap();
+        std::fs::write(dir.0.join("b.txt"), "y\n").unwrap();
+        std::fs::write(dir.0.join("c.txt"), "x\n").unwrap();
+        let mut ctx = ToolContext::new(|_: &str| {});
+        ctx.cwd = Some(dir.0.clone());
+        let out = tool_grep_unsandboxed(
+            &r#"{"pattern": "x", "count": true, "paths": ["a.txt", "b.txt", "c.txt"]}"#.to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert!(out.contains("a.txt:2"), "{out}");
+        assert!(out.contains("c.txt:1"), "{out}");
+        assert!(
+            !out.contains("b.txt"),
+            "files without a match aren't listed: {out}"
+        );
+    }
+
+    #[test]
+    fn test_the_grep_sandbox_shows_only_the_working_directory() {
+        let args = bwrap_search_args("/work/proj", "/usr/bin/rg", &["x".to_string()]);
+        let joined = args.join(" ");
+        assert!(joined.contains("--tmpfs /"), "{joined}");
+        assert!(
+            joined.contains("--ro-bind /work/proj /work/proj"),
+            "{joined}"
+        );
+        // Nothing else of the filesystem but the system's binaries and
+        // libraries: no home, no /etc.
+        let bound: Vec<&str> = args
+            .windows(3)
+            .filter(|w| w[0].starts_with("--ro-bind"))
+            .map(|w| w[1].as_str())
+            .collect();
+        assert!(
+            bound
+                .iter()
+                .all(|p| ["/usr", "/lib", "/lib64", "/work/proj"].contains(p)),
+            "{bound:?}"
+        );
     }
 
     #[test]
@@ -17898,7 +18006,7 @@ mod tests {
             "context_lines": 50,
             "include_ignored": true
         }));
-        let args = rg_search_args(&params, "src");
+        let args = rg_search_args(&params, &["src".to_string()]);
         for expected in ["-i", "-F", "--no-ignore", "--hidden", "--no-config"] {
             assert!(
                 args.contains(&expected.to_string()),
@@ -17917,14 +18025,14 @@ mod tests {
     #[test]
     fn test_grep_search_args_excludes_generated_dirs_unless_asked() {
         let params = search_params(serde_json::json!({"pattern": "-v", "files_only": true}));
-        let args = grep_search_args(&params, ".");
+        let args = grep_search_args(&params, &[".".to_string()]);
         assert!(args.contains(&"-E".to_string()));
         assert!(args.contains(&"-l".to_string()));
         assert!(args.contains(&"--exclude-dir=target".to_string()));
         assert_eq!(&args[args.len() - 4..], ["-e", "-v", "--", "."]);
 
         let params = search_params(serde_json::json!({"pattern": "x", "include_ignored": true}));
-        let args = grep_search_args(&params, ".");
+        let args = grep_search_args(&params, &[".".to_string()]);
         assert!(!args.iter().any(|a| a.starts_with("--exclude-dir")));
     }
 
@@ -17977,7 +18085,7 @@ mod tests {
         // Sandboxed as in production when bubblewrap is installed.
         let sandboxed = latex_kitty::resolve_on_path("bwrap").is_some();
         let run = |params: serde_json::Value| {
-            search_in_current_directory(&params.to_string(), &test_ctx(), sandboxed).unwrap()
+            search_files(&params.to_string(), &test_ctx(), sandboxed).unwrap()
         };
         let out = run(serde_json::json!({"pattern": "fn tool_\\w+", "path": dir}));
         assert_eq!(out.lines().count(), 2, "{out}");
