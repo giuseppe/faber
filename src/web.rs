@@ -26,7 +26,8 @@
 //!   `POST /api/agents` (make one), `DELETE /api/agents/<name>`,
 //!   `PATCH /api/agents/<name>/config` (change its settings - the user's
 //!   to, unsafe tools and working directory included),
-//!   `POST /api/agents/<name>/cwd`
+//!   `POST /api/agents/<name>/cwd`, `POST /api/agents/<name>/stop` (stop
+//!   what it's doing), `POST /api/agents/<name>/clear` (its conversation)
 //! - `GET /api/tools`: the tools an agent's list can name, with
 //!   `?schemas=1` their descriptions and parameters too;
 //!   `POST /api/tools/<name>/run`: run one now, as a tool task
@@ -329,42 +330,6 @@ fn route(
         }
         _ => Response::error(404, "not found"),
     }
-}
-
-/// The agents agents made - sub-agents, task agents, fan-out workers:
-/// those with a parent - that are done: nothing runs them, nor any agent
-/// below them. Agents the user made, and those still at work, stay.
-fn finished_made_agents(
-    conn: &Connection,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Result<Vec<String>, Box<dyn Error>> {
-    let agents = db::list_agents(conn)?;
-    let live: std::collections::HashSet<&str> = agents
-        .iter()
-        .filter(|a| db::agent_session_is_live(a, now))
-        .map(|a| a.name.as_str())
-        .collect();
-    // An agent with a live one anywhere below it stays, as its parent.
-    let mut keep: std::collections::HashSet<&str> = live.clone();
-    for agent in agents.iter().filter(|a| live.contains(a.name.as_str())) {
-        let mut parent = agent.parent.as_deref();
-        let mut steps = 0;
-        while let Some(name) = parent {
-            if !keep.insert(name) || steps > 64 {
-                break;
-            }
-            parent = agents
-                .iter()
-                .find(|a| a.name == name)
-                .and_then(|a| a.parent.as_deref());
-            steps += 1;
-        }
-    }
-    Ok(agents
-        .iter()
-        .filter(|a| a.parent.is_some() && !keep.contains(a.name.as_str()))
-        .map(|a| a.name.clone())
-        .collect())
 }
 
 /// An agent's plan, as plan_update keeps it - `None` without one.
@@ -807,6 +772,32 @@ fn api(
             db::delete_agent(conn, name)?;
             Response::ok(true)
         }
+        ("POST", ["agents", name, "stop"]) => {
+            let Some(agent) = db::get_agent(conn, name)? else {
+                return Ok(Response::error(404, &format!("no agent named '{}'", name)));
+            };
+            if !db::agent_session_is_live(&agent, now) {
+                return Err(format!("nothing is running '{}'", name).into());
+            }
+            // Whichever process runs it acts on it (handle_agent_stops).
+            db::set_agent_data(conn, name, db::AGENT_STOP_KEY, &now.to_rfc3339())?;
+            Response::ok(true)
+        }
+        ("POST", ["agents", name, "clear"]) => {
+            let Some(agent) = db::get_agent(conn, name)? else {
+                return Ok(Response::error(404, &format!("no agent named '{}'", name)));
+            };
+            if db::agent_session_is_live(&agent, now) {
+                return Err(format!(
+                    "'{}' is running: its session would keep its conversation (in a chat, use /clear)",
+                    name
+                )
+                .into());
+            }
+            db::clear_agent_messages(conn, name)?;
+            db::delete_agent_data(conn, name, crate::PLAN_DATA_KEY)?;
+            Response::ok(true)
+        }
         ("POST", ["agents", name, "messages"]) => {
             // A message from the user: a task for the agent, so it reaches
             // it however it runs - a chat, a worker - once it's free.
@@ -822,24 +813,7 @@ fn api(
             if text.is_empty() {
                 return Err("the message is empty".into());
             }
-            let id = db::create_task(
-                conn,
-                &db::NewTask {
-                    name: format!("Message: {}", first_line(&text, 40)),
-                    description: String::new(),
-                    kind: db::TaskKind::PROMPT.to_string(),
-                    command: text,
-                    agent_name: Some(name.to_string()),
-                    schedule: db::TaskSchedule::Once {
-                        at: now.to_rfc3339(),
-                    },
-                    held: false,
-                    depends_on: Vec::new(),
-                    profile: None,
-                    run_safe: false,
-                    cwd: None,
-                },
-            )?;
+            let id = db::create_task(conn, &db::message_task(name, &text, now))?;
             let mut reply = serde_json::json!({ "task_id": id });
             if !db::agent_session_is_live(&agent, now) {
                 reply["note"] = format!(
@@ -893,7 +867,7 @@ fn api(
             } else {
                 body_json(request)?
             };
-            let names = finished_made_agents(conn, now)?;
+            let names = db::finished_made_agents(&db::list_agents(conn)?, now);
             if !body.dry_run {
                 for name in &names {
                     db::delete_agent(conn, name)?;
@@ -1710,6 +1684,42 @@ mod tests {
             serde_json::json!({"tool": "kb_search", "arguments": {"query": "deploy"}})
         );
         assert_eq!(call(&db, "POST", "/api/tools/nope/run", "{}").status, 404);
+    }
+
+    #[test]
+    fn test_agents_are_stopped_and_cleared() {
+        let db = test_db();
+        {
+            let conn = db.lock().unwrap();
+            db::create_agent(&conn, "a", "").unwrap();
+            db::save_agent_messages(
+                &conn,
+                "a",
+                &[serde_json::json!({"role": "user", "content": "hi"})],
+            )
+            .unwrap();
+        }
+        let r = call(&db, "POST", "/api/agents/a/stop", "");
+        assert!(
+            json(&r)["error"]
+                .as_str()
+                .unwrap()
+                .contains("nothing is running")
+        );
+        assert_eq!(call(&db, "POST", "/api/agents/a/clear", "").status, 200);
+        assert_eq!(
+            db::agent_message_count(&db.lock().unwrap(), "a").unwrap(),
+            0
+        );
+        assert!(db::claim_agent(&db.lock().unwrap(), "a", "s").unwrap());
+        assert_eq!(call(&db, "POST", "/api/agents/a/stop", "").status, 200);
+        assert!(
+            db::get_agent_data(&db.lock().unwrap(), "a", db::AGENT_STOP_KEY)
+                .unwrap()
+                .is_some()
+        );
+        let r = call(&db, "POST", "/api/agents/a/clear", "");
+        assert!(json(&r)["error"].as_str().unwrap().contains("is running"));
     }
 
     #[test]

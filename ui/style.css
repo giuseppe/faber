@@ -409,6 +409,8 @@ code { background: var(--code); padding: 0 4px; border-radius: 4px; }
 .views .view { font-size: 12px; padding: 2px 10px; color: var(--muted); }
 .views .view.on { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
 .conversation { display: flex; flex-direction: column; gap: 8px; }
+.conversation-head { display: flex; align-items: center; gap: 8px; }
+.conversation-head p { flex: 1; }
 .msg { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; white-space: pre-wrap; word-break: break-word; }
 .msg .role { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 2px; }
 .msg.user { background: var(--code); }

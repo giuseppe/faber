@@ -736,6 +736,19 @@ function renderDetail() {
       fields.replaceChildren(...field("State", "gone"));
       return;
     }
+    if (agent.live && busy(agent.activity)) {
+      actions.append(el("button", {
+        class: "danger stop-button",
+        onclick: async () => {
+          try {
+            await api("POST", `agents/${encodeURIComponent(agent.name)}/stop`);
+            toast(`Stopping ${agent.name}…`);
+          } catch (e) {
+            toast(e.message);
+          }
+        },
+      }, "Stop"));
+    }
     actions.append(el("button", { onclick: () => openNewTask(`agent:${agent.name}`) }, "Give it a task"));
     actions.append(el("button", { onclick: () => openAgentDialog(agent.name) }, "Edit…"));
     actions.append(el("button", { onclick: () => openAgentDialog(null, agent.name) }, "Clone…"));
@@ -1024,6 +1037,17 @@ async function loadConversation() {
     loadingConversation = false;
   }
 }
+
+$("clear-conversation").addEventListener("click", async () => {
+  const name = state.selected?.kind === "agent" && state.selected.name;
+  if (!name || !confirm(`Clear ${name}'s conversation? It starts afresh next time.`)) return;
+  try {
+    await api("POST", `agents/${encodeURIComponent(name)}/clear`);
+    loadConversation();
+  } catch (e) {
+    toast(e.message);
+  }
+});
 
 $("composer").addEventListener("submit", async (e) => {
   e.preventDefault();

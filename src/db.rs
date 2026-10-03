@@ -987,6 +987,40 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
     Ok(conn.last_insert_rowid())
 }
 
+/// A message from the user to `agent`, as the task that takes it there:
+/// for the agent, due now - so it gets it once it's free, however it runs.
+pub fn message_task(agent: &str, text: &str, now: chrono::DateTime<chrono::Utc>) -> NewTask {
+    let first = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let short: String = first.chars().take(40).collect();
+    NewTask {
+        name: format!(
+            "Message: {}{}",
+            short,
+            if first.chars().count() > 40 {
+                "…"
+            } else {
+                ""
+            }
+        ),
+        description: String::new(),
+        kind: TaskKind::PROMPT.to_string(),
+        command: text.trim().to_string(),
+        agent_name: Some(agent.to_string()),
+        schedule: TaskSchedule::Once {
+            at: now.to_rfc3339(),
+        },
+        held: false,
+        depends_on: Vec::new(),
+        profile: None,
+        run_safe: false,
+        cwd: None,
+    }
+}
+
 /// Changes what task `id` is - its name, command, kind, where and when it
 /// runs, what it waits for, its directory - as `task` says; its state
 /// (held, disabled, done...), runs and outcomes stay, and so does whether
@@ -2084,6 +2118,15 @@ pub fn agent_session_is_live(agent: &AgentRow, now: chrono::DateTime<chrono::Utc
             .is_some_and(|t| now - t < chrono::Duration::seconds(30))
 }
 
+/// The `agent_data` key set on an agent the user asked to stop (the web
+/// UI): the process running it stops what it's doing, and clears it.
+pub const AGENT_STOP_KEY: &str = "control:stop";
+
+/// The `agent_data` key a worker sets on the agent running one of its
+/// tasks, while it does: the task's id - so stopping the agent can stop
+/// its task.
+pub const RUNNING_TASK_KEY: &str = "state:running_task";
+
 /// The `agent_data` key a session sets on an agent it runs as its own
 /// with the unsafe tools for the session only (`--unsafe-tools`): the
 /// session's id. Its config doesn't say so; this does, while it lasts.
@@ -2102,6 +2145,41 @@ pub fn has_unsafe_tools(
         || marker.is_some_and(|session| {
             agent.session_id.as_deref() == Some(session) && agent_session_is_live(agent, now)
         })
+}
+
+/// The agents agents made - sub-agents, task agents, fan-out workers:
+/// those with a parent - that are done: nothing runs them, nor any agent
+/// below them. Agents the user made, and those still at work, stay.
+pub fn finished_made_agents(
+    agents: &[AgentRow],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let live: std::collections::HashSet<&str> = agents
+        .iter()
+        .filter(|a| agent_session_is_live(a, now))
+        .map(|a| a.name.as_str())
+        .collect();
+    // An agent with a live one anywhere below it stays, as its parent.
+    let mut keep: std::collections::HashSet<&str> = live.clone();
+    for agent in agents.iter().filter(|a| live.contains(a.name.as_str())) {
+        let mut parent = agent.parent.as_deref();
+        let mut steps = 0;
+        while let Some(name) = parent {
+            if !keep.insert(name) || steps > 64 {
+                break;
+            }
+            parent = agents
+                .iter()
+                .find(|a| a.name == name)
+                .and_then(|a| a.parent.as_deref());
+            steps += 1;
+        }
+    }
+    agents
+        .iter()
+        .filter(|a| a.parent.is_some() && !keep.contains(a.name.as_str()))
+        .map(|a| a.name.clone())
+        .collect()
 }
 
 /// Each task's dependencies that aren't done successfully yet - among

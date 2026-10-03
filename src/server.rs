@@ -350,6 +350,25 @@ fn dispatch_inner(
             let v = db::set_task_held(&conn, i64_param!("task_id"), held)?;
             Ok(serde_json::to_value(v)?)
         }
+        "update_task" => {
+            let task: db::NewTask = serde_json::from_value(p["task"].clone())
+                .map_err(|e| format!("bad param 'task': {}", e))?;
+            let v = db::update_task(&conn, i64_param!("task_id"), &task)?;
+            Ok(serde_json::to_value(v)?)
+        }
+        "set_profile" => {
+            db::set_profile(&conn, str_param!("name"), &p["settings"])?;
+            Ok(serde_json::json!(true))
+        }
+        "delete_profile" => {
+            let v = db::delete_profile(&conn, str_param!("name"))?;
+            Ok(serde_json::to_value(v)?)
+        }
+        "set_agent_description" => {
+            let v =
+                db::set_agent_description(&conn, str_param!("agent"), str_param!("description"))?;
+            Ok(serde_json::to_value(v)?)
+        }
         "list_profiles" => {
             let v = db::list_profiles(&conn)?;
             Ok(serde_json::to_value(v)?)

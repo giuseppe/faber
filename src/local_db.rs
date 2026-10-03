@@ -347,6 +347,30 @@ impl DbBackend for LocalDb {
         db::kb_delete(&conn, id, viewer)
     }
 
+    fn update_task(&self, task_id: i64, task: &NewTask) -> Result<bool, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::update_task(&conn, task_id, task)
+    }
+
+    fn set_profile(&self, name: &str, settings: &serde_json::Value) -> Result<(), Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::set_profile(&conn, name, settings)
+    }
+
+    fn delete_profile(&self, name: &str) -> Result<bool, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::delete_profile(&conn, name)
+    }
+
+    fn set_agent_description(
+        &self,
+        agent: &str,
+        description: &str,
+    ) -> Result<bool, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::set_agent_description(&conn, agent, description)
+    }
+
     fn list_profiles(&self) -> Result<Vec<(String, serde_json::Value)>, Box<dyn Error>> {
         let conn = self.lock()?;
         db::list_profiles(&conn)
