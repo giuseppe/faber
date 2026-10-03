@@ -17,6 +17,7 @@
  *
  */
 
+use crate::agent_io::{AgentEvent, AgentEventRow, EventFilter};
 use cron::Schedule;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -369,6 +370,19 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
     );
     let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN activity TEXT DEFAULT NULL;");
     let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN activity_at TEXT DEFAULT NULL;");
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agent_events (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             agent TEXT NOT NULL,
+             task_id INTEGER,
+             at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+             event TEXT NOT NULL,
+             FOREIGN KEY (agent) REFERENCES agents(name) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS idx_agent_events_agent ON agent_events(agent, id);
+         CREATE INDEX IF NOT EXISTS idx_agent_events_task ON agent_events(task_id, id);",
+    )?;
 
     initialize_kb(conn)?;
     Ok(())
@@ -1014,6 +1028,19 @@ pub fn set_task_enabled(
             params![task_id],
         )?
     };
+    Ok(rows > 0)
+}
+
+/// Makes a task due right away, whatever it was waiting for - its time, a
+/// release (`held`), being enabled (`disabled`) - or, `done`, runs it
+/// again. Dependencies still have to be met. A running task is left
+/// alone; returns false for it, or a missing one.
+pub fn run_task_now(conn: &Connection, task_id: i64) -> Result<bool, Box<dyn Error>> {
+    let rows = conn.execute(
+        "UPDATE scheduled_tasks SET status = 'scheduled', next_run_at = ?2
+         WHERE id = ?1 AND status IN ('scheduled', 'held', 'disabled', 'done')",
+        params![task_id, chrono::Utc::now().to_rfc3339()],
+    )?;
     Ok(rows > 0)
 }
 
@@ -1828,6 +1855,119 @@ pub fn send_notification(
     Ok(conn.last_insert_rowid())
 }
 
+/// Whether an agent's chat session (or the session running it, for a
+/// sub-agent) is still heartbeating.
+pub fn agent_session_is_live(agent: &AgentRow, now: chrono::DateTime<chrono::Utc>) -> bool {
+    agent.session_id.is_some()
+        && agent
+            .heartbeat_at
+            .as_deref()
+            .and_then(parse_db_time)
+            .is_some_and(|t| now - t < chrono::Duration::seconds(30))
+}
+
+/// Each task's dependencies that aren't done successfully yet - among
+/// `all` tasks; one that no longer exists counts as unmet.
+pub fn unmet_dependencies(all: &[TaskRow]) -> std::collections::HashMap<i64, Vec<i64>> {
+    let met = |id: &i64| {
+        all.iter().any(|t| {
+            t.id == *id
+                && t.status == TaskStatus::DONE
+                && t.last_outcome.as_deref() == Some("succeeded")
+        })
+    };
+    all.iter()
+        .filter_map(|t| {
+            let unmet: Vec<i64> = t.depends_on.iter().copied().filter(|d| !met(d)).collect();
+            (!unmet.is_empty()).then_some((t.id, unmet))
+        })
+        .collect()
+}
+
+/// Records `events` of `agent` (for `task_id`'s run, if any), dropping
+/// its oldest beyond `agent_io::MAX_EVENTS_PER_AGENT`.
+pub fn append_agent_events(
+    conn: &Connection,
+    agent: &str,
+    task_id: Option<i64>,
+    events: &[AgentEvent],
+) -> Result<(), Box<dyn Error>> {
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut insert =
+            tx.prepare("INSERT INTO agent_events (agent, task_id, event) VALUES (?1, ?2, ?3)")?;
+        for event in events {
+            insert.execute(params![agent, task_id, serde_json::to_string(event)?])?;
+        }
+    }
+    tx.execute(
+        "DELETE FROM agent_events WHERE agent = ?1 AND id <= (
+             SELECT id FROM agent_events WHERE agent = ?1
+             ORDER BY id DESC LIMIT 1 OFFSET ?2)",
+        params![agent, crate::agent_io::MAX_EVENTS_PER_AGENT],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The recorded events `filter` picks, oldest first.
+pub fn agent_events(
+    conn: &Connection,
+    filter: &EventFilter,
+) -> Result<Vec<AgentEventRow>, Box<dyn Error>> {
+    let mut sql = "SELECT id, agent, task_id, at, event FROM agent_events WHERE 1".to_string();
+    let mut values: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(agent) = &filter.agent {
+        values.push(agent.clone().into());
+        sql.push_str(&format!(" AND agent = ?{}", values.len()));
+    }
+    if let Some(task_id) = filter.task_id {
+        values.push(task_id.into());
+        sql.push_str(&format!(" AND task_id = ?{}", values.len()));
+    }
+    if let Some(after) = filter.after {
+        values.push(after.into());
+        sql.push_str(&format!(" AND id > ?{}", values.len()));
+    }
+    // Without `after`, the latest ones: newest first here, reversed below.
+    sql.push_str(if filter.after.is_some() {
+        " ORDER BY id ASC"
+    } else {
+        " ORDER BY id DESC"
+    });
+    values.push((filter.limit as i64).into());
+    sql.push_str(&format!(" LIMIT ?{}", values.len()));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut events = Vec::new();
+    for row in rows {
+        let (id, agent, task_id, at, event) = row?;
+        // An event of a kind this faber doesn't know: skip it.
+        let Ok(event) = serde_json::from_str(&event) else {
+            continue;
+        };
+        events.push(AgentEventRow {
+            id,
+            agent,
+            task_id,
+            at,
+            event,
+        });
+    }
+    if filter.after.is_none() {
+        events.reverse();
+    }
+    Ok(events)
+}
+
 pub fn gc_agents(conn: &Connection) -> Result<Vec<String>, Box<dyn Error>> {
     let tx = conn.unchecked_transaction()?;
     let mut stmt = tx.prepare(
@@ -1861,6 +2001,102 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         initialize_db(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn test_run_task_now_makes_any_waiting_or_finished_task_due() {
+        let conn = test_db();
+        let later = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        let id = create_oneshot_task(&conn, "t", "", &later, "x", None).unwrap();
+        assert!(get_pending_tasks(&conn).unwrap().is_empty());
+        for status in ["scheduled", "held", "disabled", "done"] {
+            conn.execute(
+                "UPDATE scheduled_tasks SET status = ?2, next_run_at = ?3 WHERE id = ?1",
+                params![id, status, later],
+            )
+            .unwrap();
+            assert!(run_task_now(&conn, id).unwrap(), "{}", status);
+            let due = get_pending_tasks(&conn).unwrap();
+            assert_eq!(due.len(), 1, "{}", status);
+            assert_eq!(due[0].status, "scheduled");
+        }
+        assert!(claim_task(&conn, id, "s").unwrap());
+        assert!(!run_task_now(&conn, id).unwrap(), "running");
+        assert!(!run_task_now(&conn, 999).unwrap());
+    }
+
+    #[test]
+    fn test_agent_events_are_kept_per_agent_and_read_in_order() {
+        let conn = test_db();
+        create_agent(&conn, "a", "").unwrap();
+        create_agent(&conn, "b", "").unwrap();
+        let text = |t: &str| AgentEvent::Text {
+            text: t.to_string(),
+        };
+        append_agent_events(&conn, "a", Some(1), &[text("1"), text("2")]).unwrap();
+        append_agent_events(&conn, "b", None, &[text("3")]).unwrap();
+        append_agent_events(&conn, "a", None, &[text("4")]).unwrap();
+        let read = |filter: EventFilter| -> Vec<AgentEvent> {
+            agent_events(&conn, &filter)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.event)
+                .collect()
+        };
+        let a = |after, limit| EventFilter {
+            agent: Some("a".to_string()),
+            after,
+            limit,
+            ..Default::default()
+        };
+        assert_eq!(read(a(None, 10)), vec![text("1"), text("2"), text("4")]);
+        // The latest ones, still oldest first.
+        assert_eq!(read(a(None, 2)), vec![text("2"), text("4")]);
+        let first = agent_events(&conn, &a(None, 10)).unwrap()[0].id;
+        assert_eq!(read(a(Some(first), 1)), vec![text("2")]);
+        let task = EventFilter {
+            task_id: Some(1),
+            limit: 10,
+            ..Default::default()
+        };
+        assert_eq!(read(task), vec![text("1"), text("2")]);
+        // An unknown agent's events can't be recorded; a deleted one's go.
+        assert!(append_agent_events(&conn, "nobody", None, &[text("x")]).is_err());
+        delete_agent(&conn, "a").unwrap();
+        assert_eq!(
+            read(EventFilter {
+                limit: 10,
+                ..Default::default()
+            }),
+            vec![text("3")]
+        );
+    }
+
+    #[test]
+    fn test_agent_events_are_capped_per_agent() {
+        let conn = test_db();
+        create_agent(&conn, "a", "").unwrap();
+        let events: Vec<AgentEvent> = (0..crate::agent_io::MAX_EVENTS_PER_AGENT + 5)
+            .map(|i| AgentEvent::Text {
+                text: i.to_string(),
+            })
+            .collect();
+        append_agent_events(&conn, "a", None, &events).unwrap();
+        let kept = agent_events(
+            &conn,
+            &EventFilter {
+                limit: 10_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(kept.len() as i64, crate::agent_io::MAX_EVENTS_PER_AGENT);
+        assert_eq!(
+            kept[0].event,
+            AgentEvent::Text {
+                text: "5".to_string()
+            }
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@
  *
  */
 
+use crate::agent_io::{AgentEvent, AgentEventRow, EventFilter};
 use crate::db;
 use crate::db::{
     AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow, TaskOutcome, TaskRow,
@@ -346,8 +347,28 @@ impl DbBackend for LocalDb {
         db::kb_delete(&conn, id, viewer)
     }
 
+    fn run_task_now(&self, task_id: i64) -> Result<bool, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::run_task_now(&conn, task_id)
+    }
+
     fn gc_agents(&self) -> Result<Vec<String>, Box<dyn Error>> {
         let conn = self.lock()?;
         db::gc_agents(&conn)
+    }
+
+    fn append_agent_events(
+        &self,
+        agent: &str,
+        task_id: Option<i64>,
+        events: &[AgentEvent],
+    ) -> Result<(), Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::append_agent_events(&conn, agent, task_id, events)
+    }
+
+    fn agent_events(&self, filter: &EventFilter) -> Result<Vec<AgentEventRow>, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::agent_events(&conn, filter)
     }
 }

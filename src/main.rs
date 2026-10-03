@@ -17,18 +17,18 @@
  *
  */
 
-mod dummy_llm;
 mod fan_out;
 mod github;
 mod latex_kitty;
 mod lsp;
-mod openai;
+use faber::openai;
 mod remote_db;
-mod scripted_llm;
 mod server;
 mod status_bar;
 mod summarize;
+mod web;
 
+use faber::agent_io::{self, AgentEvent, AgentOutput, EventLog};
 use faber::db;
 
 use clap::{Parser, Subcommand};
@@ -3580,23 +3580,32 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         sub_ctx.result_schema = result_schema.clone();
         let activity = ActivityRecorder::new(db.clone(), &agent_name);
         activity.set("thinking");
+        let events = Some(EventLog::new(db.clone(), &agent_name, None));
+        if let Some(events) = &events {
+            events.emit(AgentEvent::Input {
+                text: prompt.clone(),
+            });
+        }
         // Streamed, though nothing is shown: its progress keeps the status
-        // bar and `faber agents` current.
+        // bar and `faber agents` current, and its events are recorded.
         let mode = || {
             let activity = activity.clone();
             let status_bar = sub_status_bar_for_progress.clone();
             let name = agent_name.clone();
-            ResponseMode::Streaming {
-                stream_handler: Box::new(|_: &str| Ok(())),
-                reasoning_handler: Box::new(|_: &str| Ok(())),
-                progress_handler: Box::new(move |progress: &ProgressInfo| {
-                    activity.follow(&progress.status);
-                    if let StatusUpdate::ToolStart { name: tool, .. } = &progress.status {
-                        status_bar.set_agent_status(&name, &format!("Running {}", tool), false);
-                    }
-                    Ok(())
-                }),
-            }
+            recorded_mode(
+                ResponseMode::Streaming {
+                    stream_handler: Box::new(|_: &str| Ok(())),
+                    reasoning_handler: Box::new(|_: &str| Ok(())),
+                    progress_handler: Box::new(move |progress: &ProgressInfo| {
+                        activity.follow(&progress.status);
+                        if let StatusUpdate::ToolStart { name: tool, .. } = &progress.status {
+                            status_bar.set_agent_status(&name, &format!("Running {}", tool), false);
+                        }
+                        Ok(())
+                    }),
+                },
+                &events,
+            )
         };
         let transcript_start = messages.clone();
         let cancel = Some(Arc::new(Mutex::new(cancel_rx)));
@@ -3642,6 +3651,16 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
             },
         };
         let first_line = first_line(&response_text, 80);
+        record_turn_end(
+            &events,
+            &db::TaskOutcome {
+                succeeded: !["Stopped: ", "Error: ", "Failed: "]
+                    .iter()
+                    .any(|p| response_text.starts_with(p)),
+                exit_code: None,
+                result: response_text.clone(),
+            },
+        );
         activity.set(
             &if let Some(reason) = first_line.strip_prefix("Stopped: ") {
                 format!("stopped: {}", reason)
@@ -6543,6 +6562,13 @@ impl ActivityRecorder {
         }
     }
 
+    /// Records `activity` even if it's what this recorder last wrote:
+    /// another recorder of the same agent may have changed it since.
+    fn force(&self, activity: &str) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = activity.to_string();
+        let _ = self.db.set_agent_activity(&self.agent, activity);
+    }
+
     /// Records the activity a progress update means, if any.
     fn follow(&self, status: &StatusUpdate) {
         let activity = match status {
@@ -6564,6 +6590,25 @@ impl Drop for IdleWhenDone {
         if let Some(activity) = &self.0 {
             activity.set("idle");
         }
+    }
+}
+
+/// `mode`, also recorded in the database as an agent's events (see
+/// `agent_io`) when there is a database to record them in.
+fn recorded_mode(mode: ResponseMode, events: &Option<Arc<EventLog>>) -> ResponseMode {
+    match events {
+        Some(events) => agent_io::observed(mode, events.clone()),
+        None => mode,
+    }
+}
+
+/// Records that a turn ended, as `outcome` says.
+fn record_turn_end(events: &Option<Arc<EventLog>>, outcome: &db::TaskOutcome) {
+    if let Some(events) = events {
+        events.emit(AgentEvent::TurnEnd {
+            succeeded: outcome.succeeded,
+            text: outcome.result.clone(),
+        });
     }
 }
 
@@ -6687,7 +6732,9 @@ fn create_response_mode(
                         true,
                     );
                 }
-                StatusUpdate::ToolComplete { name, duration_ms } => {
+                StatusUpdate::ToolComplete {
+                    name, duration_ms, ..
+                } => {
                     let duration_secs = *duration_ms as f64 / 1000.0;
                     tool_active_for_progress.store(false, Ordering::Relaxed);
                     printer_for_progress.println(&tool_box_close(name, duration_secs));
@@ -7424,11 +7471,24 @@ fn claim_prompt_task(
     agent: &str,
     profiles: &[String],
 ) -> Option<db::TaskRow> {
+    claim_prompt_task_but(db, session_id, agent, profiles, false)
+}
+
+/// `claim_prompt_task`, but with `busy`, none of those for `agent` by
+/// name: it's already running one, and only one can run as it at a time.
+fn claim_prompt_task_but(
+    db: &dyn DbBackend,
+    session_id: &str,
+    agent: &str,
+    profiles: &[String],
+    busy: bool,
+) -> Option<db::TaskRow> {
     let tasks = db.get_pending_tasks().ok()?;
     tasks
         .into_iter()
         .filter(|t| t.kind == db::TaskKind::PROMPT)
         .filter(|t| t.agent_name.as_deref().is_none_or(|a| a == agent))
+        .filter(|t| !(busy && task_is_for_worker(t)))
         .filter(|t| t.profile.as_ref().is_none_or(|p| profiles.contains(p)))
         .find(|t| db.claim_task(t.id, session_id).unwrap_or(false))
 }
@@ -7957,6 +8017,14 @@ fn chat_command(
                     return Ok(());
                 }
                 if let ChatCommand::Message(user_message) = parse_chat_command(&line) {
+                    let events = db.as_ref().map(|db| {
+                        EventLog::new(db.clone(), &active_agent.name, running_prompt_task)
+                    });
+                    if let Some(events) = &events {
+                        events.emit(AgentEvent::Input {
+                            text: user_message.clone(),
+                        });
+                    }
                     active_agent
                         .messages
                         .push(make_message("user", user_message));
@@ -8022,7 +8090,7 @@ fn chat_command(
                                     messages,
                                     &tools,
                                     &openai_opts,
-                                    ResponseMode::Complete,
+                                    recorded_mode(ResponseMode::Complete, &events),
                                     &tool_context,
                                     Some(ctrl_c_rx.clone()),
                                     &signal_handler_active,
@@ -8033,8 +8101,9 @@ fn chat_command(
                             },
                         );
                         let task_turn = running_prompt_task.take();
+                        let outcome = reported_task_outcome(result.as_ref(), &task_result_slot);
+                        record_turn_end(&events, &outcome);
                         if let (Some(task_id), Some(db)) = (task_turn, &db) {
-                            let outcome = reported_task_outcome(result.as_ref(), &task_result_slot);
                             if let Err(e) = db.finish_task(task_id, &session_id, &outcome) {
                                 warn!("Couldn't record the outcome of task {}: {}", task_id, e);
                             }
@@ -8131,7 +8200,7 @@ fn chat_command(
                             &status_bar,
                             &chat_pb,
                         );
-                        match request_with_summary_fallback(
+                        let result = request_with_summary_fallback(
                             &mut active_agent,
                             &openai_opts,
                             &db,
@@ -8140,14 +8209,17 @@ fn chat_command(
                             &status_bar,
                             &chat_pb,
                             |messages| {
-                                let mode = create_response_mode(
-                                    chat_pb.clone(),
-                                    status_bar.clone(),
-                                    agent_name.clone(),
-                                    pending_complete_message.clone(),
-                                    graphics_mode,
-                                    reasoning_accumulator.clone(),
-                                    activity.clone(),
+                                let mode = recorded_mode(
+                                    create_response_mode(
+                                        chat_pb.clone(),
+                                        status_bar.clone(),
+                                        agent_name.clone(),
+                                        pending_complete_message.clone(),
+                                        graphics_mode,
+                                        reasoning_accumulator.clone(),
+                                        activity.clone(),
+                                    ),
+                                    &events,
                                 );
                                 status_bar.set_agent_status(
                                     &agent_name,
@@ -8167,7 +8239,9 @@ fn chat_command(
                                     &agent_name,
                                 )
                             },
-                        ) {
+                        );
+                        record_turn_end(&events, &prompt_task_outcome(result.as_ref()));
+                        match result {
                             Ok(response) => {
                                 warn_if_truncated(&response, &chat_pb);
                                 if let Some(prompt_tokens) =
@@ -8414,24 +8488,6 @@ fn first_line(text: &str, max: usize) -> String {
 }
 
 /// One row of the `faber tasks` table.
-/// Each task's dependencies that aren't done successfully yet - among
-/// `all` tasks; one that no longer exists counts as unmet.
-fn unmet_dependencies(all: &[db::TaskRow]) -> HashMap<i64, Vec<i64>> {
-    let met = |id: &i64| {
-        all.iter().any(|t| {
-            t.id == *id
-                && t.status == db::TaskStatus::DONE
-                && t.last_outcome.as_deref() == Some("succeeded")
-        })
-    };
-    all.iter()
-        .filter_map(|t| {
-            let unmet: Vec<i64> = t.depends_on.iter().copied().filter(|d| !met(d)).collect();
-            (!unmet.is_empty()).then_some((t.id, unmet))
-        })
-        .collect()
-}
-
 /// Where a task runs, for showing: "profile fast", an agent's name, "any
 /// agent" for an unbound prompt task, or "-" for a tool task (any
 /// session's scheduler runs those).
@@ -8716,7 +8772,7 @@ fn print_tasks_table(
 ) -> Result<(), Box<dyn Error>> {
     let since = since.map(|s| parse_since(s, now)).transpose()?;
     let all = db.list_tasks(None)?;
-    let blocked = unmet_dependencies(&all);
+    let blocked = db::unmet_dependencies(&all);
     let mut tasks = db.list_tasks(agent)?;
     if let Some(profile) = profile {
         tasks.retain(|t| t.profile.as_deref() == Some(profile));
@@ -8964,9 +9020,38 @@ fn profile_task_agent(
     Ok(name)
 }
 
+/// The agent a task no one in particular was given runs on: `task-<id>`,
+/// a sub-agent of the worker `parent` with its settings, claimed by its
+/// session - so the worker can run any number of them at once, each with
+/// its own conversation.
+fn own_task_agent(
+    task: &db::TaskRow,
+    parent: &str,
+    db: &dyn DbBackend,
+    session_id: &str,
+) -> Result<String, Box<dyn Error>> {
+    let name = format!("task-{}", task.id);
+    if db.get_agent(&name)?.is_none() {
+        db.create_agent(&name, &format!("Runs task #{}", task.id))?;
+    }
+    db.set_agent_config(&name, &db.get_agent_config(parent)?)?;
+    db.set_agent_parent(&name, Some(parent))?;
+    if !db.claim_agent(&name, session_id)? {
+        return Err(format!("agent '{}' is in use by another session", name).into());
+    }
+    Ok(name)
+}
+
+/// Whether a task is for its worker itself, by name - the only kind it
+/// runs as itself, and so one at a time.
+fn task_is_for_worker(task: &db::TaskRow) -> bool {
+    task.profile.is_none() && task.agent_name.is_some()
+}
+
 /// Runs one claimed prompt task headlessly, in a fresh conversation, and
-/// records how it went. Returns that outcome. It runs as `agent`, or, for
-/// a task bound to a profile, as a new agent made from it under `agent`.
+/// records how it went. Returns that outcome. A task for `agent` by name
+/// runs as `agent`; one bound to a profile on a new agent made from it,
+/// and one for any agent on a new `task-<id>` agent - both under `agent`.
 fn run_prompt_task_headless(
     task: &db::TaskRow,
     agent: &str,
@@ -8979,17 +9064,19 @@ fn run_prompt_task_headless(
     cancel: mpsc::Receiver<()>,
 ) -> db::TaskOutcome {
     let worker = agent;
-    let profile_agent = task.profile.as_deref().map(|profile| {
-        profile_task_agent(
+    let task_agent = match &task.profile {
+        Some(profile) => Some(profile_task_agent(
             task,
             profile,
             worker,
             db.as_ref(),
             session_id,
             &opts.profiles,
-        )
-    });
-    let agent = match &profile_agent {
+        )),
+        None if task_is_for_worker(task) => None,
+        None => Some(own_task_agent(task, worker, db.as_ref(), session_id)),
+    };
+    let agent = match &task_agent {
         None => worker,
         Some(Ok(name)) => name.as_str(),
         Some(Err(e)) => {
@@ -8998,6 +9085,10 @@ fn run_prompt_task_headless(
                 exit_code: None,
                 result: format!("Couldn't make its agent: {}", e),
             };
+            record_turn_end(
+                &Some(EventLog::new(db.clone(), worker, Some(task.id))),
+                &outcome,
+            );
             if let Err(e) = db.finish_task(task.id, session_id, &outcome) {
                 warn!("Couldn't record the outcome of task {}: {}", task.id, e);
             }
@@ -9014,13 +9105,17 @@ fn run_prompt_task_headless(
         ..(*extra).clone()
     });
     let mut messages = initialize_agent_messages(tools, opts, &agent_config);
-    messages.push(make_message(
-        "user",
-        format!(
-            "[Scheduled task #{} \"{}\"]: {}",
-            task.id, task.name, task.command
-        ),
-    ));
+    let input = format!(
+        "[Scheduled task #{} \"{}\"]: {}",
+        task.id, task.name, task.command
+    );
+    let events = Some(EventLog::new(db.clone(), agent, Some(task.id)));
+    if let Some(events) = &events {
+        events.emit(AgentEvent::Input {
+            text: input.clone(),
+        });
+    }
+    messages.push(make_message("user", input));
     let mut ctx = ToolContext::new(|_: &str| {});
     ctx.db = Some(db.clone());
     ctx.agent_name = Some(agent.to_string());
@@ -9032,14 +9127,17 @@ fn run_prompt_task_headless(
     let activity = ActivityRecorder::new(db.clone(), agent);
     let mode = {
         let activity = activity.clone();
-        ResponseMode::Streaming {
-            stream_handler: Box::new(|_: &str| Ok(())),
-            reasoning_handler: Box::new(|_: &str| Ok(())),
-            progress_handler: Box::new(move |progress: &ProgressInfo| {
-                activity.follow(&progress.status);
-                Ok(())
-            }),
-        }
+        recorded_mode(
+            ResponseMode::Streaming {
+                stream_handler: Box::new(|_: &str| Ok(())),
+                reasoning_handler: Box::new(|_: &str| Ok(())),
+                progress_handler: Box::new(move |progress: &ProgressInfo| {
+                    activity.follow(&progress.status);
+                    Ok(())
+                }),
+            },
+            &events,
+        )
     };
     let result = post_request_with_mode(
         messages,
@@ -9058,6 +9156,7 @@ fn run_prompt_task_headless(
         let _ = db.save_agent_messages(agent, &values);
     }
     let outcome = reported_task_outcome(result.as_ref(), &slot);
+    record_turn_end(&events, &outcome);
     if let Err(e) = db.finish_task(task.id, session_id, &outcome) {
         warn!("Couldn't record the outcome of task {}: {}", task.id, e);
     }
@@ -9074,6 +9173,67 @@ fn run_prompt_task_headless(
     outcome
 }
 
+/// Stops headless workers - they pick up no more tasks - and interrupts
+/// the tasks they're running: what Ctrl-C does.
+#[derive(Clone, Default)]
+struct WorkerStop {
+    stopping: Arc<AtomicBool>,
+    /// Interrupts each running task, by id.
+    cancels: Arc<Mutex<HashMap<i64, mpsc::Sender<()>>>>,
+}
+
+impl WorkerStop {
+    fn stop(&self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        for cancel in self
+            .cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+        {
+            let _ = cancel.send(());
+        }
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopping.load(Ordering::Relaxed)
+    }
+}
+
+/// A headless worker to run (`run_worker`).
+struct WorkerSpec {
+    agent: String,
+    /// The most prompt tasks it works on at once, if limited: each runs on
+    /// its own agent (but those for it by name, one at a time), so there's
+    /// no need to - the model's capacity is `--max-parallel-requests`'.
+    parallel: Option<usize>,
+    /// The profiles whose tasks it takes on.
+    profiles: Vec<String>,
+    /// If another session has the agent, wait for it to be free instead
+    /// of failing.
+    wait_for_agent: bool,
+    /// Also run tool tasks: one scheduler per process is enough.
+    tool_tasks: bool,
+    /// Start each line it logs with the agent's name, as several log
+    /// together.
+    label: bool,
+}
+
+/// The profiles a worker takes on: `only` (checked to exist), or all of
+/// the config file's.
+fn worker_profiles(opts: &Opts, only: &[String]) -> Result<Vec<String>, Box<dyn Error>> {
+    for name in only {
+        find_profile(&opts.profiles, name)?;
+    }
+    let mut profiles: Vec<String> = if only.is_empty() {
+        opts.profiles.keys().cloned().collect()
+    } else {
+        only.to_vec()
+    };
+    profiles.sort();
+    Ok(profiles)
+}
+
 /// `faber worker`: works through scheduled tasks as `agent`, headlessly,
 /// up to `parallel` prompt tasks at once, until Ctrl-C.
 fn worker_command(
@@ -9081,62 +9241,92 @@ fn worker_command(
     db: Option<Arc<dyn DbBackend>>,
     mcp_manager: Option<Arc<faber::mcp::McpManager>>,
     agent: Option<String>,
-    parallel: usize,
+    parallel: Option<usize>,
     only_profiles: &[String],
 ) -> Result<(), Box<dyn Error>> {
     let db = db.ok_or(
         "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
     )?;
-    for name in only_profiles {
-        find_profile(&opts.profiles, name)?;
-    }
-    let mut profiles: Vec<String> = if only_profiles.is_empty() {
-        opts.profiles.keys().cloned().collect()
-    } else {
-        only_profiles.to_vec()
+    let spec = WorkerSpec {
+        agent: agent.unwrap_or_else(|| format!("worker-{}", std::process::id())),
+        parallel,
+        profiles: worker_profiles(opts, only_profiles)?,
+        wait_for_agent: false,
+        tool_tasks: true,
+        label: false,
     };
-    profiles.sort();
-    let agent = agent.unwrap_or_else(|| format!("worker-{}", std::process::id()));
+    let stop = WorkerStop::default();
+    {
+        let stop = stop.clone();
+        ctrlc::set_handler(move || stop.stop())?;
+    }
+    run_worker(opts, db, &mcp_manager, &spec, &stop)
+}
+
+/// Works through scheduled tasks as `spec.agent` until `stop`.
+fn run_worker(
+    opts: &Opts,
+    db: Arc<dyn DbBackend>,
+    mcp_manager: &Option<Arc<faber::mcp::McpManager>>,
+    spec: &WorkerSpec,
+    stop: &WorkerStop,
+) -> Result<(), Box<dyn Error>> {
+    let agent = spec.agent.clone();
+    let profiles = &spec.profiles;
+    let log = |line: String| {
+        println!(
+            "[{}] {}{}",
+            chrono::Local::now().format("%H:%M:%S"),
+            if spec.label {
+                format!("{}: ", agent)
+            } else {
+                String::new()
+            },
+            line
+        );
+    };
     let session_id = format!(
-        "{}-{}",
+        "{}-{}-{}",
         std::process::id(),
+        agent,
         chrono::Utc::now().timestamp_millis()
     );
     if db.get_agent(&agent)?.is_none() {
         db.create_agent(&agent, "Headless worker")?;
     }
-    if !db.claim_agent(&agent, &session_id)? {
-        return Err(format!("agent '{}' is in use by another session", agent).into());
+    let mut waiting = false;
+    while !db.claim_agent(&agent, &session_id)? {
+        if !spec.wait_for_agent {
+            return Err(format!("agent '{}' is in use by another session", agent).into());
+        }
+        if !waiting {
+            log(format!(
+                "'{}' is in use by another session; waiting for it to be free",
+                agent
+            ));
+            waiting = true;
+        }
+        for _ in 0..10 {
+            if stop.stopped() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
-    let parallel = parallel.max(1);
+    let parallel = spec.parallel.map(|p| p.max(1));
     let tools = Arc::new(if opts.no_tools {
         ToolsCollection::new()
     } else {
         let allowed = (!opts.tools.is_empty()).then(|| opts.tools.clone());
         initialize_tools(opts.unsafe_tools, allowed.as_deref())
     });
-    let log = |line: String| {
-        println!("[{}] {}", chrono::Local::now().format("%H:%M:%S"), line);
-    };
-
-    // Ctrl-C: stop picking up tasks and interrupt the running ones.
-    let stopping = Arc::new(AtomicBool::new(false));
-    let cancels: Arc<Mutex<HashMap<i64, mpsc::Sender<()>>>> = Arc::new(Mutex::new(HashMap::new()));
-    {
-        let stopping = stopping.clone();
-        let cancels = cancels.clone();
-        ctrlc::set_handler(move || {
-            stopping.store(true, Ordering::Relaxed);
-            for cancel in cancels.lock().unwrap_or_else(|e| e.into_inner()).values() {
-                let _ = cancel.send(());
-            }
-        })?;
-    }
+    let cancels = &stop.cancels;
     {
         let db = db.clone();
         let session_id = session_id.clone();
+        let stopping = stop.stopping.clone();
         std::thread::spawn(move || {
-            loop {
+            while !stopping.load(Ordering::Relaxed) {
                 let _ = db.heartbeat_all(&session_id);
                 std::thread::sleep(Duration::from_secs(5));
             }
@@ -9145,7 +9335,7 @@ fn worker_command(
     // Tool tasks, as any chat session runs them; their results only get
     // logged here.
     let (task_tx, task_rx) = mpsc::channel::<(Option<String>, String, Message, Message)>();
-    {
+    if spec.tool_tasks {
         let db = db.clone();
         let session_id = session_id.clone();
         let tools = tools.clone();
@@ -9157,10 +9347,13 @@ fn worker_command(
         .clone()
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     log(format!(
-        "Working as '{}' ({} task{} at a time, model {}{}); Ctrl-C to stop",
+        "Working as '{}' ({}model {}{}); Ctrl-C to stop",
         agent,
-        parallel,
-        if parallel == 1 { "" } else { "s" },
+        match parallel {
+            Some(1) => "1 task at a time, ".to_string(),
+            Some(n) => format!("up to {} tasks at once, ", n),
+            None => String::new(),
+        },
         model,
         if profiles.is_empty() {
             String::new()
@@ -9182,10 +9375,22 @@ fn worker_command(
     let activity = ActivityRecorder::new(db.clone(), &agent);
     activity.set("idle");
     let running = std::sync::atomic::AtomicUsize::new(0);
+    // Running a task for it by name, as itself: that run keeps the
+    // activity meanwhile.
+    let own_busy = AtomicBool::new(false);
+    let summarize = |running: usize| {
+        if !own_busy.load(Ordering::Relaxed) {
+            activity.force(&match running {
+                0 => "idle".to_string(),
+                1 => "running 1 task".to_string(),
+                n => format!("running {} tasks", n),
+            });
+        }
+    };
     // Task threads borrow from here, so they live in a scope that ends
     // only once every one of them has.
     std::thread::scope(|scope| {
-        while !stopping.load(Ordering::Relaxed) {
+        while !stop.stopped() {
             while let Ok((_, command, _, tool_msg)) = task_rx.try_recv() {
                 log(format!(
                     "tool task ran: {} -> {}",
@@ -9193,14 +9398,24 @@ fn worker_command(
                     first_line(tool_msg.content.as_deref().unwrap_or(""), 80)
                 ));
             }
-            if running.load(Ordering::Relaxed) < parallel {
-                if let Some(task) = claim_prompt_task(db.as_ref(), &session_id, &agent, &profiles) {
+            if parallel.is_none_or(|p| running.load(Ordering::Relaxed) < p) {
+                if let Some(task) = claim_prompt_task_but(
+                    db.as_ref(),
+                    &session_id,
+                    &agent,
+                    profiles,
+                    own_busy.load(Ordering::Relaxed),
+                ) {
+                    let own = task_is_for_worker(&task);
+                    if own {
+                        own_busy.store(true, Ordering::Relaxed);
+                    }
                     let (cancel_tx, cancel_rx) = mpsc::channel();
                     cancels
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(task.id, cancel_tx);
-                    running.fetch_add(1, Ordering::Relaxed);
+                    summarize(running.fetch_add(1, Ordering::Relaxed) + 1);
                     log(match &task.profile {
                         Some(profile) => format!(
                             "#{} \"{}\" started on profile {}",
@@ -9208,15 +9423,10 @@ fn worker_command(
                         ),
                         None => format!("#{} \"{}\" started", task.id, task.name),
                     });
-                    let (db, session_id, tools, extra, mcp_manager, agent) = (
-                        &db,
-                        &session_id,
-                        &tools,
-                        extra.clone(),
-                        &mcp_manager,
-                        &agent,
-                    );
-                    let (running, cancels, activity) = (&running, &cancels, &activity);
+                    let (db, session_id, tools, extra, mcp_manager, agent) =
+                        (&db, &session_id, &tools, extra.clone(), mcp_manager, &agent);
+                    let (running, cancels, own_busy, summarize) =
+                        (&running, &cancels, &own_busy, &summarize);
                     scope.spawn(move || {
                         let started = std::time::Instant::now();
                         let outcome = run_prompt_task_headless(
@@ -9245,9 +9455,10 @@ fn worker_command(
                             started.elapsed().as_secs_f64(),
                             first_line(&outcome.result, 100)
                         ));
-                        if running.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            activity.set("idle");
+                        if own {
+                            own_busy.store(false, Ordering::Relaxed);
                         }
+                        summarize(running.fetch_sub(1, Ordering::Relaxed) - 1);
                     });
                     continue; // there may be more ready right away
                 }
@@ -9259,17 +9470,6 @@ fn worker_command(
     let _ = db.release_all_agents(&session_id);
     activity.set("stopped");
     Ok(())
-}
-
-/// Whether an agent's chat session (or the session running it, for a
-/// sub-agent) is still heartbeating.
-fn agent_session_is_live(agent: &db::AgentRow, now: chrono::DateTime<chrono::Utc>) -> bool {
-    agent.session_id.is_some()
-        && agent
-            .heartbeat_at
-            .as_deref()
-            .and_then(db::parse_db_time)
-            .is_some_and(|t| now - t < chrono::Duration::seconds(30))
 }
 
 /// The agents in tree order - each followed by the ones it spawned - with
@@ -9359,7 +9559,7 @@ fn print_agents_tree(
             .unwrap_or_else(|| "-".to_string());
         table.add_row(Row::new(vec![
             Cell::new(&format!("{}{}", prefix, agent.name)),
-            Cell::new(if agent_session_is_live(agent, now) {
+            Cell::new(if db::agent_session_is_live(agent, now) {
                 "live"
             } else {
                 "-"
@@ -9434,7 +9634,7 @@ fn agents_command(
         );
         println!(
             "  Session:      {}",
-            if agent_session_is_live(&agent, now) {
+            if db::agent_session_is_live(&agent, now) {
                 "live"
             } else {
                 "-"
@@ -9661,6 +9861,29 @@ fn hold_tasks_command(
             if hold { "held" } else { "released" },
             reason
         );
+    }
+    if failed > 0 {
+        return Err(format!("{} of {} task(s) not changed", failed, ids.len()).into());
+    }
+    Ok(())
+}
+
+/// `faber tasks run`: makes tasks due now (see `db::run_task_now`).
+fn run_tasks_command(db: &Option<Arc<dyn DbBackend>>, ids: &[i64]) -> Result<(), Box<dyn Error>> {
+    let db = db.as_ref().ok_or(
+        "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
+    )?;
+    let mut failed = 0;
+    for &id in ids {
+        if db.run_task_now(id)? {
+            println!("Task #{} runs as soon as it can.", id);
+            continue;
+        }
+        failed += 1;
+        match db.get_task(id)? {
+            None => eprintln!("Task #{} can't be run: no such task.", id),
+            Some(_) => eprintln!("Task #{} can't be run: it's already running.", id),
+        }
     }
     if failed > 0 {
         return Err(format!("{} of {} task(s) not changed", failed, ids.len()).into());
@@ -10465,6 +10688,14 @@ enum TasksAction {
         #[clap(required = true)]
         ids: Vec<i64>,
     },
+    /// Run tasks now: whatever they're waiting for - their time, a
+    /// release, being enabled - or, if done, again. Dependencies still
+    /// have to be met
+    Run {
+        /// The ids of the tasks, as `faber tasks` lists them
+        #[clap(required = true)]
+        ids: Vec<i64>,
+    },
     /// Change where tasks that aren't running or done yet run: on an agent, on a
     /// new agent made from a profile, or on any agent
     #[clap(group(clap::ArgGroup::new("target").required(true).args(["agent", "profile", "any"])))]
@@ -10565,9 +10796,12 @@ enum CliCommand {
         /// The agent to work as (created if needed); default: worker-<pid>
         #[clap(long)]
         agent: Option<String>,
-        /// How many prompt tasks to work on at once
-        #[clap(long, default_value = "1")]
-        parallel: usize,
+        /// At most this many prompt tasks at once; default: no limit. Each
+        /// runs on its own agent, except those for this agent by name,
+        /// which run as it, one at a time. To limit how hard the model is
+        /// pushed, use --max-parallel-requests
+        #[clap(long)]
+        parallel: Option<usize>,
         /// Only take on tasks bound to these profiles (comma-separated) of
         /// the config file's; default: all of them. Tasks bound to no
         /// profile are taken on either way
@@ -10630,7 +10864,9 @@ enum CliCommand {
         board: bool,
     },
 
-    /// Start a server exposing the DB API over TCP
+    /// Start a server sharing the database with other faber processes
+    /// over TCP, and a web UI to watch the agents and manage the tasks at
+    /// http://<bind>/ui/ (profiles to run tasks on come from the config)
     Serve {
         /// Address to bind to
         #[clap(long, default_value = "127.0.0.1:9090")]
@@ -10641,6 +10877,11 @@ enum CliCommand {
         /// Read auth key from file (first line)
         #[clap(long)]
         auth_key_file: Option<String>,
+        /// Also work through tasks as this agent, like `faber worker
+        /// --agent NAME` running inside the server. Repeat for more agents.
+        /// If a chat has the agent, it waits for it to be free
+        #[clap(long = "run-agent", value_name = "NAME")]
+        run_agents: Vec<String>,
     },
 }
 
@@ -10835,6 +11076,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             ..
         } => hold_tasks_command(&db_connection, ids, false),
         CliCommand::Tasks {
+            action: Some(TasksAction::Run { ids }),
+            ..
+        } => run_tasks_command(&db_connection, ids),
+        CliCommand::Tasks {
             action:
                 Some(TasksAction::Assign {
                     ids,
@@ -10877,11 +11122,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             bind,
             auth_key,
             auth_key_file,
+            run_agents,
         } => {
-            let db_path = opts
-                .db_path
-                .as_ref()
-                .ok_or("--db-path is required for serve command")?;
+            let (Some(conn), Some(db)) = (db_conn_for_history.clone(), db_connection.clone())
+            else {
+                return Err("--db-path is required for serve command".into());
+            };
             let key = match (auth_key, auth_key_file) {
                 (Some(k), _) => Some(k.clone()),
                 (_, Some(f)) => {
@@ -10890,7 +11136,70 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 _ => None,
             };
-            server::serve_command(bind, db_path, key.as_deref())
+            let mut profiles: Vec<web::UiProfile> = opts
+                .profiles
+                .iter()
+                .map(|(name, profile)| web::UiProfile {
+                    name: name.clone(),
+                    description: profile.description.clone(),
+                    model: profile.model.clone(),
+                })
+                .collect();
+            profiles.sort_by(|a, b| a.name.cmp(&b.name));
+            let workers = run_agents
+                .iter()
+                .enumerate()
+                .map(|(i, agent)| {
+                    if agent.trim().is_empty() {
+                        return Err("--run-agent needs an agent name".into());
+                    }
+                    Ok(WorkerSpec {
+                        agent: agent.clone(),
+                        parallel: None,
+                        profiles: worker_profiles(&opts, &[])?,
+                        wait_for_agent: true,
+                        tool_tasks: i == 0,
+                        label: true,
+                    })
+                })
+                .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+            let stop = WorkerStop::default();
+            std::thread::scope(|scope| {
+                if !workers.is_empty() {
+                    {
+                        let stop = stop.clone();
+                        ctrlc::set_handler(move || stop.stop())?;
+                    }
+                    let handles: Vec<_> = workers
+                        .iter()
+                        .map(|spec| {
+                            let (opts, db, mcp_manager, stop) = (&opts, &db, &mcp_manager, &stop);
+                            scope.spawn(move || {
+                                if let Err(e) =
+                                    run_worker(opts, db.clone(), mcp_manager, spec, stop)
+                                {
+                                    eprintln!("Agent '{}' stopped: {}", spec.agent, e);
+                                }
+                            })
+                        })
+                        .collect();
+                    let (mcp_manager, stop) = (&mcp_manager, &stop);
+                    // On Ctrl-C, once the agents have stopped, so does the
+                    // server.
+                    scope.spawn(move || {
+                        for handle in handles {
+                            let _ = handle.join();
+                        }
+                        if stop.stopped() {
+                            if let Some(mcp) = mcp_manager {
+                                mcp.shutdown();
+                            }
+                            std::process::exit(0);
+                        }
+                    });
+                }
+                server::serve_command(bind, conn, key.as_deref(), profiles)
+            })
         }
     };
 
@@ -11582,7 +11891,7 @@ mod tests {
         let mut waiting = task_row(5, "2026-10-01 10:00:00", None);
         waiting.depends_on = vec![3, 4, 99];
         let all = vec![done_ok, running, waiting];
-        let blocked = unmet_dependencies(&all);
+        let blocked = db::unmet_dependencies(&all);
         assert_eq!(
             blocked.get(&5),
             Some(&vec![4, 99]),
@@ -13056,8 +13365,30 @@ mod tests {
             (task.status.as_str(), task.last_result.as_deref()),
             ("done", Some("all quiet"))
         );
-        let transcript = db.load_agent_messages("w").unwrap();
+        // For any agent: it ran on an agent of its own, under the worker.
+        let agent = db.get_agent(&format!("task-{}", id)).unwrap().unwrap();
+        assert_eq!(agent.parent.as_deref(), Some("w"));
+        assert!(agent.session_id.is_none(), "released once done");
+        let transcript = db.load_agent_messages(&agent.name).unwrap();
         assert!(transcript.last().unwrap()["content"] == "all quiet");
+        assert!(db.load_agent_messages("w").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_a_busy_worker_takes_no_more_tasks_for_itself() {
+        let db = local_db_with_agents(&["w"]);
+        // A live session's claims aren't up for grabs again.
+        assert!(db.claim_agent("w", "s").unwrap());
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let mine = db
+            .create_oneshot_task("mine", "", &past, "x", Some("w"))
+            .unwrap();
+        let anyone = db.create_oneshot_task("any", "", &past, "x", None).unwrap();
+        let claim = |busy| claim_prompt_task_but(db.as_ref(), "s", "w", &[], busy).map(|t| t.id);
+        // Busy with one of its own, it can still take tasks for anyone.
+        assert_eq!(claim(true), Some(anyone));
+        assert_eq!(claim(true), None);
+        assert_eq!(claim(false), Some(mine));
     }
 
     #[test]
