@@ -60,7 +60,7 @@ const MIN_RESULT_CHARS: usize = 2000;
 const READ_ONLY_TOOLS: &[&str] = &[
     "read_file",
     "glob",
-    "grep_in_current_directory",
+    "grep",
     "lsp",
     "fetch_web_content",
     "github_issue",

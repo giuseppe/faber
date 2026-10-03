@@ -978,7 +978,7 @@ fn tool_access(name: &str, arguments: &str) -> ToolAccess {
     match name {
         "read_file" => path().map_or(ToolAccess::Exclusive, ToolAccess::ReadPath),
         "write_file" | "patch_file" => path().map_or(ToolAccess::Exclusive, ToolAccess::WritePath),
-        "glob" | "grep_in_current_directory" => ToolAccess::ReadTree,
+        "glob" | "grep" => ToolAccess::ReadTree,
         "fetch_web_content"
         | "github_pull_request"
         | "github_issue"
