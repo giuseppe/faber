@@ -347,6 +347,11 @@ impl DbBackend for LocalDb {
         db::kb_delete(&conn, id, viewer)
     }
 
+    fn list_profiles(&self) -> Result<Vec<(String, serde_json::Value)>, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::list_profiles(&conn)
+    }
+
     fn request_task_stop(&self, task_id: i64) -> Result<bool, Box<dyn Error>> {
         let conn = self.lock()?;
         db::request_task_stop(&conn, task_id)

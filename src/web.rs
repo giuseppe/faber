@@ -27,13 +27,20 @@
 //!   `PATCH /api/agents/<name>/config` (change its settings - the user's
 //!   to, unsafe tools and working directory included),
 //!   `POST /api/agents/<name>/cwd`
-//! - `GET /api/tools`: the tools an agent's list can name
+//! - `GET /api/tools`: the tools an agent's list can name, with
+//!   `?schemas=1` their descriptions and parameters too;
+//!   `POST /api/tools/<name>/run`: run one now, as a tool task
+//! - `POST /api/tasks/prune`, `POST /api/agents/cleanup`: remove finished
+//!   tasks, and finished agents made by agents (`dry_run` to only see)
 //! - `GET /api/events?agent=&task=&after=&limit=`
 //! - `GET /api/tasks`, `GET /api/tasks/<id>`, `POST /api/tasks`,
+//!   `PATCH /api/tasks/<id>` (change it, as `POST /api/tasks` takes it),
 //!   `DELETE /api/tasks/<id>`,
 //!   `POST /api/tasks/<id>/hold|release|enable|disable|run|stop`,
 //!   `POST /api/tasks/<id>/assign`
-//! - `GET /api/profiles`, `GET /api/info` (the server's directory, for a
+//! - `GET /api/profiles` (the config file's and the database's),
+//!   `POST /api/profiles`, `DELETE /api/profiles/<name>` (the database's),
+//! - `GET /api/info` (the server's directory, for a
 //!   new task's default)
 //!
 //! With an auth key, every `/api/` request needs `Authorization: Bearer
@@ -52,14 +59,6 @@ use std::error::Error;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
-
-/// A profile agents can be made from, as `faber serve`'s config has it.
-#[derive(Serialize, Debug, Clone, PartialEq)]
-pub struct UiProfile {
-    pub name: String,
-    pub description: Option<String>,
-    pub model: Option<String>,
-}
 
 /// The largest request body accepted.
 const MAX_BODY_BYTES: usize = 1 << 20;
@@ -260,7 +259,7 @@ pub fn handle_http(
     stream: TcpStream,
     db: Arc<Mutex<Connection>>,
     auth_key: Option<&str>,
-    profiles: &[UiProfile],
+    profiles: &crate::Profiles,
 ) -> Result<(), Box<dyn Error>> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -276,7 +275,7 @@ fn route(
     request: &Request,
     db: &Arc<Mutex<Connection>>,
     auth_key: Option<&str>,
-    profiles: &[UiProfile],
+    profiles: &crate::Profiles,
 ) -> Response {
     let segments: Vec<&str> = request.path.split('/').filter(|s| !s.is_empty()).collect();
     match (request.method.as_str(), segments.as_slice()) {
@@ -330,6 +329,75 @@ fn route(
         }
         _ => Response::error(404, "not found"),
     }
+}
+
+/// The agents agents made - sub-agents, task agents, fan-out workers:
+/// those with a parent - that are done: nothing runs them, nor any agent
+/// below them. Agents the user made, and those still at work, stay.
+fn finished_made_agents(
+    conn: &Connection,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let agents = db::list_agents(conn)?;
+    let live: std::collections::HashSet<&str> = agents
+        .iter()
+        .filter(|a| db::agent_session_is_live(a, now))
+        .map(|a| a.name.as_str())
+        .collect();
+    // An agent with a live one anywhere below it stays, as its parent.
+    let mut keep: std::collections::HashSet<&str> = live.clone();
+    for agent in agents.iter().filter(|a| live.contains(a.name.as_str())) {
+        let mut parent = agent.parent.as_deref();
+        let mut steps = 0;
+        while let Some(name) = parent {
+            if !keep.insert(name) || steps > 64 {
+                break;
+            }
+            parent = agents
+                .iter()
+                .find(|a| a.name == name)
+                .and_then(|a| a.parent.as_deref());
+            steps += 1;
+        }
+    }
+    Ok(agents
+        .iter()
+        .filter(|a| a.parent.is_some() && !keep.contains(a.name.as_str()))
+        .map(|a| a.name.clone())
+        .collect())
+}
+
+/// An agent's plan, as plan_update keeps it - `None` without one.
+fn agent_plan(conn: &Connection, agent: &str) -> Result<Option<serde_json::Value>, Box<dyn Error>> {
+    Ok(db::get_agent_data(conn, agent, crate::PLAN_DATA_KEY)?
+        .and_then(|plan| serde_json::from_str::<serde_json::Value>(&plan).ok())
+        .filter(|plan| plan.as_array().is_some_and(|steps| !steps.is_empty())))
+}
+
+/// The config an agent made from `profile` (the config file's, or else
+/// the database's) gets: a copy of its settings, keeping what's not a
+/// profile's to set - the agent's unsafe tools and working directory.
+fn profile_config(
+    conn: &Connection,
+    profiles: &crate::Profiles,
+    profile: &str,
+    current: db::AgentConfig,
+) -> Result<db::AgentConfig, String> {
+    let settings = match profiles.get(profile) {
+        Some(settings) => settings.clone(),
+        None => {
+            let stored = db::list_profiles(conn)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|(name, _)| name == profile)
+                .ok_or_else(|| format!("no profile '{}'", profile))?;
+            serde_json::from_value(stored.1).map_err(|e| e.to_string())?
+        }
+    };
+    let mut config = settings.agent_config(profile);
+    config.unsafe_tools = current.unsafe_tools;
+    config.cwd = current.cwd;
+    Ok(config)
 }
 
 /// The settings of an agent the web UI edits.
@@ -453,12 +521,15 @@ struct ApiAgent {
     live: bool,
     model: Option<String>,
     profile: Option<String>,
-    /// Given the unsafe tools for good (`faber agents set --unsafe`, or by
-    /// an agent that has them). A session's own agent may have them too,
-    /// for the session, if started with --unsafe-tools.
+    /// Has the unsafe tools now: for good (`faber agents set --unsafe`, its
+    /// settings, an agent that has them), or for the session running it
+    /// (started with --unsafe-tools).
     unsafe_tools: bool,
     /// Where it works, if not where whatever runs it does.
     cwd: Option<String>,
+    /// Its plan (plan_update), if it has one: its steps, each with what
+    /// it is and its status (pending, in_progress, completed).
+    plan: Option<serde_json::Value>,
 }
 
 /// A task as `/api/tasks` lists it: with the dependencies it's still
@@ -615,7 +686,7 @@ fn api(
     path: &[&str],
     request: &Request,
     conn: &Connection,
-    profiles: &[UiProfile],
+    profiles: &crate::Profiles,
 ) -> Result<Response, Box<dyn Error>> {
     let task_id = |id: &str| -> Result<i64, Box<dyn Error>> {
         id.parse()
@@ -629,10 +700,16 @@ fn api(
                 let config = db::get_agent_config(conn, &agent.name)?;
                 agents.push(ApiAgent {
                     live: db::agent_session_is_live(&agent, now),
-                    model: config.model,
-                    profile: config.profile,
-                    unsafe_tools: config.unsafe_tools == Some(true),
+                    model: config.model.clone(),
+                    profile: config.profile.clone(),
+                    unsafe_tools: db::has_unsafe_tools(
+                        &agent,
+                        &config,
+                        db::get_agent_data(conn, &agent.name, db::SESSION_UNSAFE_KEY)?.as_deref(),
+                        now,
+                    ),
                     cwd: config.cwd.clone(),
+                    plan: agent_plan(conn, &agent.name)?,
                     agent,
                 });
             }
@@ -653,8 +730,14 @@ fn api(
                     live: db::agent_session_is_live(&agent, now),
                     model: config.model.clone(),
                     profile: config.profile.clone(),
-                    unsafe_tools: config.unsafe_tools == Some(true),
+                    unsafe_tools: db::has_unsafe_tools(
+                        &agent,
+                        &config,
+                        db::get_agent_data(conn, &agent.name, db::SESSION_UNSAFE_KEY)?.as_deref(),
+                        now,
+                    ),
                     cwd: config.cwd.clone(),
+                    plan: agent_plan(conn, &agent.name)?,
                     agent,
                 },
                 "children": children,
@@ -692,6 +775,14 @@ fn api(
                 return Ok(Response::error(404, &format!("no agent named '{}'", name)));
             }
             let mut changes: serde_json::Map<String, serde_json::Value> = body_json(request)?;
+            // A profile's settings first, then the others given.
+            let base = match changes.remove("profile") {
+                Some(serde_json::Value::String(profile)) => {
+                    profile_config(conn, profiles, &profile, db::get_agent_config(conn, name)?)?
+                }
+                None | Some(serde_json::Value::Null) => db::get_agent_config(conn, name)?,
+                Some(_) => return Err("'profile' must be a profile's name".into()),
+            };
             // Not a setting, but the user's to change too.
             let description = match changes.remove("description") {
                 None => None,
@@ -699,7 +790,7 @@ fn api(
                 Some(serde_json::Value::Null) => Some(String::new()),
                 Some(_) => return Err("'description' must be a string".into()),
             };
-            let config = apply_config(db::get_agent_config(conn, name)?, &changes)?;
+            let config = apply_config(base, &changes)?;
             db::set_agent_config(conn, name, &config)?;
             if let Some(description) = description {
                 db::set_agent_description(conn, name, &description)?;
@@ -716,10 +807,165 @@ fn api(
             db::delete_agent(conn, name)?;
             Response::ok(true)
         }
+        ("POST", ["agents", name, "messages"]) => {
+            // A message from the user: a task for the agent, so it reaches
+            // it however it runs - a chat, a worker - once it's free.
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Body {
+                text: String,
+            }
+            let Some(agent) = db::get_agent(conn, name)? else {
+                return Ok(Response::error(404, &format!("no agent named '{}'", name)));
+            };
+            let text = body_json::<Body>(request)?.text.trim().to_string();
+            if text.is_empty() {
+                return Err("the message is empty".into());
+            }
+            let id = db::create_task(
+                conn,
+                &db::NewTask {
+                    name: format!("Message: {}", first_line(&text, 40)),
+                    description: String::new(),
+                    kind: db::TaskKind::PROMPT.to_string(),
+                    command: text,
+                    agent_name: Some(name.to_string()),
+                    schedule: db::TaskSchedule::Once {
+                        at: now.to_rfc3339(),
+                    },
+                    held: false,
+                    depends_on: Vec::new(),
+                    profile: None,
+                    run_safe: false,
+                    cwd: None,
+                },
+            )?;
+            let mut reply = serde_json::json!({ "task_id": id });
+            if !db::agent_session_is_live(&agent, now) {
+                reply["note"] = format!(
+                    "Nothing is running '{}' now: it gets the message once a chat or worker does.",
+                    name
+                )
+                .into();
+            }
+            Response::json(201, &reply)
+        }
+        ("GET", ["agents", name, "messages"]) => {
+            if db::get_agent(conn, name)?.is_none() {
+                return Ok(Response::error(404, &format!("no agent named '{}'", name)));
+            }
+            let messages: Vec<serde_json::Value> = db::load_agent_messages(conn, name)?;
+            let limit = request
+                .query("limit")
+                .and_then(|l| l.parse::<usize>().ok())
+                .unwrap_or(300);
+            let skip = messages.len().saturating_sub(limit);
+            Response::ok(serde_json::json!({
+                "total": messages.len(),
+                "messages": &messages[skip..],
+            }))
+        }
+        ("POST", ["tasks", "prune"]) => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Body {
+                /// How long ago their last run, at least: e.g. 7d.
+                older_than: String,
+                #[serde(default)]
+                dry_run: bool,
+            }
+            let body: Body = body_json(request)?;
+            let age = crate::parse_duration(&body.older_than)
+                .ok_or_else(|| format!("'{}': give an age like 30m, 12h, 7d", body.older_than))?;
+            let pruned = db::prune_tasks(conn, now - age, body.dry_run)?;
+            let ids: Vec<i64> = pruned.iter().map(|t| t.id).collect();
+            Response::ok(serde_json::json!({ "tasks": ids }))
+        }
+        ("POST", ["agents", "cleanup"]) => {
+            #[derive(Deserialize, Default)]
+            #[serde(deny_unknown_fields)]
+            struct Body {
+                #[serde(default)]
+                dry_run: bool,
+            }
+            let body: Body = if request.body.is_empty() {
+                Body::default()
+            } else {
+                body_json(request)?
+            };
+            let names = finished_made_agents(conn, now)?;
+            if !body.dry_run {
+                for name in &names {
+                    db::delete_agent(conn, name)?;
+                }
+            }
+            Response::ok(serde_json::json!({ "agents": names }))
+        }
         ("GET", ["tools"]) => {
-            let mut names: Vec<String> = crate::initialize_tools(true, None).into_keys().collect();
+            let tools = crate::initialize_tools(true, None);
+            let mut names: Vec<&String> = tools.keys().collect();
             names.sort();
-            Response::ok(names)
+            if request.query("schemas").is_none() {
+                return Ok(Response::ok(names));
+            }
+            let schemas: Vec<serde_json::Value> = names
+                .iter()
+                .filter_map(|name| {
+                    serde_json::from_str::<serde_json::Value>(&tools[*name].schema).ok()
+                })
+                .map(|schema| {
+                    serde_json::json!({
+                        "name": schema["function"]["name"],
+                        "description": schema["function"]["description"],
+                        "parameters": schema["function"]["parameters"],
+                    })
+                })
+                .collect();
+            Response::ok(schemas)
+        }
+        ("POST", ["tools", name, "run"]) => {
+            // As a tool task: run, with the tools it has, by whichever
+            // chat or worker's scheduler takes it, its result recorded.
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Body {
+                #[serde(default)]
+                arguments: serde_json::Map<String, serde_json::Value>,
+                /// Whose conversation gets the call and its result.
+                #[serde(default)]
+                agent: Option<String>,
+            }
+            if !crate::initialize_tools(true, None).contains_key(*name) {
+                return Ok(Response::error(404, &format!("no tool named '{}'", name)));
+            }
+            let body: Body = body_json(request)?;
+            let id = db::create_task(
+                conn,
+                &db::NewTask {
+                    name: format!("Run {}", name),
+                    description: String::new(),
+                    kind: db::TaskKind::TOOL.to_string(),
+                    command: serde_json::json!({"tool": name, "arguments": body.arguments})
+                        .to_string(),
+                    agent_name: non_empty(&body.agent),
+                    schedule: db::TaskSchedule::Once {
+                        at: now.to_rfc3339(),
+                    },
+                    held: false,
+                    depends_on: Vec::new(),
+                    profile: None,
+                    run_safe: false,
+                    cwd: None,
+                },
+            )?;
+            let mut reply = serde_json::json!({ "task_id": id });
+            let anyone_running = db::list_agents(conn)?
+                .iter()
+                .any(|a| db::agent_session_is_live(a, now));
+            if !anyone_running {
+                reply["note"] = "No chat or worker is running: it runs once one is.".into();
+            }
+            Response::json(201, &reply)
         }
 
         ("POST", ["agents", name, "cwd"]) => {
@@ -793,6 +1039,17 @@ fn api(
             let id = db::create_task(conn, &task)?;
             Response::json(201, &serde_json::json!({ "id": id }))
         }
+        ("PATCH", ["tasks", id]) => {
+            let id = task_id(id)?;
+            let task = body_json::<ApiNewTask>(request)?.into_new_task(now)?;
+            if !db::update_task(conn, id, &task)? {
+                return match db::get_task(conn, id)? {
+                    None => Ok(Response::error(404, &format!("no task #{}", id))),
+                    Some(_) => Err(format!("task #{} is running: stop it to change it", id).into()),
+                };
+            }
+            Response::ok(true)
+        }
         ("DELETE", ["tasks", id]) => {
             let id = task_id(id)?;
             if !db::delete_task(conn, id)? {
@@ -862,7 +1119,58 @@ fn api(
             }
             Response::ok(true)
         }
-        ("GET", ["profiles"]) => Response::ok(profiles),
+        ("GET", ["profiles"]) => {
+            let mut listed: Vec<serde_json::Value> = profiles
+                .iter()
+                .map(|(name, profile)| {
+                    serde_json::json!({"name": name, "source": "config", "settings": profile})
+                })
+                .collect();
+            for (name, settings) in db::list_profiles(conn)? {
+                if !profiles.contains_key(&name) {
+                    listed.push(
+                        serde_json::json!({"name": name, "source": "database", "settings": settings}),
+                    );
+                }
+            }
+            listed.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+            Response::ok(listed)
+        }
+        ("POST", ["profiles"]) => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Body {
+                name: String,
+                settings: serde_json::Value,
+            }
+            let body: Body = body_json(request)?;
+            let name = body.name.trim().to_string();
+            if profiles.contains_key(&name) {
+                return Err(format!(
+                    "profile '{}' is in faber serve's config file: change it there",
+                    name
+                )
+                .into());
+            }
+            let profile: crate::Profile = serde_json::from_value(body.settings.clone())
+                .map_err(|e| format!("bad profile settings: {}", e))?;
+            crate::validate_profiles(&crate::Profiles::from([(name.clone(), profile)]))?;
+            db::set_profile(conn, &name, &body.settings)?;
+            Response::ok(serde_json::json!({ "name": name }))
+        }
+        ("DELETE", ["profiles", name]) => {
+            if profiles.contains_key(*name) {
+                return Err(format!(
+                    "profile '{}' is in faber serve's config file: remove it there",
+                    name
+                )
+                .into());
+            }
+            if !db::delete_profile(conn, name)? {
+                return Ok(Response::error(404, &format!("no profile '{}'", name)));
+            }
+            Response::ok(true)
+        }
         ("GET", ["info"]) => Response::ok(serde_json::json!({
             "cwd": std::env::current_dir().ok(),
         })),
@@ -901,11 +1209,11 @@ mod tests {
     }
 
     fn call(db: &Arc<Mutex<Connection>>, method: &str, target: &str, body: &str) -> Response {
-        let profiles = [UiProfile {
-            name: "fast".to_string(),
-            description: Some("quick".to_string()),
-            model: None,
-        }];
+        let profiles = crate::Profiles::from([(
+            "fast".to_string(),
+            serde_json::from_value(serde_json::json!({"description": "quick", "model": "small"}))
+                .unwrap(),
+        )]);
         route(&request(method, target, body), db, None, &profiles)
     }
 
@@ -932,15 +1240,18 @@ mod tests {
         let db = test_db();
         let mut r = request("POST", "/api/tasks", r#"{"command": "rm -rf"}"#);
         r.content_type = Some("text/plain".to_string());
-        assert_eq!(route(&r, &db, None, &[]).status, 415);
+        assert_eq!(route(&r, &db, None, &crate::Profiles::new()).status, 415);
         r.content_type = None;
-        assert_eq!(route(&r, &db, None, &[]).status, 415);
+        assert_eq!(route(&r, &db, None, &crate::Profiles::new()).status, 415);
         let mut r = request("GET", "/api/tasks", "");
         r.host = Some("evil.example:9090".to_string());
-        assert_eq!(route(&r, &db, None, &[]).status, 403);
+        assert_eq!(route(&r, &db, None, &crate::Profiles::new()).status, 403);
         // With a key, any host will do.
         r.authorization = Some("Bearer k".to_string());
-        assert_eq!(route(&r, &db, Some("k"), &[]).status, 200);
+        assert_eq!(
+            route(&r, &db, Some("k"), &crate::Profiles::new()).status,
+            200
+        );
         assert!(
             db::list_tasks(&db.lock().unwrap(), None)
                 .unwrap()
@@ -977,14 +1288,26 @@ mod tests {
     fn test_auth_key_guards_the_api_only() {
         let db = test_db();
         let r = request("GET", "/api/tasks", "");
-        assert_eq!(route(&r, &db, Some("k"), &[]).status, 401);
         assert_eq!(
-            route(&request("GET", "/ui/", ""), &db, Some("k"), &[]).status,
+            route(&r, &db, Some("k"), &crate::Profiles::new()).status,
+            401
+        );
+        assert_eq!(
+            route(
+                &request("GET", "/ui/", ""),
+                &db,
+                Some("k"),
+                &crate::Profiles::new()
+            )
+            .status,
             200
         );
         let mut r = request("GET", "/api/tasks", "");
         r.authorization = Some("Bearer k".to_string());
-        assert_eq!(route(&r, &db, Some("k"), &[]).status, 200);
+        assert_eq!(
+            route(&r, &db, Some("k"), &crate::Profiles::new()).status,
+            200
+        );
     }
 
     #[test]
@@ -1094,6 +1417,62 @@ mod tests {
     }
 
     #[test]
+    fn test_tasks_can_be_changed_until_they_run() {
+        let db = test_db();
+        let r = call(
+            &db,
+            "POST",
+            "/api/tasks",
+            r#"{"command": "first", "hold": true}"#,
+        );
+        let id = json(&r)["id"].as_i64().unwrap();
+        let other = json(&call(&db, "POST", "/api/tasks", r#"{"command": "other"}"#))["id"]
+            .as_i64()
+            .unwrap();
+        let path = format!("/api/tasks/{}", id);
+        let body = serde_json::json!({
+            "command": "second", "name": "renamed", "cron": "0 0 9 * * * *",
+            "depends_on": [other], "cwd": std::env::temp_dir(),
+        });
+        let r = call(&db, "PATCH", &path, &body.to_string());
+        assert_eq!(r.status, 200, "{:?}", json(&r));
+        let task = json(&call(&db, "GET", &path, ""));
+        assert_eq!(task["command"], "second");
+        assert_eq!(task["name"], "renamed");
+        assert_eq!(task["task_type"], "cron");
+        assert_eq!(task["depends_on"], serde_json::json!([other]));
+        assert_eq!(task["status"], "held", "its state stays");
+        // A cycle, through the other task, is refused.
+        let cycle = serde_json::json!({"command": "other", "depends_on": [id]});
+        let r = call(
+            &db,
+            "PATCH",
+            &format!("/api/tasks/{}", other),
+            &cycle.to_string(),
+        );
+        assert_eq!(r.status, 400);
+        assert!(json(&r)["error"].as_str().unwrap().contains("itself"));
+        // Running, it can't be changed.
+        {
+            let conn = db.lock().unwrap();
+            db::create_agent(&conn, "w", "").unwrap();
+            assert!(db::claim_agent(&conn, "w", "s").unwrap());
+            assert!(db::claim_task(&conn, other, "s").unwrap());
+        }
+        let r = call(
+            &db,
+            "PATCH",
+            &format!("/api/tasks/{}", other),
+            r#"{"command": "x"}"#,
+        );
+        assert!(json(&r)["error"].as_str().unwrap().contains("running"));
+        assert_eq!(
+            call(&db, "PATCH", "/api/tasks/999", r#"{"command": "x"}"#).status,
+            404
+        );
+    }
+
+    #[test]
     fn test_bad_tasks_are_refused() {
         let db = test_db();
         for body in [
@@ -1120,6 +1499,217 @@ mod tests {
             json(&call(&db, "GET", &format!("/api/tasks/{}", id), ""))["name"],
             "glob"
         );
+    }
+
+    #[test]
+    fn test_the_user_messages_agents_and_reads_their_conversation() {
+        let db = test_db();
+        {
+            let conn = db.lock().unwrap();
+            db::create_agent(&conn, "boss", "").unwrap();
+            db::save_agent_messages(
+                &conn,
+                "boss",
+                &[
+                    serde_json::json!({"role": "user", "content": "hi"}),
+                    serde_json::json!({"role": "assistant", "content": "hello"}),
+                ],
+            )
+            .unwrap();
+        }
+        let r = call(
+            &db,
+            "POST",
+            "/api/agents/boss/messages",
+            r#"{"text": "count the files"}"#,
+        );
+        assert_eq!(r.status, 201, "{:?}", json(&r));
+        assert!(
+            json(&r)["note"]
+                .as_str()
+                .unwrap()
+                .contains("Nothing is running")
+        );
+        let id = json(&r)["task_id"].as_i64().unwrap();
+        let task = json(&call(&db, "GET", &format!("/api/tasks/{}", id), ""));
+        assert_eq!(task["agent_name"], "boss");
+        assert_eq!(task["command"], "count the files");
+        assert_eq!(
+            call(&db, "POST", "/api/agents/boss/messages", r#"{"text": " "}"#).status,
+            400
+        );
+        assert_eq!(
+            call(
+                &db,
+                "POST",
+                "/api/agents/nobody/messages",
+                r#"{"text": "x"}"#
+            )
+            .status,
+            404
+        );
+        let convo = json(&call(&db, "GET", "/api/agents/boss/messages?limit=1", ""));
+        assert_eq!(convo["total"], 2);
+        assert_eq!(convo["messages"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn test_profiles_are_kept_in_the_database_and_applied_to_agents() {
+        let db = test_db();
+        // The config file's, read-only here.
+        let listed = json(&call(&db, "GET", "/api/profiles", ""));
+        assert_eq!(listed[0]["name"], "fast");
+        assert_eq!(listed[0]["source"], "config");
+        let r = call(
+            &db,
+            "POST",
+            "/api/profiles",
+            r#"{"name": "fast", "settings": {}}"#,
+        );
+        assert!(json(&r)["error"].as_str().unwrap().contains("config file"));
+        // The database's: made, listed, applied, removed.
+        let deep = r#"{"name": "deep", "settings": {"model": "big", "system_prompt": "think", "tools": ["read_file"]}}"#;
+        assert_eq!(call(&db, "POST", "/api/profiles", deep).status, 200);
+        let listed = json(&call(&db, "GET", "/api/profiles", ""));
+        assert_eq!(listed[0]["name"], "deep");
+        assert_eq!(listed[0]["source"], "database");
+        assert_eq!(listed[0]["settings"]["model"], "big");
+        for bad in [
+            r#"{"name": "x y", "settings": {}}"#,
+            r#"{"name": "x", "settings": {"tools": ["nope"]}}"#,
+            r#"{"name": "x", "settings": {"bogus": 1}}"#,
+        ] {
+            assert_eq!(call(&db, "POST", "/api/profiles", bad).status, 400, "{bad}");
+        }
+        {
+            let conn = db.lock().unwrap();
+            db::create_agent(&conn, "a", "").unwrap();
+        }
+        let r = call(
+            &db,
+            "PATCH",
+            "/api/agents/a/config",
+            r#"{"unsafe_tools": true, "cwd": "/tmp"}"#,
+        );
+        assert_eq!(r.status, 200);
+        // A profile's settings, then what else is given; its unsafe tools
+        // and directory stay the agent's.
+        let r = call(
+            &db,
+            "PATCH",
+            "/api/agents/a/config",
+            r#"{"profile": "deep", "max_tokens": 99}"#,
+        );
+        let config = json(&r);
+        assert_eq!(config["model"], "big");
+        assert_eq!(config["profile"], "deep");
+        assert_eq!(config["max_tokens"], 99);
+        assert_eq!(config["unsafe_tools"], true);
+        assert!(config["cwd"].as_str().is_some());
+        let r = call(
+            &db,
+            "PATCH",
+            "/api/agents/a/config",
+            r#"{"profile": "fast"}"#,
+        );
+        assert_eq!(json(&r)["model"], "small", "the config file's too");
+        let r = call(
+            &db,
+            "PATCH",
+            "/api/agents/a/config",
+            r#"{"profile": "nope"}"#,
+        );
+        assert_eq!(r.status, 400);
+        assert_eq!(call(&db, "DELETE", "/api/profiles/deep", "").status, 200);
+        assert_eq!(call(&db, "DELETE", "/api/profiles/deep", "").status, 404);
+        assert_eq!(call(&db, "DELETE", "/api/profiles/fast", "").status, 400);
+    }
+
+    #[test]
+    fn test_cleaning_up_finished_tasks_and_agents() {
+        let db = test_db();
+        {
+            let conn = db.lock().unwrap();
+            for name in ["mine", "boss", "done-helper", "busy-helper", "deep"] {
+                db::create_agent(&conn, name, "").unwrap();
+            }
+            db::set_agent_parent(&conn, "done-helper", Some("boss")).unwrap();
+            db::set_agent_parent(&conn, "busy-helper", Some("done-helper")).unwrap();
+            db::set_agent_parent(&conn, "deep", Some("boss")).unwrap();
+            // A sub-agent of a sub-agent is still at work.
+            assert!(db::claim_agent(&conn, "busy-helper", "s").unwrap());
+        }
+        let r = call(&db, "POST", "/api/agents/cleanup", r#"{"dry_run": true}"#);
+        assert_eq!(json(&r)["agents"], serde_json::json!(["deep"]));
+        assert!(
+            db::get_agent(&db.lock().unwrap(), "deep")
+                .unwrap()
+                .is_some(),
+            "only looked"
+        );
+        call(&db, "POST", "/api/agents/cleanup", "");
+        let names: Vec<String> = db::list_agents(&db.lock().unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        assert_eq!(names, ["boss", "busy-helper", "done-helper", "mine"]);
+
+        let old = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+        let id = {
+            let conn = db.lock().unwrap();
+            let id = db::create_oneshot_task(&conn, "t", "", &old, "x", None).unwrap();
+            conn.execute(
+                "UPDATE scheduled_tasks SET status = 'done', last_run_at = ?2 WHERE id = ?1",
+                rusqlite::params![id, old],
+            )
+            .unwrap();
+            id
+        };
+        let r = call(&db, "POST", "/api/tasks/prune", r#"{"older_than": "30d"}"#);
+        assert_eq!(json(&r)["tasks"], serde_json::json!([]));
+        let r = call(&db, "POST", "/api/tasks/prune", r#"{"older_than": "7d"}"#);
+        assert_eq!(json(&r)["tasks"], serde_json::json!([id]));
+        assert_eq!(
+            call(&db, "POST", "/api/tasks/prune", r#"{"older_than": "soon"}"#).status,
+            400
+        );
+    }
+
+    #[test]
+    fn test_tools_can_be_listed_and_run() {
+        let db = test_db();
+        let schemas = json(&call(&db, "GET", "/api/tools?schemas=1", ""));
+        let kb = schemas
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "kb_search")
+            .unwrap();
+        assert!(kb["parameters"]["properties"]["query"].is_object());
+        let r = call(
+            &db,
+            "POST",
+            "/api/tools/kb_search/run",
+            r#"{"arguments": {"query": "deploy"}}"#,
+        );
+        assert_eq!(r.status, 201, "{:?}", json(&r));
+        assert!(
+            json(&r)["note"]
+                .as_str()
+                .unwrap()
+                .contains("No chat or worker")
+        );
+        let id = json(&r)["task_id"].as_i64().unwrap();
+        let task = json(&call(&db, "GET", &format!("/api/tasks/{}", id), ""));
+        assert_eq!(task["kind"], "tool");
+        let command: serde_json::Value =
+            serde_json::from_str(task["command"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            command,
+            serde_json::json!({"tool": "kb_search", "arguments": {"query": "deploy"}})
+        );
+        assert_eq!(call(&db, "POST", "/api/tools/nope/run", "{}").status, 404);
     }
 
     #[test]
@@ -1208,6 +1798,16 @@ mod tests {
         let boss = json(&call(&db, "GET", "/api/agents/boss", ""));
         assert_eq!(boss["children"], serde_json::json!(["helper"]));
         assert!(boss["agent"]["cwd"].is_null());
+        assert!(boss["agent"]["plan"].is_null());
+        db::set_agent_data(
+            &db.lock().unwrap(),
+            "boss",
+            crate::PLAN_DATA_KEY,
+            r#"[{"content": "read", "status": "completed"}, {"content": "write", "status": "in_progress"}]"#,
+        )
+        .unwrap();
+        let agents = json(&call(&db, "GET", "/api/agents", ""));
+        assert_eq!(agents[0]["plan"][1]["status"], "in_progress");
         let tmp = std::env::temp_dir();
         let r = call(
             &db,

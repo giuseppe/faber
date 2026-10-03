@@ -36,6 +36,9 @@ const state = {
   expanded: new Set(),
   // Every tool an agent's list can name.
   tools: null,
+  // What an agent's panel shows: "activity" (the live feed) or
+  // "conversation" (its saved messages).
+  agentView: "activity",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -425,6 +428,8 @@ function renderAgents() {
         el("span", { class: dot, title: STATE_TITLES[st] }),
         agent.name,
         agent.profile ? el("span", { class: "tag" }, agent.profile) : null,
+        agent.plan ? el("span", { class: "tag", title: "its plan" },
+          `plan ${agent.plan.filter((s) => s.status === "completed").length}/${agent.plan.length}`) : null,
         agent.unsafe_tools ? el("span", { class: "badge danger", title: "Has the unsafe tools: unsandboxed commands, web access" }, "unsafe") : null),
       el("div", { class: `agent-activity ${st}`, title: agent.activity || "" },
         agent.activity ? `${firstLine(agent.activity, 60)} · ${relative(agent.activity_at)}` : "-"),
@@ -648,6 +653,7 @@ function select(what) {
   renderDetail();
   renderFeed();
   pollEvents();
+  if (what?.kind === "agent" && state.agentView === "conversation") loadConversation();
 }
 
 $("detail-back").addEventListener("click", () => select(null));
@@ -698,6 +704,20 @@ function renderProblems(task, st) {
 function renderDetail() {
   renderFeedStatus();
   if (state.selected?.kind !== "task") renderProblems(null);
+  const agentSelected = state.selected?.kind === "agent";
+  renderPlan(agentSelected ? state.agents.find((a) => a.name === state.selected.name) : null);
+  $("agent-views").hidden = !agentSelected;
+  $("composer").hidden = !agentSelected;
+  const conversation = agentSelected && state.agentView === "conversation";
+  $("activity-view").hidden = conversation;
+  $("conversation-view").hidden = !conversation;
+  for (const button of document.querySelectorAll("[data-agent-view]")) {
+    button.classList.toggle("on", button.dataset.agentView === (agentSelected ? state.agentView : ""));
+  }
+  if (agentSelected) {
+    $("composer").elements.text.placeholder =
+      `Message ${state.selected.name}… (Ctrl+Enter to send)`;
+  }
   const selected = state.selected;
   const fields = $("detail-fields");
   const actions = $("detail-actions");
@@ -762,6 +782,9 @@ function renderDetail() {
   } else if (["waiting", "blocked", "held", "running"].includes(st)) {
     actions.append(el("button", { onclick: () => taskAction(task.id, "disable") }, "Disable"));
   }
+  if (st !== "running") {
+    actions.append(el("button", { onclick: () => openTaskEditor(task) }, "Edit…"));
+  }
   if (["waiting", "blocked", "held", "disabled"].includes(st) && task.kind === "prompt") {
     actions.append(el("button", { onclick: () => reassign(task) }, "Run on…"));
   }
@@ -819,6 +842,9 @@ async function openAgentDialog(name, from) {
       form.elements[field].value = config[field] ?? "";
     }
     form.elements.unsafe_tools.checked = !!config.unsafe_tools;
+    $("agent-profile").replaceChildren(el("option", { value: "" }, "(keep these settings)"),
+      ...state.profiles.map((p) => el("option", { value: p.name },
+        `${p.name}${p.settings?.description ? ` — ${p.settings.description}` : ""}`)));
     form.elements.parameters.value = config.parameters ? JSON.stringify(config.parameters) : "";
     const chosen = new Set(config.tools || []);
     $("all-tools").checked = !config.tools;
@@ -834,6 +860,26 @@ async function openAgentDialog(name, from) {
 
 $("all-tools").addEventListener("change", (e) =>
   $("tool-list").classList.toggle("disabled", e.target.checked));
+
+// Fills the agent form with a profile's settings; its unsafe tools and
+// working directory stay as they are - a profile has neither.
+$("agent-profile").addEventListener("change", (e) => {
+  const profile = state.profiles.find((p) => p.name === e.target.value);
+  if (!profile) return;
+  const form = $("agent-form");
+  const settings = profile.settings || {};
+  for (const field of ["model", "endpoint", "system_prompt", "max_tokens", "context_window"]) {
+    form.elements[field].value = settings[field] ?? "";
+  }
+  if (settings.description && !form.elements.description.value) {
+    form.elements.description.value = settings.description;
+  }
+  form.elements.parameters.value = settings.parameters ? JSON.stringify(settings.parameters) : "";
+  const chosen = new Set(settings.tools || []);
+  $("all-tools").checked = !settings.tools;
+  for (const box of form.querySelectorAll("input[name=tool]")) box.checked = chosen.has(box.value);
+  $("tool-list").classList.toggle("disabled", !settings.tools);
+});
 $("new-agent-button").addEventListener("click", () => openAgentDialog(null));
 $("agent-cancel").addEventListener("click", () => $("agent-dialog").close());
 
@@ -875,6 +921,8 @@ $("agent-form").addEventListener("submit", async (e) => {
       : [...form.querySelectorAll("input[name=tool]:checked")].map((c) => c.value),
   };
   if (config.cwd && !config.cwd.startsWith("/")) return showAgentError("The working directory must be an absolute path.");
+  // Made from a profile: recorded, with what the form says over it.
+  if ($("agent-profile").value) config.profile = $("agent-profile").value;
   try {
     if (editing) {
       await api("PATCH", `agents/${encodeURIComponent(editing)}/config`,
@@ -916,6 +964,377 @@ function reassign(task) {
   taskAction(task.id, "assign", body);
 }
 
+// An agent's plan (plan_update), as a checklist.
+function renderPlan(agent) {
+  const box = $("plan");
+  const steps = agent?.plan || [];
+  box.hidden = !steps.length;
+  if (!steps.length) return;
+  const done = steps.filter((s) => s.status === "completed").length;
+  box.replaceChildren(
+    el("h3", {}, `Plan · ${done}/${steps.length}`),
+    el("ol", {}, steps.map((s) => el("li", { class: s.status, title: s.status.replace("_", " ") }, s.content))));
+}
+
+// --- An agent's conversation, and messages to it ---------------------------
+
+for (const button of document.querySelectorAll("[data-agent-view]")) {
+  button.addEventListener("click", () => {
+    state.agentView = button.dataset.agentView;
+    renderDetail();
+    if (state.agentView === "conversation") loadConversation();
+  });
+}
+
+function messageNode(message) {
+  const role = message.role || "?";
+  const content = typeof message.content === "string" ? message.content : "";
+  if (role === "tool") {
+    return el("div", { class: "msg tool" },
+      el("details", {},
+        el("summary", {}, `${message.name || "tool"} result · ${firstLine(content, 100)}`),
+        el("pre", {}, content)));
+  }
+  const calls = (message.tool_calls || []).map((call) =>
+    el("details", { class: "call" },
+      el("summary", {}, `→ ${call.function?.name}(${firstLine(call.function?.arguments, 100)})`),
+      el("pre", {}, call.function?.arguments || "")));
+  return el("div", { class: `msg ${role}` },
+    el("span", { class: "role" }, role),
+    content ? el("div", {}, content) : null,
+    calls);
+}
+
+let loadingConversation = false;
+
+async function loadConversation() {
+  const selected = state.selected;
+  if (selected?.kind !== "agent" || loadingConversation) return;
+  loadingConversation = true;
+  try {
+    const { total, messages } = await api("GET", `agents/${encodeURIComponent(selected.name)}/messages`);
+    if (state.selected !== selected) return;
+    $("conversation-info").textContent = total
+      ? `${total} message${total === 1 ? "" : "s"}${messages.length < total ? `, the last ${messages.length} shown` : ""} - saved after each turn.`
+      : "No conversation saved yet.";
+    $("conversation").replaceChildren(...messages.map(messageNode));
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    loadingConversation = false;
+  }
+}
+
+$("composer").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const name = state.selected?.kind === "agent" && state.selected.name;
+  const text = e.target.elements.text.value.trim();
+  if (!name || !text) return;
+  try {
+    const reply = await api("POST", `agents/${encodeURIComponent(name)}/messages`, { text });
+    e.target.elements.text.value = "";
+    toast(reply.note || `Sent to ${name} (task #${reply.task_id}): its answer shows here once it's run.`);
+    refresh();
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
+$("composer").elements.text.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    $("composer").requestSubmit();
+  }
+});
+
+// --- Running a tool ---------------------------------------------------------
+
+let toolSchemas = null;
+
+// An input for one of a tool's parameters, from its JSON schema.
+function paramField(name, schema, required) {
+  const label = el("span", { class: required ? "required" : "" }, name);
+  const hint = schema.description ? el("span", { class: "hint" }, schema.description) : null;
+  let input;
+  if (schema.enum) {
+    input = el("select", { "data-param": name, "data-kind": "string" },
+      required ? null : el("option", { value: "" }, ""),
+      schema.enum.map((v) => el("option", { value: v }, v)));
+  } else if (schema.type === "boolean") {
+    return el("label", { class: "inline" },
+      el("input", { type: "checkbox", "data-param": name, "data-kind": "boolean" }), label, hint);
+  } else if (schema.type === "integer" || schema.type === "number") {
+    input = el("input", { type: "number", "data-param": name, "data-kind": schema.type });
+  } else if (schema.type === "array" || schema.type === "object") {
+    input = el("textarea", { rows: 3, spellcheck: "false", "data-param": name, "data-kind": "json",
+      placeholder: schema.type === "array" ? '["…"]' : '{"…": …}' });
+  } else {
+    const long = /content|command|body|text|prompt/.test(name);
+    input = long
+      ? el("textarea", { rows: 4, "data-param": name, "data-kind": "string" })
+      : el("input", { "data-param": name, "data-kind": "string", spellcheck: "false" });
+  }
+  return el("label", {}, label, hint, input);
+}
+
+function renderToolFields() {
+  const tool = toolSchemas.find((t) => t.name === $("tool-select").value);
+  $("tool-description").textContent = tool?.description || "";
+  const props = tool?.parameters?.properties || {};
+  const required = new Set(tool?.parameters?.required || []);
+  // What it needs first.
+  const entries = Object.entries(props).sort(([a], [b]) => required.has(b) - required.has(a));
+  $("tool-fields").replaceChildren(...entries.map(([name, schema]) =>
+    paramField(name, schema, required.has(name))));
+  $("tool-result").hidden = true;
+  $("tool-error").hidden = true;
+}
+
+$("run-tool-button").addEventListener("click", async () => {
+  try {
+    if (!toolSchemas) toolSchemas = await api("GET", "tools?schemas=1");
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  const select = $("tool-select");
+  const current = select.value || "kb_search";
+  select.replaceChildren(...toolSchemas.map((t) => el("option", { value: t.name }, t.name)));
+  select.value = toolSchemas.some((t) => t.name === current) ? current : toolSchemas[0]?.name;
+  $("tool-agent").replaceChildren(el("option", { value: "" }, "(none)"),
+    ...state.agents.map((a) => el("option", { value: a.name }, a.name)));
+  renderToolFields();
+  $("tool-dialog").showModal();
+});
+$("tool-select").addEventListener("change", renderToolFields);
+$("tool-close").addEventListener("click", () => $("tool-dialog").close());
+
+$("tool-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const showError = (message) => {
+    $("tool-error").textContent = message;
+    $("tool-error").hidden = false;
+  };
+  $("tool-error").hidden = true;
+  const args = {};
+  for (const input of $("tool-fields").querySelectorAll("[data-param]")) {
+    const name = input.dataset.param;
+    const kind = input.dataset.kind;
+    if (kind === "boolean") {
+      if (input.checked) args[name] = true;
+      continue;
+    }
+    const value = input.value.trim();
+    if (!value) continue;
+    if (kind === "json") {
+      try {
+        args[name] = JSON.parse(value);
+      } catch {
+        return showError(`${name} must be JSON.`);
+      }
+    } else if (kind === "integer" || kind === "number") {
+      args[name] = Number(value);
+    } else {
+      args[name] = input.value;
+    }
+  }
+  const name = $("tool-select").value;
+  const box = $("tool-result");
+  try {
+    const reply = await api("POST", `tools/${encodeURIComponent(name)}/run`,
+      { arguments: args, agent: $("tool-agent").value || null });
+    box.hidden = false;
+    box.className = "tool-result";
+    box.replaceChildren(el("div", { class: "hint" }, reply.note || `Running as task #${reply.task_id}…`));
+    // Its result, once a session has run it.
+    for (let i = 0; i < 120; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      const task = await api("GET", `tasks/${reply.task_id}`);
+      if (task.status === "done") {
+        const failed = task.last_outcome === "failed";
+        box.className = `tool-result${failed ? " failed" : ""}`;
+        box.replaceChildren(
+          el("div", { class: "hint" }, `${name} ${failed ? "failed" : "done"} · task #${task.id}`),
+          el("pre", {}, task.last_result || "(no output)"));
+        refresh();
+        return;
+      }
+    }
+    box.replaceChildren(el("div", { class: "hint" },
+      `Task #${reply.task_id} hasn't run yet: it will once a chat or worker is running.`));
+  } catch (err) {
+    showError(err.message);
+  }
+});
+
+// --- Cleaning up ----------------------------------------------------------
+
+function listOf(things, label) {
+  if (!things.length) return `No ${label}.`;
+  const shown = things.slice(0, 12).join(", ");
+  return `${things.length} ${label}: ${shown}${things.length > 12 ? ", …" : ""}`;
+}
+
+async function previewCleanup() {
+  try {
+    const { tasks } = await api("POST", "tasks/prune", { older_than: $("prune-age").value.trim(), dry_run: true });
+    $("prune-preview").textContent = listOf(tasks.map((id) => `#${id}`), "tasks to remove");
+    $("prune-button").disabled = !tasks.length;
+  } catch (e) {
+    $("prune-preview").textContent = e.message;
+    $("prune-button").disabled = true;
+  }
+  try {
+    const { agents } = await api("POST", "agents/cleanup", { dry_run: true });
+    $("agents-preview").textContent = listOf(agents, "agents to remove");
+    $("agents-cleanup-button").disabled = !agents.length;
+  } catch (e) {
+    $("agents-preview").textContent = e.message;
+  }
+}
+
+$("cleanup-button").addEventListener("click", () => {
+  previewCleanup();
+  $("cleanup-dialog").showModal();
+});
+$("cleanup-close").addEventListener("click", () => $("cleanup-dialog").close());
+$("prune-age").addEventListener("input", previewCleanup);
+
+$("prune-button").addEventListener("click", async () => {
+  try {
+    const { tasks } = await api("POST", "tasks/prune", { older_than: $("prune-age").value.trim() });
+    toast(`Removed ${tasks.length} task${tasks.length === 1 ? "" : "s"}.`);
+  } catch (e) {
+    toast(e.message);
+  }
+  await refresh();
+  previewCleanup();
+});
+
+$("agents-cleanup-button").addEventListener("click", async () => {
+  try {
+    const { agents } = await api("POST", "agents/cleanup", {});
+    toast(`Removed ${agents.length} agent${agents.length === 1 ? "" : "s"}.`);
+    if (state.selected?.kind === "agent" && agents.includes(state.selected.name)) select(null);
+  } catch (e) {
+    toast(e.message);
+  }
+  await refresh();
+  previewCleanup();
+});
+
+// --- Profiles -------------------------------------------------------------
+
+function renderProfileList() {
+  const list = $("profile-list");
+  if (!state.profiles.length) {
+    list.replaceChildren(el("div", { class: "empty" }, "No profiles yet."));
+    return;
+  }
+  list.replaceChildren(...state.profiles.map((p) => {
+    const s = p.settings || {};
+    const editable = p.source === "database";
+    return el("div", { class: "profile-row" },
+      el("div", { class: "what" },
+        el("div", { class: "card-title" }, p.name, " ",
+          el("span", { class: "badge" }, editable ? "database" : "config file")),
+        el("div", { class: "card-meta" },
+          [s.model || "the session's model", s.description].filter(Boolean).join(" · "))),
+      editable ? el("button", { onclick: () => openProfileEditor(p) }, "Edit…") : null,
+      editable ? el("button", { class: "danger", onclick: () => deleteProfile(p.name) }, "Delete") : null);
+  }));
+}
+
+$("profiles-button").addEventListener("click", () => {
+  renderProfileList();
+  $("profiles-dialog").showModal();
+});
+$("profiles-close").addEventListener("click", () => $("profiles-dialog").close());
+$("new-profile-button").addEventListener("click", () => openProfileEditor(null));
+$("profile-cancel").addEventListener("click", () => $("profile-dialog").close());
+$("profile-all-tools").addEventListener("change", (e) =>
+  $("profile-tool-list").classList.toggle("disabled", e.target.checked));
+
+async function openProfileEditor(profile) {
+  const form = $("profile-form");
+  form.reset();
+  $("profile-error").hidden = true;
+  $("profile-dialog-title").textContent = profile ? `Profile ${profile.name}` : "New profile";
+  form.elements.name.readOnly = !!profile;
+  try {
+    if (!state.tools) state.tools = await api("GET", "tools");
+  } catch (e) {
+    toast(e.message);
+    return;
+  }
+  const s = profile?.settings || {};
+  form.elements.name.value = profile?.name || "";
+  for (const field of ["description", "model", "endpoint", "system_prompt", "max_tokens", "context_window"]) {
+    form.elements[field].value = s[field] ?? "";
+  }
+  form.elements.parameters.value = s.parameters ? JSON.stringify(s.parameters) : "";
+  const chosen = new Set(s.tools || []);
+  $("profile-all-tools").checked = !s.tools;
+  $("profile-tool-list").replaceChildren(...state.tools.map((tool) => el("label", { class: "inline" },
+    el("input", { type: "checkbox", name: "tool", value: tool, checked: chosen.has(tool) }), tool)));
+  $("profile-tool-list").classList.toggle("disabled", !s.tools);
+  // Kept as they were: what this form doesn't show.
+  form.dataset.kept = JSON.stringify(s.api_key ? { api_key: s.api_key } : {});
+  $("profile-dialog").showModal();
+}
+
+$("profile-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const value = (field) => form.elements[field].value.trim() || undefined;
+  const number = (field) => (value(field) === undefined ? undefined : Number(value(field)));
+  const showError = (message) => {
+    $("profile-error").textContent = message;
+    $("profile-error").hidden = false;
+  };
+  let parameters;
+  if (value("parameters")) {
+    try {
+      parameters = JSON.parse(value("parameters"));
+    } catch {
+      return showError("Request parameters must be JSON.");
+    }
+  }
+  const settings = {
+    ...JSON.parse(form.dataset.kept || "{}"),
+    description: value("description"),
+    model: value("model"),
+    endpoint: value("endpoint"),
+    system_prompt: value("system_prompt"),
+    max_tokens: number("max_tokens"),
+    context_window: number("context_window"),
+    parameters,
+    tools: $("profile-all-tools").checked ? undefined
+      : [...form.querySelectorAll("input[name=tool]:checked")].map((c) => c.value),
+  };
+  const name = value("name");
+  if (!name) return showError("Give it a name.");
+  try {
+    await api("POST", "profiles", { name, settings });
+    $("profile-dialog").close();
+    await refresh();
+    renderProfileList();
+  } catch (err) {
+    showError(err.message);
+  }
+});
+
+async function deleteProfile(name) {
+  if (!confirm(`Delete profile ${name}? Agents made from it keep their settings.`)) return;
+  try {
+    await api("DELETE", `profiles/${encodeURIComponent(name)}`);
+  } catch (e) {
+    toast(e.message);
+  }
+  await refresh();
+  renderProfileList();
+}
+
 // --- Views ----------------------------------------------------------------
 
 function setView(view) {
@@ -941,7 +1360,7 @@ function fillTargets(preset) {
   if (state.profiles.length) {
     options.push(el("optgroup", { label: "New agent from a profile" },
       state.profiles.map((p) => el("option", { value: `profile:${p.name}` },
-        p.name + (p.description ? ` — ${p.description}` : "")))));
+        p.name + (p.settings?.description ? ` — ${p.settings.description}` : "")))));
   }
   if (state.agents.length) {
     options.push(el("optgroup", { label: "Agent" },
@@ -982,9 +1401,51 @@ $("target-select").addEventListener("change", updateTargetHint);
 
 $("cwd-input").addEventListener("input", (e) => { e.target.dataset.edited = "1"; });
 
+// The task being edited in the New task form, or null for a new one.
+let editingTask = null;
+
 function openNewTask(preset) {
+  editingTask = null;
+  $("new-task-form").reset();
+  $("new-task-title").textContent = "New task";
+  $("new-task-submit").textContent = "Create";
+  $("hold-option").hidden = false;
   delete $("cwd-input").dataset.edited;
   fillTargets(preset);
+  $("new-task-error").hidden = true;
+  $("new-task").showModal();
+}
+
+// "2026-10-03T08:00:00Z" as a datetime-local input's value, local time.
+function localInputTime(text) {
+  const date = parseTime(text);
+  if (!date) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+// The same form, filled in with `task`, to change it.
+function openTaskEditor(task) {
+  const form = $("new-task-form");
+  form.reset();
+  editingTask = task.id;
+  $("new-task-title").textContent = `Edit task #${task.id}`;
+  $("new-task-submit").textContent = "Save";
+  $("hold-option").hidden = true;
+  fillTargets(task.profile ? `profile:${task.profile}` : task.agent_name ? `agent:${task.agent_name}` : "");
+  form.elements.command.value = task.command;
+  form.elements.name.value = task.name;
+  form.elements.tool.checked = task.kind === "tool";
+  form.elements.depends_on.value = (task.depends_on || []).join(", ");
+  $("cwd-input").value = task.cwd || "";
+  $("cwd-input").dataset.edited = "1";
+  if (task.cron_expression) {
+    form.elements.when.value = "cron";
+    form.elements.cron.value = task.cron_expression;
+  } else {
+    form.elements.when.value = "at";
+    form.elements.at.value = localInputTime(task.run_at);
+  }
   $("new-task-error").hidden = true;
   $("new-task").showModal();
 }
@@ -1017,7 +1478,13 @@ $("new-task-form").addEventListener("submit", async (e) => {
   }
   if (body.depends_on.some(isNaN)) return showFormError("Dependencies are task ids, e.g. 3, 5.");
   try {
-    const { id } = await api("POST", "tasks", body);
+    let id = editingTask;
+    if (id === null) {
+      id = (await api("POST", "tasks", body)).id;
+    } else {
+      delete body.hold; // held or not is the task's state, not what it is
+      await api("PATCH", `tasks/${id}`, body);
+    }
     try { if (body.cwd) localStorage.setItem("faber-cwd", body.cwd); } catch { /* fine */ }
     $("new-task").close();
     e.target.reset();
@@ -1056,9 +1523,12 @@ async function refresh() {
   }
 }
 
+let ticks = 0;
+
 async function tick() {
   await refresh();
   await pollEvents();
+  if (state.agentView === "conversation" && ++ticks % 3 === 0) loadConversation();
   setTimeout(tick, POLL_MS);
 }
 
