@@ -350,6 +350,10 @@ fn dispatch_inner(
             let v = db::set_task_held(&conn, i64_param!("task_id"), held)?;
             Ok(serde_json::to_value(v)?)
         }
+        "request_task_stop" => {
+            let v = db::request_task_stop(&conn, i64_param!("task_id"))?;
+            Ok(serde_json::to_value(v)?)
+        }
         "run_task_now" => {
             let v = db::run_task_now(&conn, i64_param!("task_id"))?;
             Ok(serde_json::to_value(v)?)
@@ -563,6 +567,7 @@ mod tests {
                 depends_on: Vec::new(),
                 profile: Some("fast".to_string()),
                 run_safe: false,
+                cwd: None,
             })
             .unwrap();
         assert_eq!(

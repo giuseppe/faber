@@ -27,9 +27,10 @@
 //! - `GET /api/events?agent=&task=&after=&limit=`
 //! - `GET /api/tasks`, `GET /api/tasks/<id>`, `POST /api/tasks`,
 //!   `DELETE /api/tasks/<id>`,
-//!   `POST /api/tasks/<id>/hold|release|enable|disable|run`,
+//!   `POST /api/tasks/<id>/hold|release|enable|disable|run|stop`,
 //!   `POST /api/tasks/<id>/assign`
-//! - `GET /api/profiles`
+//! - `GET /api/profiles`, `GET /api/info` (the server's directory, for a
+//!   new task's default)
 //!
 //! With an auth key, every `/api/` request needs `Authorization: Bearer
 //! <key>`; the UI's own files don't, as they hold no data. Without one,
@@ -398,6 +399,23 @@ struct ApiNewTask {
     depends_on: Vec<i64>,
     #[serde(default)]
     hold: bool,
+    /// The directory it runs in, absolute; default: its agent's.
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+/// `dir` as a working directory: absolute, and resolved if it's on this
+/// machine - the agent running it may be on another.
+fn absolute_dir(dir: &str) -> Result<String, String> {
+    let path = std::path::Path::new(dir);
+    if !path.is_absolute() {
+        return Err(format!("'{}': give an absolute path", dir));
+    }
+    Ok(path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned())
 }
 
 fn non_empty(value: &Option<String>) -> Option<String> {
@@ -455,6 +473,9 @@ impl ApiNewTask {
         let name = non_empty(&self.name)
             .or(tool_name)
             .unwrap_or_else(|| first_line(&command, 40));
+        let cwd = non_empty(&self.cwd)
+            .map(|dir| absolute_dir(&dir))
+            .transpose()?;
         Ok(db::NewTask {
             name,
             description: String::new(),
@@ -471,6 +492,7 @@ impl ApiNewTask {
             depends_on: self.depends_on,
             profile: non_empty(&self.profile),
             run_safe: false,
+            cwd,
         })
     }
 }
@@ -550,23 +572,9 @@ fn api(
             if db::get_agent(conn, name)?.is_none() {
                 return Ok(Response::error(404, &format!("no agent named '{}'", name)));
             }
-            let cwd = match body_json::<Body>(request)?.cwd.as_deref().map(str::trim) {
-                None | Some("") => None,
-                Some(path) => {
-                    let path = std::path::Path::new(path);
-                    if !path.is_absolute() {
-                        return Err("give an absolute path".into());
-                    }
-                    // The agent may run on another machine than this
-                    // server: only resolved if it's here.
-                    Some(
-                        path.canonicalize()
-                            .unwrap_or_else(|_| path.to_path_buf())
-                            .to_string_lossy()
-                            .into_owned(),
-                    )
-                }
-            };
+            let cwd = non_empty(&body_json::<Body>(request)?.cwd)
+                .map(|dir| absolute_dir(&dir))
+                .transpose()?;
             let mut config = db::get_agent_config(conn, name)?;
             config.cwd = cwd.clone();
             db::set_agent_config(conn, name, &config)?;
@@ -654,17 +662,30 @@ fn api(
             }
             Response::ok(true)
         }
-        ("POST", ["tasks", id, action @ ("enable" | "disable" | "run")]) => {
+        (
+            "POST",
+            [
+                "tasks",
+                id,
+                action @ ("enable" | "disable" | "run" | "stop"),
+            ],
+        ) => {
             let id = task_id(id)?;
             let changed = match *action {
                 "run" => db::run_task_now(conn, id)?,
+                "stop" => db::request_task_stop(conn, id)?,
                 action => db::set_task_enabled(conn, id, action == "enable")?,
             };
             if !changed {
                 let status = db::get_task(conn, id)?
                     .map(|t| t.status)
                     .ok_or_else(|| format!("no task #{}", id))?;
-                return Err(format!("task #{} can't be {}d: it's {}", id, action, status).into());
+                let done = match *action {
+                    "stop" => "stopped".to_string(),
+                    "run" => "run".to_string(),
+                    action => format!("{}d", action),
+                };
+                return Err(format!("task #{} can't be {}: it's {}", id, done, status).into());
             }
             Response::ok(true)
         }
@@ -683,7 +704,10 @@ fn api(
             Response::ok(true)
         }
         ("GET", ["profiles"]) => Response::ok(profiles),
-        (_, ["agents" | "events" | "tasks" | "profiles", ..]) => {
+        ("GET", ["info"]) => Response::ok(serde_json::json!({
+            "cwd": std::env::current_dir().ok(),
+        })),
+        (_, ["agents" | "events" | "tasks" | "profiles" | "info", ..]) => {
             Response::error(405, "method not allowed")
         }
         _ => Response::error(404, "not found"),
@@ -881,6 +905,29 @@ mod tests {
         );
         assert_eq!(call(&db, "DELETE", &path, "").status, 200);
         assert_eq!(call(&db, "GET", &path, "").status, 404);
+    }
+
+    #[test]
+    fn test_a_task_can_run_in_its_own_directory() {
+        let db = test_db();
+        let tmp = std::env::temp_dir();
+        let body = serde_json::json!({"command": "count lines", "cwd": tmp}).to_string();
+        let id = json(&call(&db, "POST", "/api/tasks", &body))["id"]
+            .as_i64()
+            .unwrap();
+        let task = json(&call(&db, "GET", &format!("/api/tasks/{}", id), ""));
+        assert_eq!(
+            task["cwd"].as_str().map(std::path::PathBuf::from),
+            Some(tmp.canonicalize().unwrap())
+        );
+        let r = call(
+            &db,
+            "POST",
+            "/api/tasks",
+            r#"{"command": "x", "cwd": "rel/dir"}"#,
+        );
+        assert_eq!(r.status, 400);
+        assert!(json(&call(&db, "GET", "/api/info", ""))["cwd"].is_string());
     }
 
     #[test]

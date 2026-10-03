@@ -84,6 +84,13 @@ pub struct TaskRow {
     /// an unsafe one through a task.
     #[serde(default)]
     pub run_safe: bool,
+    /// The directory it runs in, over its agent's own (absolute).
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Asked to stop (`request_task_stop`) while running: the session
+    /// running it interrupts it.
+    #[serde(default)]
+    pub stop_requested: bool,
 }
 
 /// What a task's `command` is:
@@ -135,6 +142,9 @@ pub struct NewTask {
     /// See `TaskRow::run_safe`.
     #[serde(default)]
     pub run_safe: bool,
+    /// See `TaskRow::cwd`.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// A task's lifecycle:
@@ -216,11 +226,13 @@ const TASK_TABLE_DEFINITION: &str = "
     depends_on TEXT DEFAULT NULL,
     profile TEXT DEFAULT NULL,
     run_safe INTEGER NOT NULL DEFAULT 0,
+    cwd TEXT DEFAULT NULL,
+    stop_requested INTEGER NOT NULL DEFAULT 0,
     CHECK(agent_name IS NULL OR profile IS NULL),
     FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE SET NULL";
 
 /// Every column of `TASK_TABLE_DEFINITION`, for copying rows across.
-const TASK_TABLE_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, kind, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, depends_on, profile, run_safe";
+const TASK_TABLE_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, kind, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, depends_on, profile, run_safe, cwd, stop_requested";
 
 /// Brings an existing `scheduled_tasks` table to `TASK_TABLE_DEFINITION`
 /// when its constraints are older: its `status` one predates the `held`
@@ -341,6 +353,8 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
         "depends_on TEXT DEFAULT NULL",
         "profile TEXT DEFAULT NULL",
         "run_safe INTEGER NOT NULL DEFAULT 0",
+        "cwd TEXT DEFAULT NULL",
+        "stop_requested INTEGER NOT NULL DEFAULT 0",
         "kind TEXT NOT NULL DEFAULT 'tool' CHECK(kind IN ('tool', 'prompt'))",
     ] {
         let _ = conn.execute_batch(&format!(
@@ -758,10 +772,12 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
             .unwrap_or_default(),
         profile: row.get(21)?,
         run_safe: row.get(22)?,
+        cwd: row.get(23)?,
+        stop_requested: row.get(24)?,
     })
 }
 
-const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, kind, depends_on, profile, run_safe";
+const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, kind, depends_on, profile, run_safe, cwd, stop_requested";
 
 pub fn create_cron_task(
     conn: &Connection,
@@ -873,8 +889,8 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
     conn.execute(
         "INSERT INTO scheduled_tasks
              (name, description, kind, task_type, cron_expression, run_at, next_run_at,
-              agent_name, command, max_runs, status, depends_on, profile, run_safe)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              agent_name, command, max_runs, status, depends_on, profile, run_safe, cwd)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             task.name,
             task.description,
@@ -893,7 +909,8 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
             },
             depends_on,
             task.profile,
-            task.run_safe
+            task.run_safe,
+            task.cwd
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -1043,6 +1060,33 @@ pub fn set_task_enabled(
     Ok(rows > 0)
 }
 
+/// Asks the session running a task to stop it. Returns false if it isn't
+/// running. If nobody is running it any more - its session died - it's
+/// ended right here instead, as failed.
+pub fn request_task_stop(conn: &Connection, task_id: i64) -> Result<bool, Box<dyn Error>> {
+    let abandoned = format!(
+        "UPDATE scheduled_tasks SET
+             status = CASE WHEN task_type = 'cron' THEN 'scheduled' ELSE 'done' END,
+             claimed_by = NULL, stop_requested = 0,
+             last_outcome = 'failed', last_result = 'stopped (nobody was running it any more)',
+             last_run_at = ?2
+         WHERE id = ?1 AND status = 'running' AND ({})",
+        CLAIM_ABANDONED
+    );
+    if conn.execute(
+        &abandoned,
+        params![task_id, chrono::Utc::now().to_rfc3339()],
+    )? > 0
+    {
+        return Ok(true);
+    }
+    let rows = conn.execute(
+        "UPDATE scheduled_tasks SET stop_requested = 1 WHERE id = ?1 AND status = 'running'",
+        params![task_id],
+    )?;
+    Ok(rows > 0)
+}
+
 /// Makes a task due right away, whatever it was waiting for - its time, a
 /// release (`held`), being enabled (`disabled`) - or, `done`, runs it
 /// again. Dependencies still have to be met. A running task is left
@@ -1185,7 +1229,8 @@ pub fn claim_task(
 ) -> Result<bool, Box<dyn Error>> {
     let now = chrono::Utc::now().to_rfc3339();
     let sql = format!(
-        "UPDATE scheduled_tasks SET status = 'running', claimed_by = ?2, started_at = ?3
+        "UPDATE scheduled_tasks SET status = 'running', claimed_by = ?2, started_at = ?3,
+             stop_requested = 0
          WHERE id = ?1 AND next_run_at <= ?3
            AND (status = 'scheduled' OR (status = 'running' AND ({})))
            AND {}",
@@ -1232,7 +1277,8 @@ pub fn finish_task(
              last_outcome = ?6,
              last_exit_code = ?7,
              last_result = ?8,
-             claimed_by = NULL
+             claimed_by = NULL,
+             stop_requested = 0
          WHERE id = ?1 AND claimed_by = ?2",
         params![
             task_id,
@@ -2032,6 +2078,36 @@ mod tests {
     }
 
     #[test]
+    fn test_request_task_stop() {
+        let conn = test_db();
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let id = create_oneshot_task(&conn, "t", "", &past, "x", None).unwrap();
+        assert!(!request_task_stop(&conn, id).unwrap(), "not running");
+        // Running in a live session: it's asked to stop.
+        create_agent(&conn, "w", "").unwrap();
+        assert!(claim_agent(&conn, "w", "s").unwrap());
+        assert!(claim_task(&conn, id, "s").unwrap());
+        assert!(request_task_stop(&conn, id).unwrap());
+        assert!(get_task(&conn, id).unwrap().unwrap().stop_requested);
+        let outcome = TaskOutcome {
+            succeeded: false,
+            exit_code: None,
+            result: "stopped".to_string(),
+        };
+        assert!(finish_task(&conn, id, "s", &outcome).unwrap());
+        assert!(!get_task(&conn, id).unwrap().unwrap().stop_requested);
+        // Running in a session that's gone: ended right away.
+        let id = create_oneshot_task(&conn, "t2", "", &past, "x", None).unwrap();
+        assert!(claim_task(&conn, id, "dead-session").unwrap());
+        assert!(request_task_stop(&conn, id).unwrap());
+        let task = get_task(&conn, id).unwrap().unwrap();
+        assert_eq!(
+            (task.status.as_str(), task.last_outcome.as_deref()),
+            ("done", Some("failed"))
+        );
+    }
+
+    #[test]
     fn test_run_task_now_makes_any_waiting_or_finished_task_due() {
         let conn = test_db();
         let later = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
@@ -2646,6 +2722,7 @@ mod tests {
             depends_on: Vec::new(),
             profile: None,
             run_safe: false,
+            cwd: None,
         };
         let id = create_task(&conn, &task("prompt")).unwrap();
         let row = get_task(&conn, id).unwrap().unwrap();
@@ -2835,6 +2912,7 @@ mod tests {
                 depends_on: Vec::new(),
                 profile: None,
                 run_safe: false,
+                cwd: None,
             },
         )
         .unwrap();
@@ -3236,6 +3314,7 @@ mod tests {
                 depends_on,
                 profile: None,
                 run_safe: false,
+                cwd: None,
             },
         )
         .unwrap()
@@ -3335,6 +3414,7 @@ mod tests {
                 depends_on: vec![999],
                 profile: None,
                 run_safe: false,
+                cwd: None,
             },
         )
         .unwrap_err();
@@ -3468,6 +3548,7 @@ mod tests {
             depends_on: Vec::new(),
             profile: profile.map(String::from),
             run_safe: false,
+            cwd: None,
         };
         let id = create_task(&conn, &task(TaskKind::PROMPT, None, Some("fast"))).unwrap();
         assert_eq!(

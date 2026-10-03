@@ -39,6 +39,7 @@ use crate::openai::{
 };
 use crate::{ActivityRecorder, SubAgentContext};
 use faber::ToolContext;
+use faber::agent_io::{AgentEvent, AgentOutput, EventLog};
 use faber::db::AgentConfig;
 
 const MAX_ITEMS: usize = 1000;
@@ -170,13 +171,51 @@ fn worker_context(ctx: &ToolContext) -> ToolContext {
     worker_ctx
 }
 
+/// A worker's progress handler: the status bar, and its agent's activity.
+fn worker_progress(
+    sa_ctx: &SubAgentContext,
+    status_key: &str,
+    activity: Option<Arc<ActivityRecorder>>,
+) -> Box<dyn Fn(&ProgressInfo) -> Result<(), Box<dyn Error>>> {
+    let status_bar = sa_ctx.status_bar.clone();
+    let key = status_key.to_string();
+    Box::new(move |progress: &ProgressInfo| {
+        if let Some(activity) = &activity {
+            activity.follow(&progress.status);
+        }
+        let status = match &progress.status {
+            StatusUpdate::Thinking => "Thinking".to_string(),
+            StatusUpdate::ToolStart { name, .. } => format!("Running {}", name),
+            StatusUpdate::SendingRequest { .. } => "Waiting for response".to_string(),
+            StatusUpdate::WaitingForSlot => "Waiting for a free request slot".to_string(),
+            _ => return Ok(()),
+        };
+        status_bar.set_agent_status(&key, &status, false);
+        Ok(())
+    })
+}
+
+/// Releases a worker's agent however its run ends.
+struct ReleaseWhenDone(Option<(Arc<dyn faber::db_backend::DbBackend>, String, String)>);
+
+impl Drop for ReleaseWhenDone {
+    fn drop(&mut self) {
+        if let Some((db, agent, session)) = &self.0 {
+            let _ = db.release_agent(agent, session);
+        }
+    }
+}
+
 /// Runs one worker to completion. `cancel` gets a message on Ctrl-C.
+/// With a database, it runs as `agent`, a sub-agent of the caller made
+/// for it - so it can be seen, and followed, like any other.
 fn run_worker(
     sa_ctx: &SubAgentContext,
     ctx: &ToolContext,
     tools: &ToolsCollection,
     config: &AgentConfig,
     status_key: &str,
+    agent: &str,
     prompt: String,
     handoff: Option<&crate::Message>,
     schema: Option<&serde_json::Value>,
@@ -184,32 +223,50 @@ fn run_worker(
 ) -> Result<String, Box<dyn Error>> {
     let mut worker_ctx = worker_context(ctx);
     worker_ctx.context_window = config.context_window.or(ctx.context_window);
+    let db = match (&ctx.db, &ctx.agent_name) {
+        (Some(db), Some(caller)) => {
+            crate::make_worker_agent(db.as_ref(), agent, caller, ctx, &sa_ctx.session_id)?;
+            worker_ctx.agent_name = Some(agent.to_string());
+            Some(db.clone())
+        }
+        _ => None,
+    };
+    let _release = ReleaseWhenDone(
+        db.clone()
+            .map(|db| (db, agent.to_string(), sa_ctx.session_id.clone())),
+    );
+    let events = db.as_ref().map(|db| EventLog::new(db.clone(), agent, None));
+    let activity = db
+        .as_ref()
+        .map(|db| ActivityRecorder::new(db.clone(), agent));
+    if let Some(events) = &events {
+        events.emit(AgentEvent::Input {
+            text: prompt.clone(),
+        });
+    }
+    if let Some(activity) = &activity {
+        activity.set("thinking");
+    }
     let slot = Arc::new(Mutex::new(None));
     worker_ctx.result_slot = Some(slot.clone());
     worker_ctx.result_schema = schema.cloned();
     // Streamed, although nothing is shown, so Ctrl-C is noticed between
     // chunks rather than only once a whole response has arrived.
-    let mode = || ResponseMode::Streaming {
-        stream_handler: Box::new(|_: &str| Ok(())),
-        reasoning_handler: Box::new(|_: &str| Ok(())),
-        progress_handler: {
-            let status_bar = sa_ctx.status_bar.clone();
-            let key = status_key.to_string();
-            Box::new(move |progress: &ProgressInfo| {
-                let status = match &progress.status {
-                    StatusUpdate::Thinking => "Thinking".to_string(),
-                    StatusUpdate::ToolStart { name, .. } => format!("Running {}", name),
-                    StatusUpdate::SendingRequest { .. } => "Waiting for response".to_string(),
-                    StatusUpdate::WaitingForSlot => "Waiting for a free request slot".to_string(),
-                    _ => return Ok(()),
-                };
-                status_bar.set_agent_status(&key, &status, false);
-                Ok(())
-            })
-        },
+    let mode = || {
+        crate::recorded_mode(
+            ResponseMode::Streaming {
+                stream_handler: Box::new(|_: &str| Ok(())),
+                reasoning_handler: Box::new(|_: &str| Ok(())),
+                progress_handler: worker_progress(sa_ctx, status_key, activity.clone()),
+            },
+            &events,
+        )
     };
     let cancel = Some(Arc::new(Mutex::new(cancel)));
-    let mut messages = vec![make_message("system", WORKER_INSTRUCTIONS.to_string())];
+    let mut messages = vec![
+        make_message("system", WORKER_INSTRUCTIONS.to_string()),
+        crate::working_directory_note(&worker_ctx.cwd()),
+    ];
     if let Some(system_prompt) = &config.system_prompt {
         messages.push(make_message("system", system_prompt.clone()));
     }
@@ -254,8 +311,28 @@ fn run_worker(
         }
     };
     let result = crate::run_reporting(messages, &slot, schema, run_once);
+    if let (Some(db), Ok(response)) = (&db, &result) {
+        // Kept, with the agent, for `faber agents show` and the web UI.
+        let values: Vec<serde_json::Value> = response
+            .history
+            .iter()
+            .filter_map(|m| serde_json::to_value(m).ok())
+            .collect();
+        let _ = db.save_agent_messages(agent, &values);
+    }
     if let Err(e) = &result {
         if e.downcast_ref::<InterruptedError>().is_some() {
+            if let Some(activity) = &activity {
+                activity.set("stopped");
+            }
+            crate::record_turn_end(
+                &events,
+                &faber::db::TaskOutcome {
+                    succeeded: false,
+                    exit_code: None,
+                    result: "stopped".to_string(),
+                },
+            );
             return Err(Box::new(InterruptedError::new(
                 "Operation interrupted by user",
             )));
@@ -268,7 +345,28 @@ fn run_worker(
             .unwrap_or_else(|e| e.into_inner())
             .record(usage);
     }
-    match crate::work_outcome(result, &slot) {
+    let outcome = crate::work_outcome(result, &slot);
+    let (succeeded, text) = match &outcome {
+        Ok(outcome) => (outcome.succeeded, outcome.text()),
+        Err(e) => (false, e.to_string()),
+    };
+    crate::record_turn_end(
+        &events,
+        &faber::db::TaskOutcome {
+            succeeded,
+            exit_code: None,
+            result: text.clone(),
+        },
+    );
+    if let Some(activity) = &activity {
+        let first = crate::first_line(&text, 80);
+        activity.set(&if succeeded {
+            format!("finished: {}", first)
+        } else {
+            format!("failed: {}", first)
+        });
+    }
+    match outcome {
         Ok(outcome) if outcome.succeeded => Ok(outcome.text()),
         Ok(outcome) => Err(format!("reported failure - {}", outcome.text()).into()),
         Err(e) => Err(e.into()),
@@ -291,7 +389,8 @@ pub(crate) fn tool_fan_out(
     }
     // Workers run with the profile's settings and tools, if given, else
     // the caller's.
-    let config = match params.profile.as_deref() {
+    let profile = crate::requested_profile(&caller.profiles, params.profile.clone());
+    let config = match profile.as_deref() {
         Some(name) => crate::find_profile(&caller.profiles, name)?.agent_config(name),
         None => AgentConfig::default(),
     };
@@ -381,6 +480,11 @@ pub(crate) fn tool_fan_out(
                         }
                         let item = &params.items[index];
                         let key = format!("fan-out {}/{}", index + 1, total);
+                        let agent = format!(
+                            "{}-item-{}",
+                            ctx.agent_name.as_deref().unwrap_or("default"),
+                            index + 1
+                        );
                         sa_ctx.status_bar.set_agent_status(&key, "Starting", true);
                         let result = run_worker(
                             sa_ctx,
@@ -388,6 +492,7 @@ pub(crate) fn tool_fan_out(
                             &tools,
                             &config,
                             &key,
+                            &agent,
                             expand_prompt(&params.prompt, item),
                             handoff.as_ref(),
                             params.result_schema.as_ref(),
@@ -419,6 +524,15 @@ pub(crate) fn tool_fan_out(
         }
         finished.store(true, Ordering::Relaxed);
     });
+    // Workers finishing together can record their counts out of order:
+    // the last word is the final count.
+    if let Some(activity) = &activity {
+        activity.set(&format!(
+            "fan_out: {}/{} done",
+            done_count.load(Ordering::Relaxed),
+            total
+        ));
+    }
 
     if cancelled.load(Ordering::Relaxed) {
         return Err(Box::new(InterruptedError::new(

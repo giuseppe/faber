@@ -206,6 +206,24 @@ button.play::before { margin-right: 6px; }
   opacity: 0.55;
 }
 .card:hover .run, .card .run:focus { opacity: 1; }
+/* A stop square, drawn too. */
+.card .stop::before, button.stop-button::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  background: currentColor;
+}
+button.stop-button::before { margin-right: 6px; }
+.card .stop {
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: 4px 6px;
+  color: var(--bad);
+}
+.card .stop:hover { background: var(--bad); color: #fff; }
+button:disabled { opacity: 0.5; cursor: default; }
 .card .run:hover { background: var(--accent); color: #fff; }
 .card[draggable="true"] { cursor: grab; }
 .card.dragging { opacity: 0.4; }
@@ -280,6 +298,19 @@ button.play::before { margin-right: 6px; }
 }
 .event.tool summary { cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .event.tool.running summary { color: var(--warn); }
+.event.tool.error { border-color: var(--bad); }
+.event.tool.error summary { color: var(--bad); white-space: normal; }
+.problems {
+  margin: 10px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--bad);
+  border-radius: 6px;
+  color: var(--bad);
+  font-size: 13px;
+}
+.problems ul { margin: 4px 0 0; padding-left: 18px; }
+.problems li { color: var(--text); word-break: break-word; }
+.problem-title { font-weight: 600; }
 .event.tool pre { margin: 6px 0 0; white-space: pre-wrap; max-height: 300px; overflow: auto; }
 .event.end { font-size: 12px; font-weight: 600; }
 .event.end.ok { color: var(--ok); }
