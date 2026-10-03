@@ -6388,6 +6388,70 @@ fn check_may_change(ctx: &ToolContext, db: &dyn DbBackend, agent: &str) -> Resul
 
 /// `path` as a working directory: absolute (relative ones taken from
 /// `base`), symlinks resolved, and an existing directory.
+/// `$XDG_CONFIG_HOME/faber/config.json` (or `~/.config/...`): the config
+/// file read when none is given.
+fn default_config_file() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("faber").join("config.json"))
+}
+
+/// faber's own files: the database and the config file in use, as
+/// absolute paths. No agent's working directory may hold them: an agent
+/// without the unsafe tools can write where it works - with the file
+/// tools, or in its sandbox - and could give itself the unsafe tools in
+/// the database, or a command to run in the config file (an MCP server's),
+/// and read every agent's conversation.
+static FABER_FILES: std::sync::OnceLock<Vec<(&'static str, PathBuf)>> = std::sync::OnceLock::new();
+
+fn set_faber_files(config: Option<&str>, db: Option<&str>) {
+    let absolute = |path: &str| {
+        let path = std::path::Path::new(path);
+        // A database not made yet: where it will be.
+        path.canonicalize().ok().or_else(|| {
+            let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+            let dir = parent
+                .map_or_else(std::env::current_dir, |p| p.canonicalize())
+                .ok()?;
+            Some(dir.join(path.file_name()?))
+        })
+    };
+    let files = [("config file", config), ("database", db)]
+        .into_iter()
+        .filter_map(|(what, path)| Some((what, absolute(path?)?)))
+        .collect();
+    let _ = FABER_FILES.set(files);
+}
+
+/// Refuses `dir` as a working directory when it holds one of faber's own
+/// files (`FABER_FILES`).
+fn check_no_faber_files(dir: &std::path::Path) -> Result<(), String> {
+    faber_files_outside(dir, FABER_FILES.get().map_or(&[], |f| f.as_slice()))
+}
+
+fn faber_files_outside(
+    dir: &std::path::Path,
+    files: &[(&'static str, PathBuf)],
+) -> Result<(), String> {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    for (what, file) in files {
+        if file.starts_with(&dir) {
+            return Err(format!(
+                "faber's {} ({}) is inside {}, where agents would work: one could rewrite it, \
+                 and give itself the unsafe tools. Keep it elsewhere - e.g. the database in \
+                 ~/.local/share/faber/, the config file in ~/.config/faber/config.json - or \
+                 work in another directory",
+                what,
+                file.display(),
+                dir.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn resolve_cwd(base: &std::path::Path, path: &str) -> Result<String, String> {
     let path = std::path::Path::new(path.trim());
     let full = if path.is_absolute() {
@@ -6404,6 +6468,7 @@ fn resolve_cwd(base: &std::path::Path, path: &str) -> Result<String, String> {
             resolved.display()
         ));
     }
+    check_no_faber_files(&resolved)?;
     resolved
         .to_str()
         .map(String::from)
@@ -13025,22 +13090,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Load and merge configuration file
+    // Without -c, the user's own config file - never one in the current
+    // directory, which is where agents work and could write one.
     let config_path = match &opts.config {
         Some(path) => Some(path.clone()),
-        None => {
-            // Check for default config.json in current directory
-            let default_config = "config.json";
-            if std::path::Path::new(default_config).exists() {
-                debug!("Found default config file: {}", default_config);
-                Some(default_config.to_string())
-            } else {
-                None
-            }
-        }
+        None => default_config_file()
+            .filter(|path| path.is_file())
+            .map(|path| path.display().to_string()),
     };
-
-    if let Some(config_file) = config_path {
-        match Opts::load_from_file(&config_file) {
+    if let Some(config_file) = &config_path {
+        match Opts::load_from_file(config_file) {
             Ok(config) => {
                 debug!("Loaded configuration file: {}", config_file);
                 opts.merge_with_config(config);
@@ -13051,7 +13110,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // With the config file's db_path, when it has one.
+    if let Some(path) = &opts.db_path {
+        if let (Some(rest), Some(home)) = (path.strip_prefix("~/"), std::env::var_os("HOME")) {
+            opts.db_path = Some(PathBuf::from(home).join(rest).display().to_string());
+        }
+    }
+    set_faber_files(config_path.as_deref(), opts.db_path.as_deref());
     opts.apply_mcp_server_flags()?;
+    // Commands that run agents: never where faber keeps its own files.
+    if matches!(
+        opts.command,
+        CliCommand::Prompt { .. }
+            | CliCommand::Chat {}
+            | CliCommand::Worker { .. }
+            | CliCommand::Serve { .. }
+    ) {
+        check_no_faber_files(&std::env::current_dir()?)?;
+    }
+
     lsp::configure(&opts.lsp_servers)?;
     validate_profiles(&opts.profiles).map_err(|e| format!("Configuration file error: {}", e))?;
     openai::set_max_parallel_requests(opts.max_parallel_requests.unwrap_or(0));
@@ -13106,6 +13183,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             // Only looks: never create or migrate a database for it.
             db::open_read_only(db_path)?
         } else {
+            if let Some(dir) = std::path::Path::new(db_path).parent() {
+                if !dir.as_os_str().is_empty() {
+                    std::fs::create_dir_all(dir)?;
+                }
+            }
             let conn = rusqlite::Connection::open(db_path)?;
             db::initialize_db(&conn)?;
             conn
@@ -17956,6 +18038,31 @@ mod tests {
 
     fn search_params(json: serde_json::Value) -> SearchParams {
         serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn test_no_agent_works_where_faber_keeps_its_files() {
+        let dir = TempTestDir::new("faber_files");
+        std::fs::create_dir_all(dir.0.join("proj/sub")).unwrap();
+        std::fs::create_dir_all(dir.0.join("data")).unwrap();
+        let files = [
+            ("database", dir.0.join("data/faber.db")),
+            ("config file", dir.0.join("proj/config.json")),
+        ];
+        assert!(faber_files_outside(&dir.0.join("proj/sub"), &files).is_ok());
+        let err = faber_files_outside(&dir.0.join("proj"), &files).unwrap_err();
+        assert!(
+            err.contains("config file") && err.contains("unsafe tools"),
+            "{err}"
+        );
+        // A parent of it, or the root, holds it too.
+        assert!(faber_files_outside(&dir.0, &files).is_err());
+        assert!(faber_files_outside(std::path::Path::new("/"), &files).is_err());
+        assert!(
+            faber_files_outside(&dir.0.join("data"), &files)
+                .unwrap_err()
+                .contains("database")
+        );
     }
 
     #[test]
