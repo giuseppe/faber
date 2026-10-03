@@ -224,11 +224,6 @@ impl DbBackend for RemoteDb {
         Ok(v.as_bool().unwrap_or(false))
     }
 
-    fn list_agent_data(&self, agent: &str) -> Result<Vec<(String, String)>, Box<dyn Error>> {
-        let v = self.call("list_agent_data", serde_json::json!({"agent": agent}))?;
-        Ok(serde_json::from_value(v)?)
-    }
-
     fn get_agent_config(&self, agent_name: &str) -> Result<AgentConfig, Box<dyn Error>> {
         let v = self.call(
             "get_agent_config",
@@ -322,50 +317,6 @@ impl DbBackend for RemoteDb {
             serde_json::json!({"session_id": session_id}),
         )?;
         Ok(serde_json::from_value(v)?)
-    }
-
-    fn create_cron_task(
-        &self,
-        name: &str,
-        description: &str,
-        cron_expr: &str,
-        command: &str,
-        agent_name: Option<&str>,
-        max_runs: Option<i64>,
-    ) -> Result<i64, Box<dyn Error>> {
-        let v = self.call(
-            "create_cron_task",
-            serde_json::json!({
-                "name": name,
-                "description": description,
-                "cron_expression": cron_expr,
-                "command": command,
-                "agent_name": agent_name,
-                "max_runs": max_runs,
-            }),
-        )?;
-        v.as_i64().ok_or("expected integer".into())
-    }
-
-    fn create_oneshot_task(
-        &self,
-        name: &str,
-        description: &str,
-        run_at: &str,
-        command: &str,
-        agent_name: Option<&str>,
-    ) -> Result<i64, Box<dyn Error>> {
-        let v = self.call(
-            "create_oneshot_task",
-            serde_json::json!({
-                "name": name,
-                "description": description,
-                "run_at": run_at,
-                "command": command,
-                "agent_name": agent_name,
-            }),
-        )?;
-        v.as_i64().ok_or("expected integer".into())
     }
 
     fn delete_task(&self, task_id: i64) -> Result<bool, Box<dyn Error>> {

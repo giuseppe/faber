@@ -746,6 +746,7 @@ pub fn delete_agent_data(
     Ok(rows > 0)
 }
 
+#[cfg(test)]
 pub fn list_agent_data(
     conn: &Connection,
     agent: &str,
@@ -799,6 +800,7 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
 
 const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, kind, depends_on, profile, run_safe, cwd, stop_requested";
 
+#[cfg(test)]
 pub fn create_cron_task(
     conn: &Connection,
     name: &str,
@@ -845,6 +847,7 @@ pub fn is_tool_call(command: &str) -> bool {
 /// The kind of task `command` makes: a tool call runs as one, anything else
 /// is an instruction for an agent. An empty command stays a `tool` task,
 /// which fails saying so when it runs.
+#[cfg(test)]
 fn kind_for_command(command: &str) -> &'static str {
     if command.trim().is_empty() || is_tool_call(command) {
         TaskKind::TOOL
@@ -855,6 +858,7 @@ fn kind_for_command(command: &str) -> &'static str {
 
 /// What a task runs: its command, or its description if the command is
 /// empty (as the scheduler has always done).
+#[cfg(test)]
 fn effective_command<'a>(command: &'a str, description: &'a str) -> &'a str {
     if command.trim().is_empty() {
         description
@@ -1102,6 +1106,7 @@ pub fn set_task_target(
     Ok(rows > 0)
 }
 
+#[cfg(test)]
 pub fn create_oneshot_task(
     conn: &Connection,
     name: &str,
