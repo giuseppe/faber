@@ -1391,12 +1391,17 @@ pub enum KbViewer {
     /// spawned it, and so on up. A sub-agent's own private notes aren't
     /// seen by the agents above it.
     Agent(Option<String>),
+    /// An agent that sees shared notes and the private ones of exactly
+    /// these agents, nearest first: itself and those above it, up to - not
+    /// including - the first with the unsafe tools. What an unsafe agent
+    /// keeps privately isn't for the safe agents it runs tasks on.
+    Scopes(Vec<String>),
 }
 
 impl KbViewer {
     /// The SQL condition for notes this viewer sees, and the value to bind
     /// to its `?1` (always referenced, so the parameter count is fixed).
-    fn condition(&self) -> (String, Option<&str>) {
+    fn condition(&self) -> (String, Option<String>) {
         match self {
             KbViewer::User => ("(?1 IS NULL OR 1)".to_string(), None),
             KbViewer::Agent(None) => (
@@ -1408,7 +1413,12 @@ impl KbViewer {
                     "(kb_notes.agent_name IS NULL OR kb_notes.agent_name IN ({} SELECT name FROM lineage))",
                     LINEAGE_CTE
                 ),
-                Some(agent.as_str()),
+                Some(agent.clone()),
+            ),
+            KbViewer::Scopes(agents) => (
+                "(kb_notes.agent_name IS NULL OR kb_notes.agent_name IN (SELECT value FROM json_each(?1)))"
+                    .to_string(),
+                Some(serde_json::Value::from(agents.clone()).to_string()),
             ),
         }
     }
@@ -1513,6 +1523,7 @@ pub fn kb_get_by_title(
             .map(Some)
             .chain([None])
             .collect(),
+        KbViewer::Scopes(agents) => agents.iter().cloned().map(Some).chain([None]).collect(),
     };
     let sql = format!(
         "SELECT {} FROM kb_notes
