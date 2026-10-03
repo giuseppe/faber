@@ -436,20 +436,11 @@ pub(crate) fn handoff_message(
         ));
     }
     for file in &handoff.files {
-        let path = std::path::Path::new(file);
-        if path.is_absolute()
-            || path
-                .components()
-                .any(|c| c == std::path::Component::ParentDir)
-        {
-            return Err(format!(
-                "file '{}' must be relative to the current directory, without '..'",
-                file
-            )
-            .into());
-        }
-        let content =
-            std::fs::read_to_string(path).map_err(|e| format!("can't read '{}': {}", file, e))?;
+        // Inside where the agent works, as the file tools read: a symlink
+        // out of it reads nothing.
+        let path = PathBuf::from(ctx.tool_path(file));
+        let content = read_text_in_root(&ctx.cwd(), &path)
+            .map_err(|e| format!("can't read '{}': {}", file, e))?;
         text.push_str(&format!(
             "\n## File: {}\n```\n{}\n```\n",
             file,
@@ -1431,10 +1422,20 @@ pub(crate) fn open_regular_in_root(
     path: &std::path::Path,
 ) -> Result<std::fs::File, Box<dyn Error>> {
     let file = Root::open(root)?.open_subpath(path, OpenFlags::O_RDONLY | OpenFlags::O_NONBLOCK)?;
-    if !file.metadata()?.is_file() {
-        return Err(format!("{} isn't a regular file", path.display()).into());
-    }
+    check_readable(&file, &path.display().to_string())?;
     Ok(file)
+}
+
+/// `path`'s text, read inside `root` (see `open_regular_in_root`): how
+/// faber reads a file a model - or something it controls - names, other
+/// than through the file tools themselves.
+pub(crate) fn read_text_in_root(
+    root: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<String, Box<dyn Error>> {
+    let mut text = String::new();
+    open_regular_in_root(root, path)?.read_to_string(&mut text)?;
+    Ok(text)
 }
 
 fn tool_read_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
@@ -18991,6 +18992,31 @@ for line in sys.stdin:
 
     fn search_params(json: serde_json::Value) -> SearchParams {
         serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn test_handed_off_files_are_read_where_the_agent_works() {
+        let dir = TempTestDir::new("handoff_files");
+        std::fs::create_dir_all(dir.0.join("w")).unwrap();
+        std::fs::write(dir.0.join("secret"), "TOPSECRET\n").unwrap();
+        std::fs::write(dir.0.join("w/notes.md"), "the plan\n").unwrap();
+        std::os::unix::fs::symlink(dir.0.join("secret"), dir.0.join("w/k")).unwrap();
+        let mut ctx = test_ctx();
+        ctx.cwd = Some(dir.0.join("w"));
+        let hand = |file: &str| {
+            handoff_message(
+                &ctx,
+                &Handoff {
+                    notes: Vec::new(),
+                    files: vec![file.to_string()],
+                },
+            )
+        };
+        let message = hand("notes.md").unwrap().unwrap();
+        assert!(message.content.unwrap().contains("the plan"));
+        for out in ["k", "../secret", dir.0.join("secret").to_str().unwrap()] {
+            assert!(hand(out).is_err(), "{out}");
+        }
     }
 
     #[test]
