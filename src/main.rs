@@ -1367,6 +1367,21 @@ fn lines_within_budget(lines: &[&str], budget_chars: usize) -> usize {
     lines.len()
 }
 
+/// Opens `path` for reading inside `root` - resolved within it as the file
+/// tools resolve paths, symlinks included, so nothing outside it can be
+/// reached - and only if it's a regular file: reading a FIFO would block
+/// forever (an open can't be interrupted), a device would never end.
+pub(crate) fn open_regular_in_root(
+    root: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<std::fs::File, Box<dyn Error>> {
+    let file = Root::open(root)?.open_subpath(path, OpenFlags::O_RDONLY | OpenFlags::O_NONBLOCK)?;
+    if !file.metadata()?.is_file() {
+        return Err(format!("{} isn't a regular file", path.display()).into());
+    }
+    Ok(file)
+}
+
 fn tool_read_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     use serde::Serialize;
 

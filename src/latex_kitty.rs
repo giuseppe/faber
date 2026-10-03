@@ -837,27 +837,58 @@ pub(crate) fn resolve_in_path_dirs(
 ///   chosen by the model - unlike `run_command`, which keeps the tighter,
 ///   curated sandbox since it has no such guarantee about what it's
 ///   running.
-/// - No `--clearenv`: kpathsea also relies on `$HOME` (and variables
-///   commonly derived from it) to locate its files, and a wiped
-///   environment made that lookup fail outright even for files that ARE
-///   now readable under the read-only root. Passing the real environment
-///   through costs nothing here - there's no untrusted code running that
-///   could read it back out, just the LaTeX toolchain locating its own
-///   files.
+/// - The environment is cleared but for what toolchains use to find their
+///   files (`SANDBOX_ENV`): kpathsea needs `$HOME`, rust-analyzer
+///   `$CARGO_HOME`. Tokens and keys in faber's own environment stay out -
+///   a language server runs the project's code (build scripts, proc
+///   macros), which may be the model's.
 pub(crate) fn whole_root_ro_bwrap_args(
     cwd: &str,
     command: &str,
     args: Option<&[String]>,
 ) -> Vec<String> {
-    let mut a = crate::bwrap_isolation_flags(false);
-    a.push("--ro-bind".to_string());
-    a.push("/".to_string());
-    a.push("/".to_string());
-    a.push("--bind".to_string());
-    a.push(cwd.to_string());
-    a.push(cwd.to_string());
+    let mut a = crate::bwrap_isolation_flags(true);
+    for (name, value) in std::env::vars_os() {
+        let (Some(name), Some(value)) = (name.to_str(), value.to_str()) else {
+            continue;
+        };
+        if sandbox_env_allowed(name) {
+            a.extend(["--setenv".to_string(), name.to_string(), value.to_string()]);
+        }
+    }
+    a.extend(["--ro-bind", "/", "/"].map(String::from));
+    a.extend(["--bind".to_string(), cwd.to_string(), cwd.to_string()]);
     a.extend(crate::bwrap_command_tail(command, args));
     a
+}
+
+/// The environment variables a whole-root sandbox keeps: what toolchains
+/// locate themselves and their files with.
+const SANDBOX_ENV: &[&str] = &[
+    "HOME",
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LANGUAGE",
+    "TZ",
+    "TERM",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "GOPATH",
+    "GOROOT",
+    "GOMODCACHE",
+    "GOCACHE",
+    "GOFLAGS",
+    "JAVA_HOME",
+    "PYTHONPATH",
+    "VIRTUAL_ENV",
+    "NODE_PATH",
+];
+
+fn sandbox_env_allowed(name: &str) -> bool {
+    SANDBOX_ENV.contains(&name) || name.starts_with("LC_") || name.starts_with("TEXMF")
 }
 
 /// Runs `program` (resolved via `resolve_on_path`) with `args`, sandboxed
@@ -997,7 +1028,7 @@ mod tests {
     #[test]
     fn test_whole_root_ro_bwrap_args_binds_root_ro_and_cwd_rw() {
         let flags = whole_root_ro_bwrap_args("/tmp/scratch", "/usr/bin/pdflatex", None);
-        assert!(!flags.contains(&"--clearenv".to_string()));
+        assert!(flags.contains(&"--clearenv".to_string()));
 
         let ro_pos = flags
             .windows(3)
@@ -1013,6 +1044,21 @@ mod tests {
         assert!(bind_pos > ro_pos);
 
         assert_eq!(flags.last(), Some(&"/usr/bin/pdflatex".to_string()));
+    }
+
+    #[test]
+    fn test_whole_root_sandbox_keeps_faber_s_environment_out() {
+        let flags = whole_root_ro_bwrap_args("/tmp/scratch", "/usr/bin/pdflatex", None);
+        // Only allowed variables are passed in.
+        let set: Vec<&str> = flags
+            .windows(2)
+            .filter(|w| w[0] == "--setenv")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert!(set.iter().all(|name| sandbox_env_allowed(name)), "{set:?}");
+        assert!(sandbox_env_allowed("HOME") && sandbox_env_allowed("LC_ALL"));
+        assert!(!sandbox_env_allowed("OPENAI_API_KEY") && !sandbox_env_allowed("SSH_AUTH_SOCK"));
+        assert!(!sandbox_env_allowed("DBUS_SESSION_BUS_ADDRESS"));
     }
 
     #[test]
