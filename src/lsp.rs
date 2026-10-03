@@ -1117,7 +1117,7 @@ pub(crate) fn run(
 ) -> Result<String, Box<dyn Error>> {
     let params: Params = serde_json::from_str(params_str)?;
     let cwd = ctx.cwd();
-    let path = project_file(&cwd, &params.path)?;
+    let path = project_file(&cwd, &ctx.tool_path(&params.path))?;
     let client = client_for(&path, &cwd, sandboxed)?;
     let root = client.root.clone();
     let before = client.diagnostics_generation(&path_to_uri(&path));

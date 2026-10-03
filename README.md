@@ -339,7 +339,8 @@ on `spawn_agent` and `fan_out` help delegation:
   `{"notes": ["Deploying"], "files": ["src/main.rs"]}`.
 
 `fan_out`'s workers are agents too, `<caller>-item-<n>`, under the agent
-that fanned out: they show, and can be followed, like sub-agents.
+that fanned out: all of them show as soon as it starts - queued, until
+their turn comes - and can be followed like sub-agents.
 
 A finished sub-agent is kept, with its conversation, until `faber gc`
 removes it (it then has no live session), so you can see what it did.
@@ -350,7 +351,16 @@ removes it (it then has no live session), so you can see what it did.
 faber agents                 # the agents as a tree by who spawned whom, with what each is doing
 faber agents --watch         # redraw every 2s (--watch=N for N seconds)
 faber agents show scout      # one agent in detail, with its conversation (--full for whole messages)
+faber agents follow          # what every agent does, live: input, answers, tool calls, outcomes
+faber agents follow scout    # only scout's (--reasoning to include its reasoning)
+faber tasks follow 7         # everything done for task #7, by its agent, sub-agents and workers
 ```
+
+What agents do is recorded in the database as it happens, wherever they
+run - a chat, a `faber worker`, `faber serve --run-agent`, on this
+machine or another sharing it through `faber serve` - so `follow` (and
+the web UI) see every one of them, from any terminal: point it at the
+same `--db-path`, or the same `--server`.
 
 ```
  Agent        | Session | Activity                        | Since | Model
@@ -673,6 +683,7 @@ that agent.
 | `spawn_agent` | Spawn a sub-agent for parallel work, optionally with a `timeout_seconds` or `max_requests` budget |
 | `agent_cancel` | Stop a running sub-agent you started |
 | `agent_wait` | Wait for your sub-agents (all, some, or the first to finish) and get their results together |
+| `task_wait` | Wait for tasks (run by other agents) to finish, and get how each went |
 | `report_result` | For a sub-agent, fan-out worker or task: report the outcome of its work - succeeded/failed, summary, data |
 | `fan_out` | Run the same task for many items (e.g. files) at once, one worker agent each, at most `max_parallel` at a time (default 32, up to 256; up to 1000 items), and return all the results together, in item order, once every worker is done. `{item}` in the prompt is replaced by each worker's item. Workers only get read-only tools (`read_file`, `glob`, `grep_in_current_directory`, `lsp`, web/GitHub reads) unless `tools` names others - workers that write can overwrite each other's changes - and can't spawn agents. Ctrl-C stops every worker. Each result gets a share of the output cap |
 | `run_command` | Execute a command, sandboxed with [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`): no network access, no capabilities, a cleared environment, a read-only root with only the current directory writable, its own PID/IPC/UTS/cgroup namespaces (no visibility into other processes or the host's hostname), killed if faber itself dies, and detached from the controlling terminal. Requires `bwrap` to be installed; use `--unsafe-tools` for unrestricted execution instead |
@@ -979,7 +990,30 @@ server can serve at once, e.g. llama.cpp's `--parallel`: with more, they
 queue there anyway, and each llama.cpp slot only gets its share of the
 context. Requests over the limit wait their turn, shown in the status bar
 ("Waiting for other requests to the model to finish"); Ctrl-C still
-interrupts them. Unlimited unless set.
+interrupts them. Unlimited unless set. `fan_out` runs no more workers at
+once than this either: more would only take turns on the server's slots,
+each evicting the others' prompts from its cache.
+
+#### With a local server's prompt cache
+
+A server like llama.cpp keeps each slot's last prompt and only processes
+what's new in the next request - if it starts the same way. faber keeps
+requests that way: the tools are always sent in the same order, and each
+agent's conversation only grows (except when old tool results are
+shortened to fit the context window). What still costs is more
+conversations than slots: each switch on a slot means processing the
+incoming conversation's prompt from where it differs from what was there.
+So:
+
+- Give the server as many slots as you want agents working at once
+  (llama.cpp's `-np`), and set `--max-parallel-requests` to the same
+  number. With one slot, a fan-out's workers run one after another - each
+  then reuses the start it shares with the one before (instructions and
+  tools), and only processes its own task.
+- Each slot needs room for a whole conversation: in llama.cpp the context
+  (`-c`) is split between the slots unless the KV cache is unified across
+  them - see `llama-server --help` for the version you run, along with its
+  options to keep and reuse more prompts than there are slots.
 
 ### Displaying LaTeX as images
 
