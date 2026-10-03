@@ -209,11 +209,40 @@ config:context_window - the model's context window
 config:parameters     - request parameters (JSON), over --parameter's
 config:tools          - the only tools it may use (JSON list), of the session's
 config:profile        - the profile it was made from, if any
+config:unsafe_tools   - whether it has the unsafe tools (see Unsafe tools)
+config:cwd            - the directory it works in
 ```
 
 The model sets or clears the model, endpoint and system prompt with the
 `agent_configure` tool, or replaces them all with a profile's; `agent_get`
 and `faber agents show NAME` show them.
+
+### Working directory
+
+Each agent can work in its own directory instead of the current one of
+whatever runs it: its file tools' relative paths are relative to it,
+its commands run there, the sandbox lets it write only there, and the
+language servers are started for it. Several agents in one chat, worker
+or server can each work on a different project.
+
+Setting it is the user's to do:
+
+```bash
+faber agents set reviewer --cwd ~/src/other-project
+faber agents set reviewer --no-cwd       # back to wherever it's run
+```
+
+In a chat, `/cwd PATH` sets it for the current agent, `/cwd -` clears it,
+and `/cwd` shows it (`/chdir` still changes the directory of the whole
+process, for agents without their own). The web UI has it in each
+agent's panel.
+
+An agent an agent makes - a sub-agent, a worker's task agent - works
+where its maker does. Only an agent with the unsafe tools can choose
+another directory (`cwd` in `spawn_agent`, `agent_create`,
+`agent_configure`); a safe one can't, nor reuse an agent the user set to
+work elsewhere. A worker fails a task whose agent's directory doesn't
+exist on its machine.
 
 ### Profiles
 
@@ -635,12 +664,35 @@ that agent.
 | `fan_out` | Run the same task for many items (e.g. files) at once, one worker agent each, at most `max_parallel` at a time (default 32, up to 256; up to 1000 items), and return all the results together, in item order, once every worker is done. `{item}` in the prompt is replaced by each worker's item. Workers only get read-only tools (`read_file`, `glob`, `grep_in_current_directory`, `lsp`, web/GitHub reads) unless `tools` names others - workers that write can overwrite each other's changes - and can't spawn agents. Ctrl-C stops every worker. Each result gets a share of the output cap |
 | `run_command` | Execute a command, sandboxed with [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`): no network access, no capabilities, a cleared environment, a read-only root with only the current directory writable, its own PID/IPC/UTS/cgroup namespaces (no visibility into other processes or the host's hostname), killed if faber itself dies, and detached from the controlling terminal. Requires `bwrap` to be installed; use `--unsafe-tools` for unrestricted execution instead |
 
-### Unsafe tools (require `--unsafe-tools`)
+### Unsafe tools
 
 | Tool | Description |
 |---|---|
 | `run_command` | Execute a command directly, with the same access as the faber process itself - no sandboxing |
 | `fetch_web_content` | Fetch content from a URL |
+
+(`grep_in_current_directory` and `lsp` also run unsandboxed for an agent
+with the unsafe tools.)
+
+Whether an agent has them is up to each agent, not the whole session:
+
+- `--unsafe-tools` gives them to the session's own agent: the chat's, a
+  worker's, `faber serve --run-agent`'s.
+- `faber agents set NAME --unsafe` gives them to an agent for good, in
+  any session (`--safe` takes them away). `faber agents` marks such
+  agents `(unsafe)`, and so does the web UI.
+- An agent an agent makes - `spawn_agent`, `agent_create` - is like its
+  maker unless it asks otherwise (`unsafe_tools`). Only an agent that has
+  the unsafe tools can give them, so a safe agent can only make safe
+  ones; an unsafe one can make either. A safe agent can't change an
+  unsafe agent either (`agent_configure`, or reusing its name), and a
+  profile never gives or takes them.
+- A task a safe agent creates (`task_create`) runs without them, whoever
+  picks it up: a worker that has them runs it on a safe agent of its own,
+  and a tool task gets the safe tools.
+
+Messages (`send_message`) aren't restricted: a safe agent can still ask an
+unsafe one to do something, which it may do.
 
 ### Tool filtering
 
@@ -870,7 +922,7 @@ address, so a web page can't reach it through a name it controls.
     --model <MODEL>          AI model to use
     --endpoint <URL>         API endpoint URL
     --no-tools               Disable all tools
-    --unsafe-tools           Run commands unsandboxed and enable fetch_web_content
+    --unsafe-tools           Give the session's own agent the unsafe tools (see Unsafe tools)
     --tools <LIST>           Comma-separated list of tools to enable
     --tool-choice <MODE>     Tool usage mode: auto, none, required
     --api-key <PATH>         File containing the API key

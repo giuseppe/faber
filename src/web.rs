@@ -22,7 +22,8 @@
 //! port as the line protocol - `server::serve_command` tells them apart by
 //! the first byte. One request per connection.
 //!
-//! - `GET /api/agents`, `GET /api/agents/<name>`
+//! - `GET /api/agents`, `GET /api/agents/<name>`,
+//!   `POST /api/agents/<name>/cwd` (where it works: the user's to set)
 //! - `GET /api/events?agent=&task=&after=&limit=`
 //! - `GET /api/tasks`, `GET /api/tasks/<id>`, `POST /api/tasks`,
 //!   `DELETE /api/tasks/<id>`,
@@ -351,6 +352,12 @@ struct ApiAgent {
     live: bool,
     model: Option<String>,
     profile: Option<String>,
+    /// Given the unsafe tools for good (`faber agents set --unsafe`, or by
+    /// an agent that has them). A session's own agent may have them too,
+    /// for the session, if started with --unsafe-tools.
+    unsafe_tools: bool,
+    /// Where it works, if not where whatever runs it does.
+    cwd: Option<String>,
 }
 
 /// A task as `/api/tasks` lists it: with the dependencies it's still
@@ -463,6 +470,7 @@ impl ApiNewTask {
             held: self.hold,
             depends_on: self.depends_on,
             profile: non_empty(&self.profile),
+            run_safe: false,
         })
     }
 }
@@ -501,6 +509,8 @@ fn api(
                     live: db::agent_session_is_live(&agent, now),
                     model: config.model,
                     profile: config.profile,
+                    unsafe_tools: config.unsafe_tools == Some(true),
+                    cwd: config.cwd.clone(),
                     agent,
                 });
             }
@@ -521,6 +531,8 @@ fn api(
                     live: db::agent_session_is_live(&agent, now),
                     model: config.model.clone(),
                     profile: config.profile.clone(),
+                    unsafe_tools: config.unsafe_tools == Some(true),
+                    cwd: config.cwd.clone(),
                     agent,
                 },
                 "children": children,
@@ -528,6 +540,40 @@ fn api(
                 "tools": config.tools,
                 "messages": db::agent_message_count(conn, name)?,
             }))
+        }
+        ("POST", ["agents", name, "cwd"]) => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Body {
+                cwd: Option<String>,
+            }
+            if db::get_agent(conn, name)?.is_none() {
+                return Ok(Response::error(404, &format!("no agent named '{}'", name)));
+            }
+            let cwd = match body_json::<Body>(request)?.cwd.as_deref().map(str::trim) {
+                None | Some("") => None,
+                Some(path) => {
+                    let path = std::path::Path::new(path);
+                    if !path.is_absolute() {
+                        return Err("give an absolute path".into());
+                    }
+                    // The agent may run on another machine than this
+                    // server: only resolved if it's here.
+                    Some(
+                        path.canonicalize()
+                            .unwrap_or_else(|_| path.to_path_buf())
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                }
+            };
+            let mut config = db::get_agent_config(conn, name)?;
+            config.cwd = cwd.clone();
+            db::set_agent_config(conn, name, &config)?;
+            let here = cwd
+                .as_deref()
+                .is_none_or(|c| std::path::Path::new(c).is_dir());
+            Response::ok(serde_json::json!({ "cwd": cwd, "exists_here": here }))
         }
         ("GET", ["events"]) => {
             let number = |name: &str| -> Result<Option<i64>, Box<dyn Error>> {
@@ -895,6 +941,29 @@ mod tests {
         assert_eq!(agents[1]["live"], false);
         let boss = json(&call(&db, "GET", "/api/agents/boss", ""));
         assert_eq!(boss["children"], serde_json::json!(["helper"]));
+        assert!(boss["agent"]["cwd"].is_null());
+        let tmp = std::env::temp_dir();
+        let r = call(
+            &db,
+            "POST",
+            "/api/agents/boss/cwd",
+            &serde_json::json!({ "cwd": tmp }).to_string(),
+        );
+        assert_eq!(json(&r)["exists_here"], true, "{:?}", json(&r));
+        let boss = json(&call(&db, "GET", "/api/agents/boss", ""));
+        assert_eq!(
+            boss["agent"]["cwd"].as_str().map(std::path::PathBuf::from),
+            Some(tmp.canonicalize().unwrap())
+        );
+        let r = call(
+            &db,
+            "POST",
+            "/api/agents/boss/cwd",
+            r#"{"cwd": "relative"}"#,
+        );
+        assert_eq!(r.status, 400);
+        call(&db, "POST", "/api/agents/boss/cwd", r#"{"cwd": null}"#);
+        assert!(json(&call(&db, "GET", "/api/agents/boss", ""))["agent"]["cwd"].is_null());
         assert_eq!(call(&db, "GET", "/api/agents/nobody", "").status, 404);
 
         let events = json(&call(&db, "GET", "/api/events?task=7", ""));

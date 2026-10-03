@@ -562,6 +562,7 @@ mod tests {
                 held: false,
                 depends_on: Vec::new(),
                 profile: Some("fast".to_string()),
+                run_safe: false,
             })
             .unwrap();
         assert_eq!(
