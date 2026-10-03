@@ -266,6 +266,8 @@ fn run_worker(
         )
     };
     let cancel = Some(Arc::new(Mutex::new(cancel)));
+    // Its tools stop with it: a running command, say.
+    worker_ctx.interrupt = cancel.clone();
     let mut messages = vec![
         make_message("system", WORKER_INSTRUCTIONS.to_string()),
         crate::working_directory_note(&worker_ctx.cwd()),
@@ -501,13 +503,27 @@ pub(crate) fn tool_fan_out(
                         cancel_senders
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .push(tx);
+                            .push(tx.clone());
                         if cancelled.load(Ordering::Relaxed) {
                             return;
                         }
                         let item = &params.items[index];
                         let key = format!("fan-out {}/{}", index + 1, total);
                         let agent = worker_name(index);
+                        // Like a sub-agent: it can be stopped on its own
+                        // (agent_cancel, /cancel, the web UI).
+                        let stop_reason = Arc::new(Mutex::new(None));
+                        sa_ctx
+                            .running_subagents
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(
+                                agent.clone(),
+                                crate::RunningSubAgent {
+                                    cancel: tx,
+                                    stop_reason: stop_reason.clone(),
+                                },
+                            );
                         sa_ctx.status_bar.set_agent_status(&key, "Starting", true);
                         let result = run_worker(
                             sa_ctx,
@@ -522,8 +538,31 @@ pub(crate) fn tool_fan_out(
                             rx,
                         );
                         sa_ctx.status_bar.clear_agent_status(&key);
+                        sa_ctx
+                            .running_subagents
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&agent);
                         let result = match result {
-                            Err(e) if e.downcast_ref::<InterruptedError>().is_some() => return,
+                            // The whole fan-out stopped.
+                            Err(e)
+                                if e.downcast_ref::<InterruptedError>().is_some()
+                                    && cancelled.load(Ordering::Relaxed) =>
+                            {
+                                return;
+                            }
+                            // Only this worker: its item failed, the rest
+                            // carry on.
+                            Err(e) if e.downcast_ref::<InterruptedError>().is_some() => {
+                                Err(format!(
+                                    "stopped: {}",
+                                    stop_reason
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .clone()
+                                        .unwrap_or_else(|| "cancelled".to_string())
+                                ))
+                            }
                             other => other.map_err(|e| e.to_string()),
                         };
                         let done = done_count.fetch_add(1, Ordering::Relaxed) + 1;

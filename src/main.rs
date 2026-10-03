@@ -500,10 +500,10 @@ fn estimate_cost_usd(usage: &SessionUsage, pricing: &openai::Pricing) -> Option<
 }
 
 /// A sub-agent running in this session, and how to stop it.
-struct RunningSubAgent {
-    cancel: mpsc::Sender<()>,
+pub(crate) struct RunningSubAgent {
+    pub(crate) cancel: mpsc::Sender<()>,
     /// Why it was stopped, for the result its parent gets.
-    stop_reason: Arc<Mutex<Option<String>>>,
+    pub(crate) stop_reason: Arc<Mutex<Option<String>>>,
 }
 
 /// The sub-agents running in this session, by name.
@@ -511,6 +511,41 @@ type RunningSubAgents = Arc<Mutex<HashMap<String, RunningSubAgent>>>;
 
 /// Stops the running sub-agent `name`, recording `reason` (unless it was
 /// already stopped for another). Returns whether one was running.
+/// Takes care of the agents this session runs that the user asked to stop
+/// (`AGENT_STOP_KEY`): one running a task has the task stopped - however
+/// it runs, the task's stop does the rest; a sub-agent or fan-out worker
+/// of this session is cancelled; any other - the session's own agent -
+/// gets `interrupt_turn`.
+fn handle_agent_stops(
+    db: &dyn DbBackend,
+    session_id: &str,
+    running: &RunningSubAgents,
+    interrupt_turn: &dyn Fn(),
+) {
+    let Ok(agents) = db.list_agents() else {
+        return;
+    };
+    for agent in agents
+        .iter()
+        .filter(|a| a.session_id.as_deref() == Some(session_id))
+    {
+        let Ok(Some(_)) = db.get_agent_data(&agent.name, db::AGENT_STOP_KEY) else {
+            continue;
+        };
+        let _ = db.delete_agent_data(&agent.name, db::AGENT_STOP_KEY);
+        let task = db
+            .get_agent_data(&agent.name, db::RUNNING_TASK_KEY)
+            .ok()
+            .flatten()
+            .and_then(|id| id.parse::<i64>().ok());
+        if let Some(task) = task {
+            let _ = db.request_task_stop(task);
+        } else if !stop_sub_agent(running, &agent.name, "stopped by the user") {
+            interrupt_turn();
+        }
+    }
+}
+
 fn stop_sub_agent(running: &RunningSubAgents, name: &str, reason: &str) -> bool {
     let running = running.lock().unwrap_or_else(|e| e.into_inner());
     let Some(agent) = running.get(name) else {
@@ -2136,15 +2171,82 @@ fn command_spawn_error_message(sandboxed: bool, err: &std::io::Error) -> String 
 /// Runs `cmd`, reports its output through `ctx.println`, and returns the
 /// JSON result shared by the sandboxed and unsandboxed `run_command`
 /// variants.
-fn run_command_and_report(
+/// Runs `cmd` to completion, like `Command::output`, but stops it - its
+/// whole process group, so `sh -c`'s children too - as soon as `interrupt`
+/// says so (Ctrl-C, a stopped task or sub-agent), with `InterruptedError`.
+/// It gets no stdin: nobody would answer it.
+fn output_interruptibly(
     mut cmd: Command,
+    interrupt: &Option<Arc<Mutex<mpsc::Receiver<()>>>>,
+) -> Result<std::io::Result<std::process::Output>, Box<dyn Error>> {
+    use std::os::unix::process::CommandExt;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return Ok(Err(e)),
+    };
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut out);
+            }
+            out
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Ok(std::process::Output {
+                status,
+                stdout: stdout.join().unwrap_or_default(),
+                stderr: stderr.join().unwrap_or_default(),
+            }));
+        }
+        let interrupted = interrupt.as_ref().is_some_and(|rx| {
+            rx.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .try_recv()
+                .is_ok()
+        });
+        if interrupted {
+            // The group is the child's own pid (process_group(0)).
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Box::new(InterruptedError::new(
+                "Operation interrupted by user",
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn run_command_and_report(
+    cmd: Command,
     ctx: &ToolContext,
     command_label: &str,
     sandboxed: bool,
 ) -> Result<String, Box<dyn Error>> {
     trace!("Executing command: {:?}", cmd);
 
-    let result = match cmd.output() {
+    let result = match output_interruptibly(cmd, &ctx.interrupt)? {
         Ok(output) => {
             let stdout = String::from_utf8(output.stdout)
                 .unwrap_or_else(|_| "<non-utf8 output>".to_string());
@@ -2600,9 +2702,8 @@ fn search_in_current_directory(
         cmd
     };
     cmd.current_dir(&cwd);
-    cmd.stdin(Stdio::null());
     trace!("Executing search command: {:?}", cmd);
-    let output = cmd.output().map_err(|e| {
+    let output = output_interruptibly(cmd, &ctx.interrupt)?.map_err(|e| {
         if sandboxed {
             format!(
                 "Failed to launch the sandbox (bwrap): {} - is bubblewrap installed?",
@@ -4113,6 +4214,8 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         };
         let transcript_start = messages.clone();
         let cancel = Some(Arc::new(Mutex::new(cancel_rx)));
+        // Its tools stop with it: a command, a fan-out, a wait.
+        sub_ctx.interrupt = cancel.clone();
         let result = run_reporting(messages, &slot, result_schema.as_ref(), |messages| {
             run_collecting_sub_agents(&runs, &agent_name, &cancel, &events, messages, |messages| {
                 post_request_with_mode(
@@ -5919,16 +6022,67 @@ fn agent_config_lines(config: &db::AgentConfig) -> Vec<(&'static str, String)> {
 }
 
 /// `faber profiles`: the config file's profiles, and what each sets.
-fn profiles_command(opts: &Opts) -> Result<(), Box<dyn Error>> {
-    if opts.profiles.is_empty() {
-        println!("No profiles: add them under \"profiles\" in the config file.");
+fn profiles_command(
+    opts: &Opts,
+    db: &Option<Arc<dyn DbBackend>>,
+    action: Option<&ProfilesAction>,
+) -> Result<(), Box<dyn Error>> {
+    let need_db = || {
+        db.as_ref().ok_or(
+            "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
+        )
+    };
+    match action {
+        Some(ProfilesAction::Set { name, settings }) => {
+            if opts.profiles.contains_key(name) {
+                return Err(
+                    format!("profile '{}' is in the config file: change it there", name).into(),
+                );
+            }
+            let db = need_db()?;
+            let current = db
+                .list_profiles()?
+                .into_iter()
+                .find(|(n, _)| n == name)
+                .and_then(|(_, v)| serde_json::from_value::<Profile>(v).ok())
+                .unwrap_or_default();
+            let profile = settings.apply(current)?;
+            validate_profiles(&Profiles::from([(name.clone(), profile.clone())]))?;
+            db.set_profile(name, &serde_json::to_value(&profile)?)?;
+            println!("Profile '{}' saved in the database.", name);
+            return Ok(());
+        }
+        Some(ProfilesAction::Delete { name }) => {
+            if opts.profiles.contains_key(name) {
+                return Err(
+                    format!("profile '{}' is in the config file: remove it there", name).into(),
+                );
+            }
+            if !need_db()?.delete_profile(name)? {
+                return Err(format!("no profile '{}' in the database", name).into());
+            }
+            println!("Profile '{}' removed.", name);
+            return Ok(());
+        }
+        None => {}
+    }
+    let profiles = session_profiles(opts, db.as_deref());
+    if profiles.is_empty() {
+        println!(
+            "No profiles: add them under \"profiles\" in the config file, or with `faber profiles set`."
+        );
         return Ok(());
     }
-    let mut names: Vec<&String> = opts.profiles.keys().collect();
+    let mut names: Vec<&String> = profiles.keys().collect();
     names.sort();
     for name in names {
-        let profile = &opts.profiles[name];
-        println!("{}", name);
+        let profile = &profiles[name];
+        let source = if opts.profiles.contains_key(name) {
+            "config file"
+        } else {
+            "database"
+        };
+        println!("{} ({})", name, source);
         if let Some(description) = &profile.description {
             println!("  {}", description);
         }
@@ -8614,15 +8768,22 @@ fn chat_command(
     .expect("Error setting up Ctrl-C handler");
 
     // A task this session is running that's asked to stop (`faber tasks
-    // stop`, the web UI) is interrupted like Ctrl-C would.
+    // stop`, the web UI) is interrupted like Ctrl-C would; so is an agent
+    // it runs that's asked to: its sub-agents, or its own turn.
     if let Some(ref db) = db {
         let db = db.clone();
         let session = session_id.to_string();
         let ctrl_c_tx = ctrl_c_tx.clone();
         let signal_handler_active = signal_handler_active.clone();
+        let running_subagents = running_subagents.clone();
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_millis(500));
+                handle_agent_stops(db.as_ref(), &session, &running_subagents, &|| {
+                    if signal_handler_active.load(Ordering::Relaxed) {
+                        let _ = ctrl_c_tx.send(());
+                    }
+                });
                 // Only while a turn runs: that's when a task could.
                 if !signal_handler_active.load(Ordering::Relaxed) {
                     continue;
@@ -10161,6 +10322,15 @@ fn run_prompt_task_headless(
         }
     };
     let agent_config = db.get_agent_config(agent).unwrap_or_default();
+    // Stopping the agent stops this (see `handle_agent_stops`).
+    let _ = db.set_agent_data(agent, db::RUNNING_TASK_KEY, &task.id.to_string());
+    struct NotRunningWhenDone<'a>(&'a dyn DbBackend, &'a str);
+    impl Drop for NotRunningWhenDone<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.delete_agent_data(self.1, db::RUNNING_TASK_KEY);
+        }
+    }
+    let _not_running = NotRunningWhenDone(db.as_ref(), agent);
     // The task's own directory, else its agent's.
     let run_cwd = task.cwd.clone().or(agent_config.cwd.clone());
     if let Some(cwd) = run_cwd
@@ -10558,6 +10728,8 @@ fn run_worker(
     // only once every one of them has.
     std::thread::scope(|scope| {
         while !stop.stopped() {
+            // Agents asked to stop: their tasks, or them as sub-agents.
+            handle_agent_stops(db.as_ref(), &session_id, &extra.running_subagents, &|| {});
             // Tasks asked to stop (`faber tasks stop`, the web UI): signal
             // them until they do - one signal may be taken by a tool that
             // isn't the one waiting.
@@ -10951,6 +11123,7 @@ fn follow_events(
 /// `faber agents`: the agents as a tree, once or with `watch` every that
 /// many seconds - or, with `show`, one agent and its transcript.
 fn agents_command(
+    opts: &Opts,
     db: &Option<Arc<dyn DbBackend>>,
     action: Option<&AgentsAction>,
     watch: Option<u64>,
@@ -10958,16 +11131,51 @@ fn agents_command(
     let db = db.as_ref().ok_or(
         "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
     )?;
+    if let Some(AgentsAction::Message { name, text }) = action {
+        db.get_agent(name)?
+            .ok_or_else(|| format!("no agent named '{}'", name))?;
+        let id = db.create_task(&db::message_task(name, text, chrono::Utc::now()))?;
+        println!(
+            "Sent to '{}' as task #{}: it gets it once it's free.",
+            name, id
+        );
+        return Ok(());
+    }
+    if let Some(AgentsAction::Cleanup { dry_run }) = action {
+        let names = db::finished_made_agents(&db.list_agents()?, chrono::Utc::now());
+        if names.is_empty() {
+            println!("No finished agents made by agents.");
+        }
+        for name in &names {
+            if !*dry_run {
+                db.delete_agent(name)?;
+            }
+            println!(
+                "{} {}",
+                if *dry_run { "Would remove" } else { "Removed" },
+                name
+            );
+        }
+        return Ok(());
+    }
     if let Some(AgentsAction::Set {
         name,
         r#unsafe,
         safe,
         cwd,
         no_cwd,
+        profile,
+        settings,
     }) = action
     {
-        if !*r#unsafe && !*safe && cwd.is_none() && !*no_cwd {
-            return Err("nothing to change: give --unsafe, --safe, --cwd or --no-cwd".into());
+        if !*r#unsafe
+            && !*safe
+            && cwd.is_none()
+            && !*no_cwd
+            && profile.is_none()
+            && settings.is_empty()
+        {
+            return Err("nothing to change: see `faber agents set --help`".into());
         }
         let here = std::env::current_dir()?;
         let cwd = cwd
@@ -10976,6 +11184,26 @@ fn agents_command(
             .transpose()?;
         if db.get_agent(name)?.is_none() {
             db.create_agent(name, "")?;
+        }
+        if let Some(profile) = profile {
+            let profiles = session_profiles(opts, Some(db.as_ref()));
+            apply_profile(
+                db.as_ref(),
+                name,
+                profile,
+                find_profile(&profiles, profile)?,
+            )?;
+            println!("Agent '{}' has profile {}'s settings.", name, profile);
+        }
+        if !settings.is_empty() {
+            let row = db.get_agent(name)?.ok_or("the agent went away")?;
+            let config = db.get_agent_config(name)?;
+            let changed = settings.apply(agent_settings(&config, &row.description))?;
+            db.set_agent_config(name, &apply_settings(config, &changed))?;
+            if settings.description.is_some() {
+                db.set_agent_description(name, changed.description.as_deref().unwrap_or(""))?;
+            }
+            println!("Agent '{}': settings changed.", name);
         }
         if *r#unsafe || *safe {
             set_agent_unsafe(db.as_ref(), name, *r#unsafe)?;
@@ -11049,6 +11277,13 @@ fn agents_command(
         );
         for (label, value) in agent_config_lines(&config) {
             println!("  {:<13} {}", format!("{}:", label), value);
+        }
+        let plan = load_plan(db.as_ref(), name).unwrap_or_default();
+        if !plan.is_empty() {
+            println!("\nPlan:");
+            for line in format_plan(&plan) {
+                println!("  {}", line);
+            }
         }
         let messages: Vec<Message> = db
             .load_agent_messages(name)?
@@ -11262,6 +11497,120 @@ fn hold_tasks_command(
     if failed > 0 {
         return Err(format!("{} of {} task(s) not changed", failed, ids.len()).into());
     }
+    Ok(())
+}
+
+/// A task as it is, as a `NewTask` - to change and give `update_task`.
+fn task_as_new(task: &db::TaskRow) -> db::NewTask {
+    db::NewTask {
+        name: task.name.clone(),
+        description: task.description.clone(),
+        kind: task.kind.clone(),
+        command: task.command.clone(),
+        agent_name: task.agent_name.clone(),
+        schedule: match &task.cron_expression {
+            Some(expression) if task.task_type == "cron" => db::TaskSchedule::Cron {
+                expression: expression.clone(),
+                max_runs: task.max_runs,
+            },
+            _ => db::TaskSchedule::Once {
+                at: task
+                    .run_at
+                    .clone()
+                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+            },
+        },
+        held: task.status == db::TaskStatus::HELD,
+        depends_on: task.depends_on.clone(),
+        profile: task.profile.clone(),
+        run_safe: task.run_safe,
+        cwd: task.cwd.clone(),
+    }
+}
+
+/// `faber tasks edit`: changes what's given of a task that isn't running.
+fn edit_task_command(
+    db: &Option<Arc<dyn DbBackend>>,
+    action: &TasksAction,
+) -> Result<(), Box<dyn Error>> {
+    let db = db.as_ref().ok_or(
+        "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
+    )?;
+    let TasksAction::Edit {
+        id,
+        text,
+        after,
+        at,
+        cron,
+        max_runs,
+        agent,
+        profile,
+        any,
+        name,
+        depends_on,
+        no_deps,
+        cwd,
+        no_cwd,
+    } = action
+    else {
+        return Err("not a `tasks edit` command".into());
+    };
+    let current = db
+        .get_task(*id)?
+        .ok_or_else(|| format!("no task #{}", id))?;
+    let mut task = task_as_new(&current);
+    let now = chrono::Utc::now();
+    if let Some(text) = text {
+        if text.trim().is_empty() {
+            return Err("the task's text is empty".into());
+        }
+        task.command = text.clone();
+    }
+    if let Some(name) = name {
+        task.name = name.clone();
+    }
+    if let Some(expression) = cron {
+        task.schedule = db::TaskSchedule::Cron {
+            expression: expression.clone(),
+            max_runs: *max_runs,
+        };
+    } else if let Some(after) = after {
+        let duration = parse_duration(after)
+            .ok_or_else(|| format!("can't read --in '{}': use e.g. 30s, 10m, 2h, 1d", after))?;
+        task.schedule = db::TaskSchedule::Once {
+            at: (now + duration).to_rfc3339(),
+        };
+    } else if let Some(at) = at {
+        task.schedule = db::TaskSchedule::Once {
+            at: parse_datetime(at)
+                .unwrap_or_else(|| Err(format!("can't read --at '{}'", at)))?
+                .to_rfc3339(),
+        };
+    }
+    if *any {
+        task.agent_name = None;
+        task.profile = None;
+    } else if let Some(agent) = agent {
+        task.agent_name = Some(agent.clone());
+        task.profile = None;
+    } else if let Some(profile) = profile {
+        task.profile = Some(profile.clone());
+        task.agent_name = None;
+    }
+    if *no_deps {
+        task.depends_on.clear();
+    } else if !depends_on.is_empty() {
+        task.depends_on = depends_on.clone();
+    }
+    if *no_cwd {
+        task.cwd = None;
+    } else if let Some(dir) = cwd {
+        task.cwd = Some(resolve_cwd(&std::env::current_dir()?, dir)?);
+    }
+    if !db.update_task(*id, &task)? {
+        return Err(format!("task #{} is running: stop it to change it", id).into());
+    }
+    println!("Task #{} changed.", id);
     Ok(())
 }
 
@@ -12104,6 +12453,50 @@ enum TasksAction {
         #[clap(long, value_name = "DIR")]
         cwd: Option<String>,
     },
+    /// Change a task that isn't running: what it says, where and when it
+    /// runs, what it waits for, its directory - only what's given
+    Edit {
+        /// The task's id, as `faber tasks` lists it
+        id: i64,
+        /// What it should do now (for a tool task, the tool call's JSON)
+        text: Option<String>,
+        /// Run it this long from now: 30s, 10m, 2h, 1d, 1w
+        #[clap(long = "in", value_name = "DURATION", conflicts_with_all = ["at", "cron"])]
+        after: Option<String>,
+        /// Run it at this time: "2026-10-03 08:00" (local), 2026-10-03, or RFC 3339
+        #[clap(long, conflicts_with = "cron")]
+        at: Option<String>,
+        /// Run it on this 7-field cron schedule instead
+        #[clap(long)]
+        cron: Option<String>,
+        /// With --cron, stop after this many runs
+        #[clap(long, requires = "cron")]
+        max_runs: Option<i64>,
+        /// Run it on this agent
+        #[clap(long, conflicts_with_all = ["profile", "any"])]
+        agent: Option<String>,
+        /// Run it on a new agent made from this profile
+        #[clap(long, conflicts_with = "any")]
+        profile: Option<String>,
+        /// Run it on whichever agent is free first
+        #[clap(long)]
+        any: bool,
+        /// Its name in `faber tasks`
+        #[clap(long)]
+        name: Option<String>,
+        /// Wait for these tasks instead (can be repeated)
+        #[clap(long = "after", value_name = "ID", conflicts_with = "no_deps")]
+        depends_on: Vec<i64>,
+        /// Wait for no other task
+        #[clap(long)]
+        no_deps: bool,
+        /// Run it in this directory
+        #[clap(long, value_name = "DIR", conflicts_with = "no_cwd")]
+        cwd: Option<String>,
+        /// Run it where its agent works
+        #[clap(long)]
+        no_cwd: bool,
+    },
     /// Put scheduled tasks on hold, so they aren't picked up even when due
     Hold {
         /// The ids of the tasks, as `faber tasks` lists them
@@ -12200,7 +12593,170 @@ enum AgentsAction {
         /// Work in the current directory of whatever runs it again
         #[clap(long)]
         no_cwd: bool,
+        /// Copy this profile's settings (the database's or the config
+        /// file's) first; the settings given below are set over them
+        #[clap(long)]
+        profile: Option<String>,
+        #[clap(flatten)]
+        settings: SettingsArgs,
     },
+    /// Send an agent a message: it gets it as soon as it's free, however
+    /// it runs (a chat, a worker) - it's a task for it
+    Message {
+        name: String,
+        /// What to tell it
+        text: String,
+    },
+    /// Remove the finished agents that agents made - sub-agents, task
+    /// agents, fan-out workers - with nothing running them or below them.
+    /// Agents you made stay (unlike `faber gc`)
+    Cleanup {
+        /// Only show which
+        #[clap(long)]
+        dry_run: bool,
+    },
+}
+
+/// Settings of an agent, or of a profile, to change from the command
+/// line: each given is set - or, given empty, cleared - and the rest left.
+#[derive(Debug, Clone, clap::Args)]
+struct SettingsArgs {
+    /// What it's for
+    #[clap(long)]
+    description: Option<String>,
+    #[clap(long)]
+    model: Option<String>,
+    #[clap(long)]
+    endpoint: Option<String>,
+    /// Added to its instructions
+    #[clap(long)]
+    system_prompt: Option<String>,
+    #[clap(long, value_name = "N")]
+    max_tokens: Option<String>,
+    #[clap(long, value_name = "N")]
+    context_window: Option<String>,
+    /// The only tools it may use, comma-separated; "all" for no limit
+    #[clap(long, value_name = "LIST")]
+    tools: Option<String>,
+    /// Request parameters, as a JSON object, e.g. '{"temperature": 0.2}'
+    #[clap(long, value_name = "JSON")]
+    parameters: Option<String>,
+}
+
+impl SettingsArgs {
+    fn is_empty(&self) -> bool {
+        [
+            &self.description,
+            &self.model,
+            &self.endpoint,
+            &self.system_prompt,
+            &self.max_tokens,
+            &self.context_window,
+            &self.tools,
+            &self.parameters,
+        ]
+        .iter()
+        .all(|v| v.is_none())
+    }
+
+    /// `profile` with these changes made.
+    fn apply(&self, mut profile: Profile) -> Result<Profile, String> {
+        let text = |v: &Option<String>, current: Option<String>| match v {
+            None => current,
+            Some(v) if v.trim().is_empty() => None,
+            Some(v) => Some(v.clone()),
+        };
+        let number = |v: &Option<String>, current: Option<u32>, what: &str| match v {
+            None => Ok(current),
+            Some(v) if v.trim().is_empty() => Ok(None),
+            Some(v) => v
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|n| *n > 0)
+                .map(Some)
+                .ok_or_else(|| format!("--{} wants a positive number, not '{}'", what, v)),
+        };
+        profile.description = text(&self.description, profile.description);
+        profile.model = text(&self.model, profile.model);
+        profile.endpoint = text(&self.endpoint, profile.endpoint);
+        profile.system_prompt = text(&self.system_prompt, profile.system_prompt);
+        profile.max_tokens = number(&self.max_tokens, profile.max_tokens, "max-tokens")?;
+        profile.context_window = number(
+            &self.context_window,
+            profile.context_window,
+            "context-window",
+        )?;
+        if let Some(tools) = &self.tools {
+            profile.tools = match tools.trim() {
+                "" | "all" => None,
+                list => {
+                    let known = initialize_tools(true, None);
+                    let names: Vec<String> =
+                        list.split(',').map(|t| t.trim().to_string()).collect();
+                    if let Some(bad) = names.iter().find(|t| !known.contains_key(t.as_str())) {
+                        return Err(format!("no tool named '{}'", bad));
+                    }
+                    Some(names)
+                }
+            };
+        }
+        if let Some(parameters) = &self.parameters {
+            profile.parameters = match parameters.trim() {
+                "" => None,
+                json => match serde_json::from_str::<serde_json::Value>(json) {
+                    Ok(serde_json::Value::Object(map)) if map.is_empty() => None,
+                    Ok(serde_json::Value::Object(map)) => Some(map),
+                    _ => return Err("--parameters wants a JSON object".to_string()),
+                },
+            };
+        }
+        Ok(profile)
+    }
+}
+
+/// An agent's config as profile-shaped settings, to change with
+/// `SettingsArgs` and copy back (`apply_settings`).
+fn agent_settings(config: &db::AgentConfig, description: &str) -> Profile {
+    Profile {
+        description: (!description.is_empty()).then(|| description.to_string()),
+        model: config.model.clone(),
+        endpoint: config.endpoint.clone(),
+        api_key: config.api_key.clone(),
+        max_tokens: config.max_tokens,
+        context_window: config.context_window,
+        parameters: config.parameters.clone(),
+        system_prompt: config.system_prompt.clone(),
+        tools: config.tools.clone(),
+    }
+}
+
+/// `config` with `settings` copied in: what an agent's config shares with
+/// a profile - its unsafe tools, directory and profile stay.
+fn apply_settings(mut config: db::AgentConfig, settings: &Profile) -> db::AgentConfig {
+    config.model = settings.model.clone();
+    config.endpoint = settings.endpoint.clone();
+    config.api_key = settings.api_key.clone();
+    config.max_tokens = settings.max_tokens;
+    config.context_window = settings.context_window;
+    config.parameters = settings.parameters.clone();
+    config.system_prompt = settings.system_prompt.clone();
+    config.tools = settings.tools.clone();
+    config
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ProfilesAction {
+    /// Make or change a profile in the database, shared by every session
+    /// using it (the config file's are changed there)
+    Set {
+        name: String,
+        #[clap(flatten)]
+        settings: SettingsArgs,
+    },
+    /// Remove a profile from the database (agents made from it keep their
+    /// settings)
+    Delete { name: String },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -12285,8 +12841,12 @@ enum CliCommand {
         profiles: Vec<String>,
     },
 
-    /// List the profiles in the config file, to make agents from
-    Profiles {},
+    /// List the profiles to make agents from - the config file's and the
+    /// database's - or make, change or remove one in the database
+    Profiles {
+        #[clap(subcommand)]
+        action: Option<ProfilesAction>,
+    },
 
     /// Show the agents as a tree by who spawned whom, with what each is
     /// doing - or, with `show`, one agent and its conversation
@@ -12386,7 +12946,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             | CliCommand::Agents { .. }
             | CliCommand::Models {}
             | CliCommand::ListTools {}
-            | CliCommand::Profiles {}
+            | CliCommand::Profiles { action: None }
             | CliCommand::Gc {}
     ) {
         unsafe {
@@ -12530,9 +13090,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             profiles,
         ),
         CliCommand::Agents { action, watch } => {
-            agents_command(&db_connection, action.as_ref(), *watch)
+            agents_command(&opts, &db_connection, action.as_ref(), *watch)
         }
-        CliCommand::Profiles {} => profiles_command(&opts),
+        CliCommand::Profiles { action } => {
+            profiles_command(&opts, &db_connection, action.as_ref())
+        }
         CliCommand::Kb { action, tag, last } => {
             kb_command(&db_connection, action.as_ref(), tag.as_deref(), *last)
         }
@@ -12561,6 +13123,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             action: Some(TasksAction::Run { ids }),
             ..
         } => run_tasks_command(&db_connection, ids),
+        CliCommand::Tasks {
+            action: Some(edit @ TasksAction::Edit { .. }),
+            ..
+        } => edit_task_command(&db_connection, edit),
         CliCommand::Tasks {
             action: Some(TasksAction::Stop { ids }),
             ..
@@ -14469,6 +15035,39 @@ mod tests {
     }
 
     #[test]
+    fn test_a_stop_kills_a_running_command_at_once() {
+        let dir = TempTestDir::new("stop_command");
+        let (tx, rx) = mpsc::channel();
+        let mut ctx = ToolContext::new(|_: &str| {});
+        ctx.cwd = Some(dir.0.clone());
+        ctx.interrupt = Some(Arc::new(Mutex::new(rx)));
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = tx.send(());
+        });
+        let started = std::time::Instant::now();
+        // A shell, with a child of its own that would outlive it.
+        let err = tool_run_command(
+            &r#"{"command": "sleep 30 & sleep 30; touch done"}"#.to_string(),
+            &ctx,
+        )
+        .unwrap_err();
+        assert!(err.downcast_ref::<InterruptedError>().is_some(), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!dir.0.join("done").exists());
+        // Without a stop, it runs to the end, with nothing to read on stdin.
+        let mut ctx = ToolContext::new(|_: &str| {});
+        ctx.cwd = Some(dir.0.clone());
+        let out = tool_run_command(&r#"{"command": "cat; echo ok"}"#.to_string(), &ctx).unwrap();
+        assert!(out.contains("ok"), "{out}");
+    }
+
+    #[test]
     fn test_tools_work_in_the_agents_own_directory() {
         let dir = TempTestDir::new("agent_cwd");
         std::fs::create_dir(dir.0.join("sub")).unwrap();
@@ -15893,6 +16492,7 @@ mod tests {
         );
         assert_eq!(transcript[3]["tool_calls"][0]["function"]["name"], "glob");
         agents_command(
+            &Opts::default(),
             &Some(db.clone()),
             Some(&AgentsAction::Show {
                 name: "scout".to_string(),
@@ -15901,7 +16501,7 @@ mod tests {
             None,
         )
         .unwrap();
-        agents_command(&Some(db), None, None).unwrap();
+        agents_command(&Opts::default(), &Some(db), None, None).unwrap();
     }
 
     #[test]

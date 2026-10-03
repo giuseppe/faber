@@ -525,6 +525,39 @@ impl DbBackend for RemoteDb {
         Ok(serde_json::from_value(v)?)
     }
 
+    fn update_task(&self, task_id: i64, task: &NewTask) -> Result<bool, Box<dyn Error>> {
+        let v = self.call(
+            "update_task",
+            serde_json::json!({"task_id": task_id, "task": task}),
+        )?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn set_profile(&self, name: &str, settings: &serde_json::Value) -> Result<(), Box<dyn Error>> {
+        self.call(
+            "set_profile",
+            serde_json::json!({"name": name, "settings": settings}),
+        )?;
+        Ok(())
+    }
+
+    fn delete_profile(&self, name: &str) -> Result<bool, Box<dyn Error>> {
+        let v = self.call("delete_profile", serde_json::json!({"name": name}))?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn set_agent_description(
+        &self,
+        agent: &str,
+        description: &str,
+    ) -> Result<bool, Box<dyn Error>> {
+        let v = self.call(
+            "set_agent_description",
+            serde_json::json!({"agent": agent, "description": description}),
+        )?;
+        Ok(serde_json::from_value(v)?)
+    }
+
     fn list_profiles(&self) -> Result<Vec<(String, serde_json::Value)>, Box<dyn Error>> {
         let v = self.call("list_profiles", serde_json::json!({}))?;
         Ok(serde_json::from_value(v)?)

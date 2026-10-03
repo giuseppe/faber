@@ -360,6 +360,11 @@ faber agents show scout      # one agent in detail, with its conversation (--ful
 faber agents follow          # what every agent does, live: input, answers, tool calls, outcomes
 faber agents follow scout    # only scout's (--reasoning to include its reasoning)
 faber tasks follow 7         # everything done for task #7, by its agent, sub-agents and workers
+faber agents message rev "look at src"     # a task for it: it gets it once it's free
+faber agents set rev --profile deep --model qwen3-32b --tools read_file,glob   # its settings
+faber agents cleanup --dry-run             # finished agents agents made (gc removes all idle ones)
+faber profiles set deep --model big --system-prompt "Think."   # a profile in the database
+faber profiles delete deep
 ```
 
 What agents do is recorded in the database as it happens, wherever they
@@ -495,6 +500,7 @@ faber tasks add "Deploy the release notes" --hold   # created held
 faber tasks hold 7 8                                 # hold scheduled tasks
 faber tasks release 7 8                              # picked up again - right away if already due
 faber tasks run 7                                    # now: held, disabled, not due yet, or done (again)
+faber tasks edit 7 "new text" --cron "0 0 9 * * * *" # change what's given, until it runs
 faber tasks stop 7                                   # interrupt it while it runs, sub-agents and all
 ```
 
@@ -941,6 +947,10 @@ each other. Changes apply from the agent's next turn or task. A list of
 an agent's sub-agents (a fan-out's workers) shows the first few until
 asked for the rest.
 
+A working agent's panel has Stop: whichever process runs it stops what
+it's doing - the task it's running, or itself as a sub-agent or fan-out
+worker (the rest of the fan-out carries on), or its turn in a chat. Its
+Conversation view can clear the conversation of an agent nothing runs.
 An agent's panel shows its plan, if it keeps one (`plan_update`), as a
 checklist - and its row, how far along it is. An agent's panel has a
 message box: what you send it reaches it however

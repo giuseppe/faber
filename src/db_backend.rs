@@ -104,6 +104,15 @@ pub trait DbBackend: Send + Sync {
     fn list_tasks(&self, agent_name: Option<&str>) -> Result<Vec<TaskRow>, Box<dyn Error>>;
     fn get_task(&self, task_id: i64) -> Result<Option<TaskRow>, Box<dyn Error>>;
     fn set_task_enabled(&self, task_id: i64, enabled: bool) -> Result<bool, Box<dyn Error>>;
+    /// See `db::update_task`.
+    fn update_task(&self, task_id: i64, task: &NewTask) -> Result<bool, Box<dyn Error>>;
+    /// See `db::set_profile`.
+    fn set_profile(&self, name: &str, settings: &serde_json::Value) -> Result<(), Box<dyn Error>>;
+    /// See `db::delete_profile`.
+    fn delete_profile(&self, name: &str) -> Result<bool, Box<dyn Error>>;
+    /// See `db::set_agent_description`.
+    fn set_agent_description(&self, agent: &str, description: &str)
+    -> Result<bool, Box<dyn Error>>;
     /// See `db::list_profiles`.
     fn list_profiles(&self) -> Result<Vec<(String, serde_json::Value)>, Box<dyn Error>>;
     /// See `db::request_task_stop`.
