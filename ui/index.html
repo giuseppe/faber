@@ -30,6 +30,7 @@
       <h2 id="detail-title">All agents</h2>
       <div id="detail-actions" class="actions"></div>
     </div>
+    <div id="problems" class="problems" hidden></div>
     <dl id="detail-fields" class="fields"></dl>
     <div class="feed-options">
       <label class="toggle"><input type="checkbox" id="show-reasoning"> reasoning</label>
@@ -62,6 +63,10 @@
       <select name="target" id="target-select"></select>
     </label>
     <p class="hint" id="target-hint"></p>
+    <label>Working directory
+      <input name="cwd" id="cwd-input" placeholder="where its agent works" spellcheck="false">
+    </label>
+    <p class="hint">Where it runs: relative paths, commands and the sandbox are all inside it.</p>
     <fieldset>
       <legend>When</legend>
       <label class="inline"><input type="radio" name="when" value="now" checked> now</label>

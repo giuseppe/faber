@@ -525,6 +525,11 @@ impl DbBackend for RemoteDb {
         Ok(serde_json::from_value(v)?)
     }
 
+    fn request_task_stop(&self, task_id: i64) -> Result<bool, Box<dyn Error>> {
+        let v = self.call("request_task_stop", serde_json::json!({"task_id": task_id}))?;
+        Ok(serde_json::from_value(v)?)
+    }
+
     fn run_task_now(&self, task_id: i64) -> Result<bool, Box<dyn Error>> {
         let v = self.call("run_task_now", serde_json::json!({"task_id": task_id}))?;
         Ok(serde_json::from_value(v)?)

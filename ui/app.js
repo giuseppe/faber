@@ -25,6 +25,10 @@ const state = {
   // The latest thing each agent, and each task's run, said or did.
   latestByAgent: new Map(),
   latestByTask: new Map(),
+  // Tool calls that failed, by task: shown on its card and in its panel.
+  errorsByTask: new Map(),
+  // The server's own directory, a new task's default one.
+  serverCwd: null,
   showAllDone: new Set(),
 };
 
@@ -119,6 +123,31 @@ function lastLine(text, max = 100) {
 
 // --- Events: what agents said and did -------------------------------------
 
+// A failed tool call's reason: "error: tool 'x' failed: why" -> "why", or
+// the `error` of a JSON result.
+function toolError(output) {
+  const text = (output || "").trim();
+  if (text.startsWith("{")) {
+    try {
+      const json = JSON.parse(text);
+      const error = json.error || json.stderr;
+      if (error) return typeof error === "string" ? firstLine(error, 300) : JSON.stringify(error);
+    } catch { /* not JSON after all */ }
+  }
+  return text.replace(/^error: (tool '[^']*' failed: |MCP tool '[^']*' failed: )?/, "");
+}
+
+// Keeps a failed tool call of a task's run, for its card and panel.
+function noteError(row) {
+  const event = row.event;
+  if (event.type !== "tool_end" || !event.failed || row.task_id == null) return;
+  const errors = state.errorsByTask.get(row.task_id) || [];
+  if (errors.some((e) => e.id === row.id)) return;
+  errors.push({ id: row.id, agent: row.agent, tool: event.name, message: toolError(event.output) });
+  errors.sort((a, b) => a.id - b.id);
+  state.errorsByTask.set(row.task_id, errors);
+}
+
 // A one-line summary of the latest thing an agent did, from its events.
 function noteLatest(row) {
   const event = row.event;
@@ -196,14 +225,20 @@ function appendEvent(box, row, labelled) {
       const open = [...box.querySelectorAll("details.tool.running")]
         .reverse()
         .find((d) => d.dataset.agent === row.agent && d.dataset.name === event.name);
-      const summary = `✓ ${labelled ? row.agent + ": " : ""}${event.name} · ${(event.duration_ms / 1000).toFixed(1)}s · ${firstLine(event.output, 100)}`;
+      const failed = !!event.failed;
+      const summary = failed
+        ? `✗ ${labelled ? row.agent + ": " : ""}${event.name} failed: ${firstLine(toolError(event.output), 140)}`
+        : `✓ ${labelled ? row.agent + ": " : ""}${event.name} · ${(event.duration_ms / 1000).toFixed(1)}s · ${firstLine(event.output, 100)}`;
       if (open) {
         open.classList.remove("running");
+        open.classList.toggle("error", failed);
+        open.open = open.open || failed;
         open.querySelector("summary").textContent = summary;
         open.append(el("pre", {}, event.output));
         return;
       }
-      node = el("details", { class: "event tool" }, el("summary", {}, summary), el("pre", {}, event.output));
+      node = el("details", { class: `event tool${failed ? " error" : ""}`, open: failed },
+        el("summary", {}, summary), el("pre", {}, event.output));
       break;
     }
     case "turn_end":
@@ -261,16 +296,20 @@ async function pollEvents() {
     const firstAll = state.all.last === null;
     const rows = await pollStream(state.all, new URLSearchParams());
     rows.forEach(noteLatest);
+    rows.forEach(noteError);
     const selected = state.selected;
     let shown = state.selected ? [] : rows;
+    let changed = rows.length > 0;
     if (selected) {
       const stream = state.one;
       const firstOne = stream.last === null;
       const params = new URLSearchParams(selected.kind === "agent"
         ? { agent: selected.name } : { task: selected.id });
       const mine = await pollStream(stream, params);
+      mine.forEach(noteError);
       if (state.selected !== selected) return; // switched meanwhile
       shown = mine;
+      changed ||= mine.length > 0;
       if (firstOne) { renderFeed(); shown = []; }
     } else if (firstAll) {
       renderFeed();
@@ -282,9 +321,10 @@ async function pollEvents() {
       for (const row of shown) appendEvent(box, row, feedLabel());
       scrollFeed();
     }
-    if (rows.length) {
+    if (changed) {
       renderAgents();
       renderTasks();
+      renderDetail();
     }
   } catch { /* shown by the connection pill */ } finally {
     polling = false;
@@ -390,9 +430,20 @@ function taskCard(task, draggable) {
           taskAction(task.id, "run");
         },
         "aria-label": "Run",
-      }) : null),
+      }) : el("button", {
+        class: "stop",
+        title: task.stop_requested ? "Stopping…" : "Stop it",
+        disabled: task.stop_requested,
+        onclick: (e) => {
+          e.stopPropagation();
+          taskAction(task.id, "stop");
+        },
+        "aria-label": "Stop",
+      })),
     el("div", { class: "card-meta" },
       st === "disabled" ? el("span", { class: "badge" }, "disabled") : null,
+      errorCount(task) ? el("span", { class: "badge danger", title: "Tool calls that failed in its runs" },
+        `${errorCount(task)} error${errorCount(task) === 1 ? "" : "s"}`) : null,
       `${taskTarget(task)} · ${taskWhen(task, st)}`,
       task.blocked_by?.length ? ` · after ${task.blocked_by.map((d) => "#" + d).join(", ")}` : "",
       task.cron_expression ? ` · cron ${task.cron_expression}` : ""),
@@ -413,6 +464,10 @@ function taskCard(task, draggable) {
     });
   }
   return card;
+}
+
+function errorCount(task) {
+  return (state.errorsByTask.get(task.id) || []).length;
 }
 
 // What a running task's agent is up to: its latest output, or - until
@@ -575,8 +630,29 @@ function renderFeedStatus() {
   $("feed-status").textContent = working.map((a) => `${a.name}: ${a.activity}…`).join("  ·  ");
 }
 
+// At the top of a task's panel: why it failed, and the tool calls that
+// failed along the way - not left to be found in the feed.
+function renderProblems(task, st) {
+  const box = $("problems");
+  const errors = task ? state.errorsByTask.get(task.id) || [] : [];
+  const failed = task && st === "failed";
+  if (!failed && !errors.length) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  box.replaceChildren(...[
+    failed ? el("div", { class: "problem-title" }, "Failed: ", firstLine(task.last_result, 300)) : null,
+    errors.length ? el("div", { class: "problem-title" },
+      `${errors.length} tool call${errors.length === 1 ? "" : "s"} failed:`) : null,
+    errors.length ? el("ul", {}, errors.map((e) =>
+      el("li", {}, el("code", {}, e.tool), ` (${e.agent}): ${e.message}`))) : null,
+  ].filter(Boolean));
+}
+
 function renderDetail() {
   renderFeedStatus();
+  if (state.selected?.kind !== "task") renderProblems(null);
   const selected = state.selected;
   const fields = $("detail-fields");
   const actions = $("detail-actions");
@@ -622,6 +698,12 @@ function renderDetail() {
   if (st !== "running") {
     actions.append(el("button", { class: "primary play", onclick: () => taskAction(task.id, "run") },
       st === "succeeded" || st === "failed" ? "Run again" : "Run now"));
+  } else {
+    actions.append(el("button", {
+      class: "danger stop-button",
+      disabled: task.stop_requested,
+      onclick: () => taskAction(task.id, "stop"),
+    }, task.stop_requested ? "Stopping…" : "Stop"));
   }
   if (["waiting", "blocked"].includes(st)) {
     actions.append(el("button", { onclick: () => taskAction(task.id, "hold") }, "Hold"));
@@ -640,9 +722,11 @@ function renderDetail() {
   if (st !== "running") {
     actions.append(el("button", { class: "danger", onclick: () => taskAction(task.id, "delete") }, "Delete"));
   }
+  renderProblems(task, st);
   fields.replaceChildren(
     ...field("State", st + (task.blocked_by?.length ? ` (after ${task.blocked_by.map((d) => "#" + d).join(", ")})` : "")),
     ...field("Runs on", taskTarget(task)),
+    ...field("Runs in", task.cwd || "where its agent works"),
     ...field("Kind", task.kind),
     ...field("Schedule", task.cron_expression ? `cron ${task.cron_expression}` : `once, ${relative(task.run_at)}`),
     ...field("Next run", task.status === "scheduled" ? relative(task.next_run_at) : null),
@@ -718,7 +802,22 @@ function fillTargets(preset) {
   updateTargetHint();
 }
 
+// The working directory a new task gets unless changed: the chosen
+// agent's own, else the one last used, else the server's.
+function defaultCwd() {
+  const target = $("target-select").value;
+  const agent = target.startsWith("agent:") && state.agents.find((a) => a.name === target.slice(6));
+  if (agent?.cwd) return agent.cwd;
+  try {
+    const last = localStorage.getItem("faber-cwd");
+    if (last) return last;
+  } catch { /* fine */ }
+  return state.serverCwd || "";
+}
+
 function updateTargetHint() {
+  const input = $("cwd-input");
+  if (!input.dataset.edited) input.value = defaultCwd();
   const value = $("target-select").value;
   $("target-hint").textContent = value.startsWith("profile:")
     ? "Run by a worker that has this profile, on a new agent made from it."
@@ -729,7 +828,10 @@ function updateTargetHint() {
 
 $("target-select").addEventListener("change", updateTargetHint);
 
+$("cwd-input").addEventListener("input", (e) => { e.target.dataset.edited = "1"; });
+
 function openNewTask(preset) {
+  delete $("cwd-input").dataset.edited;
   fillTargets(preset);
   $("new-task-error").hidden = true;
   $("new-task").showModal();
@@ -750,7 +852,9 @@ $("new-task-form").addEventListener("submit", async (e) => {
     agent: target.startsWith("agent:") ? target.slice(6) : null,
     profile: target.startsWith("profile:") ? target.slice(8) : null,
     depends_on: (form.get("depends_on") || "").split(/[\s,#]+/).filter(Boolean).map(Number),
+    cwd: (form.get("cwd") || "").trim() || null,
   };
+  if (body.cwd && !body.cwd.startsWith("/")) return showFormError("The working directory must be an absolute path.");
   const when = form.get("when");
   if (when === "at") {
     const at = new Date(form.get("at"));
@@ -762,6 +866,7 @@ $("new-task-form").addEventListener("submit", async (e) => {
   if (body.depends_on.some(isNaN)) return showFormError("Dependencies are task ids, e.g. 3, 5.");
   try {
     const { id } = await api("POST", "tasks", body);
+    try { if (body.cwd) localStorage.setItem("faber-cwd", body.cwd); } catch { /* fine */ }
     $("new-task").close();
     e.target.reset();
     await refresh();
@@ -784,6 +889,7 @@ async function refresh() {
     const [agents, tasks, profiles] = await Promise.all([
       api("GET", "agents"), api("GET", "tasks"), api("GET", "profiles"),
     ]);
+    if (state.serverCwd === null) state.serverCwd = (await api("GET", "info")).cwd || "";
     state.agents = agents;
     state.tasks = tasks;
     state.profiles = profiles;

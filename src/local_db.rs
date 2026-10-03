@@ -347,6 +347,11 @@ impl DbBackend for LocalDb {
         db::kb_delete(&conn, id, viewer)
     }
 
+    fn request_task_stop(&self, task_id: i64) -> Result<bool, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::request_task_stop(&conn, task_id)
+    }
+
     fn run_task_now(&self, task_id: i64) -> Result<bool, Box<dyn Error>> {
         let conn = self.lock()?;
         db::run_task_now(&conn, task_id)

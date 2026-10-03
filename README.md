@@ -232,6 +232,12 @@ faber agents set reviewer --cwd ~/src/other-project
 faber agents set reviewer --no-cwd       # back to wherever it's run
 ```
 
+A task can have its own too - `faber tasks add --cwd DIR`, or the web
+UI's New task form, which starts from the server's directory (or the
+chosen agent's own) - and runs there whichever agent picks it up. An
+agent is told in its instructions where it works, so it uses relative
+paths instead of guessing absolute ones.
+
 In a chat, `/cwd PATH` sets it for the current agent, `/cwd -` clears it,
 and `/cwd` shows it (`/chdir` still changes the directory of the whole
 process, for agents without their own). The web UI has it in each
@@ -240,7 +246,7 @@ agent's panel.
 An agent an agent makes - a sub-agent, a worker's task agent - works
 where its maker does. Only an agent with the unsafe tools can choose
 another directory (`cwd` in `spawn_agent`, `agent_create`,
-`agent_configure`); a safe one can't, nor reuse an agent the user set to
+`agent_configure`, `task_create`); a safe one can't, nor reuse an agent the user set to
 work elsewhere. A worker fails a task whose agent's directory doesn't
 exist on its machine.
 
@@ -310,9 +316,12 @@ user", and so on.
 An agent can wait for its sub-agents with the `agent_wait` tool - all of
 them, the ones it names, or (`any: true`) whichever finishes first, with a
 timeout - and gets their results together, as one tool result, instead of
-one message per sub-agent arriving later. This is also how a sub-agent
-collects the results of sub-agents of its own: only a chat reads
-messages, so without it they'd go unread.
+one message per sub-agent arriving later. With nothing to wait for (say,
+after `fan_out`, which returns its results itself) it just says so.
+
+Only a chat reads messages, so a sub-agent or a task whose turn ends with
+sub-agents of its own still working doesn't end there: it waits for
+their results and carries on with them, so they're never lost.
 
 Delegated work - a sub-agent, a `fan_out` worker, or a scheduled task -
 reports its outcome with the `report_result` tool: `succeeded` or
@@ -328,6 +337,9 @@ on `spawn_agent` and `fan_out` help delegation:
 - `context` hands the new agent knowledge base notes (by title or id) and
   files up front, so it doesn't start cold:
   `{"notes": ["Deploying"], "files": ["src/main.rs"]}`.
+
+`fan_out`'s workers are agents too, `<caller>-item-<n>`, under the agent
+that fanned out: they show, and can be followed, like sub-agents.
 
 A finished sub-agent is kept, with its conversation, until `faber gc`
 removes it (it then has no live session), so you can see what it did.
@@ -467,6 +479,7 @@ faber tasks add "Deploy the release notes" --hold   # created held
 faber tasks hold 7 8                                 # hold scheduled tasks
 faber tasks release 7 8                              # picked up again - right away if already due
 faber tasks run 7                                    # now: held, disabled, not due yet, or done (again)
+faber tasks stop 7                                   # interrupt it while it runs, sub-agents and all
 ```
 
 Only a `scheduled` task can be held (a running one is already assigned)
@@ -884,11 +897,18 @@ then the server.
   result, how each turn ended - and the tasks. Pick an agent or a task to
   follow only that; a task's feed shows its runs, whichever agent ran
   them.
+- A task's panel starts with what went wrong, if anything: why it
+  failed, and every tool call that failed along the way. Failed tool
+  calls are also red, and open, in the feed, and counted on the task's
+  card.
 - **Board**: the tasks as a scrum board - Backlog (held), To do, In
   progress (with the running agent's latest output), Done, Failed. Drag a
   card between Backlog and To do to hold or release it; disabled tasks
   are greyed out in the backlog. Every task not running has a run button
-  (▶) - to start it now, whatever it was waiting for, or run it again.
+  (▶) - to start it now, whatever it was waiting for, or run it again -
+  and every running one a stop button (■): whichever chat or worker runs
+  it interrupts it, with its sub-agents and fan-out workers, and records
+  it as failed ("stopped").
 
 New tasks can be added there too, choosing where they run: on any agent
 (the first free chat or worker takes it - the default), on a given

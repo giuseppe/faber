@@ -64,6 +64,9 @@ pub enum AgentEvent {
         name: String,
         duration_ms: u64,
         output: String,
+        /// The tool failed (see `tool_failed`).
+        #[serde(default)]
+        failed: bool,
     },
     /// The turn is over: how it went, and its outcome or error.
     TurnEnd {
@@ -97,6 +100,31 @@ pub struct EventFilter {
     #[serde(default)]
     pub after: Option<i64>,
     pub limit: usize,
+}
+
+/// Whether a tool's result says it failed: tool_call's `error: ...`, a
+/// JSON object with an `error` (how several tools report one, e.g.
+/// read_file's missing file), or a command that never ran or finished. A
+/// command that ran and exited non-zero isn't a failed tool call.
+pub fn tool_failed(output: &str) -> bool {
+    let output = output.trim_start();
+    if output.starts_with("error: ") {
+        return true;
+    }
+    if !output.starts_with('{') {
+        return false;
+    }
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(output) else {
+        return false;
+    };
+    let has_error = json
+        .get("error")
+        .is_some_and(|e| !e.is_null() && e != &serde_json::Value::String(String::new()));
+    // run_command's result for a command that never ran or didn't finish:
+    // no exit code - it couldn't be started, or was killed.
+    let never_finished = json.get("success") == Some(&serde_json::Value::Bool(false))
+        && json.get("exit_code").is_some_and(|c| c.is_null());
+    has_error || never_finished
 }
 
 /// Where an agent's events go.
@@ -176,6 +204,7 @@ pub fn observed(mode: ResponseMode, output: Arc<dyn AgentOutput>) -> ResponseMod
                         result,
                         MAX_EVENT_TOOL_OUTPUT_CHARS,
                     ),
+                    failed: tool_failed(result),
                 }),
                 StatusUpdate::Complete { .. } => output.flush(),
                 _ => {}
@@ -360,6 +389,21 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 4);
         assert!(rows.iter().all(|r| r.agent == "a"));
+    }
+
+    #[test]
+    fn test_tool_failed() {
+        assert!(tool_failed("error: tool 'agent_wait' failed: nope"));
+        assert!(tool_failed(r#"{"content":null,"error":"File not found"}"#));
+        assert!(!tool_failed(r#"{"content":"x","error":null}"#));
+        assert!(!tool_failed(
+            r#"{"stdout":"","exit_code":1,"success":false}"#
+        ));
+        assert!(tool_failed(
+            r#"{"stdout":"","stderr":"Failed to launch the sandbox","exit_code":null,"success":false}"#
+        ));
+        assert!(!tool_failed("the word error: appears later"));
+        assert!(!tool_failed("{not json"));
     }
 
     #[test]

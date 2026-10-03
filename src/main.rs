@@ -164,6 +164,108 @@ fn tool_report_result(params_str: &String, ctx: &ToolContext) -> Result<String, 
 /// Runs a piece of delegated work with `run`, and if a `schema` asks for a
 /// structured result that wasn't reported, reminds the agent once and
 /// lets it continue.
+/// Most times a turn is carried on with its sub-agents' results (see
+/// `run_collecting_sub_agents`).
+const MAX_SUB_AGENT_FOLLOW_UPS: usize = 8;
+
+/// How long a turn waits for its sub-agents' results before carrying on.
+const SUB_AGENT_COLLECT_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// Waits for every sub-agent `parent` started whose result it hasn't had
+/// yet, and hands back those results - `None` if there are none. Stops
+/// early on `cancel`, with whatever has come in.
+fn collect_sub_agent_results(
+    runs: &SubAgentRuns,
+    parent: &str,
+    cancel: &Option<Arc<Mutex<mpsc::Receiver<()>>>>,
+    timeout: Duration,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut state = runs.runs.lock().unwrap_or_else(|e| e.into_inner());
+    let targets: Vec<u64> = state
+        .iter()
+        .filter(|(_, run)| run.parent == parent && !run.delivered)
+        .map(|(id, _)| *id)
+        .collect();
+    if targets.is_empty() {
+        return Ok(None);
+    }
+    loop {
+        if targets.iter().all(|id| state[id].result.is_some()) {
+            break;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        state = runs
+            .finished
+            .wait_timeout(state, (deadline - now).min(Duration::from_millis(100)))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+        let cancelled = cancel.as_ref().is_some_and(|rx| {
+            rx.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .try_recv()
+                .is_ok()
+        });
+        if cancelled {
+            return Err(Box::new(InterruptedError::new(
+                "Operation interrupted by user",
+            )));
+        }
+    }
+    let mut out = String::new();
+    for id in &targets {
+        let run = state.get_mut(id).expect("targets come from the map");
+        match &run.result {
+            Some(result) => {
+                run.delivered = true;
+                out.push_str(&format!("## {}\n{}\n\n", run.name, result.trim()));
+            }
+            None => out.push_str(&format!(
+                "## {}\n(still running after {} minutes; given up on)\n\n",
+                run.name,
+                timeout.as_secs() / 60
+            )),
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Runs `request` on `messages`; then, as long as `agent` has sub-agents
+/// out whose results it hasn't collected, waits for them and runs it again
+/// with their results - so a turn nobody else is following (a task, a
+/// sub-agent) doesn't end with work still going on, its results lost.
+fn run_collecting_sub_agents(
+    runs: &SubAgentRuns,
+    agent: &str,
+    cancel: &Option<Arc<Mutex<mpsc::Receiver<()>>>>,
+    events: &Option<Arc<EventLog>>,
+    messages: Vec<Message>,
+    mut request: impl FnMut(Vec<Message>) -> Result<OpenAIResponse, Box<dyn Error>>,
+) -> Result<OpenAIResponse, Box<dyn Error>> {
+    let mut response = request(messages)?;
+    for _ in 0..MAX_SUB_AGENT_FOLLOW_UPS {
+        let Some(results) =
+            collect_sub_agent_results(runs, agent, cancel, SUB_AGENT_COLLECT_TIMEOUT)?
+        else {
+            break;
+        };
+        let text = format!(
+            "[Your sub-agents have finished. Their results:]\n\n{}Carry on with the task.",
+            results
+        );
+        if let Some(events) = events {
+            events.emit(AgentEvent::Input { text: text.clone() });
+        }
+        let mut history = response.history.clone();
+        history.push(make_message("user", text));
+        response = request(history)?;
+    }
+    Ok(response)
+}
+
 pub(crate) fn run_reporting(
     messages: Vec<Message>,
     slot: &Arc<Mutex<Option<faber::ReportedResult>>>,
@@ -2546,7 +2648,8 @@ fn tool_agent_create(params_str: &String, ctx: &ToolContext) -> Result<String, B
         #[serde(default)]
         cwd: Option<String>,
     }
-    let params: Params = serde_json::from_str(params_str)?;
+    let mut params: Params = serde_json::from_str(params_str)?;
+    params.profile = requested_profile(&ctx_profiles(ctx), params.profile.take());
     let db = ctx.db()?;
     let unsafe_tools = child_unsafe(ctx.unsafe_tools, params.unsafe_tools)?;
     let cwd = child_cwd(ctx, params.cwd.as_deref())?;
@@ -2630,7 +2733,8 @@ fn tool_agent_configure(params_str: &String, ctx: &ToolContext) -> Result<String
         #[serde(default)]
         cwd: Option<String>,
     }
-    let params: Params = serde_json::from_str(params_str)?;
+    let mut params: Params = serde_json::from_str(params_str)?;
+    params.profile = requested_profile(&ctx_profiles(ctx), params.profile.take());
     let db = ctx.db()?;
     if db.get_agent(&params.agent)?.is_none() {
         return Err(format!("no agent named '{}'", params.agent).into());
@@ -3053,8 +3157,13 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         depends_on: Vec<i64>,
         #[serde(default)]
         profile: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     }
-    let params: Params = serde_json::from_str(params_str)?;
+    let mut params: Params = serde_json::from_str(params_str)?;
+    params.profile = requested_profile(&ctx_profiles(ctx), params.profile.take());
+    // It runs where its maker works, unless one that may choose does.
+    let cwd = child_cwd(ctx, params.cwd.as_deref())?;
     if params.command.trim().is_empty() {
         return Err("the task needs a command: an instruction, or a JSON tool call".into());
     }
@@ -3107,6 +3216,7 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         profile: params.profile,
         // Whoever picks it up, it can't do more than its maker could.
         run_safe: !ctx.unsafe_tools,
+        cwd,
     };
     let id = ctx.db()?.create_task(&task)?;
     let next_run = ctx.db()?.get_task(id)?.and_then(|t| t.next_run_at);
@@ -3239,7 +3349,8 @@ fn tool_task_assign(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         #[serde(default)]
         profile: Option<String>,
     }
-    let params: Params = serde_json::from_str(params_str)?;
+    let mut params: Params = serde_json::from_str(params_str)?;
+    params.profile = requested_profile(&ctx_profiles(ctx), params.profile.take());
     let db = ctx.db()?;
     let updated = db.set_task_target(
         params.id,
@@ -3317,14 +3428,19 @@ fn tool_agent_wait(params_str: &String, ctx: &ToolContext) -> Result<String, Box
         .map(|(id, _)| *id)
         .collect();
     if targets.is_empty() {
-        return Err(match &params.names {
+        // Not a failure - there's just nothing left to wait for, e.g. after
+        // fan_out, which hands back its results itself.
+        return Ok(match &params.names {
             Some(names) => format!(
-                "none of {} is a sub-agent of yours with a result still to collect",
+                "Nothing to wait for: none of {} is a sub-agent of yours with a result still \
+                 to collect (already collected, or never started with spawn_agent).",
                 names.join(", ")
             ),
-            None => "you have no sub-agents with results still to collect".to_string(),
-        }
-        .into());
+            None => "Nothing to wait for: you have no sub-agents with results still to collect. \
+                     (fan_out returns its results directly, as its own result; agent_wait is only \
+                     for sub-agents started with spawn_agent.)"
+                .to_string(),
+        });
     }
     let names: Vec<String> = targets.iter().map(|id| state[id].name.clone()).collect();
     ctx.println(&format!("Waiting for {}...", names.join(", ")));
@@ -3443,7 +3559,8 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         #[serde(default)]
         cwd: Option<String>,
     }
-    let params: Params = serde_json::from_str(params_str)?;
+    let mut params: Params = serde_json::from_str(params_str)?;
+    params.profile = requested_profile(&ctx_profiles(ctx), params.profile.take());
 
     let sa_ctx = ctx
         .extra
@@ -3540,13 +3657,20 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     let agent_opts = with_agent_config(&sa_ctx.opts, &agent_config);
     let tools = Arc::new(agent_tools(&sa_ctx.tools, sub_unsafe, &agent_config));
 
-    let mut messages: Vec<Message> = vec![make_message(
-        "system",
-        format!(
-            "You are a sub-agent named '{}'. Complete the task and return a concise result.",
-            agent_name
+    let mut messages: Vec<Message> = vec![
+        make_message(
+            "system",
+            format!(
+                "You are a sub-agent named '{}'. Complete the task and return a concise result.",
+                agent_name
+            ),
         ),
-    )];
+        working_directory_note(
+            &sub_cwd
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
+        ),
+    ];
     if let Some(ref sp) = agent_config.system_prompt {
         messages.push(make_message("system", sp.clone()));
     }
@@ -3693,14 +3817,16 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         let transcript_start = messages.clone();
         let cancel = Some(Arc::new(Mutex::new(cancel_rx)));
         let result = run_reporting(messages, &slot, result_schema.as_ref(), |messages| {
-            post_request_with_mode(
-                messages,
-                &tools,
-                &agent_opts,
-                mode(),
-                &sub_ctx,
-                cancel.clone(),
-            )
+            run_collecting_sub_agents(&runs, &agent_name, &cancel, &events, messages, |messages| {
+                post_request_with_mode(
+                    messages,
+                    &tools,
+                    &agent_opts,
+                    mode(),
+                    &sub_ctx,
+                    cancel.clone(),
+                )
+            })
         });
         // Kept, with the agent, until `faber gc`: `faber agents show` reads it.
         let transcript = match &result {
@@ -4845,6 +4971,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "description": {"type": "string", "description": "What the task is for"},
                         "agent_name": {"type": "string", "description": "The agent that runs it (default: you, unless a profile is given)"},
                         "profile": {"type": "string", "description": "For an instruction: run it on a new agent made from this profile (one listed in your system prompt), by a worker that has it, instead of on an agent"},
+                        "cwd": {"type": "string", "description": "The directory it runs in. Default: the one you work in. Only an agent with the unsafe tools can choose another"},
                         "cron_expression": {"type": "string", "description": "7 fields: 'sec min hour day_of_month month day_of_week year', e.g. '0 30 9 * * Mon-Fri *' for 9:30 every weekday"},
                         "max_runs": {"type": "integer", "description": "With cron_expression: stop after this many runs"},
                         "delay_seconds": {"type": "integer", "description": "Run once, this many seconds from now"},
@@ -5496,6 +5623,34 @@ fn ctx_profiles(ctx: &ToolContext) -> Arc<Profiles> {
 }
 
 /// The profile called `name`, or an error naming the ones there are.
+/// The profile a model asked for, as one: none for an empty name, or for
+/// "default" when no profile has that name - models reach for it when
+/// they mean "no particular one".
+pub(crate) fn requested_profile(profiles: &Profiles, name: Option<String>) -> Option<String> {
+    name.filter(|n| !n.trim().is_empty())
+        .filter(|n| n != "default" || profiles.contains_key(n))
+}
+
+/// The tools' schemas without their `profile` parameter, when there are
+/// no profiles to pick from: offered one anyway, a model makes a name up.
+fn without_profile_params(mut tools: ToolsCollection) -> ToolsCollection {
+    for tool in tools.values_mut() {
+        let Ok(mut schema) = serde_json::from_str::<serde_json::Value>(&tool.schema) else {
+            continue;
+        };
+        let removed = schema["function"]["parameters"]["properties"]
+            .as_object_mut()
+            .and_then(|props| props.remove("profile"));
+        if removed.is_some() {
+            if let Some(required) = schema["function"]["parameters"]["required"].as_array_mut() {
+                required.retain(|r| r != "profile");
+            }
+            tool.schema = schema.to_string();
+        }
+    }
+    tools
+}
+
 fn find_profile<'a>(profiles: &'a Profiles, name: &str) -> Result<&'a Profile, String> {
     profiles.get(name).ok_or_else(|| {
         let mut names: Vec<&str> = profiles.keys().map(String::as_str).collect();
@@ -5693,6 +5848,11 @@ fn agent_tools(
 ) -> ToolsCollection {
     let mut tools = initialize_tools(unsafe_tools, None);
     tools.retain(|name, _| within.contains_key(name));
+    // Offered no profiles to choose from, nor is it.
+    let profiles_offered = within.values().any(|t| t.schema.contains("\"profile\""));
+    if !profiles_offered {
+        tools = without_profile_params(tools);
+    }
     effective_tools(&tools, config)
 }
 
@@ -5703,7 +5863,12 @@ fn session_tools(opts: &Opts) -> ToolsCollection {
         return ToolsCollection::new();
     }
     let allowed = (!opts.tools.is_empty()).then(|| opts.tools.clone());
-    initialize_tools(true, allowed.as_deref())
+    let tools = initialize_tools(true, allowed.as_deref());
+    if opts.profiles.is_empty() {
+        without_profile_params(tools)
+    } else {
+        tools
+    }
 }
 
 /// The tools an agent with `config` gets of `available`: all of them, or
@@ -8058,6 +8223,32 @@ fn chat_command(
     })
     .expect("Error setting up Ctrl-C handler");
 
+    // A task this session is running that's asked to stop (`faber tasks
+    // stop`, the web UI) is interrupted like Ctrl-C would.
+    if let Some(ref db) = db {
+        let db = db.clone();
+        let session = session_id.to_string();
+        let ctrl_c_tx = ctrl_c_tx.clone();
+        let signal_handler_active = signal_handler_active.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(500));
+                // Only while a turn runs: that's when a task could.
+                if !signal_handler_active.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let stopping = db.list_tasks(None).is_ok_and(|tasks| {
+                    tasks.iter().any(|t| {
+                        t.stop_requested && t.claimed_by.as_deref() == Some(session.as_str())
+                    })
+                });
+                if stopping {
+                    let _ = ctrl_c_tx.send(());
+                }
+            }
+        });
+    }
+
     let (task_tx, task_rx) = mpsc::channel::<(Option<String>, String, Message, Message)>();
     if let Some(ref scheduler_db) = db {
         let heartbeat_db = scheduler_db.clone();
@@ -8136,6 +8327,8 @@ fn chat_command(
     // A prompt task this session claimed and is running as the current
     // injected turn, and when the last check for one was.
     let mut running_prompt_task: Option<i64> = None;
+    // The directory each agent was last told it works in.
+    let mut told_cwd: HashMap<String, PathBuf> = HashMap::new();
     let mut last_prompt_task_poll = std::time::Instant::now();
 
     loop {
@@ -8367,7 +8560,20 @@ fn chat_command(
                     tool_context.agent_name = Some(active_agent.name.clone());
                     tool_context.mcp_manager = mcp_manager.clone();
                     tool_context.unsafe_tools = turn_unsafe;
-                    tool_context.cwd = turn_config.cwd.clone().map(PathBuf::from);
+                    // A task's own directory, else the agent's.
+                    let task_cwd = running_prompt_task
+                        .and_then(|id| db.as_ref()?.get_task(id).ok()?)
+                        .and_then(|task| task.cwd);
+                    tool_context.cwd = task_cwd.or(turn_config.cwd.clone()).map(PathBuf::from);
+                    let here = tool_context.cwd();
+                    if told_cwd.get(&active_agent.name) != Some(&here) {
+                        // Before the message it's for.
+                        let at = active_agent.messages.len().saturating_sub(1);
+                        active_agent
+                            .messages
+                            .insert(at, working_directory_note(&here));
+                        told_cwd.insert(active_agent.name.clone(), here);
+                    }
                     if let Some(cwd) = tool_context.cwd.as_ref().filter(|c| !c.is_dir()) {
                         chat_pb.println(&format!(
                             "Warning: '{}' works in {}, which isn't a directory here (/cwd to change it)",
@@ -8436,7 +8642,11 @@ fn chat_command(
                             },
                         );
                         let task_turn = running_prompt_task.take();
-                        let outcome = reported_task_outcome(result.as_ref(), &task_result_slot);
+                        let mut outcome = reported_task_outcome(result.as_ref(), &task_result_slot);
+                        if matches!(&result, Err(e) if e.downcast_ref::<InterruptedError>().is_some())
+                        {
+                            outcome.result = "stopped".to_string();
+                        }
                         record_turn_end(&events, &outcome);
                         if let (Some(task_id), Some(db)) = (task_turn, &db) {
                             if let Err(e) = db.finish_task(task_id, &session_id, &outcome) {
@@ -9173,6 +9383,7 @@ fn new_task_from_cli(
         name,
         hold,
         depends_on,
+        cwd,
     } = action
     else {
         return Err("not a `tasks add` command".to_string());
@@ -9241,6 +9452,10 @@ fn new_task_from_cli(
         depends_on: depends_on.clone(),
         profile: profile.clone(),
         run_safe: false,
+        cwd: cwd
+            .as_deref()
+            .map(|dir| resolve_cwd(&std::env::current_dir().map_err(|e| e.to_string())?, dir))
+            .transpose()?,
     })
 }
 
@@ -9311,6 +9526,12 @@ fn describe_task(
                 dependencies.join(", ")
             },
         ),
+        (
+            "Runs in",
+            task.cwd
+                .clone()
+                .unwrap_or_else(|| "where its agent works".to_string()),
+        ),
     ];
     let indent = |text: &str| {
         text.lines()
@@ -9351,13 +9572,52 @@ fn profile_task_agent(
     let name = format!("{}-{}", profile, task.id);
     apply_profile(db, &name, profile, settings)?;
     set_agent_unsafe(db, &name, unsafe_tools)?;
-    // It works where the worker does.
-    set_agent_cwd(db, &name, db.get_agent_config(parent)?.cwd)?;
+    // It works where the task says, or else where the worker does.
+    let cwd = task.cwd.clone().or(db.get_agent_config(parent)?.cwd);
+    set_agent_cwd(db, &name, cwd)?;
     db.set_agent_parent(&name, Some(parent))?;
     if !db.claim_agent(&name, session_id)? {
         return Err(format!("agent '{}' is in use by another session", name).into());
     }
     Ok(name)
+}
+
+/// The agent a fan_out worker runs as, `name`, made for it as a sub-agent
+/// of `caller` - with its unsafe tools, or not, and directory - and
+/// claimed by the session.
+pub(crate) fn make_worker_agent(
+    db: &dyn DbBackend,
+    name: &str,
+    caller: &str,
+    ctx: &ToolContext,
+    session_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    if db.get_agent(name)?.is_none() {
+        db.create_agent(name, &format!("fan_out worker of {}", caller))?;
+    }
+    db.set_agent_parent(name, Some(caller))?;
+    let mut config = db.get_agent_config(name)?;
+    config.unsafe_tools = Some(ctx.unsafe_tools);
+    config.cwd = ctx.cwd.as_ref().and_then(|c| c.to_str()).map(String::from);
+    db.set_agent_config(name, &config)?;
+    if !db.claim_agent(name, session_id)? {
+        return Err(format!("agent '{}' is in use by another session", name).into());
+    }
+    Ok(())
+}
+
+/// Tells an agent where it works - otherwise models assume, or make up,
+/// a directory, and hand made-up paths to the agents they start.
+pub(crate) fn working_directory_note(cwd: &std::path::Path) -> Message {
+    make_message(
+        "system",
+        format!(
+            "You work in the directory {}. Relative paths in your tools (read_file, glob, \
+             grep_in_current_directory, run_command, ...) are relative to it, and so are those of \
+             the agents you start, which work there too: give them relative paths.",
+            cwd.display()
+        ),
+    )
 }
 
 /// The agent a task no one in particular was given runs on: `task-<id>`,
@@ -9377,6 +9637,9 @@ fn own_task_agent(
     }
     let mut config = db.get_agent_config(parent)?;
     config.unsafe_tools = Some(unsafe_tools);
+    if task.cwd.is_some() {
+        config.cwd = task.cwd.clone();
+    }
     db.set_agent_config(&name, &config)?;
     db.set_agent_parent(&name, Some(parent))?;
     if !db.claim_agent(&name, session_id)? {
@@ -9451,8 +9714,9 @@ fn run_prompt_task_headless(
         }
     };
     let agent_config = db.get_agent_config(agent).unwrap_or_default();
-    if let Some(cwd) = agent_config
-        .cwd
+    // The task's own directory, else its agent's.
+    let run_cwd = task.cwd.clone().or(agent_config.cwd.clone());
+    if let Some(cwd) = run_cwd
         .as_deref()
         .filter(|c| !std::path::Path::new(c).is_dir())
     {
@@ -9485,6 +9749,12 @@ fn run_prompt_task_headless(
         ..(*extra).clone()
     });
     let mut messages = initialize_agent_messages(tools, opts, &agent_config);
+    messages.push(working_directory_note(
+        &run_cwd
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
+    ));
     let input = format!(
         "[Scheduled task #{} \"{}\"]: {}",
         task.id, task.name, task.command
@@ -9499,15 +9769,17 @@ fn run_prompt_task_headless(
     let mut ctx = ToolContext::new(|_: &str| {});
     ctx.db = Some(db.clone());
     ctx.unsafe_tools = task_unsafe;
-    ctx.cwd = agent_config.cwd.clone().map(PathBuf::from);
+    ctx.cwd = run_cwd.map(PathBuf::from);
     ctx.agent_name = Some(agent.to_string());
     ctx.mcp_manager = mcp_manager.clone();
     ctx.context_window = agent_config.context_window.or(opts.context_window);
+    let runs = extra.runs.clone();
+    let running = extra.running_subagents.clone();
     ctx.extra = Some(extra);
     let slot = Arc::new(Mutex::new(None));
     ctx.result_slot = Some(slot.clone());
     let activity = ActivityRecorder::new(db.clone(), agent);
-    let mode = {
+    let mode = || {
         let activity = activity.clone();
         recorded_mode(
             ResponseMode::Streaming {
@@ -9521,14 +9793,30 @@ fn run_prompt_task_headless(
             &events,
         )
     };
-    let result = post_request_with_mode(
-        messages,
-        tools,
-        &openai_opts,
-        mode,
-        &ctx,
-        Some(Arc::new(Mutex::new(cancel))),
-    );
+    let cancel = Some(Arc::new(Mutex::new(cancel)));
+    // Long-running tools (fan_out, agent_wait) notice a stop too.
+    ctx.interrupt = cancel.clone();
+    let result = run_collecting_sub_agents(&runs, agent, &cancel, &events, messages, |messages| {
+        post_request_with_mode(messages, tools, &openai_opts, mode(), &ctx, cancel.clone())
+    });
+    let interrupted = matches!(&result, Err(e) if e.downcast_ref::<InterruptedError>().is_some());
+    if interrupted {
+        // Its sub-agents, and theirs, go with it.
+        let names: Vec<String> = running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        for name in names {
+            if db
+                .agent_lineage(&name)
+                .is_ok_and(|lineage| lineage.iter().skip(1).any(|a| a == agent))
+            {
+                stop_sub_agent(&running, &name, "its task was stopped");
+            }
+        }
+    }
     if let Ok(response) = &result {
         let values: Vec<serde_json::Value> = response
             .history
@@ -9537,7 +9825,19 @@ fn run_prompt_task_headless(
             .collect();
         let _ = db.save_agent_messages(agent, &values);
     }
-    let outcome = reported_task_outcome(result.as_ref(), &slot);
+    let mut outcome = reported_task_outcome(result.as_ref(), &slot);
+    if interrupted {
+        let asked = db
+            .get_task(task.id)
+            .ok()
+            .flatten()
+            .is_some_and(|t| t.stop_requested);
+        outcome.result = if asked {
+            "stopped".to_string()
+        } else {
+            "stopped: the worker was interrupted".to_string()
+        };
+    }
     record_turn_end(&events, &outcome);
     if let Err(e) = db.finish_task(task.id, session_id, &outcome) {
         warn!("Couldn't record the outcome of task {}: {}", task.id, e);
@@ -9769,6 +10069,28 @@ fn run_worker(
     // only once every one of them has.
     std::thread::scope(|scope| {
         while !stop.stopped() {
+            // Tasks asked to stop (`faber tasks stop`, the web UI): signal
+            // them until they do - one signal may be taken by a tool that
+            // isn't the one waiting.
+            let running_ids: Vec<i64> = cancels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .copied()
+                .collect();
+            for id in running_ids {
+                if db
+                    .get_task(id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|t| t.stop_requested)
+                {
+                    if let Some(cancel) = cancels.lock().unwrap_or_else(|e| e.into_inner()).get(&id)
+                    {
+                        let _ = cancel.send(());
+                    }
+                }
+            }
             while let Ok((_, command, _, tool_msg)) = task_rx.try_recv() {
                 log(format!(
                     "tool task ran: {} -> {}",
@@ -10285,6 +10607,33 @@ fn hold_tasks_command(
             if hold { "held" } else { "released" },
             reason
         );
+    }
+    if failed > 0 {
+        return Err(format!("{} of {} task(s) not changed", failed, ids.len()).into());
+    }
+    Ok(())
+}
+
+/// `faber tasks stop`: asks whoever runs tasks to stop them (see
+/// `db::request_task_stop`).
+fn stop_tasks_command(db: &Option<Arc<dyn DbBackend>>, ids: &[i64]) -> Result<(), Box<dyn Error>> {
+    let db = db.as_ref().ok_or(
+        "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
+    )?;
+    let mut failed = 0;
+    for &id in ids {
+        if db.request_task_stop(id)? {
+            println!("Task #{} is being stopped.", id);
+            continue;
+        }
+        failed += 1;
+        match db.get_task(id)? {
+            None => eprintln!("Task #{} can't be stopped: no such task.", id),
+            Some(task) => eprintln!(
+                "Task #{} can't be stopped: it's {}, not running.",
+                id, task.status
+            ),
+        }
     }
     if failed > 0 {
         return Err(format!("{} of {} task(s) not changed", failed, ids.len()).into());
@@ -11099,6 +11448,10 @@ enum TasksAction {
         /// one fails (can be repeated)
         #[clap(long = "after", value_name = "ID")]
         depends_on: Vec<i64>,
+        /// Run it in this directory, whichever agent runs it (default: the
+        /// directory that agent works in)
+        #[clap(long, value_name = "DIR")]
+        cwd: Option<String>,
     },
     /// Put scheduled tasks on hold, so they aren't picked up even when due
     Hold {
@@ -11108,6 +11461,13 @@ enum TasksAction {
     },
     /// Release held tasks, so they're picked up again (right away if due)
     Release {
+        /// The ids of the tasks, as `faber tasks` lists them
+        #[clap(required = true)]
+        ids: Vec<i64>,
+    },
+    /// Stop running tasks: whoever runs them interrupts them, and their
+    /// sub-agents (recorded as failed: "stopped")
+    Stop {
         /// The ids of the tasks, as `faber tasks` lists them
         #[clap(required = true)]
         ids: Vec<i64>,
@@ -11526,6 +11886,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             action: Some(TasksAction::Run { ids }),
             ..
         } => run_tasks_command(&db_connection, ids),
+        CliCommand::Tasks {
+            action: Some(TasksAction::Stop { ids }),
+            ..
+        } => stop_tasks_command(&db_connection, ids),
         CliCommand::Tasks {
             action:
                 Some(TasksAction::Assign {
@@ -12210,6 +12574,8 @@ mod tests {
             depends_on: Vec::new(),
             profile: None,
             run_safe: false,
+            cwd: None,
+            stop_requested: false,
         }
     }
 
@@ -12406,6 +12772,7 @@ mod tests {
             depends_on: Vec::new(),
             profile: None,
             run_safe: false,
+            cwd: None,
         };
         let for_bob = db.create_task(&prompt(Some("bob"))).unwrap();
         assert!(claim_prompt_task(db.as_ref(), "s1", "alice", &[]).is_none());
@@ -13545,11 +13912,10 @@ mod tests {
                 .all(|run| run.delivered && run.result.is_some())
         );
         drop(state);
-        // Collected, so nothing left to wait for.
-        let err = tool_agent_wait(&"{}".to_string(), &ctx)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("no sub-agents"), "{err}");
+        // Collected, so nothing left to wait for - which isn't a failure.
+        let out = tool_agent_wait(&"{}".to_string(), &ctx).unwrap();
+        assert!(out.starts_with("Nothing to wait for"), "{out}");
+        assert!(out.contains("fan_out returns its results"), "{out}");
         let _ = db;
     }
 
@@ -13598,8 +13964,8 @@ mod tests {
         assert!(!later.contains("## fast"), "already collected: {later}");
         assert!(later.contains("## slow\n(still running)"), "{later}");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
-        let err = tool_agent_wait(&r#"{"names": ["nobody"]}"#.to_string(), &ctx).unwrap_err();
-        assert!(err.to_string().contains("none of nobody"), "{err}");
+        let out = tool_agent_wait(&r#"{"names": ["nobody"]}"#.to_string(), &ctx).unwrap();
+        assert!(out.contains("none of nobody"), "{out}");
         tool_agent_cancel(&r#"{"name":"slow"}"#.to_string(), &ctx).unwrap();
     }
 
@@ -13797,6 +14163,7 @@ mod tests {
                 depends_on: Vec::new(),
                 profile: Some("fast".to_string()),
                 run_safe: false,
+                cwd: None,
             })
             .unwrap();
         // A chat, or a worker without the profile, leaves it alone.
@@ -13923,6 +14290,7 @@ mod tests {
                 depends_on: Vec::new(),
                 profile: Some("fast".to_string()),
                 run_safe: false,
+                cwd: None,
             })
             .unwrap();
         let mut opts = Opts::default();
@@ -14043,6 +14411,167 @@ mod tests {
         let transcript = db.load_agent_messages(&agent.name).unwrap();
         assert!(transcript.last().unwrap()["content"] == "all quiet");
         assert!(db.load_agent_messages("w").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_a_task_does_not_end_before_its_sub_agents_report() {
+        // The model starts a sub-agent and, without waiting, ends its turn.
+        let model = model_script(
+            "collect",
+            serde_json::json!([
+                {"if": "Their results", "reply": "lib.rs has 42 lines"},
+                {"if": "count the files", "tool": "spawn_agent",
+                 "arguments": {"name": "counter", "prompt": "count lib.rs"}},
+                {"if": "count lib.rs", "reply": "42 lines", "delay_ms": 300},
+                {"if": "\"spawned\"", "reply": "started a sub-agent; it will report back"}
+            ]),
+        );
+        let db = local_db_with_agents(&["w"]);
+        assert!(db.claim_agent("w", "worker-session").unwrap());
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let id = db
+            .create_oneshot_task("t", "", &past, "count the files", None)
+            .unwrap();
+        let task = claim_prompt_task(db.as_ref(), "worker-session", "w", &[]).unwrap();
+        let ctx = chat_ctx_with_model(db.clone(), "w", &model);
+        let extra = ctx
+            .extra
+            .clone()
+            .unwrap()
+            .downcast::<SubAgentContext>()
+            .ok()
+            .unwrap();
+        let mut opts = Opts::default();
+        opts.model = Some(model.clone());
+        let (_tx, rx) = mpsc::channel();
+        let outcome = run_prompt_task_headless(
+            &task,
+            "w",
+            &db,
+            "worker-session",
+            &extra.tools,
+            &opts,
+            extra.clone(),
+            &None,
+            rx,
+        );
+        // Its result is the answer it gave with the sub-agent's in hand.
+        assert!(outcome.succeeded);
+        assert_eq!(outcome.result, "lib.rs has 42 lines");
+        assert_eq!(
+            db.get_task(id).unwrap().unwrap().last_result.as_deref(),
+            Some("lib.rs has 42 lines")
+        );
+    }
+
+    #[test]
+    fn test_a_task_runs_in_its_own_directory() {
+        let dir = TempTestDir::new("task_cwd");
+        std::fs::write(dir.0.join("only-here.txt"), "x").unwrap();
+        let model = model_script(
+            "task-cwd",
+            serde_json::json!([
+                {"if": "look", "tool": "glob", "arguments": {"pattern": "*.txt"}},
+                {"if": "only-here.txt", "reply": "found it"},
+                {"if": "Glob", "reply": "not found"}
+            ]),
+        );
+        let db = local_db_with_agents(&["w"]);
+        assert!(db.claim_agent("w", "worker-session").unwrap());
+        let id = db
+            .create_task(&db::NewTask {
+                name: "t".to_string(),
+                description: String::new(),
+                kind: db::TaskKind::PROMPT.to_string(),
+                command: "look around".to_string(),
+                agent_name: None,
+                schedule: db::TaskSchedule::Once {
+                    at: (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339(),
+                },
+                held: false,
+                depends_on: Vec::new(),
+                profile: None,
+                run_safe: false,
+                cwd: Some(dir.0.to_str().unwrap().to_string()),
+            })
+            .unwrap();
+        let task = claim_prompt_task(db.as_ref(), "worker-session", "w", &[]).unwrap();
+        let ctx = chat_ctx_with_model(db.clone(), "w", &model);
+        let extra = ctx
+            .extra
+            .clone()
+            .unwrap()
+            .downcast::<SubAgentContext>()
+            .ok()
+            .unwrap();
+        let mut opts = Opts::default();
+        opts.model = Some(model.clone());
+        let (_tx, rx) = mpsc::channel();
+        let outcome = run_prompt_task_headless(
+            &task,
+            "w",
+            &db,
+            "worker-session",
+            &extra.tools,
+            &opts,
+            extra.clone(),
+            &None,
+            rx,
+        );
+        assert_eq!(outcome.result, "found it");
+        // Its agent works there, and was told so.
+        let agent = format!("task-{}", id);
+        assert_eq!(
+            db.get_agent_config(&agent).unwrap().cwd.as_deref(),
+            dir.0.to_str()
+        );
+        let transcript = db.load_agent_messages(&agent).unwrap();
+        assert!(
+            transcript.iter().any(|m| m["content"].as_str().is_some_and(
+                |c| c.starts_with(&format!("You work in the directory {}", dir.0.display()))
+            ))
+        );
+    }
+
+    #[test]
+    fn test_models_naming_a_default_profile_get_none() {
+        let mut profiles = Profiles::new();
+        assert_eq!(requested_profile(&profiles, Some("default".into())), None);
+        assert_eq!(requested_profile(&profiles, Some(" ".into())), None);
+        assert_eq!(
+            requested_profile(&profiles, Some("fast".into())),
+            Some("fast".to_string())
+        );
+        profiles.insert("default".to_string(), Profile::default());
+        assert_eq!(
+            requested_profile(&profiles, Some("default".into())),
+            Some("default".to_string())
+        );
+    }
+
+    #[test]
+    fn test_no_profile_parameter_without_profiles() {
+        let offers = |tools: &ToolsCollection, name: &str| {
+            let schema: serde_json::Value = serde_json::from_str(&tools[name].schema).unwrap();
+            schema["function"]["parameters"]["properties"]
+                .get("profile")
+                .is_some()
+        };
+        let mut opts = Opts::default();
+        let without = session_tools(&opts);
+        for name in ["spawn_agent", "fan_out", "task_create", "agent_create"] {
+            assert!(!offers(&without, name), "{name}");
+        }
+        // Nor do the agents made from it.
+        let agent = agent_tools(&without, false, &db::AgentConfig::default());
+        assert!(!offers(&agent, "fan_out"));
+        opts.profiles.insert("fast".to_string(), Profile::default());
+        let with = session_tools(&opts);
+        assert!(offers(&with, "fan_out"));
+        assert!(offers(
+            &agent_tools(&with, false, &db::AgentConfig::default()),
+            "fan_out"
+        ));
     }
 
     #[test]
@@ -14196,9 +14725,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sub_agent_result(&db, "boss", "helper"), "on it");
-        // system, handoff, task, answer.
+        // system, working directory, handoff, task, answer.
         let transcript = db.load_agent_messages("helper").unwrap();
-        let handoff = transcript[1]["content"].as_str().unwrap();
+        let handoff = transcript[2]["content"].as_str().unwrap();
         assert!(
             handoff.contains("## Note: Deploying\nmake deploy"),
             "{handoff}"
@@ -14207,7 +14736,7 @@ mod tests {
             handoff.contains("## File: Cargo.toml\n```\n[package]"),
             "{handoff}"
         );
-        assert_eq!(transcript[2]["content"], "go");
+        assert_eq!(transcript[3]["content"], "go");
         for bad in [r#"{"notes": ["nope"]}"#, r#"{"files": ["/etc/passwd"]}"#] {
             let params = format!(r#"{{"name": "x", "prompt": "go", "context": {}}}"#, bad);
             assert!(tool_spawn_agent(&params, &ctx).is_err(), "{bad}");
@@ -14358,9 +14887,15 @@ mod tests {
             Some("finished: found the manifest")
         );
         let transcript = db.load_agent_messages("scout").unwrap();
-        // system, user, tool call, tool result, answer.
-        assert_eq!(transcript.len(), 5, "{transcript:?}");
-        assert_eq!(transcript[2]["tool_calls"][0]["function"]["name"], "glob");
+        // system, working directory, user, tool call, tool result, answer.
+        assert_eq!(transcript.len(), 6, "{transcript:?}");
+        assert!(
+            transcript[1]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("You work in the directory")
+        );
+        assert_eq!(transcript[3]["tool_calls"][0]["function"]["name"], "glob");
         agents_command(
             &Some(db.clone()),
             Some(&AgentsAction::Show {
@@ -14390,6 +14925,46 @@ mod tests {
             db.get_agent("boss").unwrap().unwrap().activity.as_deref(),
             Some("fan_out: 3/3 done")
         );
+    }
+
+    #[test]
+    fn test_fan_out_workers_can_be_seen_as_agents() {
+        let model = model_script(
+            "visible",
+            serde_json::json!([{"if": "check", "reply": "ok"}]),
+        );
+        let db = local_db_with_agents(&["boss"]);
+        let ctx = chat_ctx_with_model(db.clone(), "boss", &model);
+        fan_out::tool_fan_out(
+            &serde_json::json!({"items": ["a", "b"], "prompt": "check {item}"}).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        for (i, item) in ["a", "b"].iter().enumerate() {
+            let name = format!("boss-item-{}", i + 1);
+            let agent = db.get_agent(&name).unwrap().expect("a worker agent");
+            assert_eq!(agent.parent.as_deref(), Some("boss"));
+            assert_eq!(agent.activity.as_deref(), Some("finished: ok"));
+            assert!(agent.session_id.is_none(), "released once done");
+            let events: Vec<_> = db
+                .agent_events(&faber::agent_io::EventFilter {
+                    agent: Some(name.clone()),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap()
+                .into_iter()
+                .map(|r| r.event)
+                .collect();
+            assert!(matches!(&events[0], AgentEvent::Input { text } if text.contains(item)));
+            assert!(matches!(
+                events.last(),
+                Some(AgentEvent::TurnEnd {
+                    succeeded: true,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
