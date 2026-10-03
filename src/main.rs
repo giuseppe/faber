@@ -17825,13 +17825,21 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let path = "_test_pf_mode.tmp";
         write_test_file(path, "#!/bin/sh\necho hi\n");
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            test_dir().join(path),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         patch(
             path,
             serde_json::json!([{"old_content": "hi", "new_content": "ho"}]),
         )
         .unwrap();
-        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(test_dir().join(path))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o755);
         cleanup(path);
     }
@@ -17889,7 +17897,7 @@ mod tests {
     #[test]
     fn test_patch_file_rejects_invalid_utf8_and_directories() {
         let path = "_test_pf_binary.tmp";
-        std::fs::write(path, [0xff, 0xfe, b'a']).unwrap();
+        std::fs::write(test_dir().join(path), [0xff, 0xfe, b'a']).unwrap();
         assert!(
             patch(
                 path,
@@ -18072,11 +18080,12 @@ mod tests {
     #[test]
     fn test_grep_tool_searches_a_directory_and_caps_results() {
         let dir = "_test_search_dir";
-        let _ = std::fs::remove_dir_all(dir);
-        std::fs::create_dir_all(format!("{dir}/sub")).unwrap();
-        std::fs::write(format!("{dir}/a.rs"), "fn tool_one() {}\nfn other() {}\n").unwrap();
-        std::fs::write(format!("{dir}/sub/b.rs"), "fn tool_two() {}\n").unwrap();
-        std::fs::write(format!("{dir}/notes.md"), "tool_three\n").unwrap();
+        let root = test_dir().join(dir);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.rs"), "fn tool_one() {}\nfn other() {}\n").unwrap();
+        std::fs::write(root.join("sub/b.rs"), "fn tool_two() {}\n").unwrap();
+        std::fs::write(root.join("notes.md"), "tool_three\n").unwrap();
 
         // Sandboxed as in production when bubblewrap is installed.
         let sandboxed = latex_kitty::resolve_on_path("bwrap").is_some();
@@ -18098,7 +18107,7 @@ mod tests {
         let out = run(serde_json::json!({"pattern": "nothing_matches_this", "path": dir}));
         assert_eq!(out, "No matches.");
 
-        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -18280,8 +18289,8 @@ mod tests {
         let target = "_test_pf_sym_target.tmp";
         let link = "_test_pf_sym_link.tmp";
         write_test_file(target, "linked content\n");
-        let _ = std::fs::remove_file(link);
-        std::os::unix::fs::symlink(target, link).unwrap();
+        cleanup(link);
+        std::os::unix::fs::symlink(target, test_dir().join(link)).unwrap();
         patch(
             link,
             serde_json::json!([{"old_content": "linked", "new_content": "patched"}]),
@@ -18301,10 +18310,14 @@ mod tests {
         // are resolved relative to the root, never to the real filesystem.
         let abs_link = "_test_pf_abs_link.tmp";
         let rel_link = "_test_pf_rel_link.tmp";
-        let _ = std::fs::remove_file(abs_link);
-        let _ = std::fs::remove_file(rel_link);
-        std::os::unix::fs::symlink(&outside, abs_link).unwrap();
-        std::os::unix::fs::symlink("../../../../../../../../../../tmp", rel_link).unwrap();
+        cleanup(abs_link);
+        cleanup(rel_link);
+        std::os::unix::fs::symlink(&outside, test_dir().join(abs_link)).unwrap();
+        std::os::unix::fs::symlink(
+            "../../../../../../../../../../tmp",
+            test_dir().join(rel_link),
+        )
+        .unwrap();
 
         let edits = serde_json::json!([{"old_content": "outside", "new_content": "hacked"}]);
         assert!(patch(abs_link, edits.clone()).is_err());
@@ -18338,20 +18351,35 @@ mod tests {
         cleanup(path);
     }
 
+    /// Where the file tools' tests work: a temp directory rather than the
+    /// source tree, so their files never land there - not even when a test
+    /// fails before cleaning up. Every test names its own files.
+    fn test_dir() -> &'static std::path::Path {
+        static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = std::env::temp_dir().join("faber_tests");
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        })
+    }
+
+    /// A tool context working in `test_dir()`.
     fn test_ctx() -> ToolContext {
-        ToolContext::new(|_| {})
+        let mut ctx = ToolContext::new(|_| {});
+        ctx.cwd = Some(test_dir().to_path_buf());
+        ctx
     }
 
     fn write_test_file(name: &str, content: &str) {
-        std::fs::write(name, content).unwrap();
+        std::fs::write(test_dir().join(name), content).unwrap();
     }
 
     fn read_test_file(name: &str) -> String {
-        std::fs::read_to_string(name).unwrap()
+        std::fs::read_to_string(test_dir().join(name)).unwrap()
     }
 
     fn cleanup(name: &str) {
-        let _ = std::fs::remove_file(name);
+        let _ = std::fs::remove_file(test_dir().join(name));
     }
 
     /// A fresh, uniquely-named temp directory for a single test, so parallel

@@ -1448,18 +1448,20 @@ mod tests {
             eprintln!("clangd not installed, skipping");
             return;
         }
-        let dir = "_test_lsp_c";
-        let _ = std::fs::remove_dir_all(dir);
-        std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(format!("{dir}/compile_flags.txt"), "-xc\n").unwrap();
+        let root = std::env::temp_dir().join(format!("faber_test_lsp_c_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("c")).unwrap();
+        let dir = "c";
+        std::fs::write(root.join("c/compile_flags.txt"), "-xc\n").unwrap();
         let source = "int add(int a, int b) { return a + b; }\n\
                       \n\
                       int main(void) {\n\
                       \x20   int x = add(1, 2);\n\
                       \x20   return add(x, 3);\n\
                       }\n";
-        std::fs::write(format!("{dir}/main.c"), source).unwrap();
-        let ctx = ToolContext::new(|_: &str| {});
+        std::fs::write(root.join("c/main.c"), source).unwrap();
+        let mut ctx = ToolContext::new(|_: &str| {});
+        ctx.cwd = Some(root.clone());
         let call = |params: Value| run(&params.to_string(), &ctx, false).unwrap();
         let file = format!("{dir}/main.c");
 
@@ -1483,10 +1485,10 @@ mod tests {
         assert_eq!(out, "No problems reported.");
 
         // An edit on disk is picked up by the next call.
-        std::fs::write(&file, source.replace("add(x, 3)", "add(x)")).unwrap();
+        std::fs::write(root.join(&file), source.replace("add(x, 3)", "add(x)")).unwrap();
         let out = call(json!({"action": "diagnostics", "path": file}));
         assert!(out.contains("main.c:5:") && out.contains("error"), "{out}");
 
-        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
