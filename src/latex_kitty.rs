@@ -805,7 +805,10 @@ pub(crate) fn resolve_in_path_dirs(
     program: &str,
     path_dirs: &std::ffi::OsStr,
 ) -> Option<std::path::PathBuf> {
+    // Only absolute directories: a relative one ("", ".", "bin") is
+    // wherever faber runs - which may be where agents write.
     std::env::split_paths(path_dirs)
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(program))
         .find(|candidate| candidate.is_file())
 }
@@ -1077,6 +1080,17 @@ mod tests {
                 "in.pdf".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_resolve_in_path_dirs_skips_relative_directories() {
+        let dir = std::env::temp_dir().join(format!("faber_test_relpath_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("faber-fake-tool"), "").unwrap();
+        let relative = std::ffi::OsString::from(".:bin:");
+        assert!(resolve_in_path_dirs("faber-fake-tool", &relative).is_none());
+        assert!(resolve_in_path_dirs("faber-fake-tool", dir.as_os_str()).is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

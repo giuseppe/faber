@@ -1337,6 +1337,7 @@ fn tool_delete_path(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     };
 
     debug!("Remove path: {}", params.path);
+    check_names_a_file(&params.path)?;
     let root = Root::open(ctx.cwd())?;
 
     let path = PathBuf::from(&params.path);
@@ -1386,6 +1387,39 @@ fn lines_within_budget(lines: &[&str], budget_chars: usize) -> usize {
         }
     }
     lines.len()
+}
+
+/// Largest file the file tools read whole: past it, grep or run_command
+/// can look at parts of it, without faber holding it all in memory.
+const MAX_FILE_BYTES: u64 = 64 << 20;
+
+/// Refuses `file` (opened as `path`) if it isn't a regular file - a FIFO
+/// would block forever, a device never end - or is over `MAX_FILE_BYTES`.
+fn check_readable(file: &std::fs::File, path: &str) -> Result<(), Box<dyn Error>> {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(format!("'{}' isn't a regular file", path).into());
+    }
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(format!(
+            "'{}' is {} bytes, too large to read whole (at most {}): use grep, or run_command \
+             with head, tail or sed, to look at parts of it",
+            path,
+            meta.len(),
+            MAX_FILE_BYTES
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Refuses a path that names no file - "", "/", "dir/.." - which a tool
+/// would otherwise hand on to path resolution as if it did.
+fn check_names_a_file(path: &str) -> Result<(), String> {
+    if std::path::Path::new(path).file_name().is_none() {
+        return Err(format!("'{}' doesn't name a file or directory", path));
+    }
+    Ok(())
 }
 
 /// Opens `path` for reading inside `root` - resolved within it as the file
@@ -1449,7 +1483,10 @@ fn tool_read_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
 
     let root = Root::open(ctx.cwd())?;
     let path = PathBuf::from(&params.path);
-    let file = root.open_subpath(path, OpenFlags::O_RDONLY);
+    let file: Result<std::fs::File, Box<dyn Error>> = root
+        .open_subpath(path, OpenFlags::O_RDONLY | OpenFlags::O_NONBLOCK)
+        .map_err(Box::from)
+        .and_then(|file| check_readable(&file, &params.path).map(|()| file));
 
     let result = match file {
         Ok(mut file) => {
@@ -1564,7 +1601,7 @@ fn tool_read_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
         }
         Err(e) => error(format!(
             "File not found or cannot be opened: {}",
-            describe_error(&e)
+            describe_error(e.as_ref())
         )),
     };
 
@@ -1727,57 +1764,66 @@ fn tool_write_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
 
     debug!("Parsed file mode: {} (octal: {:o})", file_mode, file_mode);
 
+    check_names_a_file(&params.path)?;
     let root = Root::open(ctx.cwd())?;
     let path_buf = PathBuf::from(&params.path);
 
-    let existing_content = match root.open_subpath(&params.path, OpenFlags::O_RDONLY) {
-        Ok(mut file) => {
-            let mut content = Vec::new();
-            match file.read_to_end(&mut content) {
-                Ok(_) => Some(content),
-                Err(_) => None,
+    let existing_content =
+        match root.open_subpath(&params.path, OpenFlags::O_RDONLY | OpenFlags::O_NONBLOCK) {
+            Ok(mut file) => {
+                check_readable(&file, &params.path)?;
+                let mut content = Vec::new();
+                match file.read_to_end(&mut content) {
+                    Ok(_) => Some(content),
+                    Err(_) => None,
+                }
             }
-        }
-        Err(_) => None,
-    };
+            Err(_) => None,
+        };
+    // Only the permission bits: no setuid, setgid or sticky bit, and not
+    // writable by every user.
+    let file_mode = file_mode & 0o777 & !0o002;
     if let Some(existing) = &existing_content {
         ctx.check_file_unchanged(&params.path, existing)?;
     }
 
-    let (created, mut file) =
-        match root.open_subpath(&params.path, OpenFlags::O_WRONLY | OpenFlags::O_TRUNC) {
-            Ok(file) => {
-                debug!("File '{}' already exists, will overwrite", params.path);
-                use std::os::unix::io::AsRawFd;
-                let mode = rustix::fs::Mode::from_raw_mode(file_mode);
-                let _ = rustix::fs::fchmod(
-                    unsafe { rustix::fd::BorrowedFd::borrow_raw(file.as_raw_fd()) },
-                    mode,
-                );
-                (false, file)
-            }
-            Err(e) => {
-                debug!("File '{}' does not exist ({}), will create", params.path, e);
+    let (created, mut file) = match root.open_subpath(
+        &params.path,
+        OpenFlags::O_WRONLY | OpenFlags::O_TRUNC | OpenFlags::O_NONBLOCK,
+    ) {
+        Ok(file) => {
+            check_readable(&file, &params.path)?;
+            debug!("File '{}' already exists, will overwrite", params.path);
+            use std::os::unix::io::AsRawFd;
+            let mode = rustix::fs::Mode::from_raw_mode(file_mode);
+            let _ = rustix::fs::fchmod(
+                unsafe { rustix::fd::BorrowedFd::borrow_raw(file.as_raw_fd()) },
+                mode,
+            );
+            (false, file)
+        }
+        Err(e) => {
+            debug!("File '{}' does not exist ({}), will create", params.path, e);
 
-                if let Some(parent) = path_buf.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        debug!("Creating parent directories for: {}", parent.display());
-                        root.mkdir_all(parent, &Permissions::from_mode(0o755))?;
-                        debug!("Parent directories created successfully");
-                    }
+            if let Some(parent) = path_buf.parent() {
+                if !parent.as_os_str().is_empty() {
+                    debug!("Creating parent directories for: {}", parent.display());
+                    root.mkdir_all(parent, &Permissions::from_mode(0o755))?;
+                    debug!("Parent directories created successfully");
                 }
-
-                let permissions = Permissions::from_mode(file_mode);
-                debug!("Using file permissions: {:o}", permissions.mode());
-
-                let new_file = root.create_file(
-                    &params.path,
-                    OpenFlags::O_WRONLY | OpenFlags::O_CREAT,
-                    &permissions,
-                )?;
-                (true, new_file)
             }
-        };
+
+            let permissions = Permissions::from_mode(file_mode);
+            debug!("Using file permissions: {:o}", permissions.mode());
+
+            let new_file = root.create_file(
+                &params.path,
+                OpenFlags::O_WRONLY | OpenFlags::O_CREAT,
+                &permissions,
+            )?;
+            (true, new_file)
+        }
+    };
 
     let bytes_written = params.content.len();
     debug!("Writing {} bytes to file: {}", bytes_written, params.path);
@@ -1864,17 +1910,28 @@ fn tool_glob(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn E
     let current_dir = cwd.canonicalize().unwrap_or(cwd.clone());
     let base = glob::Pattern::escape(&cwd.to_string_lossy());
     let mut files = Vec::new();
+    let mut outside = 0;
     for entry in glob::glob(&format!("{}/{}", base, glob_pattern))? {
         match entry {
             Ok(path) => {
-                // Additional security check: ensure resolved path is within current directory
-                let canonical_path = path.canonicalize().unwrap_or(path.clone());
-
-                if canonical_path.starts_with(&current_dir) {
+                // Where it really is: a dangling symlink, which can't be
+                // resolved itself, is where its directory is - so that a
+                // symlink out of the directory doesn't list what's there.
+                let real = path
+                    .canonicalize()
+                    .ok()
+                    .or_else(|| Some(path.parent()?.canonicalize().ok()?.join(path.file_name()?)));
+                if real.is_some_and(|real| real.starts_with(&current_dir)) {
                     let shown = path.strip_prefix(&cwd).unwrap_or(&path);
                     files.push(shown.to_string_lossy().to_string());
                 } else {
                     debug!("Skipping file outside current directory: {:?}", path);
+                    // A symlink out (to / say) would have the pattern walk
+                    // the whole filesystem for nothing.
+                    outside += 1;
+                    if outside > 1000 {
+                        break;
+                    }
                 }
             }
             Err(e) => {
@@ -4670,9 +4727,7 @@ fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
                 describe_error(&e)
             )
         })?;
-    if !file.metadata()?.is_file() {
-        return Err(format!("'{}' is not a regular file", params.path).into());
-    }
+    check_readable(&file, &params.path)?;
 
     let mut original = Vec::new();
     (&file).read_to_end(&mut original)?;
@@ -18719,6 +18774,109 @@ mod tests {
 
     fn search_params(json: serde_json::Value) -> SearchParams {
         serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn test_file_tools_refuse_what_isnt_a_file_and_keep_modes_tame() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempTestDir::new("file_tool_limits");
+        let mut ctx = ToolContext::new(|_: &str| {});
+        ctx.cwd = Some(dir.0.clone());
+        ctx.file_versions = None;
+        let call = |f: ToolCallback, params: serde_json::Value| f(&params.to_string(), &ctx);
+        // Paths naming no file: refused, not a crash.
+        for path in ["", "/", "//", "sub/.."] {
+            assert!(
+                call(tool_delete_path, serde_json::json!({"path": path})).is_err(),
+                "{path:?}"
+            );
+            assert!(
+                call(
+                    tool_write_file,
+                    serde_json::json!({"path": path, "content": "x"})
+                )
+                .is_err(),
+                "{path:?}"
+            );
+        }
+        // A FIFO is refused at once, rather than blocking forever.
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(dir.0.join("pipe"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let read = call(tool_read_file, serde_json::json!({"path": "pipe"})).unwrap();
+        assert!(read.contains("regular file"), "{read}");
+        assert!(
+            call(
+                tool_write_file,
+                serde_json::json!({"path": "pipe", "content": "x"})
+            )
+            .is_err()
+        );
+        // Too large to read whole: refused before it's read.
+        let big = std::fs::File::create(dir.0.join("big")).unwrap();
+        big.set_len(MAX_FILE_BYTES + 1).unwrap();
+        let read = call(tool_read_file, serde_json::json!({"path": "big"})).unwrap();
+        assert!(read.contains("too large"), "{read}");
+        // Only permission bits, and never writable by everyone.
+        call(
+            tool_write_file,
+            serde_json::json!({"path": "f", "content": "x", "mode": "06777"}),
+        )
+        .unwrap();
+        call(
+            tool_write_file,
+            serde_json::json!({"path": "f", "content": "y", "mode": "06777"}),
+        )
+        .unwrap();
+        let mode = std::fs::metadata(dir.0.join("f"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode & 0o7002, 0, "{mode:o}");
+    }
+
+    #[test]
+    fn test_glob_lists_nothing_through_a_symlink_out() {
+        let dir = TempTestDir::new("glob_leak");
+        std::fs::create_dir_all(dir.0.join("outside/sub")).unwrap();
+        std::os::unix::fs::symlink("/nowhere", dir.0.join("outside/sub/dangling")).unwrap();
+        std::fs::create_dir_all(dir.0.join("w")).unwrap();
+        std::os::unix::fs::symlink(dir.0.join("outside"), dir.0.join("w/out")).unwrap();
+        std::os::unix::fs::symlink("missing", dir.0.join("w/mine")).unwrap();
+        let mut ctx = ToolContext::new(|_: &str| {});
+        ctx.cwd = Some(dir.0.join("w"));
+        let found = tool_glob(&r#"{"pattern": "**/*"}"#.to_string(), &ctx).unwrap();
+        assert!(
+            !found.contains("dangling") && !found.contains("sub"),
+            "{found}"
+        );
+        // A dangling symlink inside is still listed.
+        assert!(found.contains("mine"), "{found}");
+    }
+
+    #[test]
+    fn test_a_crashing_tool_fails_its_call_only() {
+        fn crash(_: &String, _: &ToolContext) -> Result<String, Box<dyn Error>> {
+            panic!("boom")
+        }
+        let mut tools = ToolsCollection::new();
+        append_tool(&mut tools, "crash".to_string(), crash, "{}".to_string());
+        let call = ToolCall {
+            index: None,
+            id: "1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "crash".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let message = tool_call(&tools, &call, &ToolContext::new(|_: &str| {})).unwrap();
+        assert!(message.content.unwrap().contains("crashed (boom)"));
     }
 
     #[test]

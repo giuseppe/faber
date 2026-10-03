@@ -881,7 +881,20 @@ pub fn tool_call(
                 "Passing arguments {:?} to tool {}",
                 req.function.arguments, tool_name
             );
-            match (t.callback)(&req.function.arguments, ctx) {
+            // A tool that panics fails its call, not the whole turn - or,
+            // on the chat's own thread, faber.
+            let called = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (t.callback)(&req.function.arguments, ctx)
+            }))
+            .unwrap_or_else(|panic| {
+                let what = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown".to_string());
+                Err(format!("it crashed ({}) - this is a bug in faber", what).into())
+            });
+            match called {
                 Ok(result) => result,
                 // The user pressed Ctrl-C while the tool ran: stop the
                 // whole turn, as anywhere else, rather than reporting it
