@@ -359,7 +359,12 @@ that fanned out: all of them show as soon as it starts - queued, until
 their turn comes - and can be followed like sub-agents.
 
 A finished sub-agent is kept, with its conversation, until `faber gc`
-removes it (it then has no live session), so you can see what it did.
+removes it (it then has no live session), so you can see what it did -
+and its parent can run it again, by name. The agents faber makes for one
+job - a fan-out's workers, a task's `task-<id>` or `<profile>-<id>` - go
+by themselves: ten minutes after they're done (nothing runs them, nor
+anything below them), with their conversations and events. Every chat
+and worker removes them.
 
 ### Watching agents
 
@@ -527,7 +532,7 @@ A prompt task runs on one of three:
 - **a new agent made from a profile** (`--profile NAME`, `profile`): a
   `faber worker` whose config file has the profile picks it up, and runs it
   on a new agent, `<profile>-<task id>`, made from the profile under the
-  worker's agent (kept, with its conversation, until `faber gc`). Chats
+  worker's agent (removed ten minutes after the task is done). Chats
   don't run these;
 - **any agent** (neither): whichever chat or worker is free first. A
   worker runs it on a new agent of its own, `task-<task id>`, made with

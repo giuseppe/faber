@@ -6917,6 +6917,33 @@ fn child_cwd(ctx: &ToolContext, requested: Option<&str>) -> Result<Option<String
     }
 }
 
+/// How long an agent made for one job stays once it's done, its outcome
+/// shown (green or red) in `faber agents` and the web UI.
+const ONE_JOB_AGENT_LINGER_SECS: i64 = 600;
+
+/// Removes the agents made for one job - fan-out workers, tasks' agents -
+/// that are done and have lingered (`db::one_job_agents_done`), with
+/// their conversations and events. Every session does it, every minute.
+fn remove_one_job_agents_done(db: &dyn DbBackend) -> Result<Vec<String>, Box<dyn Error>> {
+    let agents = db.list_agents()?;
+    let mut one_job = std::collections::HashSet::new();
+    for agent in &agents {
+        if agent.parent.is_some() && db.get_agent_data(&agent.name, db::ONE_JOB_KEY)?.is_some() {
+            one_job.insert(agent.name.clone());
+        }
+    }
+    let done = db::one_job_agents_done(
+        &agents,
+        &one_job,
+        chrono::Utc::now(),
+        chrono::Duration::seconds(ONE_JOB_AGENT_LINGER_SECS),
+    );
+    for name in &done {
+        db.delete_agent(name)?;
+    }
+    Ok(done)
+}
+
 /// Records where `agent` works (`None`: the process's directory).
 fn set_agent_cwd(
     db: &dyn DbBackend,
@@ -9428,9 +9455,14 @@ fn chat_command(
             });
         }
         std::thread::spawn(move || {
-            loop {
+            for beat in 1u64.. {
                 std::thread::sleep(Duration::from_secs(5));
                 let _ = heartbeat_db.heartbeat_all(&heartbeat_session);
+                if beat % 12 == 0 {
+                    if let Err(e) = remove_one_job_agents_done(heartbeat_db.as_ref()) {
+                        debug!("Couldn't remove finished agents: {}", e);
+                    }
+                }
             }
         });
     }
@@ -10748,6 +10780,7 @@ fn profile_task_agent(
     let name = format!("{}-{}", profile, task.id);
     check_name_free_for(db, &name, parent)?;
     apply_profile(db, &name, profile, settings)?;
+    db.set_agent_data(&name, db::ONE_JOB_KEY, "task")?;
     set_agent_unsafe(db, &name, unsafe_tools)?;
     // It works where the task says, or else where the worker does.
     let cwd = task.cwd.clone().or(db.get_agent_config(parent)?.cwd);
@@ -10773,6 +10806,7 @@ pub(crate) fn make_worker_agent(
     if db.get_agent(name)?.is_none() {
         db.create_agent(name, &format!("fan_out worker of {}", caller))?;
     }
+    db.set_agent_data(name, db::ONE_JOB_KEY, "fan_out")?;
     db.set_agent_parent(name, Some(caller))?;
     let mut config = db.get_agent_config(name)?;
     config.unsafe_tools = Some(ctx.unsafe_tools);
@@ -10862,6 +10896,7 @@ fn own_task_agent(
     if db.get_agent(&name)?.is_none() {
         db.create_agent(&name, &format!("Runs task #{}", task.id))?;
     }
+    db.set_agent_data(&name, db::ONE_JOB_KEY, "task")?;
     let mut config = db.get_agent_config(parent)?;
     config.unsafe_tools = Some(unsafe_tools);
     if task.cwd.is_some() {
@@ -11285,8 +11320,15 @@ fn run_worker(
         let session_id = session_id.clone();
         let stopping = stop.stopping.clone();
         std::thread::spawn(move || {
+            let mut beat = 0u64;
             while !stopping.load(Ordering::Relaxed) {
                 let _ = db.heartbeat_all(&session_id);
+                beat += 1;
+                if beat % 12 == 0 {
+                    if let Err(e) = remove_one_job_agents_done(db.as_ref()) {
+                        debug!("Couldn't remove finished agents: {}", e);
+                    }
+                }
                 std::thread::sleep(Duration::from_secs(5));
             }
         });
@@ -15647,6 +15689,31 @@ for line in sys.stdin:
         ctx.db = Some(Arc::new(db));
         ctx.agent_name = Some("default".to_string());
         ctx
+    }
+
+    #[test]
+    fn test_a_fan_outs_workers_are_removed_once_done() {
+        let conn = test_db_conn();
+        let db: Arc<dyn DbBackend> = Arc::new(LocalDb::new(conn.clone()));
+        db.create_agent("boss", "").unwrap();
+        let ctx = ToolContext::new(|_: &str| {});
+        make_worker_agent(db.as_ref(), "boss-item-1", "boss", &ctx, "s").unwrap();
+        db.release_agent("boss-item-1", "s").unwrap();
+        // Just done: still shown.
+        assert!(remove_one_job_agents_done(db.as_ref()).unwrap().is_empty());
+        conn.lock()
+            .unwrap()
+            .execute_batch(
+                "UPDATE agents SET activity = 'finished', activity_at = datetime('now', '-1 hour')
+                 WHERE name = 'boss-item-1'",
+            )
+            .unwrap();
+        assert_eq!(
+            remove_one_job_agents_done(db.as_ref()).unwrap(),
+            ["boss-item-1"]
+        );
+        assert!(db.get_agent("boss-item-1").unwrap().is_none());
+        assert!(db.get_agent("boss").unwrap().is_some());
     }
 
     #[test]

@@ -1917,6 +1917,11 @@ pub const AGENT_STOP_KEY: &str = "control:stop";
 /// its task.
 pub const RUNNING_TASK_KEY: &str = "state:running_task";
 
+/// The `agent_data` key set on an agent faber makes for one job - a
+/// fan-out's worker, a task's agent: it's removed a while after it's done
+/// (`one_job_agents_done`).
+pub const ONE_JOB_KEY: &str = "state:one_job";
+
 /// The `agent_data` key a session sets on an agent it runs as its own
 /// with the unsafe tools for the session only (`--unsafe-tools`): the
 /// session's id. Its config doesn't say so; this does, while it lasts.
@@ -1969,6 +1974,26 @@ pub fn finished_made_agents(
         .iter()
         .filter(|a| a.parent.is_some() && !keep.contains(a.name.as_str()))
         .map(|a| a.name.clone())
+        .collect()
+}
+
+/// Of `agents`, those made for one job (`one_job`, see `ONE_JOB_KEY`) that
+/// are done (see `finished_made_agents`) and have done nothing for
+/// `linger` - long enough for their outcome to be seen.
+pub fn one_job_agents_done(
+    agents: &[AgentRow],
+    one_job: &std::collections::HashSet<String>,
+    now: chrono::DateTime<chrono::Utc>,
+    linger: chrono::Duration,
+) -> Vec<String> {
+    let idle_since = |name: &str| {
+        let agent = agents.iter().find(|a| a.name == name)?;
+        parse_db_time(agent.activity_at.as_deref().unwrap_or(&agent.created_at))
+    };
+    finished_made_agents(agents, now)
+        .into_iter()
+        .filter(|name| one_job.contains(name))
+        .filter(|name| idle_since(name).is_some_and(|at| at + linger <= now))
         .collect()
 }
 
@@ -2255,6 +2280,38 @@ mod tests {
 
     fn titles(hits: &[KbHit]) -> Vec<&str> {
         hits.iter().map(|h| h.note.title.as_str()).collect()
+    }
+
+    #[test]
+    fn test_agents_made_for_one_job_go_once_done_and_seen() {
+        let conn = test_db();
+        for name in ["boss", "w1", "w2", "w3", "helper", "w4", "sub"] {
+            create_agent(&conn, name, "").unwrap();
+        }
+        for name in ["w1", "w2", "w3", "helper", "w4"] {
+            set_agent_parent(&conn, name, Some("boss")).unwrap();
+        }
+        set_agent_parent(&conn, "sub", Some("w4")).unwrap();
+        let one_job: std::collections::HashSet<String> =
+            ["w1", "w2", "w3", "w4"].map(String::from).into();
+        // w1 finished long ago; w2 just now; w3 is still running (its
+        // session is live); w4 has something running below it.
+        conn.execute_batch(
+            "UPDATE agents SET activity = 'finished', activity_at = datetime('now', '-1 hour')
+                 WHERE name IN ('w1', 'w3', 'w4', 'helper');
+             UPDATE agents SET activity = 'finished', activity_at = datetime('now') WHERE name = 'w2';",
+        )
+        .unwrap();
+        assert!(claim_agent(&conn, "w3", "s").unwrap());
+        assert!(claim_agent(&conn, "sub", "s").unwrap());
+        let done = one_job_agents_done(
+            &list_agents(&conn).unwrap(),
+            &one_job,
+            chrono::Utc::now(),
+            chrono::Duration::minutes(10),
+        );
+        // helper is done too, but a sub-agent: it may be run again.
+        assert_eq!(done, ["w1"]);
     }
 
     fn test_db() -> Connection {
