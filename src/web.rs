@@ -67,6 +67,9 @@ const MAX_BODY_BYTES: usize = 1 << 20;
 /// The most header lines accepted.
 const MAX_HEADERS: usize = 100;
 
+/// Most bytes of a request's line and headers.
+const MAX_HEADER_BYTES: usize = 64 << 10;
+
 /// The most events one `/api/events` request returns.
 const MAX_EVENTS: usize = 1000;
 
@@ -239,7 +242,8 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, Response> {
 fn write_response(writer: &mut impl Write, response: &Response) -> std::io::Result<()> {
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
-         Cache-Control: no-store\r\nConnection: close\r\n",
+         Cache-Control: no-store\r\nConnection: close\r\n\
+         X-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\n",
         response.status,
         status_text(response.status),
         response.content_type,
@@ -262,7 +266,10 @@ pub fn handle_http(
     auth_key: Option<&str>,
     profiles: &crate::Profiles,
 ) -> Result<(), Box<dyn Error>> {
-    let mut reader = BufReader::new(stream.try_clone()?);
+    // A request is its headers and a body of at most MAX_BODY_BYTES: no
+    // header line of a request without end is read into memory whole.
+    let limit = (MAX_BODY_BYTES + MAX_HEADER_BYTES) as u64;
+    let mut reader = BufReader::new(std::io::Read::take(stream.try_clone()?, limit));
     let mut writer = stream;
     let response = match read_request(&mut reader) {
         Ok(request) => route(&request, &db, auth_key, profiles),
@@ -298,15 +305,16 @@ fn route(
         (_, ["api", rest @ ..]) => {
             match auth_key {
                 Some(key) => {
-                    let expected = format!("Bearer {}", key);
-                    if request.authorization.as_deref() != Some(expected.as_str()) {
+                    let given = request.authorization.as_deref().unwrap_or("");
+                    let given = given.strip_prefix("Bearer ").unwrap_or("");
+                    if !crate::server::keys_match(given, key) {
                         return Response::error(401, "unauthorized");
                     }
                 }
                 None if !is_local_host(request.host.as_deref()) => {
                     return Response::error(
                         403,
-                        "without --auth-key, the API only answers at localhost or an IP address",
+                        "with --no-auth, the API only answers at localhost or an IP address",
                     );
                 }
                 None => {}
@@ -1254,6 +1262,15 @@ mod tests {
         assert!(page.content_type.starts_with("text/html"));
         assert_eq!(call(&db, "GET", "/ui/app.js", "").status, 200);
         assert_eq!(call(&db, "GET", "/nope", "").status, 404);
+    }
+
+    #[test]
+    fn test_no_other_site_can_frame_the_ui() {
+        let mut out = Vec::new();
+        write_response(&mut out, &Response::file("text/html", "<p>")).unwrap();
+        let head = String::from_utf8(out).unwrap();
+        assert!(head.contains("X-Frame-Options: DENY\r\n"), "{head}");
+        assert!(head.contains("frame-ancestors 'none'"), "{head}");
     }
 
     #[test]

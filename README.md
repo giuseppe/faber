@@ -910,14 +910,25 @@ can share state:
 
 ```bash
 faber --db-path state.db serve --bind 127.0.0.1:9090
-faber --db-path state.db serve --bind 0.0.0.0:9090 --auth-key mysecret
-faber --db-path state.db serve --auth-key-file /path/to/keyfile
+faber --db-path state.db serve --bind 0.0.0.0:9090 --auth-key-file /path/to/keyfile
 ```
+
+Clients must give the server's key: whoever can, can do anything the
+user can - give agents the unsafe tools, run commands. Without
+`--auth-key-file`, `faber serve` makes a new key each start and writes
+it, readable only by the user, to `$XDG_RUNTIME_DIR/faber/serve-<port>.key`
+(else under `~/.local/state/faber/`). Clients on the same machine,
+connecting to a loopback address, find it there by themselves; others
+read it from a file. Keys are never given on the command line, where
+`ps` would show them to every user. `--no-auth` serves without a key, on
+a loopback address only: then any user or process on the machine is in
+control.
 
 Clients connect with `--server` instead of `--db-path`:
 
 ```bash
-faber --server 127.0.0.1:9090 --server-key mysecret chat
+faber --server 127.0.0.1:9090 chat                         # this machine
+faber --server faber-host:9090 --server-key-file ~/k chat  # another
 ```
 
 The protocol is newline-delimited JSON over TCP. TLS is not built in --
@@ -925,7 +936,7 @@ use SSH tunneling, WireGuard, or a reverse proxy for encryption:
 
 ```bash
 ssh -L 9090:localhost:9090 remote-host
-faber --server 127.0.0.1:9090 --server-key mysecret chat
+faber --server 127.0.0.1:9090 --server-key-file ~/k chat
 ```
 
 The server can also run agents itself, each working through tasks like
@@ -1015,9 +1026,11 @@ curl -H 'Content-Type: application/json' -d '{"command": "Fix the failing test",
      localhost:9090/api/tasks
 ```
 
-With `--auth-key`, API requests need `Authorization: Bearer <key>` (the UI
-asks for it). Without one, the API only answers at `localhost` or an IP
-address, so a web page can't reach it through a name it controls.
+API requests need `Authorization: Bearer <key>`. The web UI gets the key
+from the link `faber serve` prints - after `#`, which browsers don't send
+to the server - or asks for it. With `--no-auth`, the API only answers
+at `localhost` or an IP address, so a web page can't reach it through a
+name it controls.
 
 ## Options
 
@@ -1038,8 +1051,7 @@ address, so a web page can't reach it through a name it controls.
     --profile <NAME>         Make the chat's agent from this profile (see Profiles)
     --display-graphics       Render LaTeX blocks as images on terminals that support it; see below
     --server <ADDR>          Connect to a remote faber server
-    --server-key <KEY>       Pre-shared key for server authentication
-    --server-key-file <PATH> Read server key from file
+    --server-key-file <PATH> Read the server's key from this file (found by itself for one on this machine)
     --max-parallel-requests <N>  At most N model requests in flight at once (see below)
     --task-retention <DURATION>  Prune done tasks older than this while chatting
 ```
