@@ -13699,6 +13699,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // A remote server's database is all there is: a db_path (e.g. from a
+    // config file also used locally) is left unused, not refused as a
+    // faber file where agents work.
+    if opts.server.is_some() {
+        opts.db_path = None;
+    }
     // With the config file's db_path, when it has one.
     if let Some(path) = &opts.db_path {
         if let (Some(rest), Some(home)) = (path.strip_prefix("~/"), std::env::var_os("HOME")) {
