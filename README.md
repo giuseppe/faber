@@ -302,6 +302,12 @@ lists built-in tools by name, and only narrows: a profile never gives an
 agent a tool its session doesn't have, such as unsafe ones without
 `--unsafe-tools`. `faber profiles` lists them.
 
+A profile's `unsafe_tools` (`faber profiles set NAME --unsafe-tools`, or
+`--safe-tools` to take it back; in the web UI's profile editor) is used
+only for the agents of A2A contexts made from it; profile tasks,
+`spawn_agent` and `fan_out` ignore it and follow their maker's tools. No
+tool can set it.
+
 An agent made from a profile gets a **copy** of its settings, so changing
 the profile later doesn't change agents already made from it. Agents are
 made from a profile by:
@@ -763,7 +769,8 @@ Whether an agent has them is up to each agent, not the whole session:
   would send it its conversation and the API key, and run the tool calls
   it answers with. It sees only its own agents' endpoint, key file, system
   prompt and request parameters in `agent_get`. A profile never gives or
-  takes the unsafe tools.
+  takes the unsafe tools - except its `unsafe_tools` setting, which only
+  the agents of A2A contexts made from it follow, and only the user can set.
 - A task a safe agent creates (`task_create`) runs without them, whoever
   picks it up: a worker that has them runs it on a safe agent of its own,
   and a tool task gets the safe tools, in the task's working directory. A

@@ -19,7 +19,8 @@
 
 use crate::agent_io::{AgentEvent, AgentEventRow, EventFilter};
 use crate::db::{
-    AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow, TaskOutcome, TaskRow,
+    A2aContext, AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow,
+    TaskOutcome, TaskRow,
 };
 use std::error::Error;
 
@@ -126,6 +127,19 @@ pub trait DbBackend: Send + Sync {
         session_id: &str,
         outcome: &TaskOutcome,
     ) -> Result<bool, Box<dyn Error>>;
+
+    /// See `db::a2a_create_context`.
+    fn a2a_create_context(
+        &self,
+        owner: &str,
+        profile: &str,
+        config: &AgentConfig,
+    ) -> Result<A2aContext, Box<dyn Error>>;
+    fn a2a_get_context(&self, id: &str) -> Result<Option<A2aContext>, Box<dyn Error>>;
+    fn a2a_touch_context(&self, id: &str) -> Result<bool, Box<dyn Error>>;
+    /// See `db::a2a_expired_contexts`; `before` is RFC 3339.
+    fn a2a_expired_contexts(&self, before: &str) -> Result<Vec<A2aContext>, Box<dyn Error>>;
+    fn a2a_delete_context(&self, id: &str) -> Result<bool, Box<dyn Error>>;
 
     fn gc_agents(&self) -> Result<Vec<String>, Box<dyn Error>>;
 

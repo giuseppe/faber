@@ -532,6 +532,45 @@ impl DbBackend for RemoteDb {
         Ok(serde_json::from_value(v)?)
     }
 
+    fn a2a_create_context(
+        &self,
+        owner: &str,
+        profile: &str,
+        config: &AgentConfig,
+    ) -> Result<faber::db::A2aContext, Box<dyn Error>> {
+        let v = self.call(
+            "a2a_create_context",
+            serde_json::json!({"owner": owner, "profile": profile, "config": config}),
+        )?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn a2a_get_context(&self, id: &str) -> Result<Option<faber::db::A2aContext>, Box<dyn Error>> {
+        let v = self.call("a2a_get_context", serde_json::json!({"id": id}))?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn a2a_touch_context(&self, id: &str) -> Result<bool, Box<dyn Error>> {
+        let v = self.call("a2a_touch_context", serde_json::json!({"id": id}))?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn a2a_expired_contexts(
+        &self,
+        before: &str,
+    ) -> Result<Vec<faber::db::A2aContext>, Box<dyn Error>> {
+        let v = self.call(
+            "a2a_expired_contexts",
+            serde_json::json!({"before": before}),
+        )?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn a2a_delete_context(&self, id: &str) -> Result<bool, Box<dyn Error>> {
+        let v = self.call("a2a_delete_context", serde_json::json!({"id": id}))?;
+        Ok(serde_json::from_value(v)?)
+    }
+
     fn gc_agents(&self) -> Result<Vec<String>, Box<dyn Error>> {
         let v = self.call("gc_agents", serde_json::json!({}))?;
         Ok(serde_json::from_value(v)?)

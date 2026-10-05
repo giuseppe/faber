@@ -1369,6 +1369,7 @@ async function openProfileEditor(profile) {
     el("input", { type: "checkbox", name: "tool", value: tool, checked: chosen.has(tool) }), tool)));
   $("profile-tool-list").classList.toggle("disabled", !s.tools);
   fillMcp("profile-mcp-default", "profile-mcp-list", s.mcp_servers);
+  form.elements.unsafe_tools.checked = s.unsafe_tools === true;
   // Kept as they were: what this form doesn't show.
   form.dataset.kept = JSON.stringify(s.api_key ? { api_key: s.api_key } : {});
   $("profile-dialog").showModal();
@@ -1403,6 +1404,7 @@ $("profile-form").addEventListener("submit", async (e) => {
     tools: $("profile-all-tools").checked ? undefined
       : [...form.querySelectorAll("input[name=tool]:checked")].map((c) => c.value),
     mcp_servers: readMcp("profile-mcp-default", "profile-mcp-list") ?? undefined,
+    unsafe_tools: form.elements.unsafe_tools.checked || undefined,
   };
   const name = value("name");
   if (!name) return showError("Give it a name.");

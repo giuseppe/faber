@@ -91,6 +91,12 @@ pub struct TaskRow {
     /// running it interrupts it.
     #[serde(default)]
     pub stop_requested: bool,
+    /// For a prompt task: run it on this existing agent, carrying on its
+    /// conversation, on whichever worker picks it up (an A2A context's
+    /// agent, see `a2a_create_context`). Never set together with
+    /// `agent_name` or `profile`.
+    #[serde(default)]
+    pub continue_agent: Option<String>,
 }
 
 /// What a task's `command` is:
@@ -145,6 +151,9 @@ pub struct NewTask {
     /// See `TaskRow::cwd`.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// See `TaskRow::continue_agent`.
+    #[serde(default)]
+    pub continue_agent: Option<String>,
 }
 
 /// A task's lifecycle:
@@ -199,6 +208,20 @@ const CLAIM_ABANDONED: &str = "claimed_by IS NULL OR claimed_by NOT IN (
     SELECT session_id FROM agents
     WHERE session_id IS NOT NULL AND heartbeat_at >= datetime('now', '-30 seconds'))";
 
+/// SQL condition: the task doesn't carry on an agent's conversation that
+/// another task is running (`running`, and not abandoned) on: a context
+/// takes one message at a time, in the order they came. Not
+/// `depends_on`, which would fail every later message after one failed.
+const CONTEXT_FREE: &str = "(scheduled_tasks.continue_agent IS NULL OR NOT EXISTS (
+    SELECT 1 FROM scheduled_tasks AS other
+    WHERE other.continue_agent = scheduled_tasks.continue_agent
+      AND other.id != scheduled_tasks.id
+      AND ((other.status = 'running'
+            AND other.claimed_by IN (
+                SELECT session_id FROM agents
+                WHERE session_id IS NOT NULL AND heartbeat_at >= datetime('now', '-30 seconds')))
+           OR (other.status = 'scheduled' AND other.id < scheduled_tasks.id))))";
+
 /// The columns and constraints of `scheduled_tasks`.
 const TASK_TABLE_DEFINITION: &str = "
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -227,7 +250,9 @@ const TASK_TABLE_DEFINITION: &str = "
     run_safe INTEGER NOT NULL DEFAULT 0,
     cwd TEXT DEFAULT NULL,
     stop_requested INTEGER NOT NULL DEFAULT 0,
+    continue_agent TEXT DEFAULT NULL,
     CHECK(agent_name IS NULL OR profile IS NULL),
+    CHECK(continue_agent IS NULL OR (agent_name IS NULL AND profile IS NULL)),
     FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE SET NULL";
 
 pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -318,6 +343,17 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
          );
          CREATE INDEX IF NOT EXISTS idx_agent_events_agent ON agent_events(agent, id);
          CREATE INDEX IF NOT EXISTS idx_agent_events_task ON agent_events(task_id, id);",
+    )?;
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS a2a_contexts (
+             id TEXT PRIMARY KEY,
+             owner TEXT NOT NULL,
+             profile TEXT NOT NULL,
+             agent TEXT NOT NULL UNIQUE,
+             created_at TEXT NOT NULL,
+             last_used_at TEXT NOT NULL
+         );",
     )?;
 
     initialize_kb(conn)?;
@@ -649,10 +685,11 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         run_safe: row.get(22)?,
         cwd: row.get(23)?,
         stop_requested: row.get(24)?,
+        continue_agent: row.get(25)?,
     })
 }
 
-const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, kind, depends_on, profile, run_safe, cwd, stop_requested";
+const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, kind, depends_on, profile, run_safe, cwd, stop_requested, continue_agent";
 
 /// Whether `command` is a `{"tool": "<name>", ...}` call.
 pub fn is_tool_call(command: &str) -> bool {
@@ -692,6 +729,17 @@ fn task_columns(
         task.agent_name.as_deref(),
         task.profile.as_deref(),
     )?;
+    if let Some(agent) = &task.continue_agent {
+        if task.kind != TaskKind::PROMPT {
+            return Err("only prompt tasks can carry on an agent's conversation".into());
+        }
+        if task.agent_name.is_some() || task.profile.is_some() {
+            return Err("a task carrying on an agent has no agent or profile of its own".into());
+        }
+        if get_agent(conn, agent)?.is_none() {
+            return Err(format!("no agent named '{}'", agent).into());
+        }
+    }
     for dependency in &task.depends_on {
         if get_task(conn, *dependency)?.is_none() {
             return Err(format!("no task #{} to depend on", dependency).into());
@@ -759,8 +807,9 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
     conn.execute(
         "INSERT INTO scheduled_tasks
              (name, description, kind, task_type, cron_expression, run_at, next_run_at,
-              agent_name, command, max_runs, status, depends_on, profile, run_safe, cwd)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+              agent_name, command, max_runs, status, depends_on, profile, run_safe, cwd,
+              continue_agent)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             task.name,
             task.description,
@@ -780,7 +829,8 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
             columns.depends_on,
             task.profile,
             task.run_safe,
-            task.cwd
+            task.cwd,
+            task.continue_agent
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -817,6 +867,7 @@ pub fn message_task(agent: &str, text: &str, now: chrono::DateTime<chrono::Utc>)
         profile: None,
         run_safe: false,
         cwd: None,
+        continue_agent: None,
     }
 }
 
@@ -1037,6 +1088,18 @@ pub fn request_task_stop(conn: &Connection, task_id: i64) -> Result<bool, Box<dy
     Ok(rows > 0)
 }
 
+/// Ends a task nobody has picked up yet (`scheduled` or `held`) as
+/// stopped, so that nobody will. False if it isn't waiting any more.
+pub fn cancel_waiting_task(conn: &Connection, task_id: i64) -> Result<bool, Box<dyn Error>> {
+    let rows = conn.execute(
+        "UPDATE scheduled_tasks SET status = 'done', last_outcome = 'failed',
+             last_result = 'stopped', last_run_at = ?2
+         WHERE id = ?1 AND status IN ('scheduled', 'held')",
+        params![task_id, chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(rows > 0)
+}
+
 /// Makes a task due right away, whatever it was waiting for - its time, a
 /// release (`held`), being enabled (`disabled`) - or, `done`, runs it
 /// again. Dependencies still have to be met. A running task is left
@@ -1073,8 +1136,9 @@ pub fn get_pending_tasks(conn: &Connection) -> Result<Vec<TaskRow>, Box<dyn Erro
          WHERE next_run_at <= ?1
            AND (status = 'scheduled' OR (status = 'running' AND ({})))
            AND {}
-         ORDER BY next_run_at",
-        TASK_COLUMNS, CLAIM_ABANDONED, DEPENDENCIES_MET
+           AND {}
+         ORDER BY next_run_at, id",
+        TASK_COLUMNS, CLAIM_ABANDONED, DEPENDENCIES_MET, CONTEXT_FREE
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![now], row_to_task)?;
@@ -1183,8 +1247,9 @@ pub fn claim_task(
              stop_requested = 0
          WHERE id = ?1 AND next_run_at <= ?3
            AND (status = 'scheduled' OR (status = 'running' AND ({})))
+           AND {}
            AND {}",
-        CLAIM_ABANDONED, DEPENDENCIES_MET
+        CLAIM_ABANDONED, DEPENDENCIES_MET, CONTEXT_FREE
     );
     let rows = conn.execute(&sql, params![task_id, session_id, now])?;
     Ok(rows > 0)
@@ -1784,21 +1849,31 @@ pub fn set_agent_config(
     agent_name: &str,
     config: &AgentConfig,
 ) -> Result<(), Box<dyn Error>> {
+    let tx = conn.unchecked_transaction()?;
+    write_agent_config(&tx, agent_name, config)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// `set_agent_config`'s writes, for a caller already in a transaction.
+fn write_agent_config(
+    conn: &Connection,
+    agent_name: &str,
+    config: &AgentConfig,
+) -> Result<(), Box<dyn Error>> {
     let serde_json::Value::Object(fields) = serde_json::to_value(config)? else {
         return Err("agent config isn't an object".into());
     };
-    let tx = conn.unchecked_transaction()?;
     for field in AGENT_CONFIG_FIELDS {
         let key = format!("config:{}", field);
         match fields.get(field) {
             None | Some(serde_json::Value::Null) => {
-                delete_agent_data(&tx, agent_name, &key)?;
+                delete_agent_data(conn, agent_name, &key)?;
             }
-            Some(serde_json::Value::String(text)) => set_agent_data(&tx, agent_name, &key, text)?,
-            Some(value) => set_agent_data(&tx, agent_name, &key, &value.to_string())?,
+            Some(serde_json::Value::String(text)) => set_agent_data(conn, agent_name, &key, text)?,
+            Some(value) => set_agent_data(conn, agent_name, &key, &value.to_string())?,
         }
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -2054,6 +2129,189 @@ pub fn unmet_dependencies(all: &[TaskRow]) -> std::collections::HashMap<i64, Vec
             (!unmet.is_empty()).then_some((t.id, unmet))
         })
         .collect()
+}
+
+/// One A2A caller's ongoing conversation: an agent made from a profile,
+/// owned by the key (`owner`) that opened it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct A2aContext {
+    /// The A2A `contextId`: 32 random hex characters.
+    pub id: String,
+    /// The name of the A2A key that opened it.
+    pub owner: String,
+    pub profile: String,
+    /// The agent that holds its conversation.
+    pub agent: String,
+    pub created_at: String,
+    pub last_used_at: String,
+}
+
+/// The `agent_data` key of a context's agent holding the context's id.
+pub const A2A_CONTEXT_KEY: &str = "state:a2a_context";
+
+/// The `agent_data` key of a context's agent holding the whole final
+/// answer of task `task_id` (the task's own result is cut short).
+pub fn a2a_answer_key(task_id: i64) -> String {
+    format!("a2a:answer:{}", task_id)
+}
+
+/// The key holding the message task `task_id` was made from, as the
+/// caller sent it.
+pub fn a2a_message_key(task_id: i64) -> String {
+    format!("a2a:message:{}", task_id)
+}
+
+/// How long a context can go unused before it's removed.
+pub const A2A_CONTEXT_TTL_HOURS: i64 = 24;
+
+/// `bytes` random bytes, as hex, from the system.
+fn random_hex(bytes: usize) -> Result<String, Box<dyn Error>> {
+    use std::io::Read;
+    let mut buf = vec![0u8; bytes];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(buf.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+fn row_to_context(row: &rusqlite::Row) -> rusqlite::Result<A2aContext> {
+    Ok(A2aContext {
+        id: row.get(0)?,
+        owner: row.get(1)?,
+        profile: row.get(2)?,
+        agent: row.get(3)?,
+        created_at: row.get(4)?,
+        last_used_at: row.get(5)?,
+    })
+}
+
+const CONTEXT_COLUMNS: &str = "id, owner, profile, agent, created_at, last_used_at";
+
+/// Opens a context for `owner` on `profile`, with its agent: made here, in
+/// the same transaction, with `config` (which the caller makes from the
+/// profile) and not marked for the one-job cleanup.
+pub fn a2a_create_context(
+    conn: &Connection,
+    owner: &str,
+    profile: &str,
+    config: &AgentConfig,
+) -> Result<A2aContext, Box<dyn Error>> {
+    let id = random_hex(16)?;
+    let agent = format!("a2a-{}", &id[..12]);
+    let now = chrono::Utc::now().to_rfc3339();
+    let tx = conn.unchecked_transaction()?;
+    create_agent(&tx, &agent, &format!("A2A context of {}", owner))?;
+    write_agent_config(&tx, &agent, config)?;
+    set_agent_data(&tx, &agent, A2A_CONTEXT_KEY, &id)?;
+    tx.execute(
+        "INSERT INTO a2a_contexts (id, owner, profile, agent, created_at, last_used_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        params![id, owner, profile, agent, now],
+    )?;
+    tx.commit()?;
+    Ok(A2aContext {
+        id,
+        owner: owner.to_string(),
+        profile: profile.to_string(),
+        agent,
+        created_at: now.clone(),
+        last_used_at: now,
+    })
+}
+
+pub fn a2a_get_context(conn: &Connection, id: &str) -> Result<Option<A2aContext>, Box<dyn Error>> {
+    let sql = format!("SELECT {} FROM a2a_contexts WHERE id = ?1", CONTEXT_COLUMNS);
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query_map(params![id], row_to_context)?;
+    Ok(rows.next().transpose()?)
+}
+
+/// Marks the context as used now. False if there's no such context.
+pub fn a2a_touch_context(conn: &Connection, id: &str) -> Result<bool, Box<dyn Error>> {
+    let rows = conn.execute(
+        "UPDATE a2a_contexts SET last_used_at = ?2 WHERE id = ?1",
+        params![id, chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(rows > 0)
+}
+
+/// The contexts last used before `before` (RFC 3339) and with no task that
+/// isn't done.
+pub fn a2a_expired_contexts(
+    conn: &Connection,
+    before: &str,
+) -> Result<Vec<A2aContext>, Box<dyn Error>> {
+    let sql = format!(
+        "SELECT {} FROM a2a_contexts
+         WHERE last_used_at < ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM scheduled_tasks
+               WHERE continue_agent = a2a_contexts.agent AND status != 'done')
+         ORDER BY last_used_at",
+        CONTEXT_COLUMNS
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![before], row_to_context)?;
+    let mut contexts = Vec::new();
+    for row in rows {
+        contexts.push(row?);
+    }
+    Ok(contexts)
+}
+
+/// Removes a context with its agent - and so the agent's conversation,
+/// events and data - and its tasks. False if there's no such context.
+pub fn a2a_delete_context(conn: &Connection, id: &str) -> Result<bool, Box<dyn Error>> {
+    let Some(context) = a2a_get_context(conn, id)? else {
+        return Ok(false);
+    };
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM scheduled_tasks WHERE continue_agent = ?1",
+        params![context.agent],
+    )?;
+    tx.execute("DELETE FROM a2a_contexts WHERE id = ?1", params![id])?;
+    tx.execute("DELETE FROM agents WHERE name = ?1", params![context.agent])?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// A message from an A2A caller as the task that takes it to the
+/// context's agent, due now: it carries on the agent's conversation, on
+/// whichever worker picks it up.
+pub fn a2a_message_task(
+    context: &A2aContext,
+    text: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> NewTask {
+    let first = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let short: String = first.chars().take(40).collect();
+    NewTask {
+        name: format!(
+            "A2A: {}{}",
+            short,
+            if first.chars().count() > 40 {
+                "…"
+            } else {
+                ""
+            }
+        ),
+        description: format!("From {}, in context {}", context.owner, context.id),
+        kind: TaskKind::PROMPT.to_string(),
+        command: text.trim().to_string(),
+        agent_name: None,
+        schedule: TaskSchedule::Once {
+            at: now.to_rfc3339(),
+        },
+        held: false,
+        depends_on: Vec::new(),
+        profile: None,
+        run_safe: false,
+        cwd: None,
+        continue_agent: Some(context.agent.clone()),
+    }
 }
 
 /// Records `events` of `agent` (for `task_id`'s run, if any), dropping
@@ -2320,6 +2578,7 @@ mod tests {
                 profile: None,
                 run_safe: false,
                 cwd: None,
+                continue_agent: None,
             },
         )
         .unwrap()
@@ -3021,6 +3280,7 @@ mod tests {
             profile: None,
             run_safe: false,
             cwd: None,
+            continue_agent: None,
         };
         let id = create_task(&conn, &task("prompt")).unwrap();
         let row = get_task(&conn, id).unwrap().unwrap();
@@ -3179,6 +3439,7 @@ mod tests {
                 profile: None,
                 run_safe: false,
                 cwd: None,
+                continue_agent: None,
             },
         )
         .unwrap();
@@ -3567,6 +3828,7 @@ mod tests {
                 profile: None,
                 run_safe: false,
                 cwd: None,
+                continue_agent: None,
             },
         )
         .unwrap_err();
@@ -3647,6 +3909,7 @@ mod tests {
             profile: profile.map(String::from),
             run_safe: false,
             cwd: None,
+            continue_agent: None,
         };
         let id = create_task(&conn, &task(TaskKind::PROMPT, None, Some("fast"))).unwrap();
         assert_eq!(

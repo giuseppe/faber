@@ -228,7 +228,8 @@
       <div id="profile-mcp-list" class="tool-list"></div>
     </fieldset>
     <label>Request parameters (JSON) <textarea name="parameters" rows="2" spellcheck="false" placeholder='e.g. {"reasoning_effort": "low"}'></textarea></label>
-    <p class="hint">A profile never gives the unsafe tools, nor picks a working directory.</p>
+    <label class="inline"><input type="checkbox" name="unsafe_tools"> unsafe tools, for the agents of A2A contexts only (unsandboxed commands, web access)</label>
+    <p class="hint">Otherwise a profile never gives the unsafe tools, nor picks a working directory.</p>
     <p id="profile-error" class="error" hidden></p>
     <div class="actions">
       <button type="button" id="profile-cancel" class="ghost">Cancel</button>
