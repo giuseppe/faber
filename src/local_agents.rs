@@ -304,6 +304,34 @@ impl DbBackend for LocalAgents {
         self.inner.finish_task(task_id, session_id, outcome)
     }
 
+    fn a2a_create_context(
+        &self,
+        owner: &str,
+        profile: &str,
+        config: &AgentConfig,
+    ) -> Result<faber::db::A2aContext, Box<dyn Error>> {
+        self.inner.a2a_create_context(owner, profile, config)
+    }
+
+    fn a2a_get_context(&self, id: &str) -> Result<Option<faber::db::A2aContext>, Box<dyn Error>> {
+        self.inner.a2a_get_context(id)
+    }
+
+    fn a2a_touch_context(&self, id: &str) -> Result<bool, Box<dyn Error>> {
+        self.inner.a2a_touch_context(id)
+    }
+
+    fn a2a_expired_contexts(
+        &self,
+        before: &str,
+    ) -> Result<Vec<faber::db::A2aContext>, Box<dyn Error>> {
+        self.inner.a2a_expired_contexts(before)
+    }
+
+    fn a2a_delete_context(&self, id: &str) -> Result<bool, Box<dyn Error>> {
+        self.inner.a2a_delete_context(id)
+    }
+
     fn gc_agents(&self) -> Result<Vec<String>, Box<dyn Error>> {
         self.inner.gc_agents()
     }

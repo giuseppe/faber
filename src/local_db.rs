@@ -353,6 +353,36 @@ impl DbBackend for LocalDb {
         db::run_task_now(&conn, task_id)
     }
 
+    fn a2a_create_context(
+        &self,
+        owner: &str,
+        profile: &str,
+        config: &AgentConfig,
+    ) -> Result<db::A2aContext, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::a2a_create_context(&conn, owner, profile, config)
+    }
+
+    fn a2a_get_context(&self, id: &str) -> Result<Option<db::A2aContext>, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::a2a_get_context(&conn, id)
+    }
+
+    fn a2a_touch_context(&self, id: &str) -> Result<bool, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::a2a_touch_context(&conn, id)
+    }
+
+    fn a2a_expired_contexts(&self, before: &str) -> Result<Vec<db::A2aContext>, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::a2a_expired_contexts(&conn, before)
+    }
+
+    fn a2a_delete_context(&self, id: &str) -> Result<bool, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::a2a_delete_context(&conn, id)
+    }
+
     fn gc_agents(&self) -> Result<Vec<String>, Box<dyn Error>> {
         let conn = self.lock()?;
         db::gc_agents(&conn)

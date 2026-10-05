@@ -58,12 +58,17 @@ pub fn serve_command(
     db: Arc<Mutex<Connection>>,
     auth_key: Option<&str>,
     profiles: crate::Profiles,
+    a2a_keys: crate::a2a::A2aKeys,
 ) -> Result<(), Box<dyn Error>> {
     let profiles = Arc::new(profiles);
+    let a2a_keys = Arc::new(a2a_keys);
 
     let listener = TcpListener::bind(bind)?;
     info!("Listening on {}", bind);
     println!("faber serve listening on {}", bind);
+    if !a2a_keys.is_empty() {
+        println!("A2A: http://{}/.well-known/agent-card.json", bind);
+    }
     match auth_key {
         // After '#', which the browser keeps to itself: the page reads it.
         Some(key) => println!("Web UI: http://{}/ui/#key={}", bind, key),
@@ -87,10 +92,11 @@ pub fn serve_command(
         let db = db.clone();
         let auth_key = auth_key.map(|s| s.to_string());
         let profiles = profiles.clone();
+        let a2a_keys = a2a_keys.clone();
         std::thread::spawn(move || {
             let _ = stream.set_read_timeout(Some(GREETING_TIMEOUT));
             let result = if is_http(&stream) {
-                web::handle_http(stream, db, auth_key.as_deref(), &profiles)
+                web::handle_http(stream, db, auth_key.as_deref(), &profiles, &a2a_keys)
             } else {
                 handle_client(stream, db, auth_key.as_deref())
             };
@@ -406,6 +412,29 @@ fn dispatch_inner(
             let v = db::list_profiles(&conn)?;
             Ok(serde_json::to_value(v)?)
         }
+        "a2a_create_context" => {
+            let config: db::AgentConfig = serde_json::from_value(p["config"].clone())
+                .map_err(|e| format!("bad param 'config': {}", e))?;
+            let v =
+                db::a2a_create_context(&conn, str_param!("owner"), str_param!("profile"), &config)?;
+            Ok(serde_json::to_value(v)?)
+        }
+        "a2a_get_context" => {
+            let v = db::a2a_get_context(&conn, str_param!("id"))?;
+            Ok(serde_json::to_value(v)?)
+        }
+        "a2a_touch_context" => {
+            let v = db::a2a_touch_context(&conn, str_param!("id"))?;
+            Ok(serde_json::to_value(v)?)
+        }
+        "a2a_expired_contexts" => {
+            let v = db::a2a_expired_contexts(&conn, str_param!("before"))?;
+            Ok(serde_json::to_value(v)?)
+        }
+        "a2a_delete_context" => {
+            let v = db::a2a_delete_context(&conn, str_param!("id"))?;
+            Ok(serde_json::to_value(v)?)
+        }
         "request_task_stop" => {
             let v = db::request_task_stop(&conn, i64_param!("task_id"))?;
             Ok(serde_json::to_value(v)?)
@@ -628,6 +657,7 @@ mod tests {
                 profile: Some("fast".to_string()),
                 run_safe: false,
                 cwd: None,
+                continue_agent: None,
             })
             .unwrap();
         assert_eq!(

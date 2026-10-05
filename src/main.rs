@@ -17,6 +17,7 @@
  *
  */
 
+mod a2a;
 mod fan_out;
 use faber::github;
 mod latex_kitty;
@@ -3699,6 +3700,7 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         // Whoever picks it up, it can't do more than its maker could.
         run_safe: !ctx.unsafe_tools,
         cwd,
+        continue_agent: None,
     };
     let id = db.create_task(&task)?;
     let next_run = db.get_task(id)?.and_then(|t| t.next_run_at);
@@ -6266,6 +6268,13 @@ struct Profile {
     /// The MCP servers whose tools it gets, by name (see "mcp_servers").
     #[serde(default)]
     mcp_servers: Option<Vec<String>>,
+    /// Whether the agent of an A2A context made from this profile has the
+    /// unsafe tools (see `a2a_agent_config`). Used only for that: profile
+    /// tasks, `spawn_agent` and `fan_out` ignore it and follow
+    /// `child_unsafe`. Only the user sets it (`faber profiles set`, the web
+    /// UI): no tool can.
+    #[serde(default)]
+    unsafe_tools: Option<bool>,
 }
 
 impl Profile {
@@ -6286,6 +6295,17 @@ impl Profile {
             unsafe_tools: None,
             cwd: None,
             mcp_servers: self.mcp_servers.clone(),
+        }
+    }
+
+    /// The agent config an A2A context's agent made from this profile
+    /// gets: as `agent_config`, but with the unsafe tools if, and only
+    /// if, the profile says so - fixed for the context, whichever worker
+    /// runs it.
+    fn a2a_agent_config(&self, name: &str) -> db::AgentConfig {
+        db::AgentConfig {
+            unsafe_tools: Some(self.unsafe_tools.unwrap_or(false)),
+            ..self.agent_config(name)
         }
     }
 }
@@ -6352,7 +6372,12 @@ fn profiles_command(
         )
     };
     match action {
-        Some(ProfilesAction::Set { name, settings }) => {
+        Some(ProfilesAction::Set {
+            name,
+            unsafe_tools,
+            safe_tools,
+            settings,
+        }) => {
             if opts.profiles.contains_key(name) {
                 return Err(
                     format!("profile '{}' is in the config file: change it there", name).into(),
@@ -6365,7 +6390,10 @@ fn profiles_command(
                 .find(|(n, _)| n == name)
                 .and_then(|(_, v)| serde_json::from_value::<Profile>(v).ok())
                 .unwrap_or_default();
-            let profile = settings.apply(current)?;
+            let mut profile = settings.apply(current)?;
+            if *unsafe_tools || *safe_tools {
+                profile.unsafe_tools = Some(*unsafe_tools);
+            }
             validate_profiles(&Profiles::from([(name.clone(), profile.clone())]))?;
             db.set_profile(name, &serde_json::to_value(&profile)?)?;
             println!("Profile '{}' saved in the database.", name);
@@ -6410,6 +6438,9 @@ fn profiles_command(
             .skip(1)
         {
             println!("  {:<13} {}", format!("{}:", label), value);
+        }
+        if profile.unsafe_tools == Some(true) {
+            println!("  {:<13} yes, for A2A contexts", "Unsafe tools:");
         }
     }
     Ok(())
@@ -7038,7 +7069,27 @@ fn remove_one_job_agents_done(db: &dyn DbBackend) -> Result<Vec<String>, Box<dyn
     for name in &done {
         db.delete_agent(name)?;
     }
+    remove_expired_a2a_contexts(db, chrono::Utc::now())?;
     Ok(done)
+}
+
+/// How long an A2A context can go unused before it's removed.
+const A2A_CONTEXT_TTL: chrono::Duration = chrono::Duration::hours(db::A2A_CONTEXT_TTL_HOURS);
+
+/// Removes the A2A contexts unused for `A2A_CONTEXT_TTL` and with no task
+/// that isn't done, with their agents and tasks. Returns their ids.
+fn remove_expired_a2a_contexts(
+    db: &dyn DbBackend,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let before = (now - A2A_CONTEXT_TTL).to_rfc3339();
+    let mut removed = Vec::new();
+    for context in db.a2a_expired_contexts(&before)? {
+        if db.a2a_delete_context(&context.id)? {
+            removed.push(context.id);
+        }
+    }
+    Ok(removed)
 }
 
 /// Records where `agent` works (`None`: the process's directory).
@@ -9214,14 +9265,17 @@ fn claim_prompt_task(
     agent: &str,
     profiles: &[String],
 ) -> Option<db::TaskRow> {
-    claim_prompt_task_but(db, session_id, agent, profiles, false, false)
+    claim_prompt_task_but(db, session_id, agent, profiles, false, false, None)
 }
 
 /// `claim_prompt_task`, but with `busy`, none of those for `agent` by
 /// name: it's already running one, and only one can run as it at a time.
 /// With `only_unsafe`, none that must run on an agent without unsafe
 /// tools (`run_safe`): for a chat whose agent has them, which can only
-/// run a task as itself.
+/// run a task as itself. Tasks carrying on an agent's conversation (A2A
+/// contexts) are only for workers, which pass `contexts`: whether they
+/// have the unsafe tools, since an unsafe context's agent can only run on
+/// a worker that does.
 fn claim_prompt_task_but(
     db: &dyn DbBackend,
     session_id: &str,
@@ -9229,6 +9283,7 @@ fn claim_prompt_task_but(
     profiles: &[String],
     busy: bool,
     only_unsafe: bool,
+    contexts: Option<bool>,
 ) -> Option<db::TaskRow> {
     let tasks = db.get_pending_tasks().ok()?;
     tasks
@@ -9238,6 +9293,16 @@ fn claim_prompt_task_but(
         .filter(|t| !(busy && task_is_for_worker(t)))
         .filter(|t| !(only_unsafe && t.run_safe))
         .filter(|t| t.profile.as_ref().is_none_or(|p| profiles.contains(p)))
+        .filter(|t| match (&t.continue_agent, contexts) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(context), Some(worker_unsafe)) => {
+                worker_unsafe
+                    || db
+                        .get_agent_config(context)
+                        .is_ok_and(|c| c.unsafe_tools != Some(true))
+            }
+        })
         .find(|t| db.claim_task(t.id, session_id).unwrap_or(false))
 }
 
@@ -9707,6 +9772,7 @@ fn chat_command(
                     false,
                     db.get_agent_config(&active_agent.name)
                         .is_ok_and(|config| session_agent_unsafe(opts, &config)),
+                    None,
                 ) {
                     chat_pb.println(&format!(
                         "Picked up scheduled task #{} \"{}\"",
@@ -10791,6 +10857,7 @@ fn new_task_from_cli(
             .as_deref()
             .map(|dir| resolve_cwd(&std::env::current_dir().map_err(|e| e.to_string())?, dir))
             .transpose()?,
+        continue_agent: None,
     })
 }
 
@@ -11063,8 +11130,38 @@ fn run_prompt_task_headless(
         session_agent_unsafe(opts, &db.get_agent_config(worker).unwrap_or_default());
     // A task a safe agent made runs without the unsafe tools, even on an
     // agent made for it when the worker has them.
-    let task_unsafe = worker_unsafe && !task.run_safe;
+    let task_unsafe = match &task.continue_agent {
+        // A context's agent has the unsafe tools if its config says so,
+        // whatever the worker has beyond that; `claim_prompt_task_but`
+        // leaves it to a worker that has them.
+        Some(context) => {
+            worker_unsafe
+                && db
+                    .get_agent_config(context)
+                    .is_ok_and(|c| c.unsafe_tools == Some(true))
+        }
+        None => worker_unsafe && !task.run_safe,
+    };
     let task_agent = match &task.profile {
+        _ if task.continue_agent.is_some() => {
+            let context = task.continue_agent.as_deref().unwrap_or_default();
+            match db.claim_agent(context, session_id) {
+                Ok(true) => Some(Ok(context.to_string())),
+                // Another session has it: for later.
+                Ok(false) => {
+                    let outcome = db::TaskOutcome {
+                        succeeded: false,
+                        exit_code: None,
+                        result: TASK_GIVEN_BACK.to_string(),
+                    };
+                    if let Err(e) = db.release_task(task.id, session_id) {
+                        warn!("Couldn't give back task {}: {}", task.id, e);
+                    }
+                    return outcome;
+                }
+                Err(e) => Some(Err(e)),
+            }
+        }
         Some(profile) => Some(profile_task_agent(
             task,
             profile,
@@ -11112,8 +11209,13 @@ fn run_prompt_task_headless(
         }
     }
     let _not_running = NotRunningWhenDone(db.as_ref(), agent);
-    // The task's own directory, else its agent's.
-    let run_cwd = task.cwd.clone().or(agent_config.cwd.clone());
+    // The task's own directory, else its agent's - for a context's agent,
+    // which has none, the worker's, as for a profile task.
+    let run_cwd = task.cwd.clone().or(agent_config.cwd.clone()).or_else(|| {
+        task.continue_agent
+            .as_ref()
+            .and_then(|_| db.get_agent_config(worker).ok()?.cwd)
+    });
     if let Some(cwd) = run_cwd
         .as_deref()
         .filter(|c| !std::path::Path::new(c).is_dir())
@@ -11158,7 +11260,7 @@ fn run_prompt_task_headless(
     // Run as the agent itself - a task for it by name, a message to it -
     // it carries on its conversation, as a chat does; on an agent made
     // for it, it starts one.
-    let saved: Vec<Message> = if task_agent.is_none() || resuming {
+    let saved: Vec<Message> = if task_agent.is_none() || resuming || task.continue_agent.is_some() {
         db.load_agent_messages(agent)
             .unwrap_or_default()
             .into_iter()
@@ -11189,6 +11291,9 @@ fn run_prompt_task_headless(
     };
     let input = if resuming {
         resumed_task_input(task)
+    } else if task.continue_agent.is_some() {
+        // Just the message: it's a conversation, not a job to report on.
+        task.command.clone()
     } else {
         messages.push(running_task_note(task.id));
         format!(
@@ -11292,6 +11397,21 @@ fn run_prompt_task_headless(
     }
     if interrupted {
         outcome.result = "stopped".to_string();
+    }
+    if task.continue_agent.is_some() {
+        // The whole answer: the outcome's is cut short. Before the task is
+        // finished, so whoever sees it done finds the answer.
+        let answer = match &result {
+            Ok(response) => response
+                .choices
+                .as_ref()
+                .and_then(|c| c.first())
+                .and_then(|c| c.message.content.clone())
+                .filter(|_| outcome.succeeded)
+                .unwrap_or_else(|| outcome.result.clone()),
+            Err(_) => outcome.result.clone(),
+        };
+        let _ = db.set_agent_data(agent, &db::a2a_answer_key(task.id), answer.trim());
     }
     record_turn_end(&events, &outcome);
     if let Err(e) = db.finish_task(task.id, session_id, &outcome) {
@@ -11496,7 +11616,8 @@ fn run_worker(
             std::thread::sleep(Duration::from_millis(500));
         }
     }
-    if session_agent_unsafe(opts, &db.get_agent_config(&agent)?) {
+    let worker_unsafe = session_agent_unsafe(opts, &db.get_agent_config(&agent)?);
+    if worker_unsafe {
         mark_session_unsafe(db.as_ref(), &agent, &session_id);
     }
     let parallel = spec.parallel.map(|p| p.max(1));
@@ -11621,6 +11742,7 @@ fn run_worker(
                     &current_profiles(),
                     own_busy.load(Ordering::Relaxed),
                     false,
+                    Some(worker_unsafe),
                 ) {
                     let own = task_is_for_worker(&task);
                     if own {
@@ -12384,6 +12506,7 @@ fn task_as_new(task: &db::TaskRow) -> db::NewTask {
         profile: task.profile.clone(),
         run_safe: task.run_safe,
         cwd: task.cwd.clone(),
+        continue_agent: task.continue_agent.clone(),
     }
 }
 
@@ -13615,6 +13738,7 @@ fn agent_settings(config: &db::AgentConfig, description: &str) -> Profile {
         system_prompt: config.system_prompt.clone(),
         tools: config.tools.clone(),
         mcp_servers: config.mcp_servers.clone(),
+        unsafe_tools: None,
     }
 }
 
@@ -13654,6 +13778,14 @@ enum ProfilesAction {
     /// using it (the config file's are changed there)
     Set {
         name: String,
+        /// Give the agents of A2A contexts made from it the unsafe tools
+        /// (unsandboxed commands, web access): only those, not agents it
+        /// is applied to otherwise
+        #[clap(long, conflicts_with = "safe_tools")]
+        unsafe_tools: bool,
+        /// Take that away again
+        #[clap(long)]
+        safe_tools: bool,
         #[clap(flatten)]
         settings: SettingsArgs,
     },
@@ -13825,6 +13957,13 @@ enum CliCommand {
         /// If a chat has the agent, it waits for it to be free
         #[clap(long = "run-agent", value_name = "NAME")]
         run_agents: Vec<String>,
+        /// Also speak A2A (the Agent2Agent protocol) to callers with the
+        /// keys in this file, one `NAME KEY` per line (keys of at least
+        /// 32 characters, not the server's own): they message the
+        /// database's profiles as skills, at /a2a, and nothing else. Read
+        /// at start. Without it there's no A2A, and /a2a answers 404
+        #[clap(long, value_name = "FILE")]
+        a2a_keys_file: Option<String>,
     },
 }
 
@@ -14144,6 +14283,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             auth_key_file,
             no_auth,
             run_agents,
+            a2a_keys_file,
         } => {
             let (Some(conn), Some(db)) = (db_conn_for_history.clone(), db_connection.clone())
             else {
@@ -14162,6 +14302,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 (None, true) => None,
                 (None, false) => Some(write_server_key(bind)?),
+            };
+            let a2a_keys = match a2a_keys_file {
+                Some(file) => a2a::A2aKeys::read(file, key.as_deref())?,
+                None => a2a::A2aKeys::default(),
             };
             let profiles = opts.profiles.clone();
             let workers = run_agents
@@ -14219,7 +14363,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let mut mcp_servers: Vec<String> = opts.mcp_servers.keys().cloned().collect();
                 mcp_servers.sort();
                 let _ = web::MCP_SERVERS.set(mcp_servers);
-                server::serve_command(bind, conn, key.as_deref(), profiles)
+                server::serve_command(bind, conn, key.as_deref(), profiles, a2a_keys)
             })
         }
     };
@@ -14283,6 +14427,7 @@ mod tests {
                 profile: None,
                 run_safe: false,
                 cwd: None,
+                continue_agent: None,
             })
         }
     }
@@ -14881,6 +15026,7 @@ for line in sys.stdin:
             profile: None,
             run_safe,
             cwd: cwd.map(String::from),
+            continue_agent: None,
         })
         .unwrap()
     }
@@ -15156,6 +15302,7 @@ for line in sys.stdin:
             run_safe: false,
             cwd: None,
             stop_requested: false,
+            continue_agent: None,
         }
     }
 
@@ -15353,6 +15500,7 @@ for line in sys.stdin:
             profile: None,
             run_safe: false,
             cwd: None,
+            continue_agent: None,
         };
         let for_bob = db.create_task(&prompt(Some("bob"))).unwrap();
         assert!(claim_prompt_task(db.as_ref(), "s1", "alice", &[]).is_none());
@@ -17053,6 +17201,7 @@ for line in sys.stdin:
                 profile: Some("fast".to_string()),
                 run_safe: false,
                 cwd: None,
+                continue_agent: None,
             })
             .unwrap();
         // A chat, or a worker without the profile, leaves it alone.
@@ -17162,6 +17311,266 @@ for line in sys.stdin:
         assert_eq!(out.matches("fast says hi").count(), 2, "{out}");
     }
 
+    /// A context for `owner` on a profile with `unsafe_tools`, and its
+    /// agent's config as the profile gives it.
+    fn a2a_context(db: &Arc<dyn DbBackend>, owner: &str, profile: &Profile) -> db::A2aContext {
+        db.a2a_create_context(owner, "p", &profile.a2a_agent_config("p"))
+            .unwrap()
+    }
+
+    /// A message to the context, due already.
+    fn a2a_message(db: &Arc<dyn DbBackend>, context: &db::A2aContext, text: &str) -> i64 {
+        let past = chrono::Utc::now() - chrono::Duration::seconds(5);
+        db.create_task(&db::a2a_message_task(context, text, past))
+            .unwrap()
+    }
+
+    /// Runs the claimed task `id` as a worker `w` (claimed by "ws") would.
+    fn run_a2a_task(
+        db: &Arc<dyn DbBackend>,
+        id: i64,
+        model: &str,
+        unsafe_worker: bool,
+    ) -> db::TaskOutcome {
+        let task = db.get_task(id).unwrap().unwrap();
+        let ctx = chat_ctx_with_model(db.clone(), "w", model);
+        let extra = ctx
+            .extra
+            .clone()
+            .unwrap()
+            .downcast::<SubAgentContext>()
+            .ok()
+            .unwrap();
+        let mut opts = Opts::default();
+        opts.model = Some(model.to_string());
+        opts.unsafe_tools = unsafe_worker;
+        let (_cancel_tx, cancel_rx) = mpsc::channel();
+        run_prompt_task_headless(
+            &task,
+            "w",
+            db,
+            "ws",
+            &extra.tools,
+            &opts,
+            extra.clone(),
+            &None,
+            cancel_rx,
+        )
+    }
+
+    #[test]
+    fn test_a2a_context_agent_gets_its_config_from_the_profile() {
+        let db = local_db_with_agents(&["w"]);
+        let mut profile = scripted_profile("a2a_config", "hi");
+        profile.tools = Some(vec!["read_file".to_string()]);
+        profile.system_prompt = Some("be brief".to_string());
+        let context = a2a_context(&db, "alice", &profile);
+        assert_eq!(context.owner, "alice");
+        assert_eq!(context.agent, format!("a2a-{}", &context.id[..12]));
+        assert_eq!(context.id.len(), 32);
+        let config = db.get_agent_config(&context.agent).unwrap();
+        assert_eq!(config.model, profile.model);
+        assert_eq!(config.tools, profile.tools);
+        assert_eq!(config.system_prompt.as_deref(), Some("be brief"));
+        assert_eq!(config.profile.as_deref(), Some("p"));
+        assert_eq!(config.unsafe_tools, Some(false), "safe unless it says so");
+        assert_eq!(config.cwd, None);
+        assert_eq!(
+            db.get_agent_data(&context.agent, db::A2A_CONTEXT_KEY)
+                .unwrap(),
+            Some(context.id.clone())
+        );
+        assert!(
+            db.get_agent_data(&context.agent, db::ONE_JOB_KEY)
+                .unwrap()
+                .is_none(),
+            "the one-job cleanup leaves it alone"
+        );
+        assert_eq!(db.a2a_get_context(&context.id).unwrap(), Some(context));
+        assert_eq!(db.a2a_get_context("nope").unwrap(), None);
+
+        // Only the profile gives the unsafe tools - and only to contexts.
+        profile.unsafe_tools = Some(true);
+        let unsafe_context = a2a_context(&db, "alice", &profile);
+        assert_eq!(
+            db.get_agent_config(&unsafe_context.agent)
+                .unwrap()
+                .unsafe_tools,
+            Some(true)
+        );
+        assert_eq!(profile.agent_config("p").unsafe_tools, None);
+    }
+
+    #[test]
+    fn test_no_tool_sets_a_profile() {
+        // `unsafe_tools` of a profile is the user's to give: no tool, of
+        // any a session may have, touches profiles.
+        for name in initialize_tools(true, None).keys() {
+            assert!(!name.contains("profile"), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_a2a_context_tasks_run_one_at_a_time_and_remember() {
+        let model = model_script(
+            "a2a_memory",
+            serde_json::json!([{"if": "second", "reply": "two"}, {"if": "first", "reply": "one"}]),
+        );
+        let db = local_db_with_agents(&["w"]);
+        assert!(db.claim_agent("w", "ws").unwrap());
+        let profile = Profile {
+            model: Some(model.clone()),
+            ..Default::default()
+        };
+        let one = a2a_context(&db, "alice", &profile);
+        let other = a2a_context(&db, "alice", &profile);
+        let first = a2a_message(&db, &one, "first question");
+        let second = a2a_message(&db, &one, "second question");
+        let elsewhere = a2a_message(&db, &other, "second question");
+
+        // One at a time per context, in order: the second waits, though
+        // the other context's task doesn't.
+        let pending: Vec<i64> = db
+            .get_pending_tasks()
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(pending, vec![first, elsewhere]);
+        assert!(db.claim_task(first, "ws").unwrap());
+        assert!(!db.claim_task(second, "ws").unwrap(), "first is running");
+        let outcome = run_a2a_task(&db, first, &model, false);
+        assert!(outcome.succeeded, "{}", outcome.result);
+        assert_eq!(outcome.result, "one");
+        let task = db.get_task(first).unwrap().unwrap();
+        assert_eq!(task.continue_agent.as_deref(), Some(one.agent.as_str()));
+        assert_eq!(task.status, "done");
+        assert_eq!(
+            db.get_agent_data(&one.agent, &db::a2a_answer_key(first))
+                .unwrap()
+                .as_deref(),
+            Some("one")
+        );
+
+        // A failed message doesn't keep the next one from running.
+        assert!(db.claim_task(second, "ws").unwrap());
+        let outcome = run_a2a_task(&db, second, &model, false);
+        assert_eq!(outcome.result, "two");
+        let said: Vec<String> = db
+            .load_agent_messages(&one.agent)
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .map(|m| m["content"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(said, vec!["first question", "second question"]);
+
+        // The other context never heard of the first.
+        assert!(db.claim_task(elsewhere, "ws").unwrap());
+        run_a2a_task(&db, elsewhere, &model, false);
+        let said: Vec<String> = db
+            .load_agent_messages(&other.agent)
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .map(|m| m["content"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(said, vec!["second question"]);
+        assert!(
+            db.load_agent_messages("w").unwrap().is_empty(),
+            "not the worker's"
+        );
+    }
+
+    #[test]
+    fn test_a_safe_worker_leaves_an_unsafe_contexts_tasks_to_an_unsafe_one() {
+        let db = local_db_with_agents(&["w"]);
+        let mut profile = scripted_profile("a2a_unsafe", "hi");
+        let safe = a2a_context(&db, "alice", &profile);
+        profile.unsafe_tools = Some(true);
+        let risky = a2a_context(&db, "alice", &profile);
+        let safe_task = a2a_message(&db, &safe, "hello");
+        let risky_task = a2a_message(&db, &risky, "hello");
+        // A chat never takes either.
+        assert!(claim_prompt_task(db.as_ref(), "chat", "c", &[]).is_none());
+        assert!(db.claim_agent("w", "ws").unwrap(), "a live session");
+        let claim = |worker_unsafe: bool| {
+            claim_prompt_task_but(
+                db.as_ref(),
+                "ws",
+                "w",
+                &[],
+                false,
+                false,
+                Some(worker_unsafe),
+            )
+            .map(|t| t.id)
+        };
+        assert_eq!(claim(false), Some(safe_task));
+        assert_eq!(claim(false), None, "left for an unsafe worker");
+        assert_eq!(claim(true), Some(risky_task));
+    }
+
+    #[test]
+    fn test_an_unsafe_contexts_agent_runs_unsafe_only_on_an_unsafe_worker() {
+        let model = model_script("a2a_tools", serde_json::json!([{"reply": "ok"}]));
+        let db = local_db_with_agents(&["w"]);
+        assert!(db.claim_agent("w", "ws").unwrap());
+        let mut profile = scripted_profile("a2a_tools_profile", "hi");
+        profile.unsafe_tools = Some(true);
+        let risky = a2a_context(&db, "alice", &profile);
+        let id = a2a_message(&db, &risky, "hello");
+        assert!(db.claim_task(id, "ws").unwrap());
+        let outcome = run_a2a_task(&db, id, &model, true);
+        assert!(outcome.succeeded, "{}", outcome.result);
+        assert_eq!(
+            db.get_agent_config(&risky.agent).unwrap().unsafe_tools,
+            Some(true),
+            "the agent's own setting stays"
+        );
+    }
+
+    #[test]
+    fn test_expired_a2a_contexts_are_removed_with_their_agents_and_tasks() {
+        let db = local_db_with_agents(&[]);
+        let profile = scripted_profile("a2a_expiry", "hi");
+        let idle = a2a_context(&db, "alice", &profile);
+        let waiting = a2a_context(&db, "alice", &profile);
+        let finished = a2a_message(&db, &idle, "old news");
+        db.claim_task(finished, "ws").unwrap();
+        db.finish_task(
+            finished,
+            "ws",
+            &db::TaskOutcome {
+                succeeded: true,
+                exit_code: None,
+                result: "ok".to_string(),
+            },
+        )
+        .unwrap();
+        let pending = a2a_message(&db, &waiting, "still to do");
+        db.save_agent_messages(&idle.agent, &[serde_json::json!({"role": "user"})])
+            .unwrap();
+
+        // Not yet: they were used a moment ago.
+        assert!(
+            remove_expired_a2a_contexts(db.as_ref(), chrono::Utc::now())
+                .unwrap()
+                .is_empty()
+        );
+        // A day on, the one with a task not done is spared.
+        let later = chrono::Utc::now() + A2A_CONTEXT_TTL + chrono::Duration::minutes(1);
+        let removed = remove_expired_a2a_contexts(db.as_ref(), later).unwrap();
+        assert_eq!(removed, vec![idle.id.clone()]);
+        assert!(db.a2a_get_context(&idle.id).unwrap().is_none());
+        assert!(db.get_agent(&idle.agent).unwrap().is_none());
+        assert!(db.get_task(finished).unwrap().is_none());
+        assert!(db.load_agent_messages(&idle.agent).unwrap().is_empty());
+        assert!(db.get_task(pending).unwrap().is_some());
+        assert!(db.a2a_get_context(&waiting.id).unwrap().is_some());
+        assert!(db.get_agent(&waiting.agent).unwrap().is_some());
+    }
+
     #[test]
     fn test_worker_runs_a_profile_task_on_a_new_agent() {
         let db = local_db_with_agents(&["w"]);
@@ -17180,6 +17589,7 @@ for line in sys.stdin:
                 profile: Some("fast".to_string()),
                 run_safe: false,
                 cwd: None,
+                continue_agent: None,
             })
             .unwrap();
         let mut opts = Opts::default();
@@ -17382,6 +17792,7 @@ for line in sys.stdin:
                 profile: None,
                 run_safe: false,
                 cwd: Some(dir.0.to_str().unwrap().to_string()),
+                continue_agent: None,
             })
             .unwrap();
         let task = claim_prompt_task(db.as_ref(), "worker-session", "w", &[]).unwrap();
@@ -17651,8 +18062,9 @@ for line in sys.stdin:
             .create_oneshot_task("mine", "", &past, "x", Some("w"))
             .unwrap();
         let anyone = db.create_oneshot_task("any", "", &past, "x", None).unwrap();
-        let claim =
-            |busy| claim_prompt_task_but(db.as_ref(), "s", "w", &[], busy, false).map(|t| t.id);
+        let claim = |busy| {
+            claim_prompt_task_but(db.as_ref(), "s", "w", &[], busy, false, None).map(|t| t.id)
+        };
         // Busy with one of its own, it can still take tasks for anyone.
         assert_eq!(claim(true), Some(anyone));
         assert_eq!(claim(true), None);

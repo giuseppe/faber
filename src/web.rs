@@ -77,14 +77,14 @@ const MAX_HEADER_BYTES: usize = 64 << 10;
 /// The most events one `/api/events` request returns.
 const MAX_EVENTS: usize = 1000;
 
-struct Request {
-    method: String,
-    path: String,
+pub(crate) struct Request {
+    pub(crate) method: String,
+    pub(crate) path: String,
     query: Vec<(String, String)>,
-    authorization: Option<String>,
-    host: Option<String>,
-    content_type: Option<String>,
-    body: Vec<u8>,
+    pub(crate) authorization: Option<String>,
+    pub(crate) host: Option<String>,
+    pub(crate) content_type: Option<String>,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Request {
@@ -97,14 +97,14 @@ impl Request {
 }
 
 #[derive(Debug, PartialEq)]
-struct Response {
-    status: u16,
-    content_type: &'static str,
-    body: Vec<u8>,
+pub(crate) struct Response {
+    pub(crate) status: u16,
+    pub(crate) content_type: &'static str,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Response {
-    fn json(status: u16, value: &serde_json::Value) -> Self {
+    pub(crate) fn json(status: u16, value: &serde_json::Value) -> Self {
         Self {
             status,
             content_type: "application/json",
@@ -119,7 +119,7 @@ impl Response {
         }
     }
 
-    fn error(status: u16, message: &str) -> Self {
+    pub(crate) fn error(status: u16, message: &str) -> Self {
         Self::json(status, &serde_json::json!({ "error": message }))
     }
 
@@ -189,7 +189,7 @@ fn parse_query(query: &str) -> Vec<(String, String)> {
 
 /// Reads one HTTP/1.x request, or `Err` with the response to send for a
 /// malformed one.
-fn read_request(reader: &mut impl BufRead) -> Result<Request, Response> {
+pub(crate) fn read_request(reader: &mut impl BufRead) -> Result<Request, Response> {
     let bad = |m: &str| Response::error(400, m);
     let mut line = String::new();
     reader
@@ -269,6 +269,7 @@ pub fn handle_http(
     db: Arc<Mutex<Connection>>,
     auth_key: Option<&str>,
     profiles: &crate::Profiles,
+    a2a_keys: &crate::a2a::A2aKeys,
 ) -> Result<(), Box<dyn Error>> {
     // A request is its headers and a body of at most MAX_BODY_BYTES: no
     // header line of a request without end is read into memory whole.
@@ -276,7 +277,7 @@ pub fn handle_http(
     let mut reader = BufReader::new(std::io::Read::take(stream.try_clone()?, limit));
     let mut writer = stream;
     let response = match read_request(&mut reader) {
-        Ok(request) => route(&request, &db, auth_key, profiles),
+        Ok(request) => route(&request, &db, auth_key, profiles, a2a_keys),
         Err(response) => response,
     };
     write_response(&mut writer, &response)?;
@@ -288,6 +289,7 @@ fn route(
     db: &Arc<Mutex<Connection>>,
     auth_key: Option<&str>,
     profiles: &crate::Profiles,
+    a2a_keys: &crate::a2a::A2aKeys,
 ) -> Response {
     let segments: Vec<&str> = request.path.split('/').filter(|s| !s.is_empty()).collect();
     match (request.method.as_str(), segments.as_slice()) {
@@ -340,7 +342,8 @@ fn route(
                 Err(e) => Response::error(400, &e.to_string()),
             }
         }
-        _ => Response::error(404, "not found"),
+        _ => crate::a2a::handle(request, db, a2a_keys)
+            .unwrap_or_else(|| Response::error(404, "not found")),
     }
 }
 
@@ -657,6 +660,7 @@ impl ApiNewTask {
             profile: non_empty(&self.profile),
             run_safe: false,
             cwd,
+            continue_agent: None,
         })
     }
 }
@@ -969,6 +973,7 @@ fn api(
                     profile: None,
                     run_safe: false,
                     cwd: None,
+                    continue_agent: None,
                 },
             )?;
             let mut reply = serde_json::json!({ "task_id": id });
@@ -1228,7 +1233,13 @@ mod tests {
             serde_json::from_value(serde_json::json!({"description": "quick", "model": "small"}))
                 .unwrap(),
         )]);
-        route(&request(method, target, body), db, None, &profiles)
+        route(
+            &request(method, target, body),
+            db,
+            None,
+            &profiles,
+            &crate::a2a::A2aKeys::default(),
+        )
     }
 
     fn json(response: &Response) -> serde_json::Value {
@@ -1254,16 +1265,53 @@ mod tests {
         let db = test_db();
         let mut r = request("POST", "/api/tasks", r#"{"command": "rm -rf"}"#);
         r.content_type = Some("text/plain".to_string());
-        assert_eq!(route(&r, &db, None, &crate::Profiles::new()).status, 415);
+        assert_eq!(
+            route(
+                &r,
+                &db,
+                None,
+                &crate::Profiles::new(),
+                &crate::a2a::A2aKeys::default(),
+            )
+            .status,
+            415
+        );
         r.content_type = None;
-        assert_eq!(route(&r, &db, None, &crate::Profiles::new()).status, 415);
+        assert_eq!(
+            route(
+                &r,
+                &db,
+                None,
+                &crate::Profiles::new(),
+                &crate::a2a::A2aKeys::default(),
+            )
+            .status,
+            415
+        );
         let mut r = request("GET", "/api/tasks", "");
         r.host = Some("evil.example:9090".to_string());
-        assert_eq!(route(&r, &db, None, &crate::Profiles::new()).status, 403);
+        assert_eq!(
+            route(
+                &r,
+                &db,
+                None,
+                &crate::Profiles::new(),
+                &crate::a2a::A2aKeys::default(),
+            )
+            .status,
+            403
+        );
         // With a key, any host will do.
         r.authorization = Some("Bearer k".to_string());
         assert_eq!(
-            route(&r, &db, Some("k"), &crate::Profiles::new()).status,
+            route(
+                &r,
+                &db,
+                Some("k"),
+                &crate::Profiles::new(),
+                &crate::a2a::A2aKeys::default()
+            )
+            .status,
             200
         );
         assert!(
@@ -1312,7 +1360,14 @@ mod tests {
         let db = test_db();
         let r = request("GET", "/api/tasks", "");
         assert_eq!(
-            route(&r, &db, Some("k"), &crate::Profiles::new()).status,
+            route(
+                &r,
+                &db,
+                Some("k"),
+                &crate::Profiles::new(),
+                &crate::a2a::A2aKeys::default()
+            )
+            .status,
             401
         );
         assert_eq!(
@@ -1320,7 +1375,8 @@ mod tests {
                 &request("GET", "/ui/", ""),
                 &db,
                 Some("k"),
-                &crate::Profiles::new()
+                &crate::Profiles::new(),
+                &crate::a2a::A2aKeys::default()
             )
             .status,
             200
@@ -1328,7 +1384,14 @@ mod tests {
         let mut r = request("GET", "/api/tasks", "");
         r.authorization = Some("Bearer k".to_string());
         assert_eq!(
-            route(&r, &db, Some("k"), &crate::Profiles::new()).status,
+            route(
+                &r,
+                &db,
+                Some("k"),
+                &crate::Profiles::new(),
+                &crate::a2a::A2aKeys::default()
+            )
+            .status,
             200
         );
     }
@@ -1695,6 +1758,7 @@ mod tests {
                     profile: None,
                     run_safe: false,
                     cwd: None,
+                    continue_agent: None,
                 },
             )
             .unwrap();
