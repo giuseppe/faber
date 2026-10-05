@@ -562,6 +562,52 @@ The model's `task_create` takes `continue_task` for the same, and the web
 UI has "Carry on…" on a task that's done. A task made by an agent
 without the unsafe tools carries on one that had them without them.
 
+#### Workflows with a conductor
+
+Those pieces are enough for an agent to run a whole workflow: a
+*conductor*, a profile whose system prompt is the playbook, delegating
+every step to other profiles' agents with `task_create` and `task_wait`,
+and deciding what comes next from what they report:
+
+```json
+{
+  "profiles": {
+    "fix-issue": {
+      "description": "Runs the fix, review, fix again loop for an issue",
+      "tools": ["task_create", "task_wait", "task_list", "plan_update", "report_result"],
+      "system_prompt": "You run this playbook, delegating every step with task_create and never doing the work yourself.\n1. Have a coder (profile coder) fix the issue and open a PR.\n2. Have a reviewer (profile reviewer, depends_on the coder's task) review it; wait for it with task_wait.\n3. While the review asks for changes: have the same coder address them (continue_task: its task), then the same reviewer check its comments were addressed (continue_task: its task). At most 5 rounds.\n4. When approved, end your turn asking whether to merge. If told yes, merge."
+    },
+    "coder": {"description": "Writes the code"},
+    "reviewer": {"description": "Reviews PRs; says approve, or which changes"}
+  }
+}
+```
+
+```bash
+faber --unsafe-tools worker &          # runs the conductor and its steps
+faber tasks add "Fix issue 42" --profile fix-issue          # 1
+faber tasks                            # the conductor's tasks, as it makes them
+faber tasks add "yes, merge" --continue 1                   # answering its question
+```
+
+- Each step is a task of its own, on the board and in the feed. The
+  conductor's plan, if it keeps one with `plan_update`, shows in the web
+  UI.
+- `continue_task` lets the coder fix its own PR, and the reviewer check
+  its own comments, remembering what they did.
+- A reviewer that reports with `report_result`, e.g. `data: {"verdict":
+  "changes", ...}`, gives the conductor something to branch on rather
+  than prose.
+- Its question is just how its task ends. Answering is carrying it on,
+  from the terminal or "Carry on…" in the web UI, and the answer is
+  added to everything it knew.
+- From the web UI, the same is a new task for the `fix-issue` profile.
+
+Its steps get the unsafe tools only if the conductor has them: started
+by you on a worker with `--unsafe-tools`, it does, even with its `tools`
+narrowed to the task tools as above. Nothing but the playbook limits how
+many rounds it runs.
+
 A task can be put on hold, so that nobody picks it up - e.g. to create
 work ahead of time and start it on a signal:
 
