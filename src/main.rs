@@ -3610,11 +3610,17 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         profile: Option<String>,
         #[serde(default)]
         cwd: Option<String>,
+        #[serde(default)]
+        continue_task: Option<i64>,
     }
     let mut params: Params = serde_json::from_str(params_str)?;
     params.profile = requested_profile(&ctx_profiles(ctx), params.profile.take());
-    // It runs where its maker works, unless one that may choose does.
-    let cwd = child_cwd(ctx, params.cwd.as_deref())?;
+    // It runs where its maker works, unless one that may choose does -
+    // or, carrying on an agent, where that one does.
+    let cwd = match (&params.continue_task, params.cwd.as_deref()) {
+        (Some(_), None) => None,
+        (_, requested) => child_cwd(ctx, requested)?,
+    };
     if params.command.trim().is_empty() {
         return Err("the task needs a command: an instruction, or a JSON tool call".into());
     }
@@ -3681,6 +3687,7 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
             .is_some_and(|a| a.parent.is_none())
     });
     let agent_name = match &params.profile {
+        _ if params.continue_task.is_some() => params.agent_name.clone(),
         Some(_) => params.agent_name.clone(),
         None => params
             .agent_name
@@ -3701,6 +3708,7 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         run_safe: !ctx.unsafe_tools,
         cwd,
         continue_agent: None,
+        continue_task: params.continue_task,
     };
     let id = db.create_task(&task)?;
     let next_run = db.get_task(id)?.and_then(|t| t.next_run_at);
@@ -3715,9 +3723,13 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         "id": id,
         "kind": kind,
         "next_run_at": next_run,
-        "runs_on": task.agent_name.clone().unwrap_or_else(|| match &task.profile {
-            Some(profile) => format!("a new agent from profile {}", profile),
-            None => "any agent".to_string(),
+        "runs_on": task.agent_name.clone().unwrap_or_else(|| match (&task.profile, task.continue_task) {
+            (_, Some(id)) => format!(
+                "a fork of the agent that ran task #{}, as it was when done, by a free worker",
+                id
+            ),
+            (Some(profile), _) => format!("a new agent from profile {}", profile),
+            (None, None) => "any agent".to_string(),
         }),
     });
     // What a model waiting for it needs to know.
@@ -5725,7 +5737,8 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "max_runs": {"type": "integer", "description": "With cron_expression: stop after this many runs"},
                         "delay_seconds": {"type": "integer", "description": "Run once, this many seconds from now"},
                         "run_at": {"type": "string", "description": "Run once at this RFC 3339 time, e.g. 2026-10-03T08:00:00Z"},
-                        "depends_on": {"type": "array", "items": {"type": "integer"}, "description": "Ids of tasks that must finish successfully first; it fails if one of them fails"}
+                        "depends_on": {"type": "array", "items": {"type": "integer"}, "description": "Ids of tasks that must finish successfully first; it fails if one of them fails. The instruction is given their results"},
+                        "continue_task": {"type": "integer", "description": "For an instruction: carry on where this task left off, once it's done - e.g. to address a review of its work: it runs on a new agent that starts from that task's conversation as it was when done (a fork of it), so it remembers what it did, by any worker that's free. Not with agent_name or profile"}
                     },
                     "required": ["name", "command"],
                     "additionalProperties": false
@@ -9335,17 +9348,28 @@ fn claim_prompt_task_but(
         .filter(|t| !(busy && task_is_for_worker(t)))
         .filter(|t| !(only_unsafe && t.run_safe))
         .filter(|t| t.profile.as_ref().is_none_or(|p| profiles.contains(p)))
-        .filter(|t| match (&t.continue_agent, contexts) {
+        .filter(|t| match (carried_on_config(db, t), contexts) {
             (None, _) => true,
             (Some(_), None) => false,
-            (Some(context), Some(worker_unsafe)) => {
+            (Some(config), Some(worker_unsafe)) => {
                 worker_unsafe
-                    || db
-                        .get_agent_config(context)
-                        .is_ok_and(|c| c.unsafe_tools != Some(true))
+                    || t.run_safe
+                    // None: nothing to carry on - taken, to fail saying so.
+                    || config.is_none_or(|c| c.unsafe_tools != Some(true))
             }
         })
         .find(|t| db.claim_task(t.id, session_id).unwrap_or(false))
+}
+
+/// For a task carrying on a conversation - an A2A context's agent's, or
+/// the one a task it carries on had - the settings of the agent that had
+/// it, if they're there to find. None for one that doesn't carry one on.
+fn carried_on_config(db: &dyn DbBackend, task: &db::TaskRow) -> Option<Option<db::AgentConfig>> {
+    if let Some(agent) = &task.continue_agent {
+        return Some(db.get_agent_config(agent).ok());
+    }
+    let id = task.continue_task?;
+    Some(db.task_conversation_config(id).ok().flatten())
 }
 
 /// The outcome of a prompt task's turn: what the agent reported with
@@ -10087,6 +10111,12 @@ fn chat_command(
                         }
                         record_turn_end(&events, &outcome);
                         if let (Some(task_id), Some(db)) = (task_turn, &db) {
+                            save_task_conversation(
+                                db.as_ref(),
+                                task_id,
+                                &injected_agent_name,
+                                result.as_ref().ok().map(|r| r.history.as_slice()),
+                            );
                             if let Err(e) = db.finish_task(task_id, &session_id, &outcome) {
                                 warn!("Couldn't record the outcome of task {}: {}", task_id, e);
                             }
@@ -10473,10 +10503,17 @@ fn first_line(text: &str, max: usize) -> String {
 }
 
 /// One row of the `faber tasks` table.
-/// Where a task runs, for showing: "profile fast", an agent's name, "any
-/// agent" for an unbound prompt task, or "-" for a tool task (any
-/// session's scheduler runs those).
+/// Where a task runs, for showing: "profile fast", an agent's name, "fork
+/// of #3" for one carrying on where task #3 left off, "any agent" for
+/// an unbound prompt task, or "-" for a tool task (any session's scheduler
+/// runs those).
 fn task_target(task: &db::TaskRow) -> String {
+    if let Some(id) = task.continue_task {
+        return format!("fork of #{}", id);
+    }
+    if let Some(agent) = &task.continue_agent {
+        return agent.clone();
+    }
     match (&task.profile, &task.agent_name, task.kind.as_str()) {
         (Some(profile), _, _) => format!("profile {}", profile),
         (None, Some(agent), _) => agent.clone(),
@@ -10824,6 +10861,7 @@ fn new_task_from_cli(
         hold,
         depends_on,
         cwd,
+        continue_task,
     } = action
     else {
         return Err("not a `tasks add` command".to_string());
@@ -10897,6 +10935,7 @@ fn new_task_from_cli(
             .map(|dir| resolve_cwd(&std::env::current_dir().map_err(|e| e.to_string())?, dir))
             .transpose()?,
         continue_agent: None,
+        continue_task: *continue_task,
     })
 }
 
@@ -10995,6 +11034,50 @@ fn describe_task(
         out.push_str(&format!("\nLast result:\n{}\n", indent(result.trim())));
     }
     out
+}
+
+/// The agent a task carrying on another runs on: a fork of the agent that
+/// was done with that one, `<its profile, or "task">-<task id>`, with its
+/// settings and its conversation as it was then - not as it went on, if
+/// it did - made as a sub-agent of the worker `parent` and claimed by its
+/// session. A run of the task cut short carries on its own conversation.
+fn fork_task_agent(
+    task: &db::TaskRow,
+    conversation: &db::TaskConversation,
+    parent: &str,
+    unsafe_tools: bool,
+    db: &dyn DbBackend,
+    session_id: &str,
+) -> Result<String, Box<dyn Error>> {
+    let base = conversation.config.profile.as_deref().unwrap_or("task");
+    let name = format!("{}-{}", base, task.id);
+    check_task_agent_name_free(db, &name, task, parent)?;
+    if db.get_agent(&name)?.is_none() {
+        db.create_agent(
+            &name,
+            &format!(
+                "Carries on task #{} for task #{}",
+                task.continue_task.unwrap_or_default(),
+                task.id
+            ),
+        )?;
+    }
+    db.set_agent_data(&name, db::ONE_JOB_KEY, "task")?;
+    let mut config = conversation.config.clone();
+    config.unsafe_tools = Some(unsafe_tools);
+    config.cwd = match task.cwd.clone().or(config.cwd) {
+        Some(cwd) => Some(cwd),
+        None => db.get_agent_config(parent)?.cwd,
+    };
+    db.set_agent_config(&name, &config)?;
+    db.set_agent_parent(&name, Some(parent))?;
+    if !db.claim_agent(&name, session_id)? {
+        return Err(format!("agent '{}' is in use by another session", name).into());
+    }
+    if db.agent_message_count(&name)? == 0 {
+        db.save_agent_messages(&name, &conversation.messages)?;
+    }
+    Ok(name)
 }
 
 /// The agent a profile task runs on: `<profile>-<task id>`, made from the
@@ -11167,19 +11250,36 @@ fn run_prompt_task_headless(
     let worker = agent;
     let worker_unsafe =
         session_agent_unsafe(opts, &db.get_agent_config(worker).unwrap_or_default());
+    // The conversation it carries on, if it carries on a task's.
+    let forked: Option<Result<db::TaskConversation, String>> = task.continue_task.map(|id| {
+        db.load_task_conversation(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| match db.get_task(id) {
+                Ok(Some(_)) => format!(
+                    "task #{} has no conversation to carry on: it never ran on an agent",
+                    id
+                ),
+                _ => format!("task #{} is gone, and its conversation with it", id),
+            })
+    });
     // A task a safe agent made runs without the unsafe tools, even on an
     // agent made for it when the worker has them.
-    let task_unsafe = match &task.continue_agent {
-        // A context's agent has the unsafe tools if its config says so,
-        // whatever the worker has beyond that; `claim_prompt_task_but`
-        // leaves it to a worker that has them.
-        Some(context) => {
+    let task_unsafe = match (&task.continue_agent, &forked) {
+        // A context's agent, or a fork of a task's, has the unsafe tools if
+        // its config says so, whatever the worker has beyond that;
+        // `claim_prompt_task_but` leaves it to a worker that has them.
+        (Some(context), _) => {
             worker_unsafe
+                && !task.run_safe
                 && db
                     .get_agent_config(context)
                     .is_ok_and(|c| c.unsafe_tools == Some(true))
         }
-        None => worker_unsafe && !task.run_safe,
+        (None, Some(Ok(conversation))) => {
+            worker_unsafe && !task.run_safe && conversation.config.unsafe_tools == Some(true)
+        }
+        (None, Some(Err(_))) => false,
+        (None, None) => worker_unsafe && !task.run_safe,
     };
     let task_agent = match &task.profile {
         _ if task.continue_agent.is_some() => {
@@ -11201,6 +11301,17 @@ fn run_prompt_task_headless(
                 Err(e) => Some(Err(e)),
             }
         }
+        _ if forked.is_some() => Some(match forked.as_ref().unwrap_or(&Err(String::new())) {
+            Ok(conversation) => fork_task_agent(
+                task,
+                conversation,
+                worker,
+                task_unsafe,
+                db.as_ref(),
+                session_id,
+            ),
+            Err(e) => Err(e.clone().into()),
+        }),
         Some(profile) => Some(profile_task_agent(
             task,
             profile,
@@ -11226,7 +11337,7 @@ fn run_prompt_task_headless(
             let outcome = db::TaskOutcome {
                 succeeded: false,
                 exit_code: None,
-                result: format!("Couldn't make its agent: {}", e),
+                result: format!("No agent to run it on: {}", e),
             };
             record_turn_end(
                 &Some(EventLog::new(db.clone(), worker, Some(task.id))),
@@ -11297,18 +11408,26 @@ fn run_prompt_task_headless(
         .is_some_and(|id| id == task.id.to_string());
     let _ = db.set_agent_data(agent, db::UNFINISHED_TASK_KEY, &task.id.to_string());
     // Run as the agent itself - a task for it by name, a message to it -
-    // it carries on its conversation, as a chat does; on an agent made
-    // for it, it starts one.
-    let saved: Vec<Message> = if task_agent.is_none() || resuming || task.continue_agent.is_some() {
-        db.load_agent_messages(agent)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| serde_json::from_value(v).ok())
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // it carries on its conversation, as a chat does, and so on a fork of
+    // a task's; on an agent made for it, it starts one.
+    let saved: Vec<Message> =
+        if task_agent.is_none() || resuming || task.continue_agent.is_some() || forked.is_some() {
+            db.load_agent_messages(agent)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| serde_json::from_value(v).ok())
+                .collect()
+        } else {
+            Vec::new()
+        };
     let resuming = resuming && !saved.is_empty();
+    // A message to an A2A context, rather than a task carrying on an agent.
+    let a2a_message = task.continue_agent.is_some()
+        && db
+            .get_agent_data(agent, db::A2A_CONTEXT_KEY)
+            .ok()
+            .flatten()
+            .is_some();
     let here = run_cwd
         .as_deref()
         .map(PathBuf::from)
@@ -11330,7 +11449,7 @@ fn run_prompt_task_headless(
     };
     let input = if resuming {
         resumed_task_input(task)
-    } else if task.continue_agent.is_some() {
+    } else if a2a_message {
         // Just the message: it's a conversation, not a job to report on.
         task.command.clone()
     } else {
@@ -11434,7 +11553,7 @@ fn run_prompt_task_headless(
     if interrupted {
         outcome.result = "stopped".to_string();
     }
-    if task.continue_agent.is_some() {
+    if a2a_message {
         // The whole answer: the outcome's is cut short. Before the task is
         // finished, so whoever sees it done finds the answer.
         let answer = match &result {
@@ -11450,6 +11569,12 @@ fn run_prompt_task_headless(
         let _ = db.set_agent_data(agent, &db::a2a_answer_key(task.id), answer.trim());
     }
     record_turn_end(&events, &outcome);
+    save_task_conversation(
+        db.as_ref(),
+        task.id,
+        agent,
+        result.as_ref().ok().map(|r| r.history.as_slice()),
+    );
     if let Err(e) = db.finish_task(task.id, session_id, &outcome) {
         warn!("Couldn't record the outcome of task {}: {}", task.id, e);
     }
@@ -11465,6 +11590,33 @@ fn run_prompt_task_headless(
         let _ = db.release_agent(agent, session_id);
     }
     outcome
+}
+
+/// Keeps the conversation task `task_id` was done in, `agent`'s - `history`,
+/// its turn's, or else as last saved - with the agent's settings, for a
+/// task carrying on where it left off to start from (see
+/// `db::TaskConversation`). Before the task is finished, so it's there
+/// for whatever was waiting for that.
+fn save_task_conversation(
+    db: &dyn DbBackend,
+    task_id: i64,
+    agent: &str,
+    history: Option<&[Message]>,
+) {
+    let messages = match history {
+        Some(history) => history
+            .iter()
+            .filter_map(|m| serde_json::to_value(m).ok())
+            .collect(),
+        None => db.load_agent_messages(agent).unwrap_or_default(),
+    };
+    let conversation = db::TaskConversation {
+        config: db.get_agent_config(agent).unwrap_or_default(),
+        messages,
+    };
+    if let Err(e) = db.save_task_conversation(task_id, &conversation) {
+        warn!("Couldn't keep the conversation of task {}: {}", task_id, e);
+    }
 }
 
 /// The outcome of a task's run that its worker's stopping cut short: the
@@ -12577,6 +12729,7 @@ fn task_as_new(task: &db::TaskRow) -> db::NewTask {
         run_safe: task.run_safe,
         cwd: task.cwd.clone(),
         continue_agent: task.continue_agent.clone(),
+        continue_task: task.continue_task,
     }
 }
 
@@ -12642,12 +12795,15 @@ fn edit_task_command(
     if *any {
         task.agent_name = None;
         task.profile = None;
+        task.continue_task = None;
     } else if let Some(agent) = agent {
         task.agent_name = Some(agent.clone());
         task.profile = None;
+        task.continue_task = None;
     } else if let Some(profile) = profile {
         task.profile = Some(profile.clone());
         task.agent_name = None;
+        task.continue_task = None;
     }
     if *no_deps {
         task.depends_on.clear();
@@ -12885,6 +13041,11 @@ fn add_task_command(
     };
     let by = match (task.kind.as_str(), &task.agent_name, &task.profile) {
         (db::TaskKind::TOOL, _, _) => "by any session's scheduler".to_string(),
+        _ if task.continue_task.is_some() => format!(
+            "once task #{} is done, on a fork of the agent that ran it, as it was then, \
+             by whichever `faber worker` is free",
+            task.continue_task.unwrap_or_default()
+        ),
         (_, _, Some(profile)) => format!(
             "on a new agent made from profile '{}', by a `faber worker` that has it",
             profile
@@ -13522,6 +13683,11 @@ enum TasksAction {
         /// directory that agent works in)
         #[clap(long, value_name = "DIR")]
         cwd: Option<String>,
+        /// Carry on where this task left off, once it's done: run on a new
+        /// agent that starts from its conversation as it was then - a fork,
+        /// that remembers what it did - by whichever `faber worker` is free
+        #[clap(long = "continue", value_name = "ID", conflicts_with_all = ["agent", "profile", "tool"])]
+        continue_task: Option<i64>,
     },
     /// Change a task that isn't running: what it says, where and when it
     /// runs, what it waits for, its directory - only what's given
@@ -14498,6 +14664,7 @@ mod tests {
                 run_safe: false,
                 cwd: None,
                 continue_agent: None,
+                continue_task: None,
             })
         }
     }
@@ -15097,6 +15264,7 @@ for line in sys.stdin:
             run_safe,
             cwd: cwd.map(String::from),
             continue_agent: None,
+            continue_task: None,
         })
         .unwrap()
     }
@@ -15373,6 +15541,7 @@ for line in sys.stdin:
             cwd: None,
             stop_requested: false,
             continue_agent: None,
+            continue_task: None,
         }
     }
 
@@ -15571,6 +15740,7 @@ for line in sys.stdin:
             run_safe: false,
             cwd: None,
             continue_agent: None,
+            continue_task: None,
         };
         let for_bob = db.create_task(&prompt(Some("bob"))).unwrap();
         assert!(claim_prompt_task(db.as_ref(), "s1", "alice", &[]).is_none());
@@ -16340,6 +16510,57 @@ for line in sys.stdin:
         // Only the configuration: other stored data isn't reachable.
         assert!(
             configure(serde_json::json!({"agent": "default", "key": "state:plan", "value": "[]"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_task_create_can_carry_on_a_task() {
+        let mut ctx = plan_test_ctx();
+        ctx.cwd = Some(PathBuf::from("/tmp"));
+        let db = ctx.db.clone().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let work = db
+            .create_oneshot_task("work", "", &now, "fix issue 7", None)
+            .unwrap();
+        let create = |params: serde_json::Value| -> Result<serde_json::Value, String> {
+            tool_task_create(&params.to_string(), &ctx)
+                .map(|r| serde_json::from_str(&r).unwrap())
+                .map_err(|e| e.to_string())
+        };
+        let created = create(serde_json::json!({
+            "name": "fix", "command": "address the review", "continue_task": work
+        }))
+        .unwrap();
+        assert_eq!(
+            created["runs_on"],
+            format!(
+                "a fork of the agent that ran task #{}, as it was when done, by a free worker",
+                work
+            )
+        );
+        let task = db
+            .get_task(created["id"].as_i64().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.continue_task, Some(work));
+        // Not on its maker, nor where its maker works: where that agent did.
+        assert_eq!((task.agent_name, task.cwd), (None, None));
+        // And with no more than its safe maker could do.
+        assert!(task.run_safe);
+        // Waiting for the task it carries on to be done.
+        assert_eq!(
+            db::unmet_dependencies(&db.list_tasks(None).unwrap()).get(&task.id),
+            Some(&vec![work])
+        );
+        assert!(
+            create(serde_json::json!({
+                "name": "x", "command": "x", "continue_task": work, "agent_name": "default"
+            }))
+            .is_err()
+        );
+        assert!(
+            create(serde_json::json!({"name": "x", "command": "x", "continue_task": 12345}))
                 .is_err()
         );
     }
@@ -17315,6 +17536,7 @@ for line in sys.stdin:
                 run_safe: false,
                 cwd: None,
                 continue_agent: None,
+                continue_task: None,
             })
             .unwrap();
         // A chat, or a worker without the profile, leaves it alone.
@@ -17703,6 +17925,7 @@ for line in sys.stdin:
                 run_safe: false,
                 cwd: None,
                 continue_agent: None,
+                continue_task: None,
             })
             .unwrap();
         let mut opts = Opts::default();
@@ -17774,6 +17997,135 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn test_a_task_carries_on_where_a_profile_task_left_off() {
+        let db = local_db_with_agents(&["w"]);
+        assert!(db.claim_agent("w", "worker-session").unwrap());
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let new_task = |command: &str, profile: Option<&str>, continue_task: Option<i64>| {
+            db.create_task(&db::NewTask {
+                name: command.to_string(),
+                description: String::new(),
+                kind: db::TaskKind::PROMPT.to_string(),
+                command: command.to_string(),
+                agent_name: None,
+                schedule: db::TaskSchedule::Once { at: past.clone() },
+                held: false,
+                depends_on: Vec::new(),
+                profile: profile.map(String::from),
+                run_safe: false,
+                cwd: None,
+                continue_agent: None,
+                continue_task,
+            })
+            .unwrap()
+        };
+        // Laid out ahead: they carry on an agent not made yet.
+        let work = new_task("fix issue 7", Some("coder"), None);
+        let fix = new_task("rename foo, as the review asks", None, Some(work));
+        let tests = new_task("add tests, as the review asks", None, Some(work));
+        let mut opts = Opts::default();
+        opts.model = Some(model_script(
+            "carry_on_worker",
+            serde_json::json!([{"if": "", "reply": "worker's own model"}]),
+        ));
+        let mut coder = scripted_profile("carry_on_coder", "");
+        coder.model = Some(model_script(
+            "carry_on_coder",
+            serde_json::json!([
+                {"if": "rename foo", "reply": "pushed v2"},
+                {"if": "add tests", "reply": "tests added"},
+                {"if": "fix issue 7", "reply": "opened PR #12"}
+            ]),
+        ));
+        opts.profiles = HashMap::from([("coder".to_string(), coder)]);
+        let ctx = chat_ctx_with_model(db.clone(), "w", opts.model.as_deref().unwrap());
+        let extra = ctx
+            .extra
+            .clone()
+            .unwrap()
+            .downcast::<SubAgentContext>()
+            .ok()
+            .unwrap();
+        let run_next = |expected: i64| {
+            let task = claim_prompt_task_but(
+                db.as_ref(),
+                "worker-session",
+                "w",
+                &["coder".to_string()],
+                false,
+                false,
+                Some(false),
+            )
+            .expect("claimable");
+            assert_eq!(task.id, expected);
+            let (_cancel_tx, cancel_rx) = mpsc::channel();
+            run_prompt_task_headless(
+                &task,
+                "w",
+                &db,
+                "worker-session",
+                &extra.tools,
+                &opts,
+                extra.clone(),
+                &None,
+                cancel_rx,
+            )
+        };
+        assert_eq!(run_next(work).result, "opened PR #12");
+        // What its agent does after the task is done isn't the task's.
+        let original = format!("coder-{}", work);
+        db.append_agent_message(
+            &original,
+            &serde_json::json!({"role": "assistant", "content": "something else"}),
+        )
+        .unwrap();
+        let replies = |agent: &str| -> Vec<serde_json::Value> {
+            db.load_agent_messages(agent)
+                .unwrap()
+                .into_iter()
+                .filter(|m| m["role"] == "assistant")
+                .map(|m| m["content"].clone())
+                .collect()
+        };
+        let outcome = run_next(fix);
+        assert!(outcome.succeeded, "{}", outcome.result);
+        assert_eq!(outcome.result, "pushed v2");
+        assert_eq!(run_next(tests).result, "tests added");
+        // Each on a fork of the work's conversation as it was when done,
+        // with its agent's settings; that agent's own is left as it was.
+        assert_eq!(
+            replies(&format!("coder-{}", fix)),
+            ["opened PR #12", "pushed v2"]
+        );
+        assert_eq!(
+            replies(&format!("coder-{}", tests)),
+            ["opened PR #12", "tests added"]
+        );
+        assert_eq!(replies(&original), ["opened PR #12", "something else"]);
+        let fork = db.get_agent(&format!("coder-{}", fix)).unwrap().unwrap();
+        assert_eq!(fork.parent.as_deref(), Some("w"));
+        // A fork's own conversation is kept in turn, to carry on from.
+        let kept = db.load_task_conversation(fix).unwrap().unwrap();
+        assert_eq!(kept.messages.last().unwrap()["content"], "pushed v2");
+
+        // One that's gone has nothing to carry on: that fails, saying so.
+        let gone = new_task("never run", Some("coder"), None);
+        db.set_task_enabled(gone, false).unwrap();
+        let orphan = new_task("carry on", None, Some(gone));
+        db.delete_task(gone).unwrap();
+        let outcome = run_next(orphan);
+        assert!(!outcome.succeeded);
+        assert!(
+            outcome.result.contains(&format!(
+                "task #{} is gone, and its conversation with it",
+                gone
+            )),
+            "{}",
+            outcome.result
+        );
+    }
+
+    #[test]
     fn test_headless_task_run_records_its_outcome_and_transcript() {
         let model = model_script(
             "headless",
@@ -17816,6 +18168,9 @@ for line in sys.stdin:
             (task.status.as_str(), task.last_result.as_deref()),
             ("done", Some("all quiet"))
         );
+        // Its conversation is kept, for a task to carry on where it left off.
+        let kept = db.load_task_conversation(id).unwrap().unwrap();
+        assert_eq!(kept.messages.last().unwrap()["content"], "all quiet");
         // For any agent: it ran on an agent of its own, under the worker.
         let agent = db.get_agent(&format!("task-{}", id)).unwrap().unwrap();
         assert_eq!(agent.parent.as_deref(), Some("w"));
@@ -17823,6 +18178,148 @@ for line in sys.stdin:
         let transcript = db.load_agent_messages(&agent.name).unwrap();
         assert!(transcript.last().unwrap()["content"] == "all quiet");
         assert!(db.load_agent_messages("w").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_a_task_carries_on_where_another_left_off_with_what_it_ran_after() {
+        let model = model_script(
+            "carry_on",
+            serde_json::json!([{"if": "the review says: rename foo", "reply": "pushed v2"}]),
+        );
+        let db = local_db_with_agents(&["w"]);
+        assert!(db.claim_agent("w", "worker-session").unwrap());
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let finish = |id: i64, result: &str| {
+            assert!(db.claim_task(id, "s").unwrap());
+            db.finish_task(
+                id,
+                "s",
+                &db::TaskOutcome {
+                    succeeded: true,
+                    exit_code: None,
+                    result: result.to_string(),
+                },
+            )
+            .unwrap();
+        };
+        // The work, and the conversation it was done in - not done yet.
+        let work = db
+            .create_oneshot_task("work", "", &past, "fix issue 7", None)
+            .unwrap();
+        assert!(db.set_task_held(work, true).unwrap());
+        db.save_task_conversation(
+            work,
+            &db::TaskConversation {
+                config: db::AgentConfig {
+                    model: Some(model.clone()),
+                    ..Default::default()
+                },
+                messages: vec![
+                    serde_json::json!({"role": "user", "content": "fix issue 7"}),
+                    serde_json::json!({"role": "assistant", "content": "opened PR #12"}),
+                ],
+            },
+        )
+        .unwrap();
+        let review = db
+            .create_oneshot_task("review", "", &past, "review PR #12", None)
+            .unwrap();
+        finish(review, "the review says: rename foo");
+        let id = db
+            .create_task(&db::NewTask {
+                name: "fix".to_string(),
+                description: String::new(),
+                kind: db::TaskKind::PROMPT.to_string(),
+                command: "address the review".to_string(),
+                agent_name: None,
+                schedule: db::TaskSchedule::Once { at: past.clone() },
+                held: false,
+                depends_on: vec![review],
+                profile: None,
+                run_safe: false,
+                cwd: None,
+                continue_agent: None,
+                continue_task: Some(work),
+            })
+            .unwrap();
+        let claim = || {
+            claim_prompt_task_but(
+                db.as_ref(),
+                "worker-session",
+                "w",
+                &[],
+                false,
+                false,
+                Some(false),
+            )
+        };
+        assert!(claim().is_none(), "not before the work is done");
+        assert!(db.set_task_held(work, false).unwrap());
+        finish(work, "opened PR #12");
+        let task = claim_prompt_task_but(
+            db.as_ref(),
+            "worker-session",
+            "w",
+            &[],
+            false,
+            false,
+            Some(false),
+        )
+        .expect("claimable");
+        assert_eq!(task.id, id);
+        let ctx = chat_ctx_with_model(db.clone(), "w", &model);
+        let extra = ctx
+            .extra
+            .clone()
+            .unwrap()
+            .downcast::<SubAgentContext>()
+            .ok()
+            .unwrap();
+        // The work's agent's model, not the worker's.
+        let mut opts = Opts::default();
+        opts.model = Some(model_script(
+            "carry_on_worker",
+            serde_json::json!([{"if": "", "reply": "worker's own model"}]),
+        ));
+        let (_cancel_tx, cancel_rx) = mpsc::channel();
+        let outcome = run_prompt_task_headless(
+            &task,
+            "w",
+            &db,
+            "worker-session",
+            &extra.tools,
+            &opts,
+            extra.clone(),
+            &None,
+            cancel_rx,
+        );
+        assert!(outcome.succeeded, "{}", outcome.result);
+        assert_eq!(outcome.result, "pushed v2");
+        // Its conversation went on: what it did before, then the task.
+        let agent = format!("task-{}", id);
+        let transcript = db.load_agent_messages(&agent).unwrap();
+        assert_eq!(transcript[1]["content"], "opened PR #12");
+        let input = transcript
+            .iter()
+            .find(|m| m["role"] == "user" && m["content"].as_str().unwrap().contains("address"))
+            .unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            input.starts_with(&format!(
+                "[Scheduled task #{} \"fix\"]: address the review",
+                id
+            )),
+            "{input}"
+        );
+        assert!(transcript.last().unwrap()["content"] == "pushed v2");
+        // Not an A2A context's: no answer kept for a caller.
+        assert!(
+            db.get_agent_data(&agent, &db::a2a_answer_key(id))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -17906,6 +18403,7 @@ for line in sys.stdin:
                 run_safe: false,
                 cwd: Some(dir.0.to_str().unwrap().to_string()),
                 continue_agent: None,
+                continue_task: None,
             })
             .unwrap();
         let task = claim_prompt_task(db.as_ref(), "worker-session", "w", &[]).unwrap();

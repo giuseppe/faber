@@ -100,6 +100,8 @@
         <input name="cron" placeholder="0 0 9 * * Mon-Fri *"></label>
     </fieldset>
     <label>After tasks <input name="depends_on" placeholder="ids, e.g. 3, 5"></label>
+    <label>Carry on task <input name="continue_task" id="continue-input" placeholder="id, e.g. 3"></label>
+    <p class="hint">Once that task is done, run on a new agent that starts from its conversation as it was then: it remembers what it did.</p>
     <label class="inline" id="hold-option"><input type="checkbox" name="hold"> put in the backlog (held until released)</label>
     <label class="inline"><input type="checkbox" name="tool"> command is a tool call (JSON)</label>
     <p id="new-task-error" class="error" hidden></p>

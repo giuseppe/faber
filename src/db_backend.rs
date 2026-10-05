@@ -20,7 +20,7 @@
 use crate::agent_io::{AgentEvent, AgentEventRow, EventFilter};
 use crate::db::{
     A2aContext, AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow,
-    TaskOutcome, TaskRow,
+    TaskConversation, TaskOutcome, TaskRow,
 };
 use std::error::Error;
 
@@ -100,6 +100,20 @@ pub trait DbBackend: Send + Sync {
     fn list_profiles(&self) -> Result<Vec<(String, serde_json::Value)>, Box<dyn Error>>;
     /// See `db::request_task_stop`.
     fn request_task_stop(&self, task_id: i64) -> Result<bool, Box<dyn Error>>;
+    /// See `db::save_task_conversation`.
+    fn save_task_conversation(
+        &self,
+        task_id: i64,
+        conversation: &TaskConversation,
+    ) -> Result<(), Box<dyn Error>>;
+    /// See `db::load_task_conversation`.
+    fn load_task_conversation(
+        &self,
+        task_id: i64,
+    ) -> Result<Option<TaskConversation>, Box<dyn Error>>;
+    /// See `db::task_conversation_config`.
+    fn task_conversation_config(&self, task_id: i64)
+    -> Result<Option<AgentConfig>, Box<dyn Error>>;
     /// See `db::run_task_now`.
     fn run_task_now(&self, task_id: i64) -> Result<bool, Box<dyn Error>>;
     /// See `db::set_task_held`.

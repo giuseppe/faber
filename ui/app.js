@@ -463,6 +463,8 @@ function taskState(task) {
 }
 
 function taskTarget(task) {
+  if (task.continue_task) return `#${task.continue_task}'s agent`;
+  if (task.continue_agent) return task.continue_agent;
   if (task.profile) return `profile ${task.profile}`;
   if (task.agent_name) return task.agent_name;
   return task.kind === "prompt" ? "any agent" : "scheduler";
@@ -811,6 +813,10 @@ function renderDetail() {
   if (st !== "running") {
     actions.append(el("button", { class: "primary play", onclick: () => taskAction(task.id, "run") },
       st === "succeeded" || st === "failed" ? "Run again" : "Run now"));
+    if (task.kind === "prompt" && (st === "succeeded" || st === "failed")) {
+      actions.append(el("button", { title: "A new task, on a fork of the agent that did this one, as it was when done",
+        onclick: () => openNewTask(undefined, task.id) }, "Carry on…"));
+    }
   } else {
     actions.append(el("button", {
       class: "danger stop-button",
@@ -1482,7 +1488,14 @@ function defaultCwd() {
 
 function updateTargetHint() {
   const input = $("cwd-input");
-  if (!input.dataset.edited) input.value = defaultCwd();
+  // Carrying on a task, it runs where that one's agent works.
+  const carryOn = $("continue-input").value.trim();
+  if (!input.dataset.edited) input.value = carryOn ? "" : defaultCwd();
+  $("target-select").disabled = !!carryOn;
+  if (carryOn) {
+    $("target-hint").textContent = `Run on a fork of the agent that ran task #${carryOn.replace(/^#/, "")}, by whichever worker is free.`;
+    return;
+  }
   const value = $("target-select").value;
   $("target-hint").textContent = value.startsWith("profile:")
     ? "Run by a worker that has this profile, on a new agent made from it."
@@ -1492,19 +1505,21 @@ function updateTargetHint() {
 }
 
 $("target-select").addEventListener("change", updateTargetHint);
+$("continue-input").addEventListener("input", updateTargetHint);
 
 $("cwd-input").addEventListener("input", (e) => { e.target.dataset.edited = "1"; });
 
 // The task being edited in the New task form, or null for a new one.
 let editingTask = null;
 
-function openNewTask(preset) {
+function openNewTask(preset, carryOn) {
   editingTask = null;
   $("new-task-form").reset();
   $("new-task-title").textContent = "New task";
   $("new-task-submit").textContent = "Create";
   $("hold-option").hidden = false;
   delete $("cwd-input").dataset.edited;
+  $("continue-input").value = carryOn ?? "";
   fillTargets(preset);
   $("new-task-error").hidden = true;
   $("new-task").showModal();
@@ -1526,6 +1541,7 @@ function openTaskEditor(task) {
   $("new-task-title").textContent = `Edit task #${task.id}`;
   $("new-task-submit").textContent = "Save";
   $("hold-option").hidden = true;
+  $("continue-input").value = task.continue_task ?? "";
   fillTargets(task.profile ? `profile:${task.profile}` : task.agent_name ? `agent:${task.agent_name}` : "");
   form.elements.command.value = task.command;
   form.elements.name.value = task.name;
@@ -1550,7 +1566,9 @@ $("new-task-cancel").addEventListener("click", () => $("new-task").close());
 $("new-task-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const form = new FormData(e.target);
-  const target = form.get("target") || "";
+  const carryOn = (form.get("continue_task") || "").trim().replace(/^#/, "");
+  // A disabled select isn't in the form: carrying on, it's not used.
+  const target = carryOn ? "" : form.get("target") || "";
   const body = {
     command: form.get("command"),
     name: form.get("name") || null,
@@ -1559,6 +1577,7 @@ $("new-task-form").addEventListener("submit", async (e) => {
     agent: target.startsWith("agent:") ? target.slice(6) : null,
     profile: target.startsWith("profile:") ? target.slice(8) : null,
     depends_on: (form.get("depends_on") || "").split(/[\s,#]+/).filter(Boolean).map(Number),
+    continue_task: carryOn ? Number(carryOn) : null,
     cwd: (form.get("cwd") || "").trim() || null,
   };
   if (body.cwd && !body.cwd.startsWith("/")) return showFormError("The working directory must be an absolute path.");
@@ -1571,6 +1590,7 @@ $("new-task-form").addEventListener("submit", async (e) => {
     body.cron = form.get("cron");
   }
   if (body.depends_on.some(isNaN)) return showFormError("Dependencies are task ids, e.g. 3, 5.");
+  if (Number.isNaN(body.continue_task)) return showFormError("The task to carry on is a task id, e.g. 3.");
   try {
     let id = editingTask;
     if (id === null) {

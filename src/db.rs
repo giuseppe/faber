@@ -97,6 +97,13 @@ pub struct TaskRow {
     /// `agent_name` or `profile`.
     #[serde(default)]
     pub continue_agent: Option<String>,
+    /// For a prompt task: carry on where this task left off - run, once
+    /// it's done, on a new agent that starts from its conversation as it
+    /// was then (`TaskConversation`): a fork of it, by whichever worker
+    /// picks it up. Never set together with `agent_name`, `profile` or
+    /// `continue_agent`.
+    #[serde(default)]
+    pub continue_task: Option<i64>,
 }
 
 /// What a task's `command` is:
@@ -154,6 +161,9 @@ pub struct NewTask {
     /// See `TaskRow::continue_agent`.
     #[serde(default)]
     pub continue_agent: Option<String>,
+    /// See `TaskRow::continue_task`.
+    #[serde(default)]
+    pub continue_task: Option<i64>,
 }
 
 /// A task's lifecycle:
@@ -200,6 +210,13 @@ const DEPENDENCIES_MET: &str = "NOT EXISTS (
     WHERE required.id IS NULL
        OR required.status != 'done'
        OR COALESCE(required.last_outcome, '') != 'succeeded')";
+
+/// SQL condition: the task it carries on (`continue_task`), if any, is done
+/// - however it went: carrying on can be to fix what went wrong. One
+/// that's gone doesn't hold it up: running, it fails for want of an agent.
+const CONTINUED_DONE: &str = "(scheduled_tasks.continue_task IS NULL OR NOT EXISTS (
+    SELECT 1 FROM scheduled_tasks AS continued
+    WHERE continued.id = scheduled_tasks.continue_task AND continued.status != 'done'))";
 
 /// SQL condition: the task's claim belongs to a session that's no longer
 /// heartbeating (or no longer exists) - its run was abandoned. Sessions
@@ -251,8 +268,11 @@ const TASK_TABLE_DEFINITION: &str = "
     cwd TEXT DEFAULT NULL,
     stop_requested INTEGER NOT NULL DEFAULT 0,
     continue_agent TEXT DEFAULT NULL,
+    continue_task INTEGER DEFAULT NULL,
     CHECK(agent_name IS NULL OR profile IS NULL),
     CHECK(continue_agent IS NULL OR (agent_name IS NULL AND profile IS NULL)),
+    CHECK(continue_task IS NULL
+          OR (agent_name IS NULL AND profile IS NULL AND continue_agent IS NULL)),
     FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE SET NULL";
 
 pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -296,6 +316,14 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
             message_json TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
+        );
+
+        -- See `TaskConversation`.
+        CREATE TABLE IF NOT EXISTS task_conversations (
+            task_id INTEGER PRIMARY KEY NOT NULL
+                REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+            config TEXT NOT NULL,
+            messages TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS notifications (
@@ -686,10 +714,11 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         cwd: row.get(23)?,
         stop_requested: row.get(24)?,
         continue_agent: row.get(25)?,
+        continue_task: row.get(26)?,
     })
 }
 
-const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, kind, depends_on, profile, run_safe, cwd, stop_requested, continue_agent";
+const TASK_COLUMNS: &str = "id, agent_name, name, description, task_type, cron_expression, run_at, next_run_at, last_run_at, status, created_at, command, max_runs, run_count, claimed_by, started_at, last_outcome, last_exit_code, last_result, kind, depends_on, profile, run_safe, cwd, stop_requested, continue_agent, continue_task";
 
 /// Whether `command` is a `{"tool": "<name>", ...}` call.
 pub fn is_tool_call(command: &str) -> bool {
@@ -740,6 +769,21 @@ fn task_columns(
             return Err(format!("no agent named '{}'", agent).into());
         }
     }
+    if let Some(continued) = task.continue_task {
+        if task.kind != TaskKind::PROMPT {
+            return Err("only prompt tasks can carry on where a task left off".into());
+        }
+        if task.agent_name.is_some() || task.profile.is_some() || task.continue_agent.is_some() {
+            return Err(
+                "a task carrying on where another left off runs on that one's agent: \
+                 it has no agent or profile of its own"
+                    .into(),
+            );
+        }
+        if get_task(conn, continued)?.is_none() {
+            return Err(format!("no task #{} to carry on", continued).into());
+        }
+    }
     for dependency in &task.depends_on {
         if get_task(conn, *dependency)?.is_none() {
             return Err(format!("no task #{} to depend on", dependency).into());
@@ -748,7 +792,9 @@ fn task_columns(
     if let Some(id) = id {
         // Waiting on itself, through any chain, it would never run.
         let mut seen = std::collections::HashSet::new();
+        // Nor would carrying on where it, or one waiting on it, leaves off.
         let mut pending: Vec<i64> = task.depends_on.clone();
+        pending.extend(task.continue_task);
         while let Some(dependency) = pending.pop() {
             if dependency == id {
                 return Err(
@@ -758,6 +804,7 @@ fn task_columns(
             if seen.insert(dependency) {
                 if let Some(t) = get_task(conn, dependency)? {
                     pending.extend(t.depends_on);
+                    pending.extend(t.continue_task);
                 }
             }
         }
@@ -808,8 +855,8 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
         "INSERT INTO scheduled_tasks
              (name, description, kind, task_type, cron_expression, run_at, next_run_at,
               agent_name, command, max_runs, status, depends_on, profile, run_safe, cwd,
-              continue_agent)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+              continue_agent, continue_task)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             task.name,
             task.description,
@@ -830,7 +877,8 @@ pub fn create_task(conn: &Connection, task: &NewTask) -> Result<i64, Box<dyn Err
             task.profile,
             task.run_safe,
             task.cwd,
-            task.continue_agent
+            task.continue_agent,
+            task.continue_task
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -868,6 +916,7 @@ pub fn message_task(agent: &str, text: &str, now: chrono::DateTime<chrono::Utc>)
         run_safe: false,
         cwd: None,
         continue_agent: None,
+        continue_task: None,
     }
 }
 
@@ -882,7 +931,7 @@ pub fn update_task(conn: &Connection, id: i64, task: &NewTask) -> Result<bool, B
         "UPDATE scheduled_tasks SET
              name = ?2, description = ?3, kind = ?4, task_type = ?5, cron_expression = ?6,
              run_at = ?7, next_run_at = ?8, agent_name = ?9, command = ?10, max_runs = ?11,
-             depends_on = ?12, profile = ?13, cwd = ?14
+             depends_on = ?12, profile = ?13, cwd = ?14, continue_task = ?15
          WHERE id = ?1 AND status != 'running'",
         params![
             id,
@@ -898,7 +947,8 @@ pub fn update_task(conn: &Connection, id: i64, task: &NewTask) -> Result<bool, B
             columns.max_runs,
             columns.depends_on,
             task.profile,
-            task.cwd
+            task.cwd,
+            task.continue_task
         ],
     )?;
     Ok(rows > 0)
@@ -945,11 +995,69 @@ pub fn set_task_target(
     check_task_target(&task.kind, agent, profile)
         .map_err(|e| format!("task #{}: {}", task_id, e))?;
     let rows = conn.execute(
-        "UPDATE scheduled_tasks SET agent_name = ?2, profile = ?3
+        "UPDATE scheduled_tasks SET agent_name = ?2, profile = ?3, continue_task = NULL
          WHERE id = ?1 AND status NOT IN ('running', 'done')",
         params![task_id, agent, profile],
     )?;
     Ok(rows > 0)
+}
+
+/// A prompt task's conversation as it was when its (last) run was done,
+/// and the settings of the agent that had it: what a task carrying on
+/// where it left off (`continue_task`) starts from.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TaskConversation {
+    pub config: AgentConfig,
+    pub messages: Vec<serde_json::Value>,
+}
+
+/// Keeps `conversation` as task `task_id`'s, replacing an earlier run's.
+pub fn save_task_conversation(
+    conn: &Connection,
+    task_id: i64,
+    conversation: &TaskConversation,
+) -> Result<(), Box<dyn Error>> {
+    conn.execute(
+        "INSERT INTO task_conversations (task_id, config, messages) VALUES (?1, ?2, ?3)
+         ON CONFLICT(task_id) DO UPDATE SET config = ?2, messages = ?3",
+        params![
+            task_id,
+            serde_json::to_string(&conversation.config)?,
+            serde_json::to_string(&conversation.messages)?
+        ],
+    )?;
+    Ok(())
+}
+
+/// Task `task_id`'s conversation (see `save_task_conversation`), if kept.
+pub fn load_task_conversation(
+    conn: &Connection,
+    task_id: i64,
+) -> Result<Option<TaskConversation>, Box<dyn Error>> {
+    let mut stmt =
+        conn.prepare("SELECT config, messages FROM task_conversations WHERE task_id = ?1")?;
+    let mut rows = stmt.query(params![task_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    Ok(Some(TaskConversation {
+        config: serde_json::from_str(&row.get::<_, String>(0)?)?,
+        messages: serde_json::from_str(&row.get::<_, String>(1)?)?,
+    }))
+}
+
+/// The settings of the agent that had task `task_id`'s conversation, if
+/// it's kept - without the conversation, which can be long.
+pub fn task_conversation_config(
+    conn: &Connection,
+    task_id: i64,
+) -> Result<Option<AgentConfig>, Box<dyn Error>> {
+    let mut stmt = conn.prepare("SELECT config FROM task_conversations WHERE task_id = ?1")?;
+    let mut rows = stmt.query(params![task_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_str(&row.get::<_, String>(0)?)?))
 }
 
 pub fn delete_task(conn: &Connection, task_id: i64) -> Result<bool, Box<dyn Error>> {
@@ -1137,8 +1245,9 @@ pub fn get_pending_tasks(conn: &Connection) -> Result<Vec<TaskRow>, Box<dyn Erro
            AND (status = 'scheduled' OR (status = 'running' AND ({})))
            AND {}
            AND {}
+           AND {}
          ORDER BY next_run_at, id",
-        TASK_COLUMNS, CLAIM_ABANDONED, DEPENDENCIES_MET, CONTEXT_FREE
+        TASK_COLUMNS, CLAIM_ABANDONED, DEPENDENCIES_MET, CONTEXT_FREE, CONTINUED_DONE
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![now], row_to_task)?;
@@ -1248,8 +1357,9 @@ pub fn claim_task(
          WHERE id = ?1 AND next_run_at <= ?3
            AND (status = 'scheduled' OR (status = 'running' AND ({})))
            AND {}
+           AND {}
            AND {}",
-        CLAIM_ABANDONED, DEPENDENCIES_MET, CONTEXT_FREE
+        CLAIM_ABANDONED, DEPENDENCIES_MET, CONTEXT_FREE, CONTINUED_DONE
     );
     let rows = conn.execute(&sql, params![task_id, session_id, now])?;
     Ok(rows > 0)
@@ -2114,7 +2224,8 @@ pub fn one_job_agents_done(
 }
 
 /// Each task's dependencies that aren't done successfully yet - among
-/// `all` tasks; one that no longer exists counts as unmet.
+/// `all` tasks; one that no longer exists counts as unmet - and the task
+/// it carries on, while that isn't done.
 pub fn unmet_dependencies(all: &[TaskRow]) -> std::collections::HashMap<i64, Vec<i64>> {
     let met = |id: &i64| {
         all.iter().any(|t| {
@@ -2123,9 +2234,18 @@ pub fn unmet_dependencies(all: &[TaskRow]) -> std::collections::HashMap<i64, Vec
                 && t.last_outcome.as_deref() == Some("succeeded")
         })
     };
+    // The task it carries on only needs to be done (see `CONTINUED_DONE`).
+    let not_done = |id: &i64| {
+        all.iter()
+            .any(|t| t.id == *id && t.status != TaskStatus::DONE)
+    };
     all.iter()
         .filter_map(|t| {
-            let unmet: Vec<i64> = t.depends_on.iter().copied().filter(|d| !met(d)).collect();
+            let mut unmet: Vec<i64> = t.depends_on.iter().copied().filter(|d| !met(d)).collect();
+            unmet.extend(
+                t.continue_task
+                    .filter(|c| not_done(c) && !unmet.contains(c)),
+            );
             (!unmet.is_empty()).then_some((t.id, unmet))
         })
         .collect()
@@ -2311,6 +2431,7 @@ pub fn a2a_message_task(
         run_safe: false,
         cwd: None,
         continue_agent: Some(context.agent.clone()),
+        continue_task: None,
     }
 }
 
@@ -2579,6 +2700,7 @@ mod tests {
                 run_safe: false,
                 cwd: None,
                 continue_agent: None,
+                continue_task: None,
             },
         )
         .unwrap()
@@ -3281,6 +3403,7 @@ mod tests {
             run_safe: false,
             cwd: None,
             continue_agent: None,
+            continue_task: None,
         };
         let id = create_task(&conn, &task("prompt")).unwrap();
         let row = get_task(&conn, id).unwrap().unwrap();
@@ -3440,6 +3563,7 @@ mod tests {
                 run_safe: false,
                 cwd: None,
                 continue_agent: None,
+                continue_task: None,
             },
         )
         .unwrap();
@@ -3780,6 +3904,106 @@ mod tests {
     }
 
     #[test]
+    fn test_a_task_carrying_on_another_waits_for_it_to_be_done_however_it_went() {
+        let conn = test_db();
+        live_session(&conn, "s");
+        let work = due_task_after(&conn, "work", vec![]);
+        let carry_on = |name: &str, continue_task: i64| {
+            let mut new = NewTask {
+                name: name.to_string(),
+                description: String::new(),
+                kind: TaskKind::PROMPT.to_string(),
+                command: format!("do {}", name),
+                agent_name: None,
+                schedule: TaskSchedule::Once {
+                    at: chrono::Utc::now().to_rfc3339(),
+                },
+                held: false,
+                depends_on: Vec::new(),
+                profile: None,
+                run_safe: false,
+                cwd: None,
+                continue_agent: None,
+                continue_task: Some(continue_task),
+            };
+            let id = create_task(&conn, &new).unwrap();
+            new.agent_name = Some("agent-of-s".to_string());
+            assert!(
+                create_task(&conn, &new).is_err(),
+                "not on an agent of its own"
+            );
+            id
+        };
+        let fix = carry_on("fix", work);
+        assert_eq!(pending_names(&conn), ["work"]);
+        assert!(!claim_task(&conn, fix, "s").unwrap());
+        run_task(&conn, work, false);
+        // Failed or not, it's done: carrying on can be to fix it.
+        assert!(
+            fail_tasks_with_failed_dependencies(&conn)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(pending_names(&conn), ["fix"]);
+        // One whose task is gone is due too, to fail for want of an agent.
+        let again = carry_on("again", fix);
+        assert!(delete_task(&conn, fix).unwrap());
+        assert_eq!(pending_names(&conn), ["again"]);
+        // Carrying on one that waits for it, it would never run.
+        let later = due_task_after(&conn, "later", vec![again]);
+        let mut changed = NewTask {
+            name: "again".to_string(),
+            description: String::new(),
+            kind: TaskKind::PROMPT.to_string(),
+            command: "do again".to_string(),
+            agent_name: None,
+            schedule: TaskSchedule::Once {
+                at: chrono::Utc::now().to_rfc3339(),
+            },
+            held: false,
+            depends_on: Vec::new(),
+            profile: None,
+            run_safe: false,
+            cwd: None,
+            continue_agent: None,
+            continue_task: Some(later),
+        };
+        assert!(update_task(&conn, again, &changed).is_err());
+        changed.continue_task = Some(again);
+        assert!(update_task(&conn, again, &changed).is_err());
+    }
+
+    #[test]
+    fn test_a_tasks_conversation_is_kept_with_it() {
+        let conn = test_db();
+        let id = due_task_after(&conn, "work", vec![]);
+        assert!(load_task_conversation(&conn, id).unwrap().is_none());
+        let mut conversation = TaskConversation {
+            config: AgentConfig {
+                profile: Some("coder".to_string()),
+                ..Default::default()
+            },
+            messages: vec![serde_json::json!({"role": "user", "content": "fix it"})],
+        };
+        save_task_conversation(&conn, id, &conversation).unwrap();
+        // A later run's replaces it.
+        conversation
+            .messages
+            .push(serde_json::json!({"role": "assistant", "content": "done"}));
+        save_task_conversation(&conn, id, &conversation).unwrap();
+        assert_eq!(
+            load_task_conversation(&conn, id).unwrap(),
+            Some(conversation.clone())
+        );
+        assert_eq!(
+            task_conversation_config(&conn, id).unwrap(),
+            Some(conversation.config)
+        );
+        assert!(delete_task(&conn, id).unwrap());
+        assert!(load_task_conversation(&conn, id).unwrap().is_none());
+    }
+
+    #[test]
     fn test_a_failed_dependency_fails_the_whole_chain() {
         let conn = test_db();
         live_session(&conn, "s");
@@ -3829,6 +4053,7 @@ mod tests {
                 run_safe: false,
                 cwd: None,
                 continue_agent: None,
+                continue_task: None,
             },
         )
         .unwrap_err();
@@ -3910,6 +4135,7 @@ mod tests {
             run_safe: false,
             cwd: None,
             continue_agent: None,
+            continue_task: None,
         };
         let id = create_task(&conn, &task(TaskKind::PROMPT, None, Some("fast"))).unwrap();
         assert_eq!(
