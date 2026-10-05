@@ -80,6 +80,7 @@ Finish with a concise, self-contained result - it's all the coordinating agent w
 
 #[derive(Deserialize)]
 struct Params {
+    #[serde(deserialize_with = "item_texts")]
     items: Vec<String>,
     prompt: String,
     #[serde(default)]
@@ -92,6 +93,19 @@ struct Params {
     context: Option<crate::Handoff>,
     #[serde(default)]
     profile: Option<String>,
+}
+
+/// The items as text: a string as it is, anything else - an object
+/// describing the item, a number - as its JSON, rather than refusing it.
+fn item_texts<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let items: Vec<serde_json::Value> = Deserialize::deserialize(d)?;
+    Ok(items
+        .into_iter()
+        .map(|item| match item {
+            serde_json::Value::String(s) => s,
+            other => other.to_string(),
+        })
+        .collect())
 }
 
 /// The prompt for one item: `{item}` in `template` replaced by it, or the
@@ -720,6 +734,13 @@ mod tests {
         assert_eq!(worker.context_window, Some(32_000));
         assert!(worker.extra.is_none(), "workers can't spawn agents");
         assert!(worker.mcp.is_none());
+    }
+
+    #[test]
+    fn test_items_that_are_not_strings_are_their_json() {
+        let params: Params =
+            serde_json::from_str(r#"{"items": ["a", {"issue": 66}, 3], "prompt": "x"}"#).unwrap();
+        assert_eq!(params.items, vec!["a", r#"{"issue":66}"#, "3"]);
     }
 
     #[test]
