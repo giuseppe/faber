@@ -117,6 +117,8 @@ pub trait DbBackend: Send + Sync {
     fn fail_tasks_with_failed_dependencies(&self) -> Result<Vec<i64>, Box<dyn Error>>;
     /// See `db::claim_task`.
     fn claim_task(&self, task_id: i64, session_id: &str) -> Result<bool, Box<dyn Error>>;
+    /// See `db::release_task`.
+    fn release_task(&self, task_id: i64, session_id: &str) -> Result<bool, Box<dyn Error>>;
     /// See `db::finish_task`.
     fn finish_task(
         &self,

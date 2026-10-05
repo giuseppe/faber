@@ -291,6 +291,10 @@ impl DbBackend for LocalAgents {
         self.inner.claim_task(task_id, session_id)
     }
 
+    fn release_task(&self, task_id: i64, session_id: &str) -> Result<bool, Box<dyn Error>> {
+        self.inner.release_task(task_id, session_id)
+    }
+
     fn finish_task(
         &self,
         task_id: i64,

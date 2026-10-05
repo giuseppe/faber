@@ -247,6 +247,11 @@ impl DbBackend for LocalDb {
         db::claim_task(&conn, task_id, session_id)
     }
 
+    fn release_task(&self, task_id: i64, session_id: &str) -> Result<bool, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::release_task(&conn, task_id, session_id)
+    }
+
     fn finish_task(
         &self,
         task_id: i64,

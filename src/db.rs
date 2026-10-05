@@ -1190,6 +1190,24 @@ pub fn claim_task(
     Ok(rows > 0)
 }
 
+/// Gives back a task claimed by `session_id` without a run to record -
+/// its run was cut short by the session stopping (a worker's Ctrl-C), not
+/// finished: it's `scheduled` and due again, for whichever session takes
+/// it next to carry on (see `UNFINISHED_TASK_KEY`). Returns false if the
+/// claim isn't `session_id`'s.
+pub fn release_task(
+    conn: &Connection,
+    task_id: i64,
+    session_id: &str,
+) -> Result<bool, Box<dyn Error>> {
+    let rows = conn.execute(
+        "UPDATE scheduled_tasks SET status = 'scheduled', claimed_by = NULL, stop_requested = 0
+         WHERE id = ?1 AND claimed_by = ?2 AND status = 'running'",
+        params![task_id, session_id],
+    )?;
+    Ok(rows > 0)
+}
+
 /// Records the outcome of a run of a task claimed by `session_id`, and
 /// moves it on: a cron task is `scheduled` for its next run, a one-shot
 /// task or a cron task that reached `max_runs` is `done`. A task disabled
@@ -1917,6 +1935,29 @@ pub const AGENT_STOP_KEY: &str = "control:stop";
 /// its task.
 pub const RUNNING_TASK_KEY: &str = "state:running_task";
 
+/// The `agent_data` key on an agent running a task, from when the run
+/// starts until its outcome is recorded: the task's id. Still there when
+/// the task is next run, the run before didn't finish - its process was
+/// killed, or its worker stopped - and the agent carries on from its
+/// conversation as saved after each round of tool calls.
+pub const UNFINISHED_TASK_KEY: &str = "state:unfinished_task";
+
+/// Whether a run of a task was cut short on the agent with `marker`
+/// (`UNFINISHED_TASK_KEY`'s value) and `task` - by that id - is still to
+/// run: the agent is where it carries on, so it's kept.
+pub fn holds_unfinished_task(
+    marker: Option<&str>,
+    task: impl FnOnce(i64) -> Option<TaskRow>,
+) -> bool {
+    marker
+        .and_then(|id| id.parse::<i64>().ok())
+        .and_then(task)
+        .is_some_and(|task| {
+            [TaskStatus::RUNNING, TaskStatus::SCHEDULED, TaskStatus::HELD]
+                .contains(&task.status.as_str())
+        })
+}
+
 /// The `agent_data` key set on an agent faber makes for one job - a
 /// fan-out's worker, a task's agent: it's removed a while after it's done
 /// (`one_job_agents_done`).
@@ -2122,6 +2163,37 @@ pub fn gc_agents(conn: &Connection) -> Result<Vec<String>, Box<dyn Error>> {
     }
     tx.commit()?;
     Ok(names)
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    #[test]
+    fn test_a_released_task_is_due_again_for_anyone() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_db(&conn).unwrap();
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO scheduled_tasks (name, description, task_type, next_run_at, command, kind)
+             VALUES ('t', '', 'oneshot', ?1, 'do it', 'prompt')",
+            params![past],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        assert!(claim_task(&conn, id, "s1").unwrap());
+        assert!(!release_task(&conn, id, "s2").unwrap(), "not s2's claim");
+        assert!(release_task(&conn, id, "s1").unwrap());
+        let task = get_task(&conn, id).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::SCHEDULED);
+        assert_eq!(task.run_count, 0, "nothing recorded");
+        assert!(claim_task(&conn, id, "s2").unwrap());
+        assert!(holds_unfinished_task(Some(&id.to_string()), |i| get_task(
+            &conn, i
+        )
+        .unwrap()));
+        assert!(!holds_unfinished_task(None, |i| get_task(&conn, i).unwrap()));
+    }
 }
 
 #[cfg(test)]
