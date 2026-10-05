@@ -13709,6 +13709,29 @@ enum CliCommand {
     },
 }
 
+/// Raises the soft limit on open files towards the hard one: agents run
+/// in parallel, each with its connections and files, and the usual soft
+/// limit of 1024 is soon reached by a large fan-out. Out of descriptors,
+/// libpathrs panics rather than failing the file tool. Capped, as commands
+/// faber runs inherit it, and some walk every descriptor up to it.
+fn raise_open_files_limit() {
+    const WANTED: libc::rlim_t = 65536;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return;
+    }
+    let raised = WANTED.min(limit.rlim_max);
+    if raised > limit.rlim_cur {
+        limit.rlim_cur = raised;
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+            debug!("can't raise the open files limit to {}", raised);
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let env = Env::new()
         // warn!()-level messages (e.g. a single LaTeX block failing to
@@ -13718,6 +13741,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .filter_or("RUST_LOG", "error")
         .write_style_or("LOG_STYLE", "always");
     env_logger::Builder::from_env(env).init();
+    raise_open_files_limit();
 
     // Parse command line arguments
     let mut opts = Opts::parse();
