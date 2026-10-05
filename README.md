@@ -61,7 +61,16 @@ echo "your-github-token" > ~/.github/token
 faber chat
 faber --db-path state.db chat          # with persistence
 faber --db-path state.db --agent mybot chat  # start as a specific agent
+faber --server host:9090 --agent coder:~/coder.json --agent fast:~/fast.json chat
 ```
+
+`--agent NAME:CONFIG` runs the agent with the model, endpoint, `api_key`,
+`max_tokens`, `context_window`, `parameter` and `tools` of that config
+file, over whatever is stored for it - in this process only: they're
+never written to the database, so a session on a shared server doesn't
+change the agent for anyone else. Give `--agent` more than once to define
+several, and switch between them with `/select-agent`; the first is the
+chat's.
 
 ### Chat commands
 

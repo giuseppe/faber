@@ -20,6 +20,7 @@
 mod fan_out;
 use faber::github;
 mod latex_kitty;
+mod local_agents;
 mod lsp;
 use faber::openai;
 mod remote_db;
@@ -6768,6 +6769,59 @@ fn check_name_free_for(db: &dyn DbBackend, name: &str, parent: &str) -> Result<(
     }
 }
 
+/// The agent's name in an `--agent NAME[:CONFIG]`.
+fn agent_spec_name(spec: &str) -> &str {
+    spec.split_once(':').map_or(spec, |(name, _)| name)
+}
+
+/// The agents `--agent NAME:CONFIG` defines, by name: each with the
+/// settings its config file gives, and none of the others.
+fn agent_definitions(specs: &[String]) -> Result<HashMap<String, db::AgentConfig>, Box<dyn Error>> {
+    let mut agents = HashMap::new();
+    for spec in specs {
+        let Some((name, file)) = spec.split_once(':') else {
+            continue;
+        };
+        if name.is_empty() || file.is_empty() {
+            return Err(format!("--agent {}: give it as NAME or NAME:CONFIG", spec).into());
+        }
+        // The shell leaves a ~ after the colon as it is.
+        let file = match (file.strip_prefix("~/"), std::env::var_os("HOME")) {
+            (Some(rest), Some(home)) => PathBuf::from(home).join(rest).display().to_string(),
+            _ => file.to_string(),
+        };
+        let config = Opts::load_from_file(&file).map_err(|e| format!("--agent {}: {}", name, e))?;
+        let parameters = parse_parameters(&config.parameter)
+            .map_err(|e| format!("--agent {}: {}: {}", name, file, e))?;
+        let known = initialize_tools(true, None);
+        if let Some(bad) = config
+            .tools
+            .iter()
+            .find(|t| !known.contains_key(t.as_str()))
+        {
+            return Err(format!("--agent {}: {}: no tool named '{}'", name, file, bad).into());
+        }
+        let defined = db::AgentConfig {
+            // An endpoint without a model: whatever it serves, as for the
+            // session's own (see `main`).
+            model: config
+                .model
+                .or_else(|| config.endpoint.as_ref().map(|_| String::new())),
+            endpoint: config.endpoint,
+            api_key: config.api_key,
+            max_tokens: config.max_tokens,
+            context_window: config.context_window,
+            parameters: (!parameters.is_empty()).then(|| parameters.into_iter().collect()),
+            tools: (!config.tools.is_empty()).then_some(config.tools),
+            ..Default::default()
+        };
+        if agents.insert(name.to_string(), defined).is_some() {
+            return Err(format!("--agent {} is given twice", name).into());
+        }
+    }
+    Ok(agents)
+}
+
 /// `path` as a working directory: absolute (relative ones taken from
 /// `base`), symlinks resolved, and an existing directory.
 /// The key in `file`: its first line, which must not be empty.
@@ -9283,7 +9337,11 @@ fn chat_command(
     let sub_agent_runs: Arc<SubAgentRuns> = Arc::new(SubAgentRuns::default());
     // What the chat's agent has read of each file, across its turns.
     let file_versions = Arc::new(Mutex::new(HashMap::new()));
-    let initial_agent_name = opts.agent.clone().unwrap_or_else(|| "default".to_string());
+    let initial_agent_name = opts
+        .agent
+        .first()
+        .map(|spec| agent_spec_name(spec).to_string())
+        .unwrap_or_else(|| "default".to_string());
 
     let profile = opts
         .profile
@@ -9292,9 +9350,10 @@ fn chat_command(
         .transpose()?;
     let agent_config = if let Some(ref db) = db {
         db.ensure_default_agent()?;
-        if initial_agent_name != "default" {
-            if db.get_agent(&initial_agent_name)?.is_none() {
-                db.create_agent(&initial_agent_name, "")?;
+        // The agents named with --agent, so /select-agent finds them.
+        for name in opts.agent.iter().map(|spec| agent_spec_name(spec)) {
+            if name != "default" && db.get_agent(name)?.is_none() {
+                db.create_agent(name, "")?;
             }
         }
         if !db.claim_agent(&initial_agent_name, &session_id)? {
@@ -12782,9 +12841,14 @@ struct Opts {
     #[clap(long)]
     /// Path to the SQLite database file for persistent storage (agents, tasks, memory)
     db_path: Option<String>,
-    #[clap(long)]
-    /// Start chat session with this agent instead of 'default'
-    agent: Option<String>,
+    #[clap(long, value_name = "NAME[:CONFIG]")]
+    #[serde(skip)]
+    /// Start chat session with this agent instead of 'default'. With
+    /// :CONFIG, run it with that config file's model, endpoint, api_key,
+    /// max_tokens, context_window, parameter and tools, in this process
+    /// only: never stored, not even on a server. Repeat to define more
+    /// agents, to switch to with /select-agent; the first is the chat's
+    agent: Vec<String>,
     #[clap(long)]
     /// The model's context window size, in tokens - used to proactively
     /// summarize the conversation before it gets too large, rather than
@@ -12890,7 +12954,7 @@ impl Default for Opts {
             api_key: None,
             parameter: Vec::new(),
             db_path: None,
-            agent: None,
+            agent: Vec::new(),
             context_window: None,
             display_graphics: None,
             server: None,
@@ -13793,6 +13857,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         debug!("No db_path configured, database tools will be unavailable");
         None
+    };
+    let defined_agents = agent_definitions(&opts.agent)?;
+    let db_connection = match db_connection {
+        Some(inner) if !defined_agents.is_empty() => Some(Arc::new(local_agents::LocalAgents {
+            inner,
+            agents: defined_agents,
+        }) as Arc<dyn DbBackend>),
+        db => db,
     };
 
     let mcp_manager: Option<Arc<faber::mcp::McpManager>> = if !opts.mcp_servers.is_empty() {
