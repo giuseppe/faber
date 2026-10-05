@@ -292,15 +292,20 @@ pub struct ToolItem {
     pub schema: String,
 }
 
-/// Reads the API key from the specified file path.
+/// Reads the API key from the specified file path; a leading `~/` is the
+/// home directory, as in the config file's example.
 fn read_api_key(api_key_file: &String) -> Result<String, Box<dyn Error>> {
-    let key_path = std::path::PathBuf::from(api_key_file);
+    let key_path = match (api_key_file.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => std::path::PathBuf::from(home).join(rest),
+        _ => std::path::PathBuf::from(api_key_file),
+    };
 
-    let api_key = std::fs::read_to_string(key_path)?;
+    let api_key = std::fs::read_to_string(&key_path)
+        .map_err(|e| format!("can't read the API key file {}: {}", key_path.display(), e))?;
 
     let api_key = api_key.trim().to_string();
     if api_key.is_empty() {
-        return Err("API key file is empty".into());
+        return Err(format!("API key file {} is empty", key_path.display()).into());
     }
 
     Ok(api_key)

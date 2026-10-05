@@ -7119,7 +7119,8 @@ fn prompt_command(
 
     for file in files {
         debug!("Reading file for prompt context: {}", file);
-        let contents = fs::read_to_string(file)?;
+        let contents =
+            fs::read_to_string(file).map_err(|e| format!("can't read {}: {}", file, e))?;
         system_prompts.push(contents);
     }
     post_request_and_print_output(prompt, Some(system_prompts), opts, db, mcp_manager)
