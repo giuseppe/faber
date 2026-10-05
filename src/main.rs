@@ -1294,13 +1294,21 @@ fn drop_tool_params(tools: &mut ToolsCollection, tool: &str, params: &[&str]) {
     let Ok(mut schema) = serde_json::from_str::<serde_json::Value>(&item.schema) else {
         return;
     };
+    // `get_mut`, not indexing: indexing a missing field in adds it, as
+    // `null` - and a `null` `required` gets the tools rejected.
     let parameters = &mut schema["function"]["parameters"];
-    if let Some(properties) = parameters["properties"].as_object_mut() {
+    if let Some(properties) = parameters
+        .get_mut("properties")
+        .and_then(|p| p.as_object_mut())
+    {
         for param in params {
             properties.remove(*param);
         }
     }
-    if let Some(required) = parameters["required"].as_array_mut() {
+    if let Some(required) = parameters
+        .get_mut("required")
+        .and_then(|r| r.as_array_mut())
+    {
         required.retain(|r| r.as_str().is_none_or(|r| !params.contains(&r)));
     }
     item.schema = schema.to_string();
@@ -6431,11 +6439,17 @@ fn without_profile_params(mut tools: ToolsCollection) -> ToolsCollection {
         let Ok(mut schema) = serde_json::from_str::<serde_json::Value>(&tool.schema) else {
             continue;
         };
-        let removed = schema["function"]["parameters"]["properties"]
-            .as_object_mut()
+        // `get_mut`, not indexing: indexing a missing field in adds it, as
+        // `null` - and a `null` `required` gets the tools rejected.
+        let removed = schema["function"]["parameters"]
+            .get_mut("properties")
+            .and_then(|p| p.as_object_mut())
             .and_then(|props| props.remove("profile"));
         if removed.is_some() {
-            if let Some(required) = schema["function"]["parameters"]["required"].as_array_mut() {
+            if let Some(required) = schema["function"]["parameters"]
+                .get_mut("required")
+                .and_then(|r| r.as_array_mut())
+            {
                 required.retain(|r| r != "profile");
             }
             tool.schema = schema.to_string();
@@ -19407,6 +19421,31 @@ for line in sys.stdin:
         assert_eq!(out, "No matches.");
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_trimmed_tool_schemas_keep_required_an_array() {
+        // Some providers (Moonshot) reject a `required` that isn't an
+        // array: trimming parameters mustn't leave a `null` one behind.
+        for unsafe_tools in [false, true] {
+            let mut tools = initialize_tools(unsafe_tools, None);
+            // As an MCP server may give it: no fields but its type.
+            let bare = r#"{"type": "function", "function": {"name": "bare", "parameters": {"type": "object"}}}"#;
+            let callback = tools["read_file"].callback;
+            append_tool(&mut tools, "bare".into(), callback, bare.into());
+            drop_tool_params(&mut tools, "bare", &["x"]);
+            let tools = without_profile_params(tools);
+            for (name, tool) in &tools {
+                let schema: serde_json::Value = serde_json::from_str(&tool.schema).unwrap();
+                let parameters = &schema["function"]["parameters"];
+                for field in ["required", "properties"] {
+                    assert!(
+                        parameters.get(field).is_none_or(|v| !v.is_null()),
+                        "{name} (unsafe: {unsafe_tools}): {field} is null"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
