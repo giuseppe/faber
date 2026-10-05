@@ -564,6 +564,20 @@ fn make_request(url: &String) -> Result<Response, Box<dyn Error>> {
                     continue;
                 }
 
+                // GitHub answers 404, not 403, for a private repository
+                // the request may not see.
+                if status == StatusCode::NOT_FOUND {
+                    let token = if read_github_token().is_ok() {
+                        "the token in ~/.github/token can't see"
+                    } else {
+                        "with no token in ~/.github/token, faber can't see"
+                    };
+                    return Err(format!(
+                        "not found: {} - there's no such repository or number, or it's a private repository {}",
+                        url, token
+                    )
+                    .into());
+                }
                 match response.error_for_status() {
                     Ok(_should_not_happen_if_status_is_error) => Err(format!(
                         "HTTP status {} was not success but error_for_status returned Ok for URL: {}",
