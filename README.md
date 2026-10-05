@@ -532,6 +532,17 @@ faber tasks add "Tag and publish" --after 1 --after 2    # 3
 The model's `task_create` takes `depends_on` for the same. Until its
 dependencies are done, `faber tasks` shows a task as "after #1, #2".
 
+A prompt task is given what the tasks it runs after came to, their
+results, along with its own text. And a task for an agent by name runs
+as a turn of that agent's conversation, so it remembers what it did
+before. Together, that's enough for work to go back and forth:
+
+```bash
+faber tasks add "Fix issue 42 and open a PR" --agent coder               # 1
+faber tasks add "Review the PR for issue 42" --agent reviewer --after 1  # 2
+faber tasks add "Address the review, push again" --agent coder --after 2 # 3
+```
+
 A task can be put on hold, so that nobody picks it up - e.g. to create
 work ahead of time and start it on a signal:
 

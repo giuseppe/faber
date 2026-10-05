@@ -9173,8 +9173,9 @@ fn execute_scheduled_command(
     Some((assistant_msg, tool_msg))
 }
 
-/// Most of a task's output kept in `last_result`.
-const MAX_TASK_RESULT_CHARS: usize = 2000;
+/// Most of a task's output kept in `last_result`: enough for a review,
+/// say, handed to the tasks that run after it (see `task_input`).
+const MAX_TASK_RESULT_CHARS: usize = 8000;
 
 /// Most of a tool task's output kept: its output is what it's run for
 /// (e.g. a knowledge base note, from the web UI's Run a tool).
@@ -9836,10 +9837,7 @@ fn chat_command(
                     pending_injections.push(if resuming {
                         resumed_task_input(&task)
                     } else {
-                        format!(
-                            "[Scheduled task #{} \"{}\"]: {}",
-                            task.id, task.name, task.command
-                        )
+                        task_input(&task, db.as_ref())
                     });
                     running_prompt_task = Some(task.id);
                 }
@@ -11337,10 +11335,7 @@ fn run_prompt_task_headless(
         task.command.clone()
     } else {
         messages.push(running_task_note(task.id));
-        format!(
-            "[Scheduled task #{} \"{}\"]: {}",
-            task.id, task.name, task.command
-        )
+        task_input(task, db.as_ref())
     };
     let events = Some(EventLog::new(db.clone(), agent, Some(task.id)));
     if let Some(events) = &events {
@@ -11475,6 +11470,40 @@ fn run_prompt_task_headless(
 /// The outcome of a task's run that its worker's stopping cut short: the
 /// task is given back, to carry on when next run, rather than failed.
 const TASK_GIVEN_BACK: &str = "interrupted: the worker stopped; it carries on when next run";
+
+/// What a prompt task's agent is told to do: its command, and what the
+/// tasks it ran after came to - a review to address, the PR an earlier
+/// task opened - which it would otherwise have to go and find.
+fn task_input(task: &db::TaskRow, db: &dyn DbBackend) -> String {
+    let mut input = format!(
+        "[Scheduled task #{} \"{}\"]: {}",
+        task.id, task.name, task.command
+    );
+    let results: Vec<String> = task
+        .depends_on
+        .iter()
+        .filter_map(|id| db.get_task(*id).ok().flatten())
+        .map(|dependency| {
+            format!(
+                "## Task #{} \"{}\" ({})\n{}",
+                dependency.id,
+                dependency.name,
+                dependency.last_outcome.as_deref().unwrap_or("done"),
+                dependency
+                    .last_result
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or("(no result)")
+            )
+        })
+        .collect();
+    if !results.is_empty() {
+        input.push_str("\n\nWhat the tasks it runs after came to:\n\n");
+        input.push_str(&results.join("\n\n"));
+    }
+    input
+}
 
 /// What a task's agent is told when it carries on a run that didn't
 /// finish: its conversation is as it was last saved, after a round of
@@ -15567,6 +15596,49 @@ for line in sys.stdin:
                 .unwrap_err()
                 .to_string()
                 .contains("no agent named")
+        );
+    }
+
+    #[test]
+    fn test_task_input_hands_on_what_its_dependencies_came_to() {
+        let db = local_db_with_agents(&["w"]);
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let work = db
+            .create_oneshot_task("work", "", &past, "fix issue 7", None)
+            .unwrap();
+        let review = db
+            .create_oneshot_task("review", "", &past, "review the PR", None)
+            .unwrap();
+        for (id, result) in [(work, "  opened PR #12  "), (review, "")] {
+            assert!(db.claim_task(id, "s").unwrap());
+            db.finish_task(
+                id,
+                "s",
+                &db::TaskOutcome {
+                    succeeded: true,
+                    exit_code: None,
+                    result: result.to_string(),
+                },
+            )
+            .unwrap();
+        }
+        let mut task = db.get_task(review).unwrap().unwrap();
+        task.id = 99;
+        task.name = "address".to_string();
+        task.command = "address the review".to_string();
+        assert_eq!(
+            task_input(&task, db.as_ref()),
+            "[Scheduled task #99 \"address\"]: address the review"
+        );
+        task.depends_on = vec![work, review, 12345];
+        assert_eq!(
+            task_input(&task, db.as_ref()),
+            format!(
+                "[Scheduled task #99 \"address\"]: address the review\n\n\
+                 What the tasks it runs after came to:\n\n\
+                 ## Task #{work} \"work\" (succeeded)\nopened PR #12\n\n\
+                 ## Task #{review} \"review\" (succeeded)\n(no result)"
+            )
         );
     }
 
