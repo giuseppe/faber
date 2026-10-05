@@ -18125,6 +18125,156 @@ for line in sys.stdin:
         );
     }
 
+    /// A conductor - a profile whose prompt is the playbook - runs a code,
+    /// review, fix loop with the task tools alone, on a real worker: it
+    /// delegates, waits, has the coder and the reviewer each carry on their
+    /// own work, then asks; the answer carries the conductor on in turn.
+    #[test]
+    fn test_a_conductor_runs_a_review_loop_with_the_task_tools() {
+        let db = local_db_with_agents(&[]);
+        let script = |name: &str, rules: serde_json::Value| {
+            let mut profile = scripted_profile(name, "");
+            profile.model = Some(model_script(name, rules));
+            profile
+        };
+        // Rules match the latest message: the task, or a tool's result.
+        let conductor = script(
+            "conductor_playbook",
+            serde_json::json!([
+                {"if": "yes, merge", "reply": "merging PR 118"},
+                {"if": "fix issue 42", "tool": "task_create", "arguments": {
+                    "name": "code", "command": "fix issue 42 and open a PR",
+                    "profile": "coder"}},
+                {"if": "\"id\":2,", "tool": "task_create", "arguments": {
+                    "name": "review", "command": "review the PR",
+                    "profile": "reviewer", "depends_on": [2]}},
+                {"if": "\"id\":3,", "tool": "task_wait", "arguments": {"ids": [3]}},
+                {"if": "changes: rename foo", "tool": "task_create", "arguments": {
+                    "name": "fix", "command": "address: rename foo",
+                    "continue_task": 2}},
+                {"if": "\"id\":4,", "tool": "task_create", "arguments": {
+                    "name": "re-review", "command": "check your comments are addressed",
+                    "continue_task": 3, "depends_on": [4]}},
+                {"if": "\"id\":5,", "tool": "task_wait", "arguments": {"ids": [5]}},
+                {"if": "approve", "reply": "Both rounds done, approved. Merge PR 118?"}
+            ]),
+        );
+        let coder = script(
+            "conductor_coder",
+            serde_json::json!([
+                {"if": "address: rename foo", "reply": "pushed v2"},
+                {"if": "fix issue 42", "reply": "opened PR 118"}
+            ]),
+        );
+        let reviewer = script(
+            "conductor_reviewer",
+            serde_json::json!([
+                {"if": "check your comments", "reply": "approve"},
+                {"if": "review the PR", "reply": "changes: rename foo"}
+            ]),
+        );
+        let mut opts = Opts::default();
+        opts.model = Some(model_script(
+            "conductor_worker",
+            serde_json::json!([{"if": "", "reply": "worker's own model"}]),
+        ));
+        opts.profiles = HashMap::from([
+            ("conductor".to_string(), conductor),
+            ("coder".to_string(), coder),
+            ("reviewer".to_string(), reviewer),
+        ]);
+        let stop = WorkerStop::default();
+        let worker = {
+            let (opts, db, stop) = (opts.clone(), db.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let spec = WorkerSpec {
+                    agent: "w".to_string(),
+                    parallel: None,
+                    profiles: None,
+                    wait_for_agent: false,
+                    tool_tasks: true,
+                    label: false,
+                };
+                run_worker(&opts, db, &None, &spec, &stop).unwrap();
+            })
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let new_task = |command: &str, profile: Option<&str>, continue_task: Option<i64>| {
+            db.create_task(&db::NewTask {
+                name: command.to_string(),
+                description: String::new(),
+                kind: db::TaskKind::PROMPT.to_string(),
+                command: command.to_string(),
+                agent_name: None,
+                schedule: db::TaskSchedule::Once { at: now.clone() },
+                held: false,
+                depends_on: Vec::new(),
+                profile: profile.map(String::from),
+                run_safe: false,
+                cwd: None,
+                continue_agent: None,
+                continue_task,
+            })
+            .unwrap()
+        };
+        let done = |id: i64| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                let task = db.get_task(id).unwrap().unwrap();
+                if task.status == db::TaskStatus::DONE {
+                    return task;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "task #{} not done",
+                    id
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        let run = new_task("fix issue 42", Some("conductor"), None);
+        assert_eq!(run, 1, "the script counts on the ids");
+        let asked = done(run);
+        assert_eq!(
+            asked.last_result.as_deref(),
+            Some("Both rounds done, approved. Merge PR 118?")
+        );
+        let result = |id: i64| db.get_task(id).unwrap().unwrap().last_result.unwrap();
+        assert_eq!(
+            [2, 3, 4, 5].map(result),
+            [
+                "opened PR 118",
+                "changes: rename foo",
+                "pushed v2",
+                "approve"
+            ]
+        );
+        // The coder and the reviewer each carried on their own work.
+        let assistant = |agent: &str| -> Vec<serde_json::Value> {
+            db.load_agent_messages(agent)
+                .unwrap()
+                .into_iter()
+                .filter(|m| m["role"] == "assistant" && m["content"].is_string())
+                .map(|m| m["content"].clone())
+                .collect()
+        };
+        assert_eq!(assistant("coder-4"), ["opened PR 118", "pushed v2"]);
+        assert_eq!(assistant("reviewer-5"), ["changes: rename foo", "approve"]);
+
+        // The human answers by carrying the conductor on.
+        let answer = new_task("yes, merge", None, Some(run));
+        assert_eq!(done(answer).last_result.as_deref(), Some("merging PR 118"));
+        let conductor = assistant(&format!("conductor-{}", answer));
+        assert_eq!(conductor.last().unwrap(), "merging PR 118", "{conductor:?}");
+        assert!(
+            conductor
+                .iter()
+                .any(|m| m == "Both rounds done, approved. Merge PR 118?")
+        );
+        stop.stop();
+        worker.join().unwrap();
+    }
+
     #[test]
     fn test_headless_task_run_records_its_outcome_and_transcript() {
         let model = model_script(
