@@ -263,6 +263,43 @@ fn write_response(writer: &mut impl Write, response: &Response) -> std::io::Resu
     writer.flush()
 }
 
+/// A response that goes on for as long as there is something to say:
+/// server-sent events, each written and flushed as it is made - not a
+/// whole response with its length, like the rest of this file's.
+pub(crate) struct EventStream<'a> {
+    writer: &'a mut dyn Write,
+}
+
+impl<'a> EventStream<'a> {
+    /// Writes the response's head.
+    pub(crate) fn start(writer: &'a mut dyn Write) -> std::io::Result<Self> {
+        writer.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+              Cache-Control: no-store\r\nConnection: close\r\nX-Accel-Buffering: no\r\n\
+              X-Frame-Options: DENY\r\nContent-Security-Policy: frame-ancestors 'none'\r\n\r\n",
+        )?;
+        writer.flush()?;
+        Ok(Self { writer })
+    }
+
+    /// One event, whose `data` is `data` (a single line).
+    pub(crate) fn event(&mut self, data: &str) -> std::io::Result<()> {
+        self.writer
+            .write_all(format!("data: {}\n\n", data).as_bytes())?;
+        self.writer.flush()
+    }
+
+    /// A comment line, which readers ignore: for noticing that the reader
+    /// has gone, while there is nothing to say.
+    pub(crate) fn keep_alive(&mut self) -> std::io::Result<()> {
+        self.writer.write_all(b": keep-alive\n\n")?;
+        self.writer.flush()
+    }
+}
+
+/// How long writing to a stream's reader may block.
+const STREAM_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Serves one HTTP request on `stream`.
 pub fn handle_http(
     stream: TcpStream,
@@ -277,7 +314,15 @@ pub fn handle_http(
     let mut reader = BufReader::new(std::io::Read::take(stream.try_clone()?, limit));
     let mut writer = stream;
     let response = match read_request(&mut reader) {
-        Ok(request) => route(&request, &db, auth_key, profiles, a2a_keys),
+        Ok(request) => match crate::a2a::streaming(&request, &db, a2a_keys) {
+            Some(Ok(stream)) => {
+                writer.set_write_timeout(Some(STREAM_WRITE_TIMEOUT))?;
+                let mut events = EventStream::start(&mut writer)?;
+                return stream.run(&mut events).map_err(Into::into);
+            }
+            Some(Err(response)) => response,
+            None => route(&request, &db, auth_key, profiles, a2a_keys),
+        },
         Err(response) => response,
     };
     write_response(&mut writer, &response)?;

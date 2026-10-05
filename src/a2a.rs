@@ -33,7 +33,8 @@
 //! that opened it; each message is a task of that agent (see
 //! `db::a2a_message_task`), run by whichever worker picks it up.
 
-use crate::web::{Request, Response};
+use crate::web::{EventStream, Request, Response};
+use faber::agent_io::{AgentEvent, EventFilter};
 use faber::db;
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -49,6 +50,20 @@ const BLOCKING_WAIT: Duration = Duration::from_secs(60);
 
 /// How often a task is looked at while waiting for it.
 const POLL_EVERY: Duration = Duration::from_millis(250);
+
+/// How often a stream looks for the task's new events.
+const STREAM_POLL_EVERY: Duration = Duration::from_millis(200);
+
+/// A stream with no new event for this long is closed, with nothing
+/// final said: the client can resubscribe.
+const STREAM_IDLE_LIMIT: Duration = Duration::from_secs(30 * 60);
+
+/// How often a stream with nothing to say writes a comment, to notice
+/// that its reader has gone.
+const STREAM_KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+/// Most events one look at a task's events takes.
+const STREAM_BATCH: usize = 100;
 
 /// Appended to a prompt whose caller accepts only JSON.
 const JSON_ONLY: &str =
@@ -202,7 +217,7 @@ fn agent_card(request: &Request, db: &Arc<Mutex<Connection>>) -> Response {
             "url": format!("{}/a2a", base),
             "preferredTransport": "JSONRPC",
             "version": env!("CARGO_PKG_VERSION"),
-            "capabilities": {"streaming": false, "pushNotifications": false},
+            "capabilities": {"streaming": true, "pushNotifications": false},
             "securitySchemes": {"bearer": {"type": "http", "scheme": "bearer"}},
             "security": [{"bearer": []}],
             "defaultInputModes": ["text/plain", "application/json"],
@@ -258,51 +273,73 @@ fn rpc_response(id: &Value, result: Result<Value, RpcError>) -> Response {
     )
 }
 
-/// `POST /a2a`.
-fn rpc(request: &Request, db: &Arc<Mutex<Connection>>, keys: &A2aKeys) -> Response {
+/// A JSON-RPC request, checked: who sent it, its id, method and params.
+struct RpcCall {
+    caller: String,
+    id: Value,
+    method: String,
+    params: Value,
+}
+
+/// Reads `POST /a2a`: the caller's key, then the JSON-RPC request. `Err`
+/// is the response to send for one that is none.
+fn parse_rpc(request: &Request, keys: &A2aKeys) -> Result<RpcCall, Response> {
     let given = request.authorization.as_deref().unwrap_or("");
     let given = given.strip_prefix("Bearer ").unwrap_or("");
     let Some(caller) = keys.caller(given) else {
-        return Response::error(401, "unauthorized");
+        return Err(Response::error(401, "unauthorized"));
     };
     if request.method != "POST" {
-        return Response::error(405, "method not allowed");
+        return Err(Response::error(405, "method not allowed"));
     }
     if !request
         .content_type
         .as_deref()
         .is_some_and(|t| t.starts_with("application/json"))
     {
-        return Response::error(415, "send Content-Type: application/json");
+        return Err(Response::error(415, "send Content-Type: application/json"));
     }
     let body: Value = match serde_json::from_slice(&request.body) {
         Ok(body) => body,
         Err(e) => {
-            return rpc_response(&Value::Null, fail(PARSE_ERROR, format!("not JSON: {}", e)));
+            return Err(rpc_response(
+                &Value::Null,
+                fail(PARSE_ERROR, format!("not JSON: {}", e)),
+            ));
         }
     };
-    let id = body.get("id").cloned().unwrap_or(Value::Null);
     if body.is_array() {
-        return rpc_response(
+        return Err(rpc_response(
             &Value::Null,
             fail(INVALID_REQUEST, "batches aren't supported"),
-        );
+        ));
     }
-    let method = match (
+    match (
         body.get("jsonrpc").and_then(Value::as_str),
         body.get("method").and_then(Value::as_str),
         body.get("id"),
     ) {
-        (Some("2.0"), Some(method), Some(Value::String(_) | Value::Number(_))) => method,
-        _ => {
-            return rpc_response(
-                &Value::Null,
-                fail(INVALID_REQUEST, "not a JSON-RPC 2.0 request with an id"),
-            );
+        (Some("2.0"), Some(method), Some(id @ (Value::String(_) | Value::Number(_)))) => {
+            Ok(RpcCall {
+                caller: caller.to_string(),
+                id: id.clone(),
+                method: method.to_string(),
+                params: body.get("params").cloned().unwrap_or(Value::Null),
+            })
         }
-    };
-    let params = body.get("params").cloned().unwrap_or(Value::Null);
-    rpc_response(&id, call(method, &params, caller, db))
+        _ => Err(rpc_response(
+            &Value::Null,
+            fail(INVALID_REQUEST, "not a JSON-RPC 2.0 request with an id"),
+        )),
+    }
+}
+
+/// `POST /a2a`.
+fn rpc(request: &Request, db: &Arc<Mutex<Connection>>, keys: &A2aKeys) -> Response {
+    match parse_rpc(request, keys) {
+        Ok(rpc) => rpc_response(&rpc.id, call(&rpc.method, &rpc.params, &rpc.caller, db)),
+        Err(response) => response,
+    }
 }
 
 fn call(
@@ -607,11 +644,14 @@ fn history_length(value: &Value) -> Option<usize> {
         .map(|n| n as usize)
 }
 
-fn message_send(
+/// Takes a message for its context's agent - a new context, if it names
+/// none - as a task. Returns the task's id, its context, and the request's
+/// `configuration`.
+fn submit_message(
     params: &Value,
     caller: &str,
     db: &Arc<Mutex<Connection>>,
-) -> Result<Value, RpcError> {
+) -> Result<(i64, db::A2aContext, Value), RpcError> {
     let Some(message) = params.get("message").filter(|m| m.is_object()) else {
         return fail(INVALID_PARAMS, "missing 'message'");
     };
@@ -696,7 +736,15 @@ fn message_send(
         db::a2a_touch_context(&conn, &context.id)?;
         (task_id, context)
     };
+    Ok((task_id, context, configuration))
+}
 
+fn message_send(
+    params: &Value,
+    caller: &str,
+    db: &Arc<Mutex<Connection>>,
+) -> Result<Value, RpcError> {
+    let (task_id, context, configuration) = submit_message(params, caller, db)?;
     let blocking = configuration
         .get("blocking")
         .and_then(Value::as_bool)
@@ -758,6 +806,241 @@ fn tasks_cancel(
     }
     let task = db::get_task(&conn, task.id)?.unwrap_or(task);
     Ok(task_json(&conn, &task, &context, None))
+}
+
+/// A `message/stream` or `tasks/resubscribe` request, checked and ready
+/// to run: a response that goes on for as long as the task does.
+pub(crate) struct Stream {
+    id: Value,
+    db: Arc<Mutex<Connection>>,
+    task_id: i64,
+    context: db::A2aContext,
+    /// Carrying on from where the task is, not from its start.
+    resume: bool,
+}
+
+/// Prepares `request` as a stream if it is one - `None` if it isn't, for
+/// the usual answer. `Err` is the answer to one that can't be streamed (a
+/// bad request, a task that isn't the caller's).
+pub(crate) fn streaming(
+    request: &Request,
+    db: &Arc<Mutex<Connection>>,
+    keys: &A2aKeys,
+) -> Option<Result<Stream, Response>> {
+    let path = request.path.trim_matches('/');
+    if keys.is_empty() || path != "a2a" {
+        return None;
+    }
+    let rpc = parse_rpc(request, keys).ok()?;
+    let resume = match rpc.method.as_str() {
+        "message/stream" => false,
+        "tasks/resubscribe" => true,
+        _ => return None,
+    };
+    let started = if resume {
+        lock(db).and_then(|conn| {
+            owned_task(
+                &conn,
+                &rpc.caller,
+                rpc.params.get("id").unwrap_or(&Value::Null),
+            )
+            .map(|(task, context)| (task.id, context))
+        })
+    } else {
+        submit_message(&rpc.params, &rpc.caller, db).map(|(task_id, context, _)| (task_id, context))
+    };
+    Some(match started {
+        Ok((task_id, context)) => Ok(Stream {
+            id: rpc.id,
+            db: db.clone(),
+            task_id,
+            context,
+            resume,
+        }),
+        Err(e) => Err(rpc_response(&rpc.id, Err(e))),
+    })
+}
+
+impl Stream {
+    fn send(&self, out: &mut EventStream, result: Value) -> std::io::Result<()> {
+        out.event(&json!({"jsonrpc": "2.0", "id": self.id, "result": result}).to_string())
+    }
+
+    fn status_update(&self, state: &str, message: Option<Value>, last: bool) -> Value {
+        let mut status = json!({"state": state, "timestamp": chrono::Utc::now().to_rfc3339()});
+        if let Some(message) = message {
+            status["message"] = message;
+        }
+        json!({
+            "kind": "status-update",
+            "taskId": self.task_id.to_string(),
+            "contextId": self.context.id,
+            "status": status,
+            "final": last,
+        })
+    }
+
+    fn artifact_update(&self, text: &str, append: bool, last_chunk: bool) -> Value {
+        self.artifact_part_update(json!({"kind": "text", "text": text}), append, last_chunk)
+    }
+
+    fn artifact_part_update(&self, part: Value, append: bool, last_chunk: bool) -> Value {
+        json!({
+            "kind": "artifact-update",
+            "taskId": self.task_id.to_string(),
+            "contextId": self.context.id,
+            "artifact": {"artifactId": "result", "name": "result", "parts": [part]},
+            "append": append,
+            "lastChunk": last_chunk,
+        })
+    }
+
+    /// Streams the task: its state now, then what it does, until it's
+    /// done. The events come from the database, so any worker's run shows.
+    pub(crate) fn run(self, out: &mut EventStream) -> std::io::Result<()> {
+        let broken = |e: RpcError| std::io::Error::other(e.message);
+        let (task, mut last) = {
+            let conn = lock(&self.db).map_err(broken)?;
+            let task = db::get_task(&conn, self.task_id)
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .ok_or_else(|| std::io::Error::other("the task went away"))?;
+            self.send(out, task_json(&conn, &task, &self.context, None))?;
+            // Resubscribed, from now on.
+            let last = if self.resume {
+                self.events_after(&conn, None, 1)
+                    .last()
+                    .map_or(0, |event| event.id)
+            } else {
+                0
+            };
+            (task, last)
+        };
+        if task.status == db::TaskStatus::DONE && self.resume {
+            return Ok(());
+        }
+        let mut announced = false;
+        let mut text_sent = false;
+        let mut quiet_since = Instant::now();
+        let mut last_write = Instant::now();
+        loop {
+            // Done before the events are read: all that it did is in them.
+            let (task, events) = {
+                let conn = lock(&self.db).map_err(broken)?;
+                let task = db::get_task(&conn, self.task_id)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                    .ok_or_else(|| std::io::Error::other("the task went away"))?;
+                (task, self.events_after(&conn, Some(last), STREAM_BATCH))
+            };
+            if !events.is_empty() {
+                quiet_since = Instant::now();
+                last_write = Instant::now();
+            }
+            let more = events.len() >= STREAM_BATCH;
+            for row in events {
+                last = row.id;
+                if !announced {
+                    announced = true;
+                    self.send(out, self.status_update("working", None, false))?;
+                }
+                match row.event {
+                    AgentEvent::Text { text } => {
+                        self.send(out, self.artifact_update(&text, text_sent, false))?;
+                        text_sent = true;
+                    }
+                    AgentEvent::ToolStart { name, .. } => {
+                        let message = text_message(
+                            "agent",
+                            format!("{}-tool-{}", self.task_id, row.id),
+                            &format!("Running {}", name),
+                            self.task_id,
+                            &self.context.id,
+                        );
+                        self.send(out, self.status_update("working", Some(message), false))?;
+                    }
+                    // What the caller sent, the model's reasoning, a
+                    // tool's result and the turn's end (the task's own
+                    // state says how it went) aren't shown.
+                    AgentEvent::Input { .. }
+                    | AgentEvent::Reasoning { .. }
+                    | AgentEvent::ToolEnd { .. }
+                    | AgentEvent::TurnEnd { .. } => {}
+                }
+            }
+            if more {
+                continue;
+            }
+            if task.status == db::TaskStatus::DONE {
+                return self.finish(out, &task, text_sent);
+            }
+            if quiet_since.elapsed() >= STREAM_IDLE_LIMIT {
+                return Ok(());
+            }
+            if last_write.elapsed() >= STREAM_KEEP_ALIVE {
+                out.keep_alive()?;
+                last_write = Instant::now();
+            }
+            std::thread::sleep(STREAM_POLL_EVERY);
+        }
+    }
+
+    /// The task's events after `after` (the latest `limit`, without it).
+    fn events_after(
+        &self,
+        conn: &Connection,
+        after: Option<i64>,
+        limit: usize,
+    ) -> Vec<faber::agent_io::AgentEventRow> {
+        db::agent_events(
+            conn,
+            &EventFilter {
+                agent: Some(self.context.agent.clone()),
+                task_id: Some(self.task_id),
+                after,
+                limit,
+            },
+        )
+        .unwrap_or_default()
+    }
+
+    /// The end: the result's last chunk, then the final state.
+    fn finish(
+        &self,
+        out: &mut EventStream,
+        task: &db::TaskRow,
+        text_sent: bool,
+    ) -> std::io::Result<()> {
+        let state = task_state(task);
+        if state == "completed" {
+            if text_sent && !self.resume {
+                // Nothing more to add: a chunk with no parts, which a client
+                // appending parts to the artifact doesn't turn into an empty one.
+                let mut last = self.artifact_update("", true, true);
+                last["artifact"]["parts"] = json!([]);
+                self.send(out, last)?;
+            } else {
+                // Nothing streamed (the answer was reported, not said), or
+                // only its tail (resubscribed): all of it at once.
+                let answer = {
+                    let conn = lock(&self.db).map_err(|e| std::io::Error::other(e.message))?;
+                    task_answer(&conn, task)
+                };
+                self.send(
+                    out,
+                    self.artifact_part_update(answer_part(&answer), false, true),
+                )?;
+            }
+        }
+        let message = (state == "failed").then(|| {
+            text_message(
+                "agent",
+                format!("{}-status", task.id),
+                task.last_result.as_deref().unwrap_or("failed"),
+                task.id,
+                &self.context.id,
+            )
+        });
+        self.send(out, self.status_update(state, message, true))
+    }
 }
 
 #[cfg(test)]
@@ -914,6 +1197,7 @@ mod tests {
         assert_eq!(card["url"], "http://faber.test:9090/a2a");
         assert_eq!(card["preferredTransport"], "JSONRPC");
         assert_eq!(card["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(card["capabilities"]["streaming"], true);
         assert_eq!(card["capabilities"]["pushNotifications"], false);
         assert_eq!(card["security"], json!([{"bearer": []}]));
         let skills = card["skills"].as_array().unwrap();
@@ -950,7 +1234,7 @@ mod tests {
         assert_eq!(reply["error"]["code"], -32600, "no jsonrpc");
         let (_, reply) = answer(&db, Some(ALICE), r#"{"jsonrpc": "2.0", "method": "x"}"#);
         assert_eq!(reply["error"]["code"], -32600, "no id");
-        assert_eq!(rpc_as(&db, ALICE, "message/stream", json!({})), Err(-32601));
+        assert_eq!(rpc_as(&db, ALICE, "bogus/method", json!({})), Err(-32601));
         assert_eq!(
             rpc_as(&db, ALICE, "agent/getAuthenticatedExtendedCard", json!({})),
             Err(-32601)
@@ -1325,5 +1609,417 @@ mod tests {
                 .contains("script"),
             "{task}"
         );
+    }
+
+    /// Where a stream writes, for a test to read.
+    #[derive(Clone, Default)]
+    struct Pipe(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Pipe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Pipe {
+        /// The events written so far (`result` of each `data:` line).
+        fn events(&self) -> Vec<Value> {
+            let text = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
+            let body = text.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+            body.lines()
+                .filter_map(|l| l.strip_prefix("data: "))
+                .map(|l| {
+                    let reply: Value = serde_json::from_str(l).unwrap();
+                    assert_eq!(reply["jsonrpc"], "2.0");
+                    reply["result"].clone()
+                })
+                .collect()
+        }
+
+        fn head(&self) -> String {
+            let text = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
+            text.split_once("\r\n\r\n")
+                .map_or("", |(h, _)| h)
+                .to_string()
+        }
+    }
+
+    /// Runs the stream for `body` on a thread, writing to the pipe.
+    fn start_stream(
+        db: &Arc<Mutex<Connection>>,
+        key: &str,
+        body: Value,
+    ) -> (Pipe, std::thread::JoinHandle<()>) {
+        let request = http("POST", "/a2a", Some(key), &body.to_string());
+        let stream = match streaming(&request, db, &keys()) {
+            Some(Ok(stream)) => stream,
+            Some(Err(response)) => panic!("{}", String::from_utf8_lossy(&response.body)),
+            None => panic!("not a stream"),
+        };
+        let pipe = Pipe::default();
+        let mut writer = pipe.clone();
+        let thread = std::thread::spawn(move || {
+            let mut events = EventStream::start(&mut writer).unwrap();
+            stream.run(&mut events).unwrap();
+        });
+        (pipe, thread)
+    }
+
+    fn stream_request(method: &str, params: Value) -> Value {
+        json!({"jsonrpc": "2.0", "id": "s1", "method": method, "params": params})
+    }
+
+    /// Waits until `pipe` has `count` events.
+    fn wait_for_events(pipe: &Pipe, count: usize) -> Vec<Value> {
+        let started = Instant::now();
+        loop {
+            let events = pipe.events();
+            if events.len() >= count {
+                return events;
+            }
+            assert!(started.elapsed() < Duration::from_secs(20), "{events:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn run_events(db: &Arc<Mutex<Connection>>, task: i64, events: &[AgentEvent]) {
+        let conn = db.lock().unwrap();
+        let agent = db::get_task(&conn, task)
+            .unwrap()
+            .unwrap()
+            .continue_agent
+            .unwrap();
+        db::append_agent_events(&conn, &agent, Some(task), events).unwrap();
+    }
+
+    fn text(text: &str) -> AgentEvent {
+        AgentEvent::Text {
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_a_stream_follows_the_task_and_can_be_picked_up_again() {
+        let db = test_db();
+        add_profile(&db, "talker", json!({}));
+        let message = json!({"role": "user", "parts": [{"kind": "text", "text": "hi"}]});
+        let (pipe, stream) = start_stream(
+            &db,
+            ALICE,
+            stream_request("message/stream", json!({"message": message})),
+        );
+        // First, the task as it is.
+        let first = wait_for_events(&pipe, 1).remove(0);
+        assert!(
+            pipe.head().starts_with("HTTP/1.1 200 OK"),
+            "{}",
+            pipe.head()
+        );
+        assert!(pipe.head().contains("Content-Type: text/event-stream"));
+        assert_eq!(first["kind"], "task");
+        assert_eq!(first["status"]["state"], "submitted");
+        let task: i64 = first["id"].as_str().unwrap().parse().unwrap();
+        let context = first["contextId"].as_str().unwrap().to_string();
+        assert!(
+            db::claim_task(&db.lock().unwrap(), task, "ws").unwrap(),
+            "due already"
+        );
+
+        run_events(
+            &db,
+            task,
+            &[
+                AgentEvent::Input {
+                    text: "hi".to_string(),
+                },
+                text("Hel"),
+                AgentEvent::Reasoning {
+                    text: "hmm".to_string(),
+                },
+            ],
+        );
+        // working, and the first chunk.
+        let events = wait_for_events(&pipe, 3);
+        assert_eq!(events[1]["kind"], "status-update");
+        assert_eq!(events[1]["status"]["state"], "working");
+        assert_eq!(events[1]["final"], false);
+        assert_eq!(events[2]["kind"], "artifact-update");
+        assert_eq!(events[2]["append"], false);
+        assert_eq!(events[2]["artifact"]["artifactId"], "result");
+        assert_eq!(events[2]["artifact"]["parts"][0]["text"], "Hel");
+
+        // Picked up again mid-run: it carries on from where it is.
+        let (again, resubscribed) = start_stream(
+            &db,
+            ALICE,
+            stream_request("tasks/resubscribe", json!({"id": task.to_string()})),
+        );
+        let first = wait_for_events(&again, 1).remove(0);
+        assert_eq!(first["kind"], "task");
+        assert_eq!(first["status"]["state"], "working");
+        assert_eq!(first["contextId"], context.as_str());
+        run_events(
+            &db,
+            task,
+            &[
+                AgentEvent::ToolStart {
+                    name: "glob".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                AgentEvent::ToolEnd {
+                    name: "glob".to_string(),
+                    duration_ms: 1,
+                    output: "x".to_string(),
+                    failed: false,
+                },
+                text("lo"),
+                AgentEvent::TurnEnd {
+                    succeeded: true,
+                    text: "Hello".to_string(),
+                },
+            ],
+        );
+        {
+            let conn = db.lock().unwrap();
+            let agent = db::get_task(&conn, task)
+                .unwrap()
+                .unwrap()
+                .continue_agent
+                .unwrap();
+            db::set_agent_data(&conn, &agent, &db::a2a_answer_key(task), "Hello").unwrap();
+            db::finish_task(
+                &conn,
+                task,
+                "ws",
+                &db::TaskOutcome {
+                    succeeded: true,
+                    exit_code: None,
+                    result: "Hello".to_string(),
+                },
+            )
+            .unwrap();
+        }
+        stream.join().unwrap();
+        resubscribed.join().unwrap();
+
+        let events = pipe.events();
+        let kinds: Vec<(&str, Option<&str>)> = events
+            .iter()
+            .map(|e| (e["kind"].as_str().unwrap(), e["status"]["state"].as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("task", Some("submitted")),
+                ("status-update", Some("working")),
+                ("artifact-update", None),
+                ("status-update", Some("working")), // Running glob
+                ("artifact-update", None),
+                ("artifact-update", None), // the last chunk, empty
+                ("status-update", Some("completed")),
+            ]
+        );
+        assert_eq!(
+            events[3]["status"]["message"]["parts"][0]["text"],
+            "Running glob"
+        );
+        let chunks: Vec<(&str, bool)> = events
+            .iter()
+            .filter(|e| e["kind"] == "artifact-update")
+            .map(|e| {
+                (
+                    e["artifact"]["parts"][0]["text"].as_str().unwrap_or(""),
+                    e["append"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(chunks, vec![("Hel", false), ("lo", true), ("", true)]);
+        assert_eq!(events[5]["artifact"]["parts"], json!([]), "no empty part");
+        assert_eq!(events[4]["lastChunk"], false);
+        assert_eq!(events[5]["lastChunk"], true);
+        assert_eq!(events[6]["final"], true);
+        assert_eq!(events[6]["taskId"], task.to_string());
+
+        // The picked-up stream saw only what came after, then the whole
+        // result in place of that tail.
+        let events = again.events();
+        let chunks: Vec<(&str, bool)> = events
+            .iter()
+            .filter(|e| e["kind"] == "artifact-update")
+            .map(|e| {
+                (
+                    e["artifact"]["parts"][0]["text"].as_str().unwrap_or(""),
+                    e["append"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(chunks, vec![("lo", false), ("Hello", false)]);
+        assert_eq!(events.last().unwrap()["final"], true);
+
+        // A done task: its state, and the end.
+        let (done, finished) = start_stream(
+            &db,
+            ALICE,
+            stream_request("tasks/resubscribe", json!({"id": task.to_string()})),
+        );
+        finished.join().unwrap();
+        let events = done.events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["status"]["state"], "completed");
+        assert_eq!(events[0]["artifacts"][0]["parts"][0]["text"], "Hello");
+
+        // Not another caller's, and not a bad request.
+        let request = http(
+            "POST",
+            "/a2a",
+            Some(BOB),
+            &stream_request("tasks/resubscribe", json!({"id": task.to_string()})).to_string(),
+        );
+        let Some(Err(response)) = streaming(&request, &db, &keys()) else {
+            panic!("bob got a stream");
+        };
+        let reply: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            (response.status, &reply["id"], &reply["error"]["code"]),
+            (200, &json!("s1"), &json!(-32001))
+        );
+        let request = http(
+            "POST",
+            "/a2a",
+            Some(ALICE),
+            &stream_request(
+                "message/stream",
+                json!({"message": {"role": "user", "parts": []}}),
+            )
+            .to_string(),
+        );
+        let Some(Err(response)) = streaming(&request, &db, &keys()) else {
+            panic!("an empty message got a stream");
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response.body).unwrap()["error"]["code"],
+            -32602
+        );
+        // Other requests aren't streams.
+        let request = http(
+            "POST",
+            "/a2a",
+            Some(ALICE),
+            &stream_request("tasks/get", json!({})).to_string(),
+        );
+        assert!(streaming(&request, &db, &keys()).is_none());
+        let request = http(
+            "POST",
+            "/a2a",
+            Some(SERVER),
+            &stream_request("message/stream", json!({})).to_string(),
+        );
+        assert!(
+            streaming(&request, &db, &keys()).is_none(),
+            "left to say 401"
+        );
+    }
+
+    #[test]
+    fn test_a_failed_or_canceled_stream_says_so_in_the_end() {
+        let db = test_db();
+        add_profile(&db, "talker", json!({}));
+        let message = json!({"role": "user", "parts": [{"kind": "text", "text": "hi"}]});
+        let (pipe, stream) = start_stream(
+            &db,
+            ALICE,
+            stream_request("message/stream", json!({"message": message})),
+        );
+        let task: i64 = wait_for_events(&pipe, 1)[0]["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        {
+            let conn = db.lock().unwrap();
+            db::claim_task(&conn, task, "ws").unwrap();
+            db::finish_task(
+                &conn,
+                task,
+                "ws",
+                &db::TaskOutcome {
+                    succeeded: false,
+                    exit_code: None,
+                    result: "no model".to_string(),
+                },
+            )
+            .unwrap();
+        }
+        stream.join().unwrap();
+        let events = pipe.events();
+        let end = events.last().unwrap();
+        assert_eq!(end["status"]["state"], "failed");
+        assert_eq!(end["final"], true);
+        assert_eq!(end["status"]["message"]["parts"][0]["text"], "no model");
+        assert!(events.iter().all(|e| e["kind"] != "artifact-update"));
+    }
+
+    #[test]
+    fn test_streaming_over_http_with_a_worker() {
+        let model = model_script("stream", json!([{"if": "", "reply": "streamed answer"}]));
+        let db = test_db();
+        add_profile(&db, "talker", json!({"model": model}));
+        let _worker = Worker::start(&db, "w-stream", false);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                crate::web::handle_http(stream, db, Some(SERVER), &crate::Profiles::new(), &keys())
+                    .unwrap();
+            })
+        };
+        let body = stream_request(
+            "message/stream",
+            json!({"message": {"role": "user", "parts": [{"kind": "text", "text": "go"}]}}),
+        )
+        .to_string();
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        std::io::Write::write_all(
+            &mut client,
+            format!(
+                "POST /a2a HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                ALICE,
+                body.len(),
+                body
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut reply = String::new();
+        std::io::Read::read_to_string(&mut client, &mut reply).unwrap();
+        server.join().unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+        assert!(reply.contains("Content-Type: text/event-stream"), "{reply}");
+        let events: Vec<Value> = reply
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(|l| serde_json::from_str::<Value>(l).unwrap()["result"].clone())
+            .collect();
+        assert_eq!(events[0]["kind"], "task");
+        let end = events.last().unwrap();
+        assert_eq!(end["status"]["state"], "completed", "{events:?}");
+        assert_eq!(end["final"], true);
+        let said: String = events
+            .iter()
+            .filter(|e| e["kind"] == "artifact-update")
+            .filter_map(|e| e["artifact"]["parts"][0]["text"].as_str())
+            .collect();
+        assert_eq!(said, "streamed answer");
     }
 }
