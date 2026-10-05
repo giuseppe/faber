@@ -427,7 +427,9 @@ fn make_request(url: &String) -> Result<Response, Box<dyn Error>> {
         );
     }
 
-    let client = Client::new();
+    // One for the process, as for the model's (see `openai::model_client`).
+    static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(Client::new);
 
     for attempt in 1..=MAX_RETRIES {
         debug!(

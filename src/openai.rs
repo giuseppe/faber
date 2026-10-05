@@ -215,6 +215,22 @@ fn request_limiter() -> &'static RequestLimiter {
 
 /// Sets how many model requests may be in flight at once in this process
 /// (0: unlimited).
+/// The client every request to a model goes through. One for the whole
+/// process: each client has its own runtime - a thread, an epoll and an
+/// eventfd - and its own connections, so one per request had every agent
+/// waiting for its turn (`request_limiter`) hold some, and a large fan-out
+/// run out of file descriptors.
+fn model_client() -> Result<ReqwestClient, Box<dyn Error>> {
+    static CLIENT: std::sync::OnceLock<ReqwestClient> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = ReqwestClient::builder()
+        .timeout(Duration::from_secs(1000))
+        .build()?;
+    Ok(CLIENT.get_or_init(|| client).clone())
+}
+
 pub fn set_max_parallel_requests(limit: usize) {
     request_limiter().set_limit(limit);
 }
@@ -1376,9 +1392,7 @@ fn post_request_with_mode_and_recursion(
             progress_handler(&progress_info)?;
         }
 
-        let client = ReqwestClient::builder()
-            .timeout(Duration::from_secs(1000))
-            .build()?;
+        let client = model_client()?;
 
         requests += 1;
         if let Some(limit) = ctx.max_requests {
