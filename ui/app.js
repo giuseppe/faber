@@ -290,7 +290,16 @@ function renderFeed() {
 }
 
 function scrollFeed() {
-  if ($("follow").checked) $("detail-panel").scrollTop = $("detail-panel").scrollHeight;
+  // Not from under a selection being made.
+  if ($("follow").checked && !busyWithPage()) $("detail-panel").scrollTop = $("detail-panel").scrollHeight;
+}
+
+// Whether the feed is scrolled to its end: following only keeps it
+// there, and doesn't pull it back from wherever it was scrolled to be
+// read or copied from.
+function atFeedEnd() {
+  const panel = $("detail-panel");
+  return panel.scrollHeight - panel.scrollTop - panel.clientHeight < 40;
 }
 
 // Fetches a stream's new events; returns them.
@@ -334,16 +343,13 @@ async function pollEvents() {
       shown = [];
     }
     if (shown.length) {
+      const atEnd = atFeedEnd();
       const box = $("events");
       box.querySelector(":scope > .empty")?.remove();
       for (const row of shown) appendEvent(box, row, feedLabel());
-      scrollFeed();
+      if (atEnd) scrollFeed();
     }
-    if (changed) {
-      renderAgents();
-      renderTasks();
-      renderDetail();
-    }
+    if (changed) redraw();
   } catch { /* shown by the connection pill */ } finally {
     polling = false;
   }
@@ -674,6 +680,27 @@ function field(label, value) {
   return [el("dt", {}, label), el("dd", {}, value)];
 }
 
+// Replaces the details' fields, keeping where each long one (a task's
+// last result, say) was scrolled to: they're redrawn on every poll.
+let fieldsShown = null; // whose they are
+
+function setFields(...nodes) {
+  const fields = $("detail-fields");
+  const scrolled = new Map();
+  const whose = JSON.stringify(state.selected);
+  if (whose === fieldsShown) {
+    for (const dd of fields.querySelectorAll("dd")) {
+      if (dd.scrollTop) scrolled.set(dd.previousElementSibling?.textContent, dd.scrollTop);
+    }
+  }
+  fieldsShown = whose;
+  fields.replaceChildren(...nodes);
+  for (const dd of fields.querySelectorAll("dd")) {
+    const top = scrolled.get(dd.previousElementSibling?.textContent);
+    if (top) dd.scrollTop = top;
+  }
+}
+
 // Under the feed: who of the agents it shows is working, on what.
 function renderFeedStatus() {
   const s = state.selected;
@@ -727,21 +754,20 @@ function renderDetail() {
       `Message ${state.selected.name}… (Ctrl+Enter to send)`;
   }
   const selected = state.selected;
-  const fields = $("detail-fields");
   const actions = $("detail-actions");
   actions.replaceChildren();
   $("detail-back").hidden = !selected;
   if (!selected) {
     const busyCount = state.agents.filter((a) => a.live && busy(a.activity)).length;
     $("detail-title").textContent = `All agents${busyCount ? ` · ${busyCount} working` : ""}`;
-    fields.replaceChildren();
+    setFields();
     return;
   }
   if (selected.kind === "agent") {
     const agent = state.agents.find((a) => a.name === selected.name);
     $("detail-title").textContent = `Agent ${selected.name}`;
     if (!agent) {
-      fields.replaceChildren(...field("State", "gone"));
+      setFields(...field("State", "gone"));
       return;
     }
     if (agent.live && busy(agent.activity)) {
@@ -762,7 +788,7 @@ function renderDetail() {
     actions.append(el("button", { onclick: () => openAgentDialog(null, agent.name) }, "Clone…"));
     const kids = state.agents.filter((a) => a.parent === agent.name).map((a) => a.name);
     const queued = state.tasks.filter((t) => t.agent_name === agent.name && t.status !== "done");
-    fields.replaceChildren(
+    setFields(
       ...field("Session", agent.live ? "live" : "-"),
       ...field("Activity", agent.activity ? `${agent.activity} (${relative(agent.activity_at)})` : "-"),
       ...field("Description", agent.description),
@@ -778,7 +804,7 @@ function renderDetail() {
   const task = state.tasks.find((t) => t.id === selected.id);
   $("detail-title").textContent = `Task #${selected.id}${task ? ` ${task.name}` : ""}`;
   if (!task) {
-    fields.replaceChildren(...field("State", "gone"));
+    setFields(...field("State", "gone"));
     return;
   }
   const st = taskState(task);
@@ -813,7 +839,7 @@ function renderDetail() {
     actions.append(el("button", { class: "danger", onclick: () => taskAction(task.id, "delete") }, "Delete"));
   }
   renderProblems(task, st);
-  fields.replaceChildren(
+  setFields(
     ...field("State", st + (task.blocked_by?.length ? ` (after ${task.blocked_by.map((d) => "#" + d).join(", ")})` : "")),
     ...field("Runs on", taskTarget(task)),
     ...field("Runs in", task.cwd || "where its agent works"),
@@ -1052,10 +1078,14 @@ function messageNode(message) {
 }
 
 let loadingConversation = false;
+// What the conversation shown was drawn from: redrawn only when it
+// changes, so a selection in it, or a result opened, stays.
+let conversationShown = null;
 
-async function loadConversation() {
+async function loadConversation({ polled = false } = {}) {
   const selected = state.selected;
   if (selected?.kind !== "agent" || loadingConversation) return;
+  if (polled && busyWithPage()) return;
   loadingConversation = true;
   try {
     const { total, messages } = await api("GET", `agents/${encodeURIComponent(selected.name)}/messages`);
@@ -1063,6 +1093,9 @@ async function loadConversation() {
     $("conversation-info").textContent = total
       ? `${total} message${total === 1 ? "" : "s"}${messages.length < total ? `, the last ${messages.length} shown` : ""} - saved after each turn.`
       : "No conversation saved yet.";
+    const drawnFrom = JSON.stringify([selected.name, total, messages]);
+    if (polled && drawnFrom === conversationShown) return;
+    conversationShown = drawnFrom;
     $("conversation").replaceChildren(...messages.map(messageNode));
   } catch (e) {
     toast(e.message);
@@ -1561,6 +1594,49 @@ function showFormError(message) {
 
 // --- Polling --------------------------------------------------------------
 
+// Redrawing replaces the nodes under the pointer: a selection being made
+// or held for copying is lost, and so is a click pressed before a redraw
+// and released after it. So polling redraws only while neither is going
+// on, and catches up as soon as it's over.
+let pointerDown = false;
+let redrawHeld = false;
+
+function busyWithPage() {
+  const selection = window.getSelection();
+  return pointerDown || (selection && !selection.isCollapsed && selection.toString() !== "");
+}
+
+function redraw() {
+  if (busyWithPage()) {
+    redrawHeld = true;
+    return;
+  }
+  redrawHeld = false;
+  renderAgents();
+  renderTasks();
+  renderDetail();
+}
+
+function redrawIfHeld() {
+  if (redrawHeld && !busyWithPage()) redraw();
+}
+
+document.addEventListener("mousedown", () => { pointerDown = true; }, true);
+document.addEventListener("mouseup", () => {
+  pointerDown = false;
+  // After the click the release makes, which may change what's selected.
+  setTimeout(redrawIfHeld, 0);
+}, true);
+document.addEventListener("selectionchange", redrawIfHeld);
+// A release outside the window never arrives as a mouseup: don't wait on
+// it for ever.
+function pointerReleased() {
+  pointerDown = false;
+  redrawIfHeld();
+}
+document.addEventListener("mousemove", (e) => { if (pointerDown && e.buttons === 0) pointerReleased(); }, true);
+window.addEventListener("blur", pointerReleased);
+
 async function refresh() {
   const pill = $("connection");
   try {
@@ -1577,9 +1653,7 @@ async function refresh() {
     state.profiles = profiles;
     pill.textContent = "connected";
     pill.className = "pill ok";
-    renderAgents();
-    renderTasks();
-    renderDetail();
+    redraw();
   } catch (e) {
     pill.textContent = e.message === "unauthorized" ? "auth needed" : "disconnected";
     pill.className = "pill bad";
@@ -1591,7 +1665,7 @@ let ticks = 0;
 async function tick() {
   await refresh();
   await pollEvents();
-  if (state.agentView === "conversation" && ++ticks % 3 === 0) loadConversation();
+  if (state.agentView === "conversation" && ++ticks % 3 === 0) loadConversation({ polled: true });
   setTimeout(tick, POLL_MS);
 }
 
