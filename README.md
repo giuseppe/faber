@@ -1089,6 +1089,78 @@ to the server - or asks for it. With `--no-auth`, the API only answers
 at `localhost` or an IP address, so a web page can't reach it through a
 name it controls.
 
+### A2A
+
+`faber serve --a2a-keys-file FILE` also speaks the
+[A2A protocol](https://a2a-protocol.org/) (v0.3, JSON-RPC) at `/a2a`, so
+agents that aren't faber can use faber's. The line protocol isn't
+touched; this is a translation layer over the same database.
+
+`FILE` has one caller per line, `NAME KEY`, `#` for comments: `NAME` is
+`[A-Za-z0-9_-]+` and unique, `KEY` at least 32 characters and not the
+server's own key. It is read once, at start. A2A keys work on `/a2a` only
+- never on `/api/` or the line protocol - and the server's key doesn't
+work on `/a2a`: a caller can't make agents run commands by task, only
+message the skills below. Without the option, `/a2a` and the card answer
+404; there is no A2A without keys, even with `--no-auth`.
+
+- **Discovery**: `GET /.well-known/agent-card.json`, without a key. One
+  skill per profile **of the database** (`faber profiles set`, the web UI)
+  - the profiles every worker sees, so any worker can run them. Profiles
+  only in some process's config file aren't offered. The card's `url` is
+  `http://` plus the request's `Host`: `faber serve` has no TLS, so put a
+  reverse proxy in front of it for `https`, and mind that the keys travel
+  in the clear without.
+- **Methods**: `message/send`, `message/stream`, `tasks/get`,
+  `tasks/cancel`, `tasks/resubscribe`. The bearer key goes in
+  `Authorization`. `text` and `data` parts, in messages and artifacts.
+- **Skills and contexts**: a message with no `contextId` starts a new
+  context on the skill named in `message.metadata.skill` (or the only
+  profile there is). A context is an agent made from the profile, with its
+  own conversation, kept for the key that opened it: a follow-up message
+  with the same `contextId` sees what came before, and messages to one
+  context run one at a time, in order. Other callers can't see or use it -
+  asking is answered as if it didn't exist. A context unused for 24 hours,
+  with no task in progress, is removed with its agent and tasks. Only
+  profiles are reachable: A2A can't message the agents you made, whose
+  conversations are yours.
+- **Tasks**: a message is a task, picked up by whichever `faber worker`
+  or `serve --run-agent` is free, going `submitted`, `working`, then
+  `completed`, `failed` or `canceled`. The answer is the task's `result`
+  artifact: a `data` part if the agent's whole answer is a JSON object or
+  array (alone or as one fenced `json` block), else a `text` part.
+  `configuration.blocking` waits up to a minute. With
+  `acceptedOutputModes` of `application/json` only, the agent is asked to
+  answer with JSON only. An agent that needs more from the caller ends its
+  turn with a question: the task is `completed`, and the answer goes in a
+  new message with the same `contextId`.
+- **Streaming**: `message/stream` and `tasks/resubscribe` answer with
+  server-sent events: the task, `working` updates (one per tool call), the
+  text as `result` artifact chunks, then a final status. The answer
+  streams as text even when it is JSON; `tasks/get` then shows it as a
+  `data` part. A stream counts as a connection, and closes after 30
+  minutes without an event, to be resubscribed.
+- **Safety**: a context's agent has the unsafe tools if, and only if, its
+  profile says so (`faber profiles set NAME --unsafe-tools`, or in the web
+  UI) - set when the context is made, whichever worker runs it. Such
+  contexts' tasks are only taken by workers that have the unsafe tools
+  (`--unsafe-tools`), and wait for one otherwise. Think twice before
+  giving an agent that a stranger can talk to an unsandboxed shell.
+- **Not supported**: push notifications (`-32003`), `file` parts
+  (`-32005`), `auth-required` and `input-required`, the authenticated
+  extended card, and the gRPC and REST bindings.
+
+`tests/a2a_interop.py` runs the official Python SDK against a server, for
+checking that it still understands faber:
+
+```
+faber profiles set echo --model script:/path/to/script.json
+echo "tester $(head -c 24 /dev/urandom | base64)" > a2a-keys
+faber serve --a2a-keys-file a2a-keys --run-agent w
+python3 -m venv /tmp/a2a && /tmp/a2a/bin/pip install 'a2a-sdk<0.4' httpx
+/tmp/a2a/bin/python tests/a2a_interop.py a2a-keys echo http://127.0.0.1:9090
+```
+
 ## Options
 
 ```
