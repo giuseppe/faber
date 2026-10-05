@@ -4758,94 +4758,135 @@ fn tool_patch_file(params_str: &String, ctx: &ToolContext) -> Result<String, Box
     let mut edit_spans: Vec<(usize, usize)> = Vec::with_capacity(params.edits.len());
 
     let mut replacements = 0;
-    for (i, edit) in params.edits.iter().enumerate() {
-        let n = i + 1;
-        // The byte range this edit replaces, and with what.
-        let (first, old_end, new_content) =
-            match (&edit.old_content, edit.start_line, edit.end_line) {
-                (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
-                    return Err(format!(
-                        "edit {}: give either old_content or start_line/end_line, not both",
-                        n
-                    )
-                    .into());
-                }
-                (None, Some(start), Some(end)) => {
-                    let (first, old_end) = line_range_bytes(&text, start, end)
-                        .map_err(|e| format!("edit {}: {}", n, e))?;
-                    // Replacing whole lines: keep the last one's line break
-                    // unless the new text brings its own.
-                    let mut new_content = edit.new_content.clone();
-                    if text[first..old_end].ends_with('\n')
-                        && !new_content.is_empty()
-                        && !new_content.ends_with('\n')
-                    {
-                        new_content.push('\n');
-                    }
-                    (first, old_end, new_content)
-                }
-                (None, _, _) => {
-                    return Err(format!(
-                        "edit {}: give old_content, or both start_line and end_line",
-                        n
-                    )
-                    .into());
-                }
-                (Some(old_content), None, None) => {
-                    if old_content.is_empty() {
-                        return Err(format!("edit {}: old_content must not be empty", n).into());
-                    }
-                    if *old_content == edit.new_content {
+    // Edits are applied all-or-nothing, so when one fails the earlier ones
+    // aren't on disk either; the error says so, lest the caller resend only
+    // the rest.
+    let mut apply_edits = || -> Result<(), String> {
+        for (i, edit) in params.edits.iter().enumerate() {
+            let n = i + 1;
+            // The byte range this edit replaces, and with what.
+            let (first, old_end, new_content) =
+                match (&edit.old_content, edit.start_line, edit.end_line) {
+                    (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
                         return Err(format!(
-                            "edit {}: old_content and new_content are identical",
+                            "edit {}: give either old_content or start_line/end_line, not both",
                             n
-                        )
-                        .into());
+                        ));
                     }
-                    let first = text.find(old_content.as_str()).ok_or_else(|| {
-                        format!("edit {}: old_content not found in '{}'", n, params.path)
-                    })?;
-                    (first, first + old_content.len(), edit.new_content.clone())
-                }
-            };
+                    (None, Some(start), Some(end)) => {
+                        let (first, old_end) = line_range_bytes(&text, start, end)
+                            .map_err(|e| format!("edit {}: {}", n, e))?;
+                        // Replacing whole lines: keep the last one's line break
+                        // unless the new text brings its own.
+                        let mut new_content = edit.new_content.clone();
+                        if text[first..old_end].ends_with('\n')
+                            && !new_content.is_empty()
+                            && !new_content.ends_with('\n')
+                        {
+                            new_content.push('\n');
+                        }
+                        (first, old_end, new_content)
+                    }
+                    (None, _, _) => {
+                        return Err(format!(
+                            "edit {}: give old_content, or both start_line and end_line",
+                            n
+                        ));
+                    }
+                    (Some(old_content), None, None) => {
+                        if old_content.is_empty() {
+                            return Err(format!("edit {}: old_content must not be empty", n));
+                        }
+                        if *old_content == edit.new_content {
+                            return Err(format!(
+                                "edit {}: old_content and new_content are identical",
+                                n
+                            ));
+                        }
+                        let first = text.find(old_content.as_str()).ok_or_else(|| {
+                            format!("edit {}: old_content not found in '{}'", n, params.path)
+                        })?;
+                        (first, first + old_content.len(), edit.new_content.clone())
+                    }
+                };
 
-        if let (true, Some(old_content)) = (edit.replace_all, &edit.old_content) {
-            replacements += text.matches(old_content.as_str()).count();
-            text = text.replace(old_content.as_str(), &edit.new_content);
-            // Multiple occurrences move independently, so exact tracking
-            // isn't practical here; show the first one as representative.
-            edit_spans.push(
-                text.find(edit.new_content.as_str())
-                    .map(|pos| (pos, pos + edit.new_content.len()))
-                    .unwrap_or((first, first)),
-            );
-        } else {
-            if let Some(old_content) = &edit.old_content {
-                // Look for a second match starting after the first
-                // character of the first one, so overlapping matches count
-                // as ambiguous too.
-                let skip = first + old_content.chars().next().map_or(1, char::len_utf8);
-                if text[skip..].contains(old_content.as_str()) {
-                    return Err(format!(
-                        "edit {}: old_content matches multiple times in '{}'. Set replace_all=true or provide more context to make it unique",
-                        n, params.path
-                    )
-                    .into());
+            if let (true, Some(old_content)) = (edit.replace_all, &edit.old_content) {
+                replacements += text.matches(old_content.as_str()).count();
+                text = text.replace(old_content.as_str(), &edit.new_content);
+                // Multiple occurrences move independently, so exact tracking
+                // isn't practical here; show the first one as representative.
+                edit_spans.push(
+                    text.find(edit.new_content.as_str())
+                        .map(|pos| (pos, pos + edit.new_content.len()))
+                        .unwrap_or((first, first)),
+                );
+            } else {
+                if let Some(old_content) = &edit.old_content {
+                    // Look for a second match starting after the first
+                    // character of the first one, so overlapping matches count
+                    // as ambiguous too.
+                    let step = old_content.chars().next().map_or(1, char::len_utf8);
+                    if text[first + step..].contains(old_content.as_str()) {
+                        let mut lines = Vec::new();
+                        let mut pos = Some(first);
+                        while let Some(p) = pos {
+                            lines.push(text[..p].matches('\n').count() + 1);
+                            pos = text[p + step..]
+                                .find(old_content.as_str())
+                                .map(|q| p + step + q);
+                        }
+                        const MAX_SHOWN: usize = 10;
+                        let mut shown = lines
+                            .iter()
+                            .take(MAX_SHOWN)
+                            .map(usize::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        if lines.len() > MAX_SHOWN {
+                            shown.push_str(", ...");
+                        }
+                        let as_edited = if n > 1 {
+                            ", as left by the previous edits"
+                        } else {
+                            ""
+                        };
+                        return Err(format!(
+                            "edit {}: old_content matches {} times in '{}' (starting at lines {}{}). Set replace_all=true or provide more context to make it unique",
+                            n,
+                            lines.len(),
+                            params.path,
+                            shown,
+                            as_edited
+                        ));
+                    }
                 }
+
+                let delta = new_content.len() as isize - (old_end - first) as isize;
+                for (s, e) in edit_spans.iter_mut() {
+                    if *s >= old_end {
+                        *s = (*s as isize + delta) as usize;
+                        *e = (*e as isize + delta) as usize;
+                    }
+                }
+                edit_spans.push((first, first + new_content.len()));
+
+                text.replace_range(first..old_end, &new_content);
+                replacements += 1;
             }
-
-            let delta = new_content.len() as isize - (old_end - first) as isize;
-            for (s, e) in edit_spans.iter_mut() {
-                if *s >= old_end {
-                    *s = (*s as isize + delta) as usize;
-                    *e = (*e as isize + delta) as usize;
-                }
-            }
-            edit_spans.push((first, first + new_content.len()));
-
-            text.replace_range(first..old_end, &new_content);
-            replacements += 1;
         }
+        Ok(())
+    };
+    if let Err(e) = apply_edits() {
+        return Err(if params.edits.len() > 1 {
+            format!(
+                "{} (none of the {} edits were applied)",
+                e,
+                params.edits.len()
+            )
+            .into()
+        } else {
+            e.into()
+        });
     }
 
     let new_bytes = text.as_bytes();
@@ -19607,14 +19648,45 @@ for line in sys.stdin:
     #[test]
     fn test_patch_file_ambiguous_match() {
         let path = "_test_pf_ambiguous.tmp";
-        write_test_file(path, "aa bb aa\n");
+        write_test_file(path, "aa\nbb\naa bb aa\n");
         let err = patch(
             path,
             serde_json::json!([{"old_content": "aa", "new_content": "x"}]),
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("multiple times"));
-        assert_eq!(read_test_file(path), "aa bb aa\n");
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("matches 3 times"), "{}", err);
+        assert!(err.contains("starting at lines 1, 3, 3)"), "{}", err);
+        assert!(!err.contains("were applied"), "{}", err);
+        assert_eq!(read_test_file(path), "aa\nbb\naa bb aa\n");
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_patch_file_ambiguous_match_after_earlier_edit() {
+        let path = "_test_pf_ambiguous_later.tmp";
+        write_test_file(path, "one\ntwo\nend\nend\n");
+        let err = patch(
+            path,
+            serde_json::json!([
+                {"old_content": "one\n", "new_content": "one\nzero\n"},
+                {"old_content": "end", "new_content": "fin"}
+            ]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.starts_with("edit 2:"), "{}", err);
+        assert!(
+            err.contains("starting at lines 4, 5, as left by the previous edits"),
+            "{}",
+            err
+        );
+        assert!(
+            err.contains("(none of the 2 edits were applied)"),
+            "{}",
+            err
+        );
+        assert_eq!(read_test_file(path), "one\ntwo\nend\nend\n");
         cleanup(path);
     }
 
