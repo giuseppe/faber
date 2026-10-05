@@ -895,7 +895,18 @@ fn api(
             } else {
                 body_json(request)?
             };
-            let names = db::finished_made_agents(&db::list_agents(conn)?, now);
+            // Not one a task carries on from (see `db::UNFINISHED_TASK_KEY`).
+            let names: Vec<String> = db::finished_made_agents(&db::list_agents(conn)?, now)
+                .into_iter()
+                .filter(|name| {
+                    let marker = db::get_agent_data(conn, name, db::UNFINISHED_TASK_KEY)
+                        .ok()
+                        .flatten();
+                    !db::holds_unfinished_task(marker.as_deref(), |id| {
+                        db::get_task(conn, id).ok().flatten()
+                    })
+                })
+                .collect();
             if !body.dry_run {
                 for name in &names {
                     db::delete_agent(conn, name)?;

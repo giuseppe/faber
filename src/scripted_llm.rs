@@ -235,6 +235,7 @@ pub fn post_request_scripted(
         if let Some(calls) = &message.tool_calls {
             let results = run_tool_calls(tools_collection, calls, ctx, &mode, start)?;
             messages.extend(results);
+            ctx.checkpoint(&messages);
             continue;
         }
         if let ResponseMode::Streaming { stream_handler, .. } = &mode {

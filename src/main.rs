@@ -6758,6 +6758,22 @@ fn made_by(db: &dyn DbBackend, agent: &str, maker: Option<&str>) -> Result<bool,
 /// For an agent faber makes on a task's or a fan-out's behalf: refuses a
 /// `name` already taken by an agent `parent` didn't make, which would
 /// otherwise have its settings, parent and history overwritten.
+/// As `check_name_free_for`, for a task's agent - which is also free to
+/// take over, whoever made it, when it's where a run of `task` that
+/// didn't finish carries on (`UNFINISHED_TASK_KEY`).
+fn check_task_agent_name_free(
+    db: &dyn DbBackend,
+    name: &str,
+    task: &db::TaskRow,
+    parent: &str,
+) -> Result<(), Box<dyn Error>> {
+    let marker = db.get_agent_data(name, db::UNFINISHED_TASK_KEY)?;
+    if marker.is_some_and(|id| id == task.id.to_string()) {
+        return Ok(());
+    }
+    check_name_free_for(db, name, parent)
+}
+
 fn check_name_free_for(db: &dyn DbBackend, name: &str, parent: &str) -> Result<(), Box<dyn Error>> {
     match db.get_agent(name)? {
         Some(agent) if agent.parent.as_deref() != Some(parent) => Err(format!(
@@ -6989,6 +7005,16 @@ fn child_cwd(ctx: &ToolContext, requested: Option<&str>) -> Result<Option<String
 /// shown (green or red) in `faber agents` and the web UI.
 const ONE_JOB_AGENT_LINGER_SECS: i64 = 600;
 
+/// Whether `agent` was cut short running a task that's still to run - its
+/// conversation is where that task carries on (`UNFINISHED_TASK_KEY`).
+fn has_unfinished_task(db: &dyn DbBackend, agent: &str) -> bool {
+    let marker = db
+        .get_agent_data(agent, db::UNFINISHED_TASK_KEY)
+        .ok()
+        .flatten();
+    db::holds_unfinished_task(marker.as_deref(), |id| db.get_task(id).ok().flatten())
+}
+
 /// Removes the agents made for one job - fan-out workers, tasks' agents -
 /// that are done and have lingered (`db::one_job_agents_done`), with
 /// their conversations and events. Every session does it, every minute.
@@ -6996,7 +7022,10 @@ fn remove_one_job_agents_done(db: &dyn DbBackend) -> Result<Vec<String>, Box<dyn
     let agents = db.list_agents()?;
     let mut one_job = std::collections::HashSet::new();
     for agent in &agents {
-        if agent.parent.is_some() && db.get_agent_data(&agent.name, db::ONE_JOB_KEY)?.is_some() {
+        if agent.parent.is_some()
+            && db.get_agent_data(&agent.name, db::ONE_JOB_KEY)?.is_some()
+            && !has_unfinished_task(db, &agent.name)
+        {
             one_job.insert(agent.name.clone());
         }
     }
@@ -9683,12 +9712,28 @@ fn chat_command(
                         "Picked up scheduled task #{} \"{}\"",
                         task.id, task.name
                     ));
+                    // A run of it that didn't finish - this chat's agent's,
+                    // in a session that was killed - is carried on.
+                    let resuming = db
+                        .get_agent_data(&active_agent.name, db::UNFINISHED_TASK_KEY)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|id| id == task.id.to_string());
+                    let _ = db.set_agent_data(
+                        &active_agent.name,
+                        db::UNFINISHED_TASK_KEY,
+                        &task.id.to_string(),
+                    );
                     // Never starts with "/", so it can't be taken for a
                     // chat command.
-                    pending_injections.push(format!(
-                        "[Scheduled task #{} \"{}\"]: {}",
-                        task.id, task.name, task.command
-                    ));
+                    pending_injections.push(if resuming {
+                        resumed_task_input(&task)
+                    } else {
+                        format!(
+                            "[Scheduled task #{} \"{}\"]: {}",
+                            task.id, task.name, task.command
+                        )
+                    });
                     running_prompt_task = Some(task.id);
                 }
             }
@@ -9832,6 +9877,12 @@ fn chat_command(
                     tool_context.mcp = session_mcp(&mcp_manager, &turn_config, opts);
                     tool_context.unsafe_tools = turn_unsafe;
                     tool_context.task_id = running_prompt_task;
+                    // A task's turn keeps its conversation saved as it goes,
+                    // to be carried on if the chat is killed before it ends.
+                    if let (Some(_), Some(db)) = (running_prompt_task, &db) {
+                        tool_context.checkpoint =
+                            Some(save_conversation_checkpoint(db.clone(), &active_agent.name));
+                    }
                     if turn_unsafe && turn_config.unsafe_tools != Some(true) {
                         if let Some(db) = &db {
                             mark_session_unsafe(db.as_ref(), &active_agent.name, &session_id);
@@ -9934,6 +9985,8 @@ fn chat_command(
                             if let Err(e) = db.finish_task(task_id, &session_id, &outcome) {
                                 warn!("Couldn't record the outcome of task {}: {}", task_id, e);
                             }
+                            let _ =
+                                db.delete_agent_data(&injected_agent_name, db::UNFINISHED_TASK_KEY);
                         }
                         match result {
                             Ok(response) => {
@@ -10852,7 +10905,7 @@ fn profile_task_agent(
 ) -> Result<String, Box<dyn Error>> {
     let settings = find_profile(profiles, profile)?;
     let name = format!("{}-{}", profile, task.id);
-    check_name_free_for(db, &name, parent)?;
+    check_task_agent_name_free(db, &name, task, parent)?;
     apply_profile(db, &name, profile, settings)?;
     db.set_agent_data(&name, db::ONE_JOB_KEY, "task")?;
     set_agent_unsafe(db, &name, unsafe_tools)?;
@@ -10966,7 +11019,7 @@ fn own_task_agent(
     session_id: &str,
 ) -> Result<String, Box<dyn Error>> {
     let name = format!("task-{}", task.id);
-    check_name_free_for(db, &name, parent)?;
+    check_task_agent_name_free(db, &name, task, parent)?;
     if db.get_agent(&name)?.is_none() {
         db.create_agent(&name, &format!("Runs task #{}", task.id))?;
     }
@@ -11094,10 +11147,18 @@ fn run_prompt_task_headless(
         profiles: Arc::new(session_profiles(opts, Some(db.as_ref()))),
         ..(*extra).clone()
     });
+    // A run of this task that didn't finish: carried on from where its
+    // conversation was last saved, whatever agent it's on.
+    let resuming = db
+        .get_agent_data(agent, db::UNFINISHED_TASK_KEY)
+        .ok()
+        .flatten()
+        .is_some_and(|id| id == task.id.to_string());
+    let _ = db.set_agent_data(agent, db::UNFINISHED_TASK_KEY, &task.id.to_string());
     // Run as the agent itself - a task for it by name, a message to it -
     // it carries on its conversation, as a chat does; on an agent made
     // for it, it starts one.
-    let saved: Vec<Message> = if task_agent.is_none() {
+    let saved: Vec<Message> = if task_agent.is_none() || resuming {
         db.load_agent_messages(agent)
             .unwrap_or_default()
             .into_iter()
@@ -11106,6 +11167,7 @@ fn run_prompt_task_headless(
     } else {
         Vec::new()
     };
+    let resuming = resuming && !saved.is_empty();
     let here = run_cwd
         .as_deref()
         .map(PathBuf::from)
@@ -11125,11 +11187,15 @@ fn run_prompt_task_headless(
         }
         messages
     };
-    messages.push(running_task_note(task.id));
-    let input = format!(
-        "[Scheduled task #{} \"{}\"]: {}",
-        task.id, task.name, task.command
-    );
+    let input = if resuming {
+        resumed_task_input(task)
+    } else {
+        messages.push(running_task_note(task.id));
+        format!(
+            "[Scheduled task #{} \"{}\"]: {}",
+            task.id, task.name, task.command
+        )
+    };
     let events = Some(EventLog::new(db.clone(), agent, Some(task.id)));
     if let Some(events) = &events {
         events.emit(AgentEvent::Input {
@@ -11150,6 +11216,7 @@ fn run_prompt_task_headless(
         agent_mcp(mcp_manager.as_ref(), &agent_config)
     };
     ctx.context_window = agent_config.context_window.or(opts.context_window);
+    ctx.checkpoint = Some(save_conversation_checkpoint(db.clone(), agent));
     let runs = extra.runs.clone();
     let running = extra.running_subagents.clone();
     ctx.extra = Some(extra);
@@ -11203,22 +11270,34 @@ fn run_prompt_task_headless(
         let _ = db.save_agent_messages(agent, &values);
     }
     let mut outcome = reported_task_outcome(result.as_ref(), &slot);
+    let asked = db
+        .get_task(task.id)
+        .ok()
+        .flatten()
+        .is_some_and(|t| t.stop_requested);
+    if interrupted && !asked {
+        // The worker stopping, not the task: given back unfinished, for
+        // whoever runs it next to carry on (`resumed_task_input`).
+        outcome.result = TASK_GIVEN_BACK.to_string();
+        record_turn_end(&events, &outcome);
+        match db.release_task(task.id, session_id) {
+            Ok(_) => {}
+            Err(e) => warn!("Couldn't give back task {}: {}", task.id, e),
+        }
+        if agent != worker {
+            activity.set("interrupted: carries on when its task is next run");
+            let _ = db.release_agent(agent, session_id);
+        }
+        return outcome;
+    }
     if interrupted {
-        let asked = db
-            .get_task(task.id)
-            .ok()
-            .flatten()
-            .is_some_and(|t| t.stop_requested);
-        outcome.result = if asked {
-            "stopped".to_string()
-        } else {
-            "stopped: the worker was interrupted".to_string()
-        };
+        outcome.result = "stopped".to_string();
     }
     record_turn_end(&events, &outcome);
     if let Err(e) = db.finish_task(task.id, session_id, &outcome) {
         warn!("Couldn't record the outcome of task {}: {}", task.id, e);
     }
+    let _ = db.delete_agent_data(agent, db::UNFINISHED_TASK_KEY);
     if agent != worker {
         // The worker's own activity is the worker loop's to keep.
         let first = first_line(&outcome.result, 80);
@@ -11230,6 +11309,41 @@ fn run_prompt_task_headless(
         let _ = db.release_agent(agent, session_id);
     }
     outcome
+}
+
+/// The outcome of a task's run that its worker's stopping cut short: the
+/// task is given back, to carry on when next run, rather than failed.
+const TASK_GIVEN_BACK: &str = "interrupted: the worker stopped; it carries on when next run";
+
+/// What a task's agent is told when it carries on a run that didn't
+/// finish: its conversation is as it was last saved, after a round of
+/// tool calls - what it did since then is lost, though not what that did
+/// to files.
+fn resumed_task_input(task: &db::TaskRow) -> String {
+    format!(
+        "[Scheduled task #{} \"{}\", resumed]: {}\n\n(Your run of this task was cut short \
+         before it finished - the process running it stopped. The conversation above is how far \
+         it had got, though the last steps may be missing; what they changed on disk stays. \
+         Check where things stand, then carry on from there; don't start over.)",
+        task.id, task.name, task.command
+    )
+}
+
+/// A `ToolContext::checkpoint` that saves the conversation as `agent`'s.
+fn save_conversation_checkpoint(
+    db: Arc<dyn DbBackend>,
+    agent: &str,
+) -> Arc<dyn Fn(&[Message]) + Send + Sync> {
+    let agent = agent.to_string();
+    Arc::new(move |messages: &[Message]| {
+        let values: Vec<serde_json::Value> = messages
+            .iter()
+            .filter_map(|m| serde_json::to_value(m).ok())
+            .collect();
+        if let Err(e) = db.save_agent_messages(&agent, &values) {
+            warn!("Couldn't save {}'s conversation: {}", agent, e);
+        }
+    })
 }
 
 /// Stops headless workers - they pick up no more tasks - and interrupts
@@ -11551,6 +11665,8 @@ fn run_worker(
                             task.id,
                             if outcome.succeeded {
                                 "done ✓"
+                            } else if outcome.result == TASK_GIVEN_BACK {
+                                "given back ↺"
                             } else {
                                 "failed ✗"
                             },
@@ -11882,7 +11998,10 @@ fn agents_command(
         return Ok(());
     }
     if let Some(AgentsAction::Cleanup { dry_run }) = action {
-        let names = db::finished_made_agents(&db.list_agents()?, chrono::Utc::now());
+        let names: Vec<String> = db::finished_made_agents(&db.list_agents()?, chrono::Utc::now())
+            .into_iter()
+            .filter(|name| !has_unfinished_task(db.as_ref(), name))
+            .collect();
         if names.is_empty() {
             println!("No finished agents made by agents.");
         }
@@ -17301,6 +17420,100 @@ for line in sys.stdin:
                 |c| c.starts_with(&format!("You work in the directory {}", dir.0.display()))
             ))
         );
+    }
+
+    #[test]
+    fn test_a_task_cut_short_carries_on_where_it_stopped() {
+        let model = model_script(
+            "resume",
+            serde_json::json!([
+                {"if": "resumed", "reply": "carried on"},
+                {"if": "build the thing", "once": true, "tool": "glob", "arguments": {"pattern": "*.zzz"}},
+                {"reply": "still working", "delay_ms": 10000}
+            ]),
+        );
+        let db = local_db_with_agents(&["w", "w2"]);
+        assert!(db.claim_agent("w", "worker-session").unwrap());
+        assert!(db.claim_agent("w2", "other-session").unwrap());
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let id = db
+            .create_oneshot_task("t", "", &past, "build the thing", None)
+            .unwrap();
+        let ctx = chat_ctx_with_model(db.clone(), "w", &model);
+        let extra = ctx
+            .extra
+            .clone()
+            .unwrap()
+            .downcast::<SubAgentContext>()
+            .ok()
+            .unwrap();
+        let mut opts = Opts::default();
+        opts.model = Some(model.clone());
+        let run = |worker: &str, session: &str, rx| {
+            let task = claim_prompt_task(db.as_ref(), session, worker, &[]).unwrap();
+            run_prompt_task_headless(
+                &task,
+                worker,
+                &db,
+                session,
+                &extra.tools,
+                &opts,
+                extra.clone(),
+                &None,
+                rx,
+            )
+        };
+
+        // The worker is stopped (Ctrl-C) after the first round of tool calls.
+        let (tx, rx) = mpsc::channel();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            let _ = tx.send(());
+        });
+        let outcome = run("w", "worker-session", rx);
+        stopper.join().unwrap();
+        assert!(
+            outcome.result.starts_with("interrupted"),
+            "{}",
+            outcome.result
+        );
+        let task = db.get_task(id).unwrap().unwrap();
+        assert_eq!(
+            task.status,
+            db::TaskStatus::SCHEDULED,
+            "given back, not failed"
+        );
+        assert_eq!(task.claimed_by, None);
+        let agent = format!("task-{}", id);
+        let saved = db.load_agent_messages(&agent).unwrap();
+        assert!(
+            saved.iter().any(|m| m["role"] == "tool"),
+            "its first round was saved: {saved:?}"
+        );
+        assert!(has_unfinished_task(db.as_ref(), &agent), "kept for it");
+
+        // Whoever runs it next - another worker - carries on from there.
+        let (_tx, rx) = mpsc::channel();
+        let outcome = run("w2", "other-session", rx);
+        assert_eq!(outcome.result, "carried on");
+        let transcript = db.load_agent_messages(&agent).unwrap();
+        let said: Vec<&str> = transcript
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert_eq!(
+            said.iter()
+                .filter(|c| c.contains("build the thing"))
+                .count(),
+            2,
+            "the task, and its resumption: {said:?}"
+        );
+        assert!(transcript.iter().any(|m| m["role"] == "tool"), "{said:?}");
+        assert_eq!(
+            db.get_task(id).unwrap().unwrap().status,
+            db::TaskStatus::DONE
+        );
+        assert!(!has_unfinished_task(db.as_ref(), &agent));
     }
 
     #[test]

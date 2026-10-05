@@ -375,6 +375,7 @@ pub fn post_request_dummy(
                 &mode,
                 start_time,
             )?);
+            ctx.checkpoint(&messages);
 
             continue;
         }

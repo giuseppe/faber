@@ -1579,6 +1579,7 @@ fn post_request_with_mode_and_recursion(
                         );
                         messages = trimmed;
                     }
+                    ctx.checkpoint(&messages);
                 }
             }
         }

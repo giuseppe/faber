@@ -485,6 +485,10 @@ fn dispatch_inner(
             let v = db::claim_task(&conn, i64_param!("task_id"), str_param!("session_id"))?;
             Ok(serde_json::to_value(v)?)
         }
+        "release_task" => {
+            let v = db::release_task(&conn, i64_param!("task_id"), str_param!("session_id"))?;
+            Ok(serde_json::to_value(v)?)
+        }
         "finish_task" => {
             let outcome: db::TaskOutcome = serde_json::from_value(p["outcome"].clone())
                 .map_err(|e| format!("bad param 'outcome': {}", e))?;

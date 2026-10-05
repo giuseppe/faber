@@ -466,6 +466,16 @@ A session claims a due task atomically before running it, so when several
 sessions share a database (e.g. through `faber serve`) each run happens
 exactly once. If the session running a task dies, its claim is abandoned
 once it stops heartbeating (after ~30 seconds) and the task runs again.
+
+A prompt task's run **carries on** where it stopped rather than starting
+over, when it didn't finish: its agent's conversation is saved after every
+round of tool calls, and the next run - by whichever chat or worker picks
+it up - continues that conversation, told that it was cut short (the steps
+after the last save are lost; what they did on disk isn't). That's when the
+process running it is killed, or a worker is stopped with Ctrl-C, which
+gives its tasks back instead of failing them. A run that does finish -
+succeeded, failed, or stopped on purpose (`faber tasks stop`, Ctrl-C at a
+chat) - is recorded as usual, and running the task again starts afresh.
 How the last run went is recorded separately - `last_outcome`
 (`succeeded`/`failed`), `last_exit_code` and the start of its output - so a
 cron task whose last run failed is still `scheduled` for the next one. A
@@ -589,7 +599,8 @@ task), with every tool - including `spawn_agent`, `fan_out` and
 as each task starts and ends; `faber tasks` and `faber agents` show the
 same from anywhere. Run several, next to a `faber serve`, and they share
 the queue - each task is claimed by exactly one. Ctrl-C interrupts the
-tasks still running (recorded as failed), releases the agent, and exits.
+tasks still running and gives them back, to carry on from where they
+stopped when next run (see above), releases the agent, and exits.
 
 ### Listing tasks
 

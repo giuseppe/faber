@@ -121,6 +121,11 @@ pub struct ToolContext {
     /// The task this work is for, if any: what it records is tagged with
     /// it, the agents it starts included, so a task shows all it did.
     pub task_id: Option<i64>,
+    /// Called with the whole conversation after each round of tool calls,
+    /// when it's whole - every call answered - to keep it somewhere: a
+    /// task's run saves it, to be carried on if the run doesn't finish.
+    /// Never handed on to the agents this one makes.
+    pub checkpoint: Option<Arc<dyn Fn(&[openai::Message]) + Send + Sync>>,
 }
 
 /// A file's key in `ToolContext::file_versions`: absolute (relative to
@@ -174,6 +179,14 @@ impl ToolContext {
             unsafe_tools: false,
             cwd: None,
             task_id: None,
+            checkpoint: None,
+        }
+    }
+
+    /// Hands `messages` to `checkpoint`, if there's one.
+    pub fn checkpoint(&self, messages: &[openai::Message]) {
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint(messages);
         }
     }
 
