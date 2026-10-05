@@ -543,6 +543,25 @@ faber tasks add "Review the PR for issue 42" --agent reviewer --after 1  # 2
 faber tasks add "Address the review, push again" --agent coder --after 2 # 3
 ```
 
+A task can also carry on where another left off: a task's conversation
+is kept as it was when the task was done, and `--continue 1` runs, once
+task #1 is done - however it went - on a new agent that starts from #1's:
+a fork of the agent that ran it, with its settings, on whichever `faber
+worker` is free (a chat doesn't pick these up). What that agent did
+after #1 isn't part of it, and #1 can be carried on more than once, each
+fork on its own. That's what it takes for an agent made for a task, from
+a profile, which no session runs by name:
+
+```bash
+faber tasks add "Fix issue 42 and open a PR" --profile coder                # 1
+faber tasks add "Review the PR for issue 42" --profile reviewer --after 1   # 2
+faber tasks add "Address the review, push again" --continue 1 --after 2     # 3
+```
+
+The model's `task_create` takes `continue_task` for the same, and the web
+UI has "Carry on…" on a task that's done. A task made by an agent
+without the unsafe tools carries on one that had them without them.
+
 A task can be put on hold, so that nobody picks it up - e.g. to create
 work ahead of time and start it on a signal:
 

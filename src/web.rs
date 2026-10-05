@@ -616,6 +616,10 @@ struct ApiNewTask {
     /// The directory it runs in, absolute; default: its agent's.
     #[serde(default)]
     cwd: Option<String>,
+    /// Carry on where this task left off, on a fork of the agent that ran
+    /// it (not with `agent` or `profile`).
+    #[serde(default)]
+    continue_task: Option<i64>,
 }
 
 /// `dir` as a working directory: absolute, and resolved if it's on this
@@ -706,6 +710,7 @@ impl ApiNewTask {
             run_safe: false,
             cwd,
             continue_agent: None,
+            continue_task: self.continue_task,
         })
     }
 }
@@ -1019,6 +1024,7 @@ fn api(
                     run_safe: false,
                     cwd: None,
                     continue_agent: None,
+                    continue_task: None,
                 },
             )?;
             let mut reply = serde_json::json!({ "task_id": id });
@@ -1804,6 +1810,7 @@ mod tests {
                     run_safe: false,
                     cwd: None,
                     continue_agent: None,
+                    continue_task: None,
                 },
             )
             .unwrap();

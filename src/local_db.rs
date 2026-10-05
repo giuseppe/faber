@@ -20,7 +20,8 @@
 use crate::agent_io::{AgentEvent, AgentEventRow, EventFilter};
 use crate::db;
 use crate::db::{
-    AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow, TaskOutcome, TaskRow,
+    AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow, TaskConversation,
+    TaskOutcome, TaskRow,
 };
 use crate::db_backend::DbBackend;
 use std::error::Error;
@@ -346,6 +347,31 @@ impl DbBackend for LocalDb {
     fn request_task_stop(&self, task_id: i64) -> Result<bool, Box<dyn Error>> {
         let conn = self.lock()?;
         db::request_task_stop(&conn, task_id)
+    }
+
+    fn save_task_conversation(
+        &self,
+        task_id: i64,
+        conversation: &TaskConversation,
+    ) -> Result<(), Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::save_task_conversation(&conn, task_id, conversation)
+    }
+
+    fn load_task_conversation(
+        &self,
+        task_id: i64,
+    ) -> Result<Option<TaskConversation>, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::load_task_conversation(&conn, task_id)
+    }
+
+    fn task_conversation_config(
+        &self,
+        task_id: i64,
+    ) -> Result<Option<AgentConfig>, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::task_conversation_config(&conn, task_id)
     }
 
     fn run_task_now(&self, task_id: i64) -> Result<bool, Box<dyn Error>> {

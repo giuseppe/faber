@@ -24,7 +24,8 @@
 
 use faber::agent_io::{AgentEvent, AgentEventRow, EventFilter};
 use faber::db::{
-    AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow, TaskOutcome, TaskRow,
+    AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow, TaskConversation,
+    TaskOutcome, TaskRow,
 };
 use faber::db_backend::DbBackend;
 use std::collections::HashMap;
@@ -256,6 +257,28 @@ impl DbBackend for LocalAgents {
 
     fn request_task_stop(&self, task_id: i64) -> Result<bool, Box<dyn Error>> {
         self.inner.request_task_stop(task_id)
+    }
+
+    fn save_task_conversation(
+        &self,
+        task_id: i64,
+        conversation: &TaskConversation,
+    ) -> Result<(), Box<dyn Error>> {
+        self.inner.save_task_conversation(task_id, conversation)
+    }
+
+    fn load_task_conversation(
+        &self,
+        task_id: i64,
+    ) -> Result<Option<TaskConversation>, Box<dyn Error>> {
+        self.inner.load_task_conversation(task_id)
+    }
+
+    fn task_conversation_config(
+        &self,
+        task_id: i64,
+    ) -> Result<Option<AgentConfig>, Box<dyn Error>> {
+        self.inner.task_conversation_config(task_id)
     }
 
     fn run_task_now(&self, task_id: i64) -> Result<bool, Box<dyn Error>> {

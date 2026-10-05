@@ -19,7 +19,8 @@
 
 use faber::agent_io::{AgentEvent, AgentEventRow, EventFilter};
 use faber::db::{
-    AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow, TaskOutcome, TaskRow,
+    AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow, TaskConversation,
+    TaskOutcome, TaskRow,
 };
 use faber::db_backend::DbBackend;
 use faber::protocol::{RpcRequest, RpcResponse};
@@ -524,6 +525,40 @@ impl DbBackend for RemoteDb {
 
     fn request_task_stop(&self, task_id: i64) -> Result<bool, Box<dyn Error>> {
         let v = self.call("request_task_stop", serde_json::json!({"task_id": task_id}))?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn save_task_conversation(
+        &self,
+        task_id: i64,
+        conversation: &TaskConversation,
+    ) -> Result<(), Box<dyn Error>> {
+        self.call(
+            "save_task_conversation",
+            serde_json::json!({"task_id": task_id, "conversation": conversation}),
+        )?;
+        Ok(())
+    }
+
+    fn load_task_conversation(
+        &self,
+        task_id: i64,
+    ) -> Result<Option<TaskConversation>, Box<dyn Error>> {
+        let v = self.call(
+            "load_task_conversation",
+            serde_json::json!({"task_id": task_id}),
+        )?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn task_conversation_config(
+        &self,
+        task_id: i64,
+    ) -> Result<Option<AgentConfig>, Box<dyn Error>> {
+        let v = self.call(
+            "task_conversation_config",
+            serde_json::json!({"task_id": task_id}),
+        )?;
         Ok(serde_json::from_value(v)?)
     }
 

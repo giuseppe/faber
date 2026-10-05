@@ -439,6 +439,20 @@ fn dispatch_inner(
             let v = db::request_task_stop(&conn, i64_param!("task_id"))?;
             Ok(serde_json::to_value(v)?)
         }
+        "save_task_conversation" => {
+            let conversation: db::TaskConversation =
+                serde_json::from_value(p["conversation"].clone())?;
+            db::save_task_conversation(&conn, i64_param!("task_id"), &conversation)?;
+            Ok(serde_json::Value::Null)
+        }
+        "load_task_conversation" => {
+            let v = db::load_task_conversation(&conn, i64_param!("task_id"))?;
+            Ok(serde_json::to_value(v)?)
+        }
+        "task_conversation_config" => {
+            let v = db::task_conversation_config(&conn, i64_param!("task_id"))?;
+            Ok(serde_json::to_value(v)?)
+        }
         "run_task_now" => {
             let v = db::run_task_now(&conn, i64_param!("task_id"))?;
             Ok(serde_json::to_value(v)?)
@@ -658,6 +672,7 @@ mod tests {
                 run_safe: false,
                 cwd: None,
                 continue_agent: None,
+                continue_task: None,
             })
             .unwrap();
         assert_eq!(
