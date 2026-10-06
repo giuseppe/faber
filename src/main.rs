@@ -8172,6 +8172,21 @@ fn preview_partial_tool_arguments(args_json: &str) -> Option<String> {
 }
 
 /// Formats a byte count for display, e.g. `512 B`, `238.2 KB`, `1.4 MB`.
+/// "Waiting for response (412.0 KB sent, 1.2 KB received)": a request's
+/// size, and what has come back before its answer starts - nothing
+/// received, nothing said about it.
+fn waiting_status(sent: usize, received: usize) -> String {
+    if received == 0 {
+        format!("Waiting for response ({} sent)", format_bytes(sent))
+    } else {
+        format!(
+            "Waiting for response ({} sent, {} received)",
+            format_bytes(sent),
+            format_bytes(received)
+        )
+    }
+}
+
 fn format_bytes(bytes: usize) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
     let mut value = bytes as f64;
@@ -8455,6 +8470,10 @@ fn create_response_mode(
     let printer_for_progress = printer.clone();
     let tool_active_for_progress = tool_active;
     let completed_for_progress = completed;
+    // The request being waited on: its size, and whether its answer has
+    // started (until then, what arrives is shown with what was sent).
+    let sent_bytes = std::sync::atomic::AtomicUsize::new(0);
+    let answering = AtomicBool::new(false);
 
     // Reasoning is streamed live but - unlike the final answer, which ends
     // up in response.choices - it's never kept anywhere once the response
@@ -8498,6 +8517,7 @@ fn create_response_mode(
             }
             match &progress_info.status {
                 StatusUpdate::Thinking => {
+                    answering.store(true, Ordering::Relaxed);
                     status_bar.set_agent_status(&agent_name, "Thinking", true);
                 }
                 StatusUpdate::ToolAccumulating { name, arguments } => {
@@ -8547,14 +8567,15 @@ fn create_response_mode(
                     bytes_read,
                     chunks_processed,
                 } => {
-                    status_bar.set_agent_status(
-                        &agent_name,
-                        &format!(
+                    let status = if answering.load(Ordering::Relaxed) {
+                        format!(
                             "Streaming ({} bytes, {} chunks)",
                             bytes_read, chunks_processed
-                        ),
-                        false,
-                    );
+                        )
+                    } else {
+                        waiting_status(sent_bytes.load(Ordering::Relaxed), *bytes_read)
+                    };
+                    status_bar.set_agent_status(&agent_name, &status, false);
                 }
                 StatusUpdate::WaitingForSlot => {
                     status_bar.set_agent_status(
@@ -8585,11 +8606,9 @@ fn create_response_mode(
                     // sent. A long wait here means a large prompt is still
                     // being processed server-side, not a hang - show its
                     // size so that's clear instead of just a ticking clock.
-                    status_bar.set_agent_status(
-                        &agent_name,
-                        &format!("Waiting for response ({} sent)", format_bytes(*bytes)),
-                        true,
-                    );
+                    sent_bytes.store(*bytes, Ordering::Relaxed);
+                    answering.store(false, Ordering::Relaxed);
+                    status_bar.set_agent_status(&agent_name, &waiting_status(*bytes, 0), true);
                 }
                 StatusUpdate::Complete { usage } => {
                     completed_for_progress.store(true, Ordering::Relaxed);
@@ -15033,6 +15052,18 @@ for line in sys.stdin:
     fn test_parse_parameters_string() {
         let params = parse_parameters(&["name=hello world".to_string()]).unwrap();
         assert_eq!(params["name"], serde_json::json!("hello world"));
+    }
+
+    #[test]
+    fn test_waiting_status_says_what_was_received_once_there_is_some() {
+        assert_eq!(
+            waiting_status(2048, 0),
+            "Waiting for response (2.0 KB sent)"
+        );
+        assert_eq!(
+            waiting_status(2048, 300),
+            "Waiting for response (2.0 KB sent, 300 B received)"
+        );
     }
 
     #[test]
