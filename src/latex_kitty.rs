@@ -860,6 +860,7 @@ pub(crate) fn whole_root_ro_bwrap_args(
         }
     }
     a.extend(["--ro-bind", "/", "/"].map(String::from));
+    a.extend(crate::bwrap_dev_and_proc());
     a.extend(["--bind".to_string(), cwd.to_string(), cwd.to_string()]);
     a.extend(crate::bwrap_command_tail(command, args));
     a
@@ -1045,6 +1046,14 @@ mod tests {
         // bind, so it actually ends up writable rather than shadowed back
         // to read-only by a later mount at the same path.
         assert!(bind_pos > ro_pos);
+        // Its own /dev and /proc over the host's, not hidden under them.
+        for own in [["--dev", "/dev"], ["--proc", "/proc"]] {
+            let pos = flags
+                .windows(2)
+                .position(|w| w == own)
+                .unwrap_or_else(|| panic!("expected {own:?}"));
+            assert!(pos > ro_pos, "{own:?} before the root: {flags:?}");
+        }
 
         assert_eq!(flags.last(), Some(&"/usr/bin/pdflatex".to_string()));
     }

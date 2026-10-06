@@ -2176,15 +2176,24 @@ fn bwrap_isolation_flags(clearenv: bool) -> Vec<String> {
             "--unshare-cgroup-try",
             "--die-with-parent",
             "--new-session",
-            "--dev",
-            "/dev/",
-            "--proc",
-            "/proc",
         ]
         .into_iter()
         .map(String::from),
     );
     a
+}
+
+/// A sandbox's own `/dev` (just the standard devices: null, zero, random,
+/// tty...) and `/proc` (just its own processes). They go after its root:
+/// bwrap sets up its mounts in order, each hiding what was there - before
+/// a `--tmpfs /` they were gone (no /dev/null), and before a
+/// `--ro-bind / /` the host's own showed instead, every process on it
+/// included.
+pub(crate) fn bwrap_dev_and_proc() -> Vec<String> {
+    ["--dev", "/dev", "--proc", "/proc"]
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 /// The trailing `-- <command> [args...]` (or, for a multi-word `command`
@@ -2248,6 +2257,7 @@ fn bwrap_args(cwd: &str, command: &str, args: Option<&[String]>) -> Vec<String> 
         .into_iter()
         .map(String::from),
     );
+    a.extend(bwrap_dev_and_proc());
     a.push("--bind".to_string());
     a.push(cwd.to_string());
     a.push(cwd.to_string());
@@ -20061,10 +20071,6 @@ for line in sys.stdin:
                 "--unshare-cgroup-try",
                 "--die-with-parent",
                 "--new-session",
-                "--dev",
-                "/dev/",
-                "--proc",
-                "/proc",
                 "--tmpfs",
                 "/",
                 "--ro-bind",
@@ -20076,6 +20082,10 @@ for line in sys.stdin:
                 "--ro-bind-try",
                 "/lib64",
                 "/lib64",
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
                 "--bind",
                 "/home/user/project",
                 "/home/user/project",
@@ -20085,6 +20095,15 @@ for line in sys.stdin:
                 "-a",
             ]
         );
+    }
+
+    #[test]
+    fn test_bwrap_args_mount_dev_and_proc_over_the_new_root() {
+        // Mounted before the root, they'd be hidden by it.
+        let args = bwrap_args("/cwd", "true", None);
+        let at = |flag: &str| args.iter().position(|a| a == flag).unwrap();
+        assert!(at("--tmpfs") < at("--dev"), "{args:?}");
+        assert!(at("--tmpfs") < at("--proc"), "{args:?}");
     }
 
     #[test]
