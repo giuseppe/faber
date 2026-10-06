@@ -649,10 +649,21 @@ pub(crate) fn tool_fan_out(
 mod tests {
     use super::*;
     use crate::openai::ToolItem;
+    use std::collections::HashMap;
 
     /// A chat-like context for fan_out against the built-in dummy model,
     /// with the Ctrl-C sender and the session usage it records into.
     fn dummy_chat_ctx() -> (
+        ToolContext,
+        mpsc::Sender<()>,
+        Arc<Mutex<crate::SessionUsage>>,
+    ) {
+        dummy_chat_ctx_for("dummy")
+    }
+
+    fn dummy_chat_ctx_for(
+        model: &str,
+    ) -> (
         ToolContext,
         mpsc::Sender<()>,
         Arc<Mutex<crate::SessionUsage>>,
@@ -666,7 +677,7 @@ mod tests {
             tools: Arc::new(crate::initialize_tools(false, None)),
             opts: openai::Opts {
                 max_tokens: None,
-                model: "dummy".to_string(),
+                model: model.to_string(),
                 endpoint: String::new(),
                 tool_choice: None,
                 api_key: None,
@@ -682,6 +693,145 @@ mod tests {
             profiles: Default::default(),
         }));
         (ctx, ctrl_c_tx, usage)
+    }
+
+    /// Like `dummy_chat_ctx_for`, but as the agent "boss" of a database, so
+    /// workers are agents too - made, claimed and released, their events
+    /// and activity recorded - as in a real session.
+    fn dummy_agent_ctx(
+        model: &str,
+    ) -> (
+        ToolContext,
+        mpsc::Sender<()>,
+        Arc<dyn faber::db_backend::DbBackend>,
+    ) {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        faber::db::initialize_db(&conn).unwrap();
+        let db: Arc<dyn faber::db_backend::DbBackend> =
+            Arc::new(faber::local_db::LocalDb::new(Arc::new(Mutex::new(conn))));
+        db.create_agent("boss", "test").unwrap();
+        let (mut ctx, ctrl_c, _) = dummy_chat_ctx_for(model);
+        ctx.db = Some(db.clone());
+        ctx.agent_name = Some("boss".to_string());
+        (ctx, ctrl_c, db)
+    }
+
+    fn running_workers(ctx: &ToolContext) -> Arc<Mutex<HashMap<String, crate::RunningSubAgent>>> {
+        ctx.extra
+            .as_ref()
+            .and_then(|e| e.downcast_ref::<SubAgentContext>())
+            .unwrap()
+            .running_subagents
+            .clone()
+    }
+
+    /// Runs fan_out on a thread of its own and fails the test, saying where
+    /// everyone was, if it hasn't returned within `limit`: a fan-out that
+    /// stops making progress fails here instead of hanging the test run.
+    /// An error is its text, or "interrupted" for a stop.
+    fn fan_out_within(
+        ctx: Arc<ToolContext>,
+        params: serde_json::Value,
+        model: &str,
+        limit: Duration,
+    ) -> Result<String, String> {
+        run_within(ctx, model, limit, move |ctx| {
+            tool_fan_out(&params.to_string(), ctx)
+        })
+    }
+
+    /// Runs `f` like `fan_out_within` runs fan_out.
+    fn run_within(
+        ctx: Arc<ToolContext>,
+        model: &str,
+        limit: Duration,
+        f: impl FnOnce(&ToolContext) -> Result<String, Box<dyn Error>> + Send + 'static,
+    ) -> Result<String, String> {
+        let (tx, rx) = mpsc::channel();
+        let fan_out_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = f(&fan_out_ctx).map_err(|e| {
+                if e.downcast_ref::<InterruptedError>().is_some() {
+                    "interrupted".to_string()
+                } else {
+                    e.to_string()
+                }
+            });
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(limit) {
+            Ok(result) => result,
+            Err(_) => {
+                let agents: Vec<String> = ctx
+                    .db
+                    .as_ref()
+                    .and_then(|db| db.list_agents().ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|a| format!("{}: {:?}", a.name, a.activity))
+                    .collect();
+                panic!(
+                    "no progress for {:?}: {} requests in flight, {} workers \
+                     running; agents: {:#?}",
+                    limit,
+                    faber::dummy_llm::requests_in_flight(model),
+                    running_workers(&ctx).lock().unwrap().len(),
+                    agents
+                );
+            }
+        }
+    }
+
+    /// After a fan-out, however it ended: no request still holds a slot,
+    /// and no worker is still running, still claimed, or still shows as
+    /// queued or busy.
+    fn assert_all_let_go(
+        ctx: &ToolContext,
+        db: &dyn faber::db_backend::DbBackend,
+        model: &str,
+        context: &str,
+    ) {
+        assert_eq!(
+            faber::dummy_llm::requests_in_flight(model),
+            0,
+            "a request slot leaked ({context})"
+        );
+        assert!(
+            running_workers(ctx).lock().unwrap().is_empty(),
+            "a worker is still listed as running ({context})"
+        );
+        for agent in db.list_agents().unwrap() {
+            if agent.parent.as_deref() != Some("boss") {
+                continue;
+            }
+            assert_eq!(
+                agent.session_id, None,
+                "{} still claimed ({context})",
+                agent.name
+            );
+            let activity = agent.activity.unwrap_or_default();
+            assert!(
+                ["finished: ", "failed: ", "stopped", "not started: stopped"]
+                    .iter()
+                    .any(|done| activity.starts_with(done)),
+                "{} left as '{}' ({context})",
+                agent.name,
+                activity
+            );
+        }
+    }
+
+    /// A tiny deterministic generator, so a failing run can be replayed.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
     }
 
     #[test]
@@ -728,6 +878,160 @@ mod tests {
             "took {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn test_fan_out_progresses_with_fewer_request_slots_than_workers() {
+        // One request at a time among eight workers, each with several
+        // rounds of tool calls: they must take turns rather than wait on
+        // each other for good.
+        let model = "dummy:slots=1,id=fan-out-scarce";
+        let (ctx, _ctrl_c, db) = dummy_agent_ctx(model);
+        let ctx = Arc::new(ctx);
+        let items: Vec<String> = (1..=24).map(|i| format!("item-{i}")).collect();
+        let params = serde_json::json!({
+            "items": items,
+            "prompt": "work 3 2 on {item}",
+            "max_parallel": 8,
+            "result_schema": {"job": "string"},
+        });
+        let out = fan_out_within(ctx.clone(), params, model, Duration::from_secs(60)).unwrap();
+        for (i, item) in items.iter().enumerate() {
+            let expected = format!(
+                "## {}. {}\nWorked 3 steps on: work 3 2 on {}",
+                i + 1,
+                item,
+                item
+            );
+            assert!(out.contains(&expected), "{expected} missing: {out}");
+        }
+        assert_all_let_go(&ctx, db.as_ref(), model, "after finishing");
+    }
+
+    #[test]
+    fn test_a_fan_out_called_by_the_model_gets_the_request_slot_its_caller_had() {
+        // The chat's own request to the model asks for the fan_out: it must
+        // have let its one slot go by then, or no worker ever gets one.
+        let model = "dummy:slots=1,id=fan-out-from-the-model";
+        let (ctx, _ctrl_c, db) = dummy_agent_ctx(model);
+        let ctx = Arc::new(ctx);
+        let fan_out = serde_json::json!({
+            "items": ["a", "b", "c"],
+            "prompt": "work 2 1 on {item}",
+        });
+        let out = run_within(ctx.clone(), model, Duration::from_secs(30), move |ctx| {
+            let caller = ctx
+                .extra
+                .as_ref()
+                .and_then(|e| e.downcast_ref::<SubAgentContext>())
+                .unwrap();
+            let response = post_request_with_mode(
+                vec![make_message("user", format!("call fan_out {}", fan_out))],
+                &caller.tools,
+                &caller.opts,
+                ResponseMode::Complete,
+                ctx,
+                None,
+            )?;
+            Ok(crate::final_response_text(Ok(response))?)
+        })
+        .unwrap();
+        assert_eq!(out.matches("Worked 2 steps").count(), 3, "{out}");
+        assert_all_let_go(&ctx, db.as_ref(), model, "after the chat's turn");
+    }
+
+    #[test]
+    fn test_fan_out_finishes_when_workers_are_stopped_one_by_one() {
+        let model = "dummy:slots=2,id=fan-out-cancels";
+        for seed in 0..6 {
+            let (ctx, _ctrl_c, db) = dummy_agent_ctx(model);
+            let ctx = Arc::new(ctx);
+            let running = running_workers(&ctx);
+            let done = Arc::new(AtomicBool::new(false));
+            // Stops a random running worker now and then - whether it's
+            // waiting for a slot, for a response or for its tools - as
+            // agent_cancel would.
+            let canceller = {
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    let mut rng = Lcg(seed);
+                    while !done.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(5 + rng.below(30)));
+                        let running = running.lock().unwrap();
+                        let names: Vec<&String> = running.keys().collect();
+                        if names.is_empty() || rng.below(3) != 0 {
+                            continue;
+                        }
+                        let worker = &running[names[rng.below(names.len() as u64) as usize]];
+                        *worker.stop_reason.lock().unwrap() = Some("test".to_string());
+                        let _ = worker.cancel.send(());
+                    }
+                })
+            };
+            let items: Vec<String> = (1..=16).map(|i| format!("item-{i}")).collect();
+            let params = serde_json::json!({
+                "items": items,
+                "prompt": "work 4 3 on {item}",
+                "max_parallel": 6,
+                "result_schema": {"job": "string"},
+            });
+            let result = fan_out_within(ctx.clone(), params, model, Duration::from_secs(60));
+            done.store(true, Ordering::Relaxed);
+            canceller.join().unwrap();
+            let out = result.unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            // Every item got an outcome: its result, or why it stopped.
+            for (i, item) in items.iter().enumerate() {
+                let heading = format!("## {}. {}\n", i + 1, item);
+                let at = out
+                    .find(&heading)
+                    .unwrap_or_else(|| panic!("seed {seed}: {item} missing: {out}"));
+                let body = &out[at + heading.len()..];
+                assert!(
+                    body.starts_with("Worked 4 steps") || body.starts_with("Error: stopped: test"),
+                    "seed {seed}: {item}: {body}"
+                );
+            }
+            assert_all_let_go(&ctx, db.as_ref(), model, &format!("seed {seed}"));
+        }
+    }
+
+    #[test]
+    fn test_fan_out_stopped_at_any_point_returns_and_lets_everything_go() {
+        // Ctrl-C at all sorts of moments: before any worker starts, while
+        // workers queue for request slots, mid-response, mid-tool call,
+        // while results are reported, after the last one is done.
+        let model = "dummy:slots=2,id=fan-out-ctrl-c";
+        for (run, stop_after_ms) in [0u64, 1, 5, 15, 30, 60, 100, 150, 250, 400, 2000]
+            .into_iter()
+            .enumerate()
+        {
+            let (ctx, ctrl_c, db) = dummy_agent_ctx(model);
+            let ctx = Arc::new(ctx);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(stop_after_ms));
+                let _ = ctrl_c.send(());
+            });
+            let params = serde_json::json!({
+                "items": (1..=12).map(|i| format!("item-{i}")).collect::<Vec<_>>(),
+                "prompt": "work 3 4 on {item}",
+                "max_parallel": 6,
+                "result_schema": {"job": "string"},
+            });
+            let context = format!("run {run}, stopped after {stop_after_ms}ms");
+            match fan_out_within(ctx.clone(), params, model, Duration::from_secs(30)) {
+                Ok(_) => {}
+                Err(e) => assert_eq!(e, "interrupted", "{context}"),
+            }
+            assert_all_let_go(&ctx, db.as_ref(), model, &context);
+        }
+        // The slots all came back: a fan-out still gets every one done.
+        let (ctx, _ctrl_c, _) = dummy_agent_ctx(model);
+        let params = serde_json::json!({
+            "items": ["a", "b", "c", "d"],
+            "prompt": "work 2 1 on {item}",
+        });
+        let out = fan_out_within(Arc::new(ctx), params, model, Duration::from_secs(30)).unwrap();
+        assert_eq!(out.matches("Worked 2 steps").count(), 4, "{out}");
     }
 
     #[test]
