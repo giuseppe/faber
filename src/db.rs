@@ -276,6 +276,13 @@ const TASK_TABLE_DEFINITION: &str = "
     FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE SET NULL";
 
 pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
+    // Every agent records its events and activity as it goes, all through
+    // one connection: with the default rollback journal each write is
+    // several fsyncs, and a fan-out's workers spent most of their time
+    // queued behind each other's. A write-ahead log needs one fsync per
+    // checkpoint instead, and lets readers (the web UI, `faber tasks`)
+    // carry on while a write is in progress.
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS scheduled_tasks ({});",
