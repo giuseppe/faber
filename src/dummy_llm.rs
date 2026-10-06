@@ -351,7 +351,8 @@ fn assistant_message(content: Option<String>, tool_calls: Option<Vec<ToolCall>>)
 /// The response to a `work` job given at `start` in `messages`, like an
 /// agent's: `steps` rounds of read-only tool calls, made together; then,
 /// when it was asked to and can, a call to report_result (with the job as
-/// `data.job`); then a short answer naming the job. Each depends only on the conversation so far,
+/// `data.job`, and as failed if the job says `failing`); then a short
+/// answer naming the job. Each depends only on the conversation so far,
 /// so agents working at once can't change each other's course.
 fn work_response(
     start: usize,
@@ -404,8 +405,9 @@ fn work_response(
     let (message, finish_reason) = if rounds < steps && !step.is_empty() {
         (assistant_message(None, Some(step)), "tool_calls")
     } else if asked_to_report && !reported && tools_collection.contains_key("report_result") {
+        let failing = job.split_whitespace().any(|w| w == "failing");
         let arguments = serde_json::json!({
-            "status": "succeeded",
+            "status": if failing { "failed" } else { "succeeded" },
             "summary": summary,
             "data": {"job": job},
         });

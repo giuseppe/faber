@@ -29,9 +29,9 @@
 use serde::Deserialize;
 use std::collections::VecDeque;
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::openai::{
     self, ContextLengthError, InterruptedError, ProgressInfo, ResponseMode, StatusUpdate,
@@ -52,6 +52,10 @@ const MAX_PARALLEL: usize = 256;
 /// How many times a worker shortens its tool results to recover from a
 /// context overflow before giving up.
 const MAX_TOOL_RESULT_SHRINKS: usize = 3;
+
+/// How long a fan-out goes without a worker finishing before it prints
+/// where it stands anyway, so a quiet spell doesn't look like a hang.
+const QUIET_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Smallest share of the output budget any one item's result gets.
 const MIN_RESULT_CHARS: usize = 2000;
@@ -186,32 +190,356 @@ fn worker_context(ctx: &ToolContext) -> ToolContext {
     worker_ctx
 }
 
-/// A worker's progress handler: the status bar, and its agent's activity.
+/// How many items are where.
+#[derive(Default)]
+struct Counts {
+    running: usize,
+    succeeded: usize,
+    failed: usize,
+    /// Stopped with the whole fan-out: neither done nor failed.
+    stopped: usize,
+}
+
+/// One step a worker takes, as it shows.
+enum Step {
+    /// A request to the model sent, waiting for its answer to start.
+    Request,
+    /// The model's answer coming in.
+    Answering,
+    /// Running a tool: its call, shortened.
+    Tool(String),
+    WaitingForSlot,
+    /// Until when.
+    RateLimited(String),
+}
+
+/// What a running worker has done so far, and is doing.
+struct WorkerStats {
+    started: Instant,
+    requests: usize,
+    tool_calls: usize,
+    last_tool: Option<String>,
+    now: String,
+    /// What the model has streamed of its current response, reasoning
+    /// included, in characters: a long response is still a moving one.
+    streamed: usize,
+}
+
+impl WorkerStats {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            requests: 0,
+            tool_calls: 0,
+            last_tool: None,
+            now: "starting".to_string(),
+            streamed: 0,
+        }
+    }
+
+    fn take(&mut self, step: Step) {
+        self.now = match step {
+            Step::Request => {
+                self.requests += 1;
+                self.streamed = 0;
+                "waiting for the model".to_string()
+            }
+            Step::Answering => ANSWERING.to_string(),
+            Step::Tool(call) => {
+                self.tool_calls += 1;
+                let now = format!("running {}", call);
+                self.last_tool = Some(call);
+                now
+            }
+            Step::WaitingForSlot => "waiting for a free request slot".to_string(),
+            Step::RateLimited(until) => format!("rate limited, retrying at {}", until),
+        };
+    }
+
+    /// "the model is answering · 5m12s, 14 requests, 9 tool calls, last
+    /// read_file(...)".
+    fn describe(&self) -> String {
+        let plural =
+            |n: usize, what: &str| format!("{} {}{}", n, what, if n == 1 { "" } else { "s" });
+        let now = if self.now == ANSWERING && self.streamed > 0 {
+            format!("{} ({})", ANSWERING, chars_text(self.streamed))
+        } else {
+            self.now.clone()
+        };
+        let mut text = format!(
+            "{} · {}, {}, {}",
+            now,
+            duration_text(self.started.elapsed()),
+            plural(self.requests, "request"),
+            plural(self.tool_calls, "tool call")
+        );
+        // Unless that's what it's doing now.
+        if let Some(last) = self
+            .last_tool
+            .as_ref()
+            .filter(|_| !self.now.starts_with("running "))
+        {
+            text.push_str(&format!(", last {}", last));
+        }
+        text
+    }
+}
+
+const ANSWERING: &str = "the model is answering";
+
+/// "850 chars", "4.1k chars".
+fn chars_text(n: usize) -> String {
+    if n < 1000 {
+        format!("{} chars", n)
+    } else {
+        format!("{:.1}k chars", n as f64 / 1000.0)
+    }
+}
+
+/// "45s", "5m12s", "1h03m".
+fn duration_text(d: Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        0..60 => format!("{}s", secs),
+        60..3600 => format!("{}m{:02}s", secs / 60, secs % 60),
+        _ => format!("{}h{:02}m", secs / 3600, secs % 3600 / 60),
+    }
+}
+
+/// How many running workers a report lists, one a line.
+const MAX_REPORTED_WORKERS: usize = 6;
+
+/// Where a fan-out stands, shown - kept up to date - as its caller's
+/// status line, with what the latest active worker has done so far: the
+/// one line stays on screen, rather than taking turns with a line per
+/// worker.
+struct Progress {
+    total: usize,
+    counts: Mutex<Counts>,
+    /// The running workers, by label, in the order they started.
+    workers: Mutex<Vec<(String, WorkerStats)>>,
+    /// The worker that did something last: "label: what".
+    latest: Mutex<Option<String>>,
+    status_bar: Arc<crate::status_bar::StatusBar>,
+    /// The caller's line on the status bar.
+    status_key: String,
+    /// When the last line about the fan-out was printed.
+    last_report: Mutex<Instant>,
+    /// When a worker last took a step, started or finished.
+    last_step: Mutex<Instant>,
+}
+
+impl Progress {
+    fn new(total: usize, status_bar: Arc<crate::status_bar::StatusBar>, status_key: &str) -> Self {
+        Self {
+            total,
+            counts: Mutex::new(Counts::default()),
+            workers: Mutex::new(Vec::new()),
+            latest: Mutex::new(None),
+            status_bar,
+            status_key: status_key.to_string(),
+            last_report: Mutex::new(Instant::now()),
+            last_step: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// "7/24 done · 6 running · 10 queued · 1 failed", leaving out what's
+    /// none.
+    fn counts_text(&self) -> String {
+        let counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        let done = counts.succeeded + counts.failed;
+        let queued = self
+            .total
+            .saturating_sub(done + counts.running + counts.stopped);
+        let mut text = format!("{}/{} done", done, self.total);
+        for (n, what) in [
+            (counts.running, "running"),
+            (queued, "queued"),
+            (counts.failed, "failed"),
+            (counts.stopped, "stopped"),
+        ] {
+            if n > 0 {
+                text.push_str(&format!(" · {} {}", n, what));
+            }
+        }
+        text
+    }
+
+    /// The status line: the counts, and the latest active worker.
+    fn summary(&self) -> String {
+        let mut text = format!("fan_out: {}", self.counts_text());
+        if let Some(latest) = &*self.latest.lock().unwrap_or_else(|e| e.into_inner()) {
+            text.push_str(&format!(" │ {}", latest));
+        }
+        text
+    }
+
+    /// The counts, then a few running workers, a line each, with what
+    /// they've done so far.
+    fn report(&self) -> String {
+        let mut text = format!("fan_out: {}", self.counts_text());
+        let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+        for (label, stats) in workers.iter().take(MAX_REPORTED_WORKERS) {
+            text.push_str(&format!("\n  {}: {}", label, stats.describe()));
+        }
+        if workers.len() > MAX_REPORTED_WORKERS {
+            text.push_str(&format!(
+                "\n  … and {} more running",
+                workers.len() - MAX_REPORTED_WORKERS
+            ));
+        }
+        text
+    }
+
+    fn show(&self) {
+        self.status_bar
+            .set_agent_status(&self.status_key, &self.summary(), false);
+    }
+
+    fn set_latest(&self, text: String) {
+        *self.latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
+        *self.last_step.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        self.show();
+    }
+
+    /// The worker for `label` took `step`.
+    fn step(&self, label: &str, step: Step) {
+        let described = {
+            let mut workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+            let Some((_, stats)) = workers.iter_mut().find(|(l, _)| l == label) else {
+                return;
+            };
+            stats.take(step);
+            stats.describe()
+        };
+        self.set_latest(format!("{}: {}", label, described));
+    }
+
+    /// The worker for `label` got `chars` more of the model's response.
+    fn streamed(&self, label: &str, chars: usize) {
+        if chars == 0 {
+            return;
+        }
+        let described = {
+            let mut workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+            let Some((_, stats)) = workers.iter_mut().find(|(l, _)| l == label) else {
+                return;
+            };
+            stats.streamed += chars;
+            stats.now = ANSWERING.to_string();
+            stats.describe()
+        };
+        self.set_latest(format!("{}: {}", label, described));
+    }
+
+    fn started(&self, label: &str) {
+        self.counts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .running += 1;
+        self.workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((label.to_string(), WorkerStats::new()));
+        self.set_latest(format!("{}: starting", label));
+    }
+
+    fn remove(&self, label: &str) {
+        self.workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(l, _)| l != label);
+    }
+
+    /// A worker is done; how many are, now.
+    fn finished(&self, label: &str, succeeded: bool) -> usize {
+        self.remove(label);
+        let done = {
+            let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+            counts.running -= 1;
+            if succeeded {
+                counts.succeeded += 1;
+            } else {
+                counts.failed += 1;
+            }
+            counts.succeeded + counts.failed
+        };
+        self.set_latest(format!(
+            "{}: {}",
+            label,
+            if succeeded { "done" } else { "failed" }
+        ));
+        done
+    }
+
+    /// A worker that was stopped with the whole fan-out: neither done nor
+    /// failed.
+    fn abandoned(&self, label: &str) {
+        self.remove(label);
+        let mut counts = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        counts.running -= 1;
+        counts.stopped += 1;
+    }
+
+    /// Marks a line about the fan-out as printed, now.
+    fn reported(&self) {
+        *self.last_report.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    /// Whether the fan-out has gone quiet - no worker has done anything
+    /// for `interval`, nor has anything about it been printed - and if so,
+    /// counts as printing now. While workers are busy, the status line
+    /// says so: a printed line would only repeat it.
+    fn report_due(&self, interval: Duration) -> bool {
+        let quiet = self
+            .last_step
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .elapsed()
+            >= interval;
+        let mut last = self.last_report.lock().unwrap_or_else(|e| e.into_inner());
+        if !quiet || last.elapsed() < interval {
+            return false;
+        }
+        *last = Instant::now();
+        true
+    }
+}
+
+/// How a worker is called where it shows: by its item - its first line,
+/// shortened - and its place among them.
+fn worker_label(item: &str, index: usize, total: usize) -> String {
+    format!("{} ({}/{})", crate::first_line(item, 40), index + 1, total)
+}
+
+/// A worker's progress handler: the fan-out's status line, and its
+/// agent's activity.
 fn worker_progress(
-    sa_ctx: &SubAgentContext,
-    status_key: &str,
+    progress: &Arc<Progress>,
+    label: &str,
     activity: Option<Arc<ActivityRecorder>>,
 ) -> Box<dyn Fn(&ProgressInfo) -> Result<(), Box<dyn Error>>> {
-    let status_bar = sa_ctx.status_bar.clone();
-    let key = status_key.to_string();
-    Box::new(move |progress: &ProgressInfo| {
+    let progress = progress.clone();
+    let label = label.to_string();
+    Box::new(move |info: &ProgressInfo| {
         if let Some(activity) = &activity {
-            activity.follow(&progress.status);
+            activity.follow(&info.status);
         }
-        let status = match &progress.status {
-            StatusUpdate::Thinking => "Thinking".to_string(),
-            StatusUpdate::ToolStart { name, .. } => format!("Running {}", name),
-            StatusUpdate::SendingRequest { .. } => "Waiting for response".to_string(),
-            StatusUpdate::WaitingForSlot => "Waiting for a free request slot".to_string(),
+        let step = match &info.status {
+            StatusUpdate::SendingRequest { .. } => Step::Request,
+            StatusUpdate::Thinking => Step::Answering,
+            StatusUpdate::ToolStart { name, arguments } => Step::Tool(format!(
+                "{}({})",
+                name,
+                crate::format_tool_arguments(arguments)
+            )),
+            StatusUpdate::WaitingForSlot => Step::WaitingForSlot,
             StatusUpdate::RateLimited { until } => {
-                format!(
-                    "Rate limited, retrying at {}",
-                    openai::format_retry_time(*until)
-                )
+                Step::RateLimited(openai::format_retry_time(*until))
             }
             _ => return Ok(()),
         };
-        status_bar.set_agent_status(&key, &status, false);
+        progress.step(&label, step);
         Ok(())
     })
 }
@@ -235,7 +563,8 @@ fn run_worker(
     ctx: &ToolContext,
     tools: &ToolsCollection,
     config: &AgentConfig,
-    status_key: &str,
+    progress: &Arc<Progress>,
+    label: &str,
     agent: &str,
     prompt: String,
     handoff: Option<&crate::Message>,
@@ -273,14 +602,23 @@ fn run_worker(
     let slot = Arc::new(Mutex::new(None));
     worker_ctx.result_slot = Some(slot.clone());
     worker_ctx.result_schema = schema.cloned();
-    // Streamed, although nothing is shown, so Ctrl-C is noticed between
-    // chunks rather than only once a whole response has arrived.
+    // Streamed, so Ctrl-C is noticed between chunks rather than only once
+    // a whole response has arrived - and so the fan-out's status line
+    // shows the response coming in.
+    let counted = || -> Box<dyn Fn(&str) -> Result<(), Box<dyn Error>>> {
+        let progress = progress.clone();
+        let label = label.to_string();
+        Box::new(move |chunk: &str| {
+            progress.streamed(&label, chunk.chars().count());
+            Ok(())
+        })
+    };
     let mode = || {
         crate::recorded_mode(
             ResponseMode::Streaming {
-                stream_handler: Box::new(|_: &str| Ok(())),
-                reasoning_handler: Box::new(|_: &str| Ok(())),
-                progress_handler: worker_progress(sa_ctx, status_key, activity.clone()),
+                stream_handler: counted(),
+                reasoning_handler: counted(),
+                progress_handler: worker_progress(progress, label, activity.clone()),
             },
             &events,
         )
@@ -466,24 +804,40 @@ pub(crate) fn tool_fan_out(
     let results: Mutex<Vec<Option<Result<String, String>>>> = Mutex::new(vec![None; total]);
     let cancelled = AtomicBool::new(false);
     let finished = AtomicBool::new(false);
-    let done_count = AtomicUsize::new(0);
     // Every running worker's Ctrl-C channel. The watcher sets `cancelled`
     // before sending to these under the lock, and a worker checks
     // `cancelled` after registering under the same lock, so none can miss
     // the signal.
     let cancel_senders: Mutex<Vec<mpsc::Sender<()>>> = Mutex::new(Vec::new());
-
-    ctx.println(&format!(
-        "Fanning out to {} items, {} at a time...",
-        total, parallel
+    let progress = Arc::new(Progress::new(
+        total,
+        sa_ctx.status_bar.clone(),
+        ctx.agent_name.as_deref().unwrap_or("default"),
     ));
+
+    // Saying so when it's the limit on requests that holds it back, not
+    // what was asked for.
+    let held_back = parallel < params.items.len()
+        && parallel == slots
+        && parallel < params.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL);
+    ctx.println(&format!(
+        "Fanning out to {} items, {} at a time{}...",
+        total,
+        parallel,
+        if held_back {
+            format!(" (--max-parallel-requests is {})", slots)
+        } else {
+            String::new()
+        }
+    ));
+    progress.show();
     // The caller's activity follows the workers' progress.
     let activity = match (&ctx.db, &ctx.agent_name) {
         (Some(db), Some(agent)) => Some(ActivityRecorder::new(db.clone(), agent)),
         _ => None,
     };
     if let Some(activity) = &activity {
-        activity.set(&format!("fan_out: 0/{} done", total));
+        activity.set(&format!("fan_out: {}", progress.counts_text()));
     }
 
     std::thread::scope(|scope| {
@@ -505,6 +859,9 @@ pub(crate) fn tool_fan_out(
                         let _ = tx.send(());
                     }
                     return;
+                }
+                if progress.report_due(QUIET_REPORT_INTERVAL) {
+                    ctx.println(&progress.report());
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -528,7 +885,7 @@ pub(crate) fn tool_fan_out(
                             return;
                         }
                         let item = &params.items[index];
-                        let key = format!("fan-out {}/{}", index + 1, total);
+                        let label = worker_label(item, index, total);
                         let agent = worker_name(index);
                         // Like a sub-agent: it can be stopped on its own
                         // (agent_cancel, /cancel, the web UI).
@@ -544,20 +901,20 @@ pub(crate) fn tool_fan_out(
                                     stop_reason: stop_reason.clone(),
                                 },
                             );
-                        sa_ctx.status_bar.set_agent_status(&key, "Starting", true);
+                        progress.started(&label);
                         let result = run_worker(
                             sa_ctx,
                             ctx,
                             &tools,
                             &config,
-                            &key,
+                            &progress,
+                            &label,
                             &agent,
                             expand_prompt(&params.prompt, item),
                             handoff.as_ref(),
                             params.result_schema.as_ref(),
                             rx,
                         );
-                        sa_ctx.status_bar.clear_agent_status(&key);
                         sa_ctx
                             .running_subagents
                             .lock()
@@ -569,6 +926,7 @@ pub(crate) fn tool_fan_out(
                                 if e.downcast_ref::<InterruptedError>().is_some()
                                     && cancelled.load(Ordering::Relaxed) =>
                             {
+                                progress.abandoned(&label);
                                 return;
                             }
                             // Only this worker: its item failed, the rest
@@ -585,17 +943,28 @@ pub(crate) fn tool_fan_out(
                             }
                             other => other.map_err(|e| e.to_string()),
                         };
-                        let done = done_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        let done = progress.finished(&label, result.is_ok());
                         if let Some(activity) = &activity {
-                            activity.set(&format!("fan_out: {}/{} done", done, total));
+                            activity.set(&format!("fan_out: {}", progress.counts_text()));
                         }
-                        ctx.println(&format!(
-                            "[{}/{}] {} {}",
-                            done,
-                            total,
-                            if result.is_ok() { "done:" } else { "failed:" },
-                            item
-                        ));
+                        // A failure says why straight away, not only once
+                        // the whole fan-out is done.
+                        ctx.println(&match &result {
+                            Ok(_) => format!(
+                                "[{}/{}] done: {}",
+                                done,
+                                total,
+                                crate::first_line(item, 80)
+                            ),
+                            Err(e) => format!(
+                                "[{}/{}] failed: {} - {}",
+                                done,
+                                total,
+                                crate::first_line(item, 80),
+                                crate::first_line(e, 160)
+                            ),
+                        });
+                        progress.reported();
                         results.lock().unwrap_or_else(|e| e.into_inner())[index] = Some(result);
                     }
                 })
@@ -625,11 +994,7 @@ pub(crate) fn tool_fan_out(
     // Workers finishing together can record their counts out of order:
     // the last word is the final count.
     if let Some(activity) = &activity {
-        activity.set(&format!(
-            "fan_out: {}/{} done",
-            done_count.load(Ordering::Relaxed),
-            total
-        ));
+        activity.set(&format!("fan_out: {}", progress.counts_text()));
     }
 
     if cancelled.load(Ordering::Relaxed) {
@@ -650,6 +1015,7 @@ mod tests {
     use super::*;
     use crate::openai::ToolItem;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
 
     /// A chat-like context for fan_out against the built-in dummy model,
     /// with the Ctrl-C sender and the session usage it records into.
@@ -1032,6 +1398,165 @@ mod tests {
         });
         let out = fan_out_within(Arc::new(ctx), params, model, Duration::from_secs(30)).unwrap();
         assert_eq!(out.matches("Worked 2 steps").count(), 4, "{out}");
+    }
+
+    #[test]
+    fn test_progress_counts_items_and_says_what_workers_have_done() {
+        let progress = Progress::new(5, Arc::new(crate::status_bar::StatusBar::new()), "boss");
+        assert_eq!(progress.summary(), "fan_out: 0/5 done · 5 queued");
+        progress.started("a (1/5)");
+        progress.started("b (2/5)");
+        progress.step("b (2/5)", Step::Request);
+        progress.step("b (2/5)", Step::Tool("grep(pattern=x)".to_string()));
+        assert_eq!(
+            progress.summary(),
+            "fan_out: 0/5 done · 2 running · 3 queued │ \
+             b (2/5): running grep(pattern=x) · 0s, 1 request, 1 tool call"
+        );
+        // Once it's moved on, its last tool call still shows.
+        progress.step("b (2/5)", Step::Request);
+        progress.step("b (2/5)", Step::Answering);
+        assert_eq!(
+            progress.report(),
+            "fan_out: 0/5 done · 2 running · 3 queued\n  \
+             a (1/5): starting · 0s, 0 requests, 0 tool calls\n  \
+             b (2/5): the model is answering · 0s, 2 requests, 1 tool call, \
+             last grep(pattern=x)"
+        );
+        assert_eq!(progress.finished("a (1/5)", false), 1);
+        progress.abandoned("b (2/5)");
+        assert_eq!(
+            progress.summary(),
+            "fan_out: 1/5 done · 3 queued · 1 failed · 1 stopped │ a (1/5): failed"
+        );
+        assert_eq!(
+            progress.report(),
+            "fan_out: 1/5 done · 3 queued · 1 failed · 1 stopped"
+        );
+        for label in ["c", "d"] {
+            progress.started(label);
+            progress.finished(label, true);
+        }
+        assert_eq!(
+            progress.counts_text(),
+            "3/5 done · 1 queued · 1 failed · 1 stopped"
+        );
+        // A worker no longer running takes no more steps.
+        progress.step("c", Step::Request);
+        assert_eq!(
+            progress.summary(),
+            "fan_out: 3/5 done · 1 queued · 1 failed · 1 stopped │ d: done"
+        );
+
+        assert!(!progress.report_due(Duration::from_secs(60)));
+        assert!(progress.report_due(Duration::ZERO));
+        progress.reported();
+        assert!(!progress.report_due(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn test_a_report_is_due_only_once_the_workers_have_gone_quiet() {
+        let progress = Progress::new(2, Arc::new(crate::status_bar::StatusBar::new()), "boss");
+        progress.started("a");
+        let interval = Duration::from_millis(300);
+        // Busy: a step every 100ms, for twice the interval.
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(100));
+            progress.step("a", Step::Request);
+            assert!(!progress.report_due(interval), "while busy");
+        }
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(progress.report_due(interval), "once quiet");
+        assert!(!progress.report_due(interval), "not again right away");
+    }
+
+    #[test]
+    fn test_progress_counts_what_the_model_streams() {
+        let progress = Progress::new(1, Arc::new(crate::status_bar::StatusBar::new()), "boss");
+        progress.started("a");
+        progress.step("a", Step::Request);
+        progress.streamed("a", 850);
+        assert!(
+            progress
+                .summary()
+                .contains("a: the model is answering (850 chars) · "),
+            "{}",
+            progress.summary()
+        );
+        progress.streamed("a", 3250);
+        assert!(
+            progress.summary().contains("(4.1k chars)"),
+            "{}",
+            progress.summary()
+        );
+        // A new request starts the count again.
+        progress.step("a", Step::Request);
+        assert!(progress.summary().contains("a: waiting for the model · "));
+        progress.streamed("a", 10);
+        assert!(progress.summary().contains("(10 chars)"));
+        // Streaming is activity: no "gone quiet" report while it goes on.
+        let interval = Duration::from_millis(200);
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(100));
+            progress.streamed("a", 300);
+            assert!(!progress.report_due(interval));
+        }
+    }
+
+    #[test]
+    fn test_a_report_lists_a_few_running_workers() {
+        let progress = Progress::new(9, Arc::new(crate::status_bar::StatusBar::new()), "boss");
+        for i in 1..=8 {
+            progress.started(&format!("w{i}"));
+        }
+        let report = progress.report();
+        assert_eq!(
+            report.lines().count(),
+            1 + MAX_REPORTED_WORKERS + 1,
+            "{report}"
+        );
+        assert!(report.ends_with("… and 2 more running"), "{report}");
+    }
+
+    #[test]
+    fn test_duration_text() {
+        assert_eq!(duration_text(Duration::from_secs(45)), "45s");
+        assert_eq!(duration_text(Duration::from_secs(312)), "5m12s");
+        assert_eq!(duration_text(Duration::from_secs(3780)), "1h03m");
+    }
+
+    #[test]
+    fn test_worker_label_names_the_item_shortly() {
+        assert_eq!(worker_label("src/a.rs", 2, 24), "src/a.rs (3/24)");
+        let long = worker_label(&format!("{}\nmore", "x".repeat(100)), 0, 1);
+        assert!(long.starts_with(&format!("{}…", "x".repeat(39))), "{long}");
+        assert!(long.ends_with(" (1/1)"), "{long}");
+    }
+
+    #[test]
+    fn test_fan_out_says_why_an_item_failed_as_soon_as_it_does() {
+        let (mut ctx, _ctrl_c, _) = dummy_chat_ctx_for("dummy");
+        let printed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = printed.clone();
+        ctx.println = Box::new(move |line: &str| sink.lock().unwrap().push(line.to_string()));
+        let params = serde_json::json!({
+            "items": ["fine", "failing"],
+            "prompt": "work 1 0 {item}",
+            "max_parallel": 1,
+            "result_schema": {"job": "string"},
+        });
+        tool_fan_out(&params.to_string(), &ctx).unwrap();
+        let printed = printed.lock().unwrap();
+        assert!(
+            printed.iter().any(|l| l == "[1/2] done: fine"),
+            "{printed:?}"
+        );
+        assert!(
+            printed.iter().any(|l| l.starts_with(
+                "[2/2] failed: failing - reported failure - Worked 1 steps on: work 1 0 failing"
+            )),
+            "{printed:?}"
+        );
     }
 
     #[test]
