@@ -8172,7 +8172,7 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
-fn format_tool_arguments(args_json: &str) -> String {
+pub(crate) fn format_tool_arguments(args_json: &str) -> String {
     let clean_args = args_json
         .replace('\n', " ")
         .replace('\r', " ")
@@ -10503,7 +10503,7 @@ fn select_tasks(
 }
 
 /// The first line of `text`, at most `max` characters.
-fn first_line(text: &str, max: usize) -> String {
+pub(crate) fn first_line(text: &str, max: usize) -> String {
     let line = text
         .lines()
         .find(|l| !l.trim().is_empty())
