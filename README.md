@@ -1259,6 +1259,7 @@ python3 -m venv /tmp/a2a && /tmp/a2a/bin/pip install 'a2a-sdk<0.4' httpx
     --server-key-file <PATH> Read the server's key from this file (found by itself for one on this machine)
     --max-parallel-requests <N>  At most N model requests in flight at once (see below)
     --task-retention <DURATION>  Prune done tasks older than this while chatting
+    --rate-limit-wait <DURATION> Keep retrying a rate-limited request this long (default 8h)
 ```
 
 `--max-parallel-requests` (or `"max_parallel_requests"` in the config file)
@@ -1272,6 +1273,18 @@ context. Requests over the limit wait their turn, shown in the status bar
 interrupts them. Unlimited unless set. `fan_out` runs no more workers at
 once than this either: more would only take turns on the server's slots,
 each evicting the others' prompts from its cache.
+
+`--rate-limit-wait` (or `"rate_limit_wait"` in the config file) is how
+long a request the model's server turns away as rate limited (429) keeps
+being retried before it fails - 8h unless set, long enough for a usage
+quota to reset, so a long-running session or task picks up again by
+itself instead of failing. Each retry waits as long as the server's
+`Retry-After` says, or else backs off up to 5 minutes between tries; if
+`Retry-After` asks for longer than is left, the request fails right away.
+Meanwhile the status bar says when the next try is ("Rate limited by the
+model's server, retrying at 08:15"), and Ctrl-C still interrupts. Other
+server errors and network failures are still retried only a few times,
+for about 15 seconds.
 
 #### With a local server's prompt cache
 

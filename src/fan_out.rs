@@ -203,6 +203,12 @@ fn worker_progress(
             StatusUpdate::ToolStart { name, .. } => format!("Running {}", name),
             StatusUpdate::SendingRequest { .. } => "Waiting for response".to_string(),
             StatusUpdate::WaitingForSlot => "Waiting for a free request slot".to_string(),
+            StatusUpdate::RateLimited { until } => {
+                format!(
+                    "Rate limited, retrying at {}",
+                    openai::format_retry_time(*until)
+                )
+            }
             _ => return Ok(()),
         };
         status_bar.set_agent_status(&key, &status, false);

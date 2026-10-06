@@ -8359,6 +8359,10 @@ impl ActivityRecorder {
             StatusUpdate::Thinking => "thinking".to_string(),
             StatusUpdate::ToolStart { name, .. } => format!("running {}", name),
             StatusUpdate::WaitingForSlot => "waiting for a free request slot".to_string(),
+            StatusUpdate::RateLimited { until } => format!(
+                "rate limited, retrying at {}",
+                openai::format_retry_time(*until)
+            ),
             StatusUpdate::SendingRequest { .. } => "waiting for the model".to_string(),
             _ => return,
         };
@@ -8540,6 +8544,16 @@ fn create_response_mode(
                     status_bar.set_agent_status(
                         &agent_name,
                         "Waiting for other requests to the model to finish",
+                        true,
+                    );
+                }
+                StatusUpdate::RateLimited { until } => {
+                    status_bar.set_agent_status(
+                        &agent_name,
+                        &format!(
+                            "Rate limited by the model's server, retrying at {}",
+                            openai::format_retry_time(*until)
+                        ),
                         true,
                     );
                 }
@@ -13390,6 +13404,12 @@ struct Opts {
     /// than this (e.g. 30d), checked hourly. Off unless set.
     task_retention: Option<String>,
 
+    #[clap(long, value_name = "DURATION")]
+    /// How long to keep retrying a request the model's server turns away as
+    /// rate limited (429) before failing it, e.g. 30m: a usage quota can
+    /// take hours to reset. 8h unless set
+    rate_limit_wait: Option<String>,
+
     #[clap(long = "mcp-server")]
     #[serde(skip)]
     /// Give the session's own agent an MCP server's tools: NAME=URL (or
@@ -13437,6 +13457,7 @@ impl Default for Opts {
             profiles: HashMap::new(),
             profile: None,
             task_retention: None,
+            rate_limit_wait: None,
             max_parallel_requests: None,
             mcp_server: Vec::new(),
             mcp_granted: Vec::new(),
@@ -13535,6 +13556,10 @@ impl Opts {
 
         if self.task_retention.is_none() {
             self.task_retention = config.task_retention;
+        }
+
+        if self.rate_limit_wait.is_none() {
+            self.rate_limit_wait = config.rate_limit_wait;
         }
 
         if self.max_parallel_requests.is_none() {
@@ -14309,6 +14334,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     lsp::configure(&opts.lsp_servers)?;
     validate_profiles(&opts.profiles).map_err(|e| format!("Configuration file error: {}", e))?;
     openai::set_max_parallel_requests(opts.max_parallel_requests.unwrap_or(0));
+    if let Some(wait) = &opts.rate_limit_wait {
+        let duration = parse_duration(wait)
+            .and_then(|d| d.to_std().ok())
+            .ok_or_else(|| {
+                format!(
+                    "can't read rate_limit_wait '{}': use a duration like 30m or 8h",
+                    wait
+                )
+            })?;
+        openai::set_rate_limit_wait(duration);
+    }
     if let Some(retention) = &opts.task_retention {
         parse_duration(retention).ok_or_else(|| {
             format!(

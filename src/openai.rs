@@ -244,6 +244,71 @@ pub fn max_parallel_requests() -> usize {
         .0
 }
 
+/// How long, in seconds, a request the model's server keeps turning away
+/// as rate limited (429) is retried before it fails: a usage quota can
+/// take hours to reset.
+static RATE_LIMIT_WAIT_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(8 * 3600);
+
+/// The longest pause between retries of a rate-limited request the server
+/// didn't say when to retry (`Retry-After`).
+const MAX_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(300);
+
+/// Sets how long a rate-limited request is retried before it fails.
+pub fn set_rate_limit_wait(wait: Duration) {
+    RATE_LIMIT_WAIT_SECS.store(wait.as_secs(), Ordering::Relaxed);
+}
+
+fn rate_limit_wait() -> Duration {
+    Duration::from_secs(RATE_LIMIT_WAIT_SECS.load(Ordering::Relaxed))
+}
+
+/// When a response's `Retry-After` header says to try again: in seconds,
+/// or at an HTTP date.
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some(
+        (at.with_timezone(&chrono::Utc) - chrono::Utc::now())
+            .to_std()
+            .unwrap_or(Duration::ZERO),
+    )
+}
+
+/// When a rate-limited request is retried (`StatusUpdate::RateLimited`),
+/// in local time: `HH:MM`, with the date if it isn't today.
+pub fn format_retry_time(until: std::time::SystemTime) -> String {
+    let at = chrono::DateTime::<chrono::Local>::from(until);
+    if at.date_naive() == chrono::Local::now().date_naive() {
+        at.format("%H:%M").to_string()
+    } else {
+        at.format("%Y-%m-%d %H:%M").to_string()
+    }
+}
+
+/// Sleeps for `duration`, checking for Ctrl-C every 100ms.
+fn sleep_interruptibly(
+    duration: Duration,
+    ctrl_c_rx: &Option<Arc<Mutex<mpsc::Receiver<()>>>>,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + duration;
+    loop {
+        check_ctrl_c_signal(ctrl_c_rx)?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(());
+        }
+        thread::sleep(left.min(Duration::from_millis(100)));
+    }
+}
+
 /// Runs a blocking call - sending a request, reading a whole response -
 /// on a helper thread, checking for Ctrl-C every 100ms meanwhile, so the
 /// user isn't stuck waiting for a slow or hung server. If interrupted, the
@@ -507,6 +572,11 @@ pub enum StatusUpdate {
     /// Waiting for another request to finish first: no more may be in
     /// flight at once (see `set_max_parallel_requests`).
     WaitingForSlot,
+    /// The model's server is rate limiting requests: retrying at `until`
+    /// (see `set_rate_limit_wait`).
+    RateLimited {
+        until: std::time::SystemTime,
+    },
     /// About to send a request and wait for the response - reported once
     /// per turn (the first request and every one that follows a tool call),
     /// with the size of the outgoing request body, so a long wait on a
@@ -1405,9 +1475,13 @@ fn post_request_with_mode_and_recursion(
 
         let max_retries = opts.max_retries.unwrap_or(5);
         let base_delay_secs = opts.retry_base_delay_secs.unwrap_or(1);
-        let mut response = None;
+        // Failures other than being rate limited: up to `max_retries`.
+        let mut attempt = 0;
+        // Rate limited: retried for up to `rate_limit_wait()` since the first.
+        let mut rate_limited: Option<(Instant, u32)> = None;
 
-        for attempt in 1..=max_retries {
+        let response = loop {
+            attempt += 1;
             let request = client
                 .post(&opts.endpoint)
                 .headers(headers.clone())
@@ -1421,12 +1495,56 @@ fn post_request_with_mode_and_recursion(
                     let status = resp.status();
 
                     if status.is_success() {
-                        response = Some(resp);
-                        break;
+                        break resp;
                     }
 
-                    if (status.is_server_error() || status.as_u16() == 429) && attempt < max_retries
-                    {
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        attempt -= 1;
+                        let (since, tries) = rate_limited.get_or_insert((Instant::now(), 0));
+                        *tries += 1;
+                        let left = rate_limit_wait().saturating_sub(since.elapsed());
+                        let delay = retry_after(resp.headers()).unwrap_or_else(|| {
+                            Duration::from_secs(
+                                base_delay_secs.saturating_mul(1u64 << (*tries - 1).min(20)),
+                            )
+                            .min(MAX_RATE_LIMIT_BACKOFF)
+                            .min(left)
+                        });
+                        if !left.is_zero() && delay <= left {
+                            warn!(
+                                "Rate limited (try {}). Retrying after {} seconds for endpoint: {}",
+                                tries,
+                                delay.as_secs(),
+                                opts.endpoint
+                            );
+                            if let ResponseMode::Streaming {
+                                progress_handler, ..
+                            } = &mode
+                            {
+                                progress_handler(&ProgressInfo {
+                                    status: StatusUpdate::RateLimited {
+                                        until: std::time::SystemTime::now() + delay,
+                                    },
+                                    elapsed_ms: start_time.elapsed().as_millis() as u64,
+                                })?;
+                            }
+                            sleep_interruptibly(delay, &ctrl_c_rx)?;
+                            continue;
+                        }
+                        let error_text = resp
+                            .text()
+                            .unwrap_or_else(|_| "Unable to read response".to_string());
+                        return Err(format!(
+                            "got error code: {}: {} (still rate limited after waiting {}s, \
+                             the most rate_limit_wait allows)",
+                            status,
+                            error_text,
+                            since.elapsed().as_secs()
+                        )
+                        .into());
+                    }
+
+                    if status.is_server_error() && attempt < max_retries {
                         let delay_duration =
                             Duration::from_secs(base_delay_secs * 2_u64.pow(attempt as u32 - 1));
                         warn!(
@@ -1437,15 +1555,7 @@ fn post_request_with_mode_and_recursion(
                             delay_duration.as_secs(),
                             opts.endpoint
                         );
-                        // Check for interruption during sleep in smaller intervals
-                        let sleep_interval = Duration::from_millis(100);
-                        let mut remaining = delay_duration;
-                        while remaining > Duration::ZERO {
-                            check_ctrl_c_signal(&ctrl_c_rx)?;
-                            let sleep_time = std::cmp::min(sleep_interval, remaining);
-                            thread::sleep(sleep_time);
-                            remaining = remaining.saturating_sub(sleep_time);
-                        }
+                        sleep_interruptibly(delay_duration, &ctrl_c_rx)?;
                         continue;
                     }
 
@@ -1473,23 +1583,13 @@ fn post_request_with_mode_and_recursion(
                             delay_duration.as_secs(),
                             opts.endpoint
                         );
-                        // Check for interruption during sleep in smaller intervals
-                        let sleep_interval = Duration::from_millis(100);
-                        let mut remaining = delay_duration;
-                        while remaining > Duration::ZERO {
-                            check_ctrl_c_signal(&ctrl_c_rx)?;
-                            let sleep_time = std::cmp::min(sleep_interval, remaining);
-                            thread::sleep(sleep_time);
-                            remaining = remaining.saturating_sub(sleep_time);
-                        }
+                        sleep_interruptibly(delay_duration, &ctrl_c_rx)?;
                         continue;
                     }
                     return Err(e.into());
                 }
             }
-        }
-
-        let response = response.ok_or("Max retries reached without successful response")?;
+        };
 
         let mut openai_response: OpenAIResponse = if use_streaming {
             handle_streaming_response(response, &mode, ctrl_c_rx.clone())
@@ -2582,11 +2682,31 @@ mod tests {
     /// Like `serve_sse`, but serves one set of events per request, in order
     /// (each round trip through a tool call is a separate HTTP request).
     fn serve_sse_turns(turns: Vec<Vec<serde_json::Value>>) -> String {
+        serve_responses(
+            turns
+                .into_iter()
+                .map(|events| {
+                    let mut response = String::from(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                    );
+                    for event in events {
+                        response.push_str(&format!("data: {}\n\n", event));
+                    }
+                    response.push_str("data: [DONE]\n\n");
+                    response
+                })
+                .collect(),
+        )
+    }
+
+    /// Serves one raw HTTP response per request, in order, on a local port
+    /// and returns the endpoint to use.
+    fn serve_responses(responses: Vec<String>) -> String {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
-            for events in turns {
+            for response in responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = Vec::new();
                 let mut buf = [0u8; 4096];
@@ -2607,17 +2727,101 @@ mod tests {
                     let n = stream.read(&mut buf).unwrap();
                     request.extend_from_slice(&buf[..n]);
                 }
-                let mut response = String::from(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-                );
-                for event in events {
-                    response.push_str(&format!("data: {}\n\n", event));
-                }
-                response.push_str("data: [DONE]\n\n");
                 stream.write_all(response.as_bytes()).unwrap();
             }
         });
         format!("http://{}/chat/completions", addr)
+    }
+
+    /// A 429 response, with a `Retry-After` header of `retry_after`.
+    fn rate_limited_response(retry_after: &str) -> String {
+        let body = r#"{"error":{"message":"Usage limit reached"}}"#;
+        format!(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            retry_after,
+            body.len(),
+            body
+        )
+    }
+
+    #[test]
+    fn rate_limited_request_is_retried_when_the_server_says() {
+        let mut responses = vec![rate_limited_response("0"), rate_limited_response("0")];
+        responses.push(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n"
+                .to_string(),
+        );
+        let (_, answer, _, statuses, _) =
+            stream_to_vecs_with(serve_responses(responses), &ToolsCollection::new());
+        assert_eq!(answer, "ok");
+        let waits = statuses
+            .iter()
+            .filter(|s| matches!(s, StatusUpdate::RateLimited { .. }))
+            .count();
+        assert_eq!(waits, 2);
+    }
+
+    #[test]
+    fn rate_limited_request_fails_when_the_wait_is_too_long() {
+        // A day: more than the 8h a rate-limited request is retried for.
+        let endpoint = serve_responses(vec![rate_limited_response("86400")]);
+        let opts = Opts {
+            max_tokens: None,
+            model: "test-model".to_string(),
+            endpoint,
+            tool_choice: None,
+            api_key: None,
+            max_retries: Some(1),
+            retry_base_delay_secs: None,
+            parameters: HashMap::new(),
+        };
+        let ctx = crate::ToolContext::new(|_: &str| {});
+        let start = Instant::now();
+        let err = post_request_with_mode(
+            vec![make_message("user", "hi".to_string())],
+            &ToolsCollection::new(),
+            &opts,
+            ResponseMode::Complete,
+            &ctx,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(err.contains("429"), "{err}");
+        assert!(err.contains("Usage limit reached"), "{err}");
+        assert!(err.contains("rate_limit_wait"), "{err}");
+    }
+
+    #[test]
+    fn retry_after_reads_seconds_and_dates() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(retry_after(&headers), None);
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("120"),
+        );
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(120)));
+        let at = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc2822();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_str(&at.replace("+0000", "GMT")).unwrap(),
+        );
+        let wait = retry_after(&headers).unwrap();
+        assert!(wait > Duration::from_secs(7100) && wait <= Duration::from_secs(7200));
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("Tue, 01 Jan 2002 00:00:00 GMT"),
+        );
+        assert_eq!(retry_after(&headers), Some(Duration::ZERO));
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("soon"),
+        );
+        assert_eq!(retry_after(&headers), None);
     }
 
     fn delta(field: &str, text: &str, finish: Option<&str>) -> serde_json::Value {
