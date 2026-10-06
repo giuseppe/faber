@@ -211,6 +211,8 @@ enum Step {
     WaitingForSlot,
     /// Until when.
     RateLimited(String),
+    /// Why.
+    Retrying(String),
 }
 
 /// What a running worker has done so far, and is doing.
@@ -253,6 +255,7 @@ impl WorkerStats {
             }
             Step::WaitingForSlot => "waiting for a free request slot".to_string(),
             Step::RateLimited(until) => format!("rate limited, retrying at {}", until),
+            Step::Retrying(reason) => format!("{}, retrying", reason),
         };
     }
 
@@ -537,6 +540,7 @@ fn worker_progress(
             StatusUpdate::RateLimited { until } => {
                 Step::RateLimited(openai::format_retry_time(*until))
             }
+            StatusUpdate::Retrying { reason } => Step::Retrying(reason.clone()),
             _ => return Ok(()),
         };
         progress.step(&label, step);

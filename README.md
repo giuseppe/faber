@@ -1260,6 +1260,7 @@ python3 -m venv /tmp/a2a && /tmp/a2a/bin/pip install 'a2a-sdk<0.4' httpx
     --max-parallel-requests <N>  At most N model requests in flight at once (see below)
     --task-retention <DURATION>  Prune done tasks older than this while chatting
     --rate-limit-wait <DURATION> Keep retrying a rate-limited request this long (default 8h)
+    --stream-idle-timeout <DURATION> Retry a response that sends nothing this long (default 3m)
 ```
 
 `--max-parallel-requests` (or `"max_parallel_requests"` in the config file)
@@ -1285,6 +1286,17 @@ Meanwhile the status bar says when the next try is ("Rate limited by the
 model's server, retrying at 08:15"), and Ctrl-C still interrupts. Other
 server errors and network failures are still retried only a few times,
 for about 15 seconds.
+
+`--stream-idle-timeout` (or `"stream_idle_timeout"` in the config file)
+is how long a streamed response may send nothing before faber gives up on
+it as stalled and sends the request again - 3m unless set. A server can
+keep the connection open and stop sending; without it, the request would
+wait for over a quarter of an hour, then fail. A stalled response counts
+as one of the few retries other failures get. Whatever had been shown of
+it stays on screen, and the answer starts again after it.
+
+While a request waits to be retried, for whatever reason, it doesn't
+count toward `--max-parallel-requests`: it takes its turn again to retry.
 
 #### With a local server's prompt cache
 
