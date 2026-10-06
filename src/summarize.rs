@@ -235,6 +235,7 @@ mod tests {
     fn tool_call_message() -> Message {
         Message {
             role: "assistant".to_string(),
+            reasoning_content: None,
             content: None,
             tool_call_id: None,
             name: None,

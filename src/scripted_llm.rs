@@ -198,6 +198,7 @@ pub fn post_request_scripted(
                 ..
             }) => Message {
                 role: "assistant".to_string(),
+                reasoning_content: None,
                 content: None,
                 tool_call_id: None,
                 name: None,

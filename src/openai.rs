@@ -493,6 +493,28 @@ pub struct Message {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// The model's reasoning before this message, exactly as it came - kept
+    /// only when sent back (see `preserves_reasoning`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
+/// Whether the model's reasoning is kept in the conversation and sent back
+/// with it: when the request asks the model to preserve it, as z.ai's GLM
+/// does with `"thinking": {"clear_thinking": false}` - the model then
+/// expects every earlier response's reasoning, complete and unmodified, or
+/// works its way to its earlier conclusions again (and its server's prompt
+/// cache helps less). Otherwise it's left out: some servers refuse it.
+/// It's also found in `extra_body`, where a proxy in front of the model,
+/// such as LiteLLM, takes what it passes on as it is.
+pub fn preserves_reasoning(parameters: &HashMap<String, serde_json::Value>) -> bool {
+    [
+        parameters.get("thinking"),
+        parameters.get("extra_body").and_then(|b| b.get("thinking")),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|t| t.get("clear_thinking").and_then(|c| c.as_bool()) == Some(false))
 }
 
 #[derive(Deserialize, Debug)]
@@ -875,8 +897,14 @@ pub fn context_overflow_sizes(error_text: &str) -> Option<(u64, u64)> {
     })
 }
 
+/// A message's size in characters: its content, and its reasoning when
+/// it's kept (`preserves_reasoning`).
 fn content_chars(msg: &Message) -> usize {
-    msg.content.as_deref().map_or(0, |c| c.chars().count())
+    [&msg.content, &msg.reasoning_content]
+        .into_iter()
+        .flatten()
+        .map(|c| c.chars().count())
+        .sum()
 }
 
 /// Cheaper recovery from a context overflow than summarizing: shortens the
@@ -1010,6 +1038,7 @@ pub fn tool_call(
             let content = truncate_tool_output(&content, ctx.max_tool_output_chars());
             let msg = Message {
                 role: "tool".to_string(),
+                reasoning_content: None,
                 content: Some(content),
                 tool_call_id: Some(req.id.clone()),
                 name: Some(tool_name.clone()),
@@ -1069,6 +1098,7 @@ pub fn tool_call(
 
     let msg = Message {
         role: "tool".to_string(),
+        reasoning_content: None,
         content: Some(content),
         tool_call_id: Some(req.id.clone()),
         name: Some(tool_name.clone()),
@@ -1374,6 +1404,7 @@ pub fn run_tool_calls(
 pub fn make_message(role: &str, content: String) -> Message {
     Message {
         role: role.to_string(),
+        reasoning_content: None,
         content: Some(content),
         tool_calls: None,
         tool_call_id: None,
@@ -1493,6 +1524,7 @@ fn post_request_with_mode_and_recursion(
     rules: &RequestRules,
 ) -> Result<OpenAIResponse, Box<dyn Error>> {
     let limiter = rules.limiter;
+    let keep_reasoning = preserves_reasoning(&opts.parameters);
     let start_time = Instant::now();
     let mut messages = messages;
     let mut turn_usage: Option<Usage> = None;
@@ -1526,7 +1558,17 @@ fn post_request_with_mode_and_recursion(
         let request_body = OpenAIRequest {
             model: opts.model.clone(),
             max_tokens: opts.max_tokens,
-            messages: messages.clone(),
+            messages: if keep_reasoning {
+                messages.clone()
+            } else {
+                messages
+                    .iter()
+                    .map(|m| Message {
+                        reasoning_content: None,
+                        ..m.clone()
+                    })
+                    .collect()
+            },
             tools: if tools.len() > 0 { Some(tools) } else { None },
             tool_choice: tool_choice,
             stream: if use_streaming { Some(true) } else { None },
@@ -1708,13 +1750,20 @@ fn post_request_with_mode_and_recursion(
             if !use_streaming {
                 let response_text = interruptible(move || response.text(), &ctrl_c_rx)??;
                 trace!("Got response {:?}", response_text);
-                break serde_json::from_str(&response_text)?;
+                let mut response: OpenAIResponse = serde_json::from_str(&response_text)?;
+                if !keep_reasoning {
+                    for choice in response.choices.iter_mut().flatten() {
+                        choice.message.reasoning_content = None;
+                    }
+                }
+                break response;
             }
             match handle_streaming_response(
                 response,
                 &mode,
                 ctrl_c_rx.clone(),
                 rules.stream_idle_timeout,
+                keep_reasoning,
             ) {
                 Ok(response) => break response,
                 Err(e)
@@ -1869,12 +1918,14 @@ fn post_request_with_mode_and_recursion(
 
 /// Handle streaming response from the API
 /// Reads a streamed response as it comes, giving up with
-/// `StreamStalledError` once nothing has come for `idle_timeout`.
+/// `StreamStalledError` once nothing has come for `idle_timeout`. With
+/// `keep_reasoning`, the message it makes carries the model's reasoning.
 fn handle_streaming_response(
     response: reqwest::blocking::Response,
     mode: &ResponseMode,
     ctrl_c_rx: Option<Arc<Mutex<mpsc::Receiver<()>>>>,
     idle_timeout: Duration,
+    keep_reasoning: bool,
 ) -> Result<OpenAIResponse, Box<dyn Error>> {
     let (stream_handler, reasoning_handler, progress_handler) = match mode {
         ResponseMode::Streaming {
@@ -1887,6 +1938,7 @@ fn handle_streaming_response(
 
     let reader = BufReader::new(response);
     let mut accumulated_content = String::new();
+    let mut accumulated_reasoning = String::new();
     let mut accumulated_tool_calls: HashMap<usize, ToolCall> = HashMap::new();
     let mut finish_reason: Option<String> = None;
     let mut usage: Option<Usage> = None;
@@ -1996,6 +2048,9 @@ fn handle_streaming_response(
                             .flatten()
                         {
                             if !reasoning.is_empty() {
+                                if keep_reasoning {
+                                    accumulated_reasoning.push_str(reasoning);
+                                }
                                 reasoning_handler(reasoning)?;
                                 reasoning_active = true;
                             }
@@ -2240,6 +2295,7 @@ fn handle_streaming_response(
         tool_calls: tool_calls_vec,
         tool_call_id: None,
         name: None,
+        reasoning_content: (!accumulated_reasoning.is_empty()).then_some(accumulated_reasoning),
     };
 
     let choice = Choice {
@@ -2403,6 +2459,7 @@ mod tests {
             make_message("user", "read it".to_string()),
             Message {
                 role: "assistant".to_string(),
+                reasoning_content: None,
                 content: None,
                 tool_call_id: None,
                 name: None,
@@ -2875,8 +2932,9 @@ mod tests {
     }
 
     /// Like `serve_responses`, also telling, through the receiver, once
-    /// each response has been sent.
-    fn serve_responses_telling(responses: Vec<String>) -> (String, mpsc::Receiver<()>) {
+    /// each response has been sent - with the body of the request it
+    /// answered.
+    fn serve_responses_telling(responses: Vec<String>) -> (String, mpsc::Receiver<String>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2924,7 +2982,7 @@ mod tests {
                 } else {
                     drop(stream);
                 }
-                let _ = sent_tx.send(());
+                let _ = sent_tx.send(String::from_utf8_lossy(&request[header_end..]).to_string());
             }
         });
         (format!("http://{}/chat/completions", addr), sent)
@@ -3630,6 +3688,161 @@ mod tests {
         assert!(sending[1] > sending[0]);
     }
 
+    /// A streamed response of `events`.
+    fn sse_response(events: Vec<serde_json::Value>) -> String {
+        let mut response = String::from(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        );
+        for event in events {
+            response.push_str(&format!("data: {}\n\n", event));
+        }
+        response.push_str("data: [DONE]\n\n");
+        response
+    }
+
+    /// A turn where the model reasons, in two pieces, then calls a tool,
+    /// then answers, sent with `parameters`: the history it ends with, and
+    /// the assistant message the second request sent back.
+    fn reason_then_call_a_tool(parameters: serde_json::Value) -> (Vec<Message>, serde_json::Value) {
+        let mut tools = ToolsCollection::new();
+        tools.insert(
+            "lookup".to_string(),
+            ToolItem {
+                callback: ok_tool,
+                schema: r#"{"type":"function","function":{"name":"lookup","parameters":{}}}"#
+                    .to_string(),
+            },
+        );
+        let call = serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "call_1", "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"}
+        }]}, "finish_reason": "tool_calls"}]});
+        let (endpoint, sent) = serve_responses_telling(vec![
+            sse_response(vec![
+                delta("reasoning_content", "Let me ", None),
+                delta("reasoning_content", "look it up.", None),
+                call,
+            ]),
+            sse_response(vec![delta("content", "done", Some("stop"))]),
+        ]);
+        let mut opts = retry_opts(endpoint, 0);
+        opts.parameters = serde_json::from_value(parameters).unwrap();
+        let response = post_request_with_mode(
+            vec![make_message("user", "hi".to_string())],
+            &tools,
+            &opts,
+            ResponseMode::Streaming {
+                stream_handler: Box::new(|_| Ok(())),
+                reasoning_handler: Box::new(|_| Ok(())),
+                progress_handler: Box::new(|_| Ok(())),
+            },
+            &crate::ToolContext::new(|_: &str| {}),
+            None,
+        )
+        .unwrap();
+        sent.recv_timeout(STUCK).unwrap();
+        let second: serde_json::Value =
+            serde_json::from_str(&sent.recv_timeout(STUCK).unwrap()).unwrap();
+        let assistant = second["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .cloned()
+            .unwrap();
+        (response.history, assistant)
+    }
+
+    #[test]
+    fn test_reasoning_is_sent_back_unmodified_when_the_model_preserves_it() {
+        let (history, sent_back) = reason_then_call_a_tool(serde_json::json!({
+            "thinking": {"type": "enabled", "clear_thinking": false}
+        }));
+        assert_eq!(sent_back["reasoning_content"], "Let me look it up.");
+        assert_eq!(sent_back["tool_calls"][0]["function"]["name"], "lookup");
+        // Kept with the conversation, for its next turns too.
+        let kept: Vec<_> = history
+            .iter()
+            .filter_map(|m| m.reasoning_content.as_deref())
+            .collect();
+        assert_eq!(kept, vec!["Let me look it up."]);
+    }
+
+    #[test]
+    fn test_reasoning_is_preserved_when_asked_for_through_extra_body() {
+        let parameters = |v: serde_json::Value| -> HashMap<String, serde_json::Value> {
+            serde_json::from_value(v).unwrap()
+        };
+        assert!(preserves_reasoning(&parameters(serde_json::json!({
+            "extra_body": {"thinking": {"type": "enabled", "clear_thinking": false}}
+        }))));
+        assert!(!preserves_reasoning(&parameters(serde_json::json!({
+            "extra_body": {"thinking": {"type": "enabled"}}
+        }))));
+        assert!(!preserves_reasoning(&parameters(serde_json::json!({
+            "extra_body": {"temperature": 0.2}
+        }))));
+    }
+
+    #[test]
+    fn test_reasoning_is_left_out_otherwise() {
+        for parameters in [
+            serde_json::json!({}),
+            serde_json::json!({"thinking": {"type": "enabled"}}),
+            serde_json::json!({"thinking": {"type": "enabled", "clear_thinking": true}}),
+        ] {
+            let (history, sent_back) = reason_then_call_a_tool(parameters.clone());
+            assert!(
+                sent_back.get("reasoning_content").is_none(),
+                "{parameters}: {sent_back}"
+            );
+            assert!(
+                history.iter().all(|m| m.reasoning_content.is_none()),
+                "{parameters}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reasoning_in_a_whole_response_is_kept_only_when_preserved() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok","reasoning_content":"hmm"},"finish_reason":"stop"}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        for (parameters, kept) in [
+            (serde_json::json!({}), None),
+            (
+                serde_json::json!({"thinking": {"clear_thinking": false}}),
+                Some("hmm"),
+            ),
+        ] {
+            let mut opts = retry_opts(serve_responses(vec![response.clone()]), 0);
+            opts.parameters = serde_json::from_value(parameters).unwrap();
+            let answer = post_request_with_mode(
+                vec![make_message("user", "hi".to_string())],
+                &ToolsCollection::new(),
+                &opts,
+                ResponseMode::Complete,
+                &crate::ToolContext::new(|_: &str| {}),
+                None,
+            )
+            .unwrap();
+            let message = &answer.choices.unwrap()[0].message;
+            assert_eq!(message.reasoning_content.as_deref(), kept);
+        }
+    }
+
+    #[test]
+    fn test_kept_reasoning_counts_toward_a_message_s_size() {
+        let mut message = make_message("assistant", "12345".to_string());
+        assert_eq!(content_chars(&message), 5);
+        message.reasoning_content = Some("123".to_string());
+        assert_eq!(content_chars(&message), 8);
+    }
+
     #[test]
     fn test_reasoning_directly_into_a_tool_call_flushes_reasoning_first() {
         // The bug this guards against: the model reasons about which tool
@@ -3805,6 +4018,7 @@ mod tests {
     fn test_message_serialization() {
         let msg = Message {
             role: "assistant".to_string(),
+            reasoning_content: None,
             content: Some("hello".to_string()),
             tool_call_id: None,
             tool_calls: None,
@@ -3820,6 +4034,7 @@ mod tests {
     fn test_message_skips_none_fields() {
         let msg = Message {
             role: "user".to_string(),
+            reasoning_content: None,
             content: Some("hi".to_string()),
             tool_call_id: None,
             tool_calls: None,

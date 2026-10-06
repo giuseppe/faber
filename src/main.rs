@@ -1263,6 +1263,11 @@ fn parse_parameters(
                 serde_json::Value::Bool(bool_val)
             } else if value_str == "null" {
                 serde_json::Value::Null
+            } else if let Ok(value @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) =
+                serde_json::from_str(value_str)
+            {
+                // e.g. thinking={"type":"enabled","clear_thinking":false}
+                value
             } else {
                 serde_json::Value::String(value_str.to_string())
             };
@@ -9200,6 +9205,7 @@ fn execute_scheduled_command(
         Ok(msg) => msg,
         Err(e) => Message {
             role: "tool".to_string(),
+            reasoning_content: None,
             content: Some(format!("error: {}", e)),
             tool_call_id: Some(call_id),
             name: Some(tool_name),
@@ -9209,6 +9215,7 @@ fn execute_scheduled_command(
 
     let assistant_msg = Message {
         role: "assistant".to_string(),
+        reasoning_content: None,
         content: None,
         tool_call_id: None,
         name: None,
@@ -15029,6 +15036,23 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn test_parse_parameters_json_objects_and_arrays() {
+        let params = parse_parameters(&[
+            r#"thinking={"type": "enabled", "clear_thinking": false}"#.to_string(),
+            r#"stop=["a", "b"]"#.to_string(),
+            "brace={not json".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            params["thinking"],
+            serde_json::json!({"type": "enabled", "clear_thinking": false})
+        );
+        assert!(openai::preserves_reasoning(&params));
+        assert_eq!(params["stop"], serde_json::json!(["a", "b"]));
+        assert_eq!(params["brace"], serde_json::json!("{not json"));
+    }
+
+    #[test]
     fn test_parse_parameters_nan_becomes_string() {
         let params = parse_parameters(&["val=NaN".to_string()]).unwrap();
         assert_eq!(params["val"], serde_json::json!("NaN"));
@@ -17209,6 +17233,7 @@ for line in sys.stdin:
     fn test_fit_history_keeps_system_and_whole_turns() {
         let tool_call = Message {
             role: "assistant".to_string(),
+            reasoning_content: None,
             content: None,
             tool_calls: Some(vec![]),
             tool_call_id: None,

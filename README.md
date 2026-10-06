@@ -107,7 +107,18 @@ with no extra step.
 
 Reasoning ("thinking") tokens from models that stream them separately are shown
 in grey italics.  They are not kept in the conversation history, so they do not
-use up the context window on later requests.  If the model stops because it hit
+use up the context window on later requests - unless the request asks the model
+to preserve its reasoning, as z.ai's GLM models do with
+`"thinking": {"type": "enabled", "clear_thinking": false}` (their default on
+z.ai's Coding Plan endpoint, but faber only knows it's on when it's set). Then
+each response's reasoning is kept with it, exactly as it came, and sent back
+with the conversation: the model carries on from its earlier thinking instead
+of working its way there again on every step, and its server's prompt cache
+covers more of each request. Set it as a parameter, e.g.
+`--parameter 'thinking={"type":"enabled","clear_thinking":false}'`, or in a
+profile's `parameters`. Through a proxy that only takes OpenAI's own
+parameters, such as LiteLLM, put it in `extra_body` instead:
+`--parameter 'extra_body={"thinking":{"type":"enabled","clear_thinking":false}}'`. If the model stops because it hit
 its token limit, the chat prints a warning instead of showing a silently
 truncated answer.
 
@@ -1249,7 +1260,7 @@ python3 -m venv /tmp/a2a && /tmp/a2a/bin/pip install 'a2a-sdk<0.4' httpx
     --tools <LIST>           Comma-separated list of tools to enable
     --tool-choice <MODE>     Tool usage mode: auto, none, required
     --api-key <PATH>         File containing the API key
-    --parameter <K=V>        Model parameter (can be repeated)
+    --parameter <K=V>        Model parameter (can be repeated; a JSON object or array is taken as JSON)
     --mcp-server <N[=URL]>   Give the session's agent an MCP server, adding a remote one with =URL (can be repeated); see MCP section
     --db-path <PATH>         SQLite database for persistent storage
     --agent <NAME>           Start chat as this agent instead of 'default'
