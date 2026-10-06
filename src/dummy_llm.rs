@@ -269,6 +269,7 @@ fn make_text_response(turn: usize, messages: Vec<Message>) -> OpenAIResponse {
         choices: Some(vec![Choice {
             message: Message {
                 role: "assistant".to_string(),
+                reasoning_content: None,
                 content: Some(text),
                 tool_call_id: None,
                 name: None,
@@ -297,6 +298,7 @@ fn make_tool_call_response(turn: usize, messages: Vec<Message>) -> OpenAIRespons
         choices: Some(vec![Choice {
             message: Message {
                 role: "assistant".to_string(),
+                reasoning_content: None,
                 content: None,
                 tool_call_id: None,
                 name: None,
@@ -341,6 +343,7 @@ fn work_command(messages: &[Message]) -> Option<(usize, usize, u64)> {
 fn assistant_message(content: Option<String>, tool_calls: Option<Vec<ToolCall>>) -> Message {
     Message {
         role: "assistant".to_string(),
+        reasoning_content: None,
         content,
         tool_call_id: None,
         name: None,
