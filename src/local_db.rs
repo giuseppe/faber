@@ -36,10 +36,20 @@ impl LocalDb {
         Self { conn }
     }
 
+    /// The connection, to use for one call. None leaves a transaction
+    /// open between calls, so one still open is a leftover from a failure:
+    /// it's rolled back, and said so - left open, every later write would
+    /// go nowhere, silently, until faber restarted.
     fn lock(&self) -> Result<MutexGuard<'_, rusqlite::Connection>, Box<dyn Error>> {
-        self.conn
-            .lock()
-            .map_err(|e| format!("DB lock: {}", e).into())
+        let conn = self.conn.lock().map_err(|e| format!("DB lock: {}", e))?;
+        if !conn.is_autocommit() {
+            log::error!(
+                "the database connection was left inside a transaction; rolling it back \
+                 so that writes are saved again"
+            );
+            conn.execute_batch("ROLLBACK")?;
+        }
+        Ok(conn)
     }
 }
 
@@ -427,5 +437,39 @@ impl DbBackend for LocalDb {
     fn agent_events(&self, filter: &EventFilter) -> Result<Vec<AgentEventRow>, Box<dyn Error>> {
         let conn = self.lock()?;
         db::agent_events(&conn, filter)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_a_transaction_left_open_is_rolled_back_so_writes_are_saved_again() {
+        let path = std::env::temp_dir().join(format!("faber_open_tx_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        db::initialize_db(&conn).unwrap();
+        let shared = Arc::new(Mutex::new(conn));
+        let local = LocalDb::new(shared.clone());
+        // What a failure partway through a transaction can leave behind.
+        shared
+            .lock()
+            .unwrap()
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap();
+        local.create_agent("alice", "").unwrap();
+        // Saved: anyone else reading the database sees it.
+        let other = rusqlite::Connection::open(&path).unwrap();
+        let seen: i64 = other
+            .query_row(
+                "SELECT count(*) FROM agents WHERE name = 'alice'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(seen, 1);
+        drop(other);
+        let _ = std::fs::remove_file(&path);
     }
 }
