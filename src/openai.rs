@@ -268,6 +268,56 @@ fn rate_limit_wait() -> Duration {
     Duration::from_secs(RATE_LIMIT_WAIT_SECS.load(Ordering::Relaxed))
 }
 
+/// How long, in seconds, a streamed response may go without sending
+/// anything before it's given up on as stalled, and the request sent
+/// again. A server can keep a connection open and stop sending: left to
+/// the client's own timeout, the request would wait for over a quarter of
+/// an hour, then fail.
+static STREAM_IDLE_TIMEOUT_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(180);
+
+/// Sets how long a streamed response may send nothing before it's retried.
+pub fn set_stream_idle_timeout(timeout: Duration) {
+    STREAM_IDLE_TIMEOUT_SECS.store(timeout.as_secs().max(1), Ordering::Relaxed);
+}
+
+/// What a request loop goes by: whose turns its requests take, and how
+/// long a stream may send nothing.
+struct RequestRules<'a> {
+    limiter: &'a RequestLimiter,
+    stream_idle_timeout: Duration,
+}
+
+impl RequestRules<'static> {
+    /// The process's, as set at start.
+    fn process() -> Self {
+        Self {
+            limiter: request_limiter(),
+            stream_idle_timeout: Duration::from_secs(
+                STREAM_IDLE_TIMEOUT_SECS.load(Ordering::Relaxed),
+            ),
+        }
+    }
+}
+
+/// A streamed response that sent nothing for too long.
+#[derive(Debug)]
+pub struct StreamStalledError {
+    idle: Duration,
+}
+
+impl std::fmt::Display for StreamStalledError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the model's response stalled: nothing came for {}s",
+            self.idle.as_secs()
+        )
+    }
+}
+
+impl Error for StreamStalledError {}
+
 /// When a response's `Retry-After` header says to try again: in seconds,
 /// or at an HTTP date.
 fn retry_after(headers: &HeaderMap) -> Option<Duration> {
@@ -581,6 +631,11 @@ pub enum StatusUpdate {
     /// (see `set_rate_limit_wait`).
     RateLimited {
         until: std::time::SystemTime,
+    },
+    /// A request failed in a way worth another try, `reason`: it's being
+    /// sent again.
+    Retrying {
+        reason: String,
     },
     /// About to send a request and wait for the response - reported once
     /// per turn (the first request and every one that follows a tool call),
@@ -1405,7 +1460,7 @@ pub fn post_request_with_mode(
         mode,
         ctx,
         ctrl_c_rx,
-        request_limiter(),
+        &RequestRules::process(),
     )
 }
 
@@ -1427,8 +1482,7 @@ fn wait_to_retry<'a>(
     Ok(())
 }
 
-/// Internal function with iterative tool call handling. Its requests take
-/// their turns with `limiter`'s.
+/// Internal function with iterative tool call handling, going by `rules`.
 fn post_request_with_mode_and_recursion(
     messages: Vec<Message>,
     tools_collection: &ToolsCollection,
@@ -1436,8 +1490,9 @@ fn post_request_with_mode_and_recursion(
     mode: ResponseMode,
     ctx: &crate::ToolContext,
     ctrl_c_rx: Option<Arc<Mutex<mpsc::Receiver<()>>>>,
-    limiter: &RequestLimiter,
+    rules: &RequestRules,
 ) -> Result<OpenAIResponse, Box<dyn Error>> {
+    let limiter = rules.limiter;
     let start_time = Instant::now();
     let mut messages = messages;
     let mut turn_usage: Option<Usage> = None;
@@ -1515,143 +1570,183 @@ fn post_request_with_mode_and_recursion(
         // Rate limited: retried for up to `rate_limit_wait()` since the first.
         let mut rate_limited: Option<(Instant, u32)> = None;
 
-        let response = loop {
-            attempt += 1;
-            let request = client
-                .post(&opts.endpoint)
-                .headers(headers.clone())
-                .json(&request_body);
-            let response_result = interruptible(move || request.send(), &ctrl_c_rx)?;
+        // A response that stalls partway is sent again, as a failure
+        // to get one at all would be.
+        let mut openai_response: OpenAIResponse = loop {
+            let response = loop {
+                attempt += 1;
+                let request = client
+                    .post(&opts.endpoint)
+                    .headers(headers.clone())
+                    .json(&request_body);
+                let response_result = interruptible(move || request.send(), &ctrl_c_rx)?;
 
-            check_ctrl_c_signal(&ctrl_c_rx)?;
+                check_ctrl_c_signal(&ctrl_c_rx)?;
 
-            match response_result {
-                Ok(resp) => {
-                    let status = resp.status();
+                match response_result {
+                    Ok(resp) => {
+                        let status = resp.status();
 
-                    if status.is_success() {
-                        break resp;
-                    }
+                        if status.is_success() {
+                            break resp;
+                        }
 
-                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        attempt -= 1;
-                        let (since, tries) = rate_limited.get_or_insert((Instant::now(), 0));
-                        *tries += 1;
-                        let left = rate_limit_wait().saturating_sub(since.elapsed());
-                        let delay = retry_after(resp.headers()).unwrap_or_else(|| {
-                            Duration::from_secs(
-                                base_delay_secs.saturating_mul(1u64 << (*tries - 1).min(20)),
+                        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                            attempt -= 1;
+                            let (since, tries) = rate_limited.get_or_insert((Instant::now(), 0));
+                            *tries += 1;
+                            let left = rate_limit_wait().saturating_sub(since.elapsed());
+                            let delay = retry_after(resp.headers()).unwrap_or_else(|| {
+                                Duration::from_secs(
+                                    base_delay_secs.saturating_mul(1u64 << (*tries - 1).min(20)),
+                                )
+                                .min(MAX_RATE_LIMIT_BACKOFF)
+                                .min(left)
+                            });
+                            if !left.is_zero() && delay <= left {
+                                // Let go before saying so: by the time anyone
+                                // hears it's waiting, others can go ahead.
+                                slot = None;
+                                warn!(
+                                    "Rate limited (try {}). Retrying after {} seconds for endpoint: {}",
+                                    tries,
+                                    delay.as_secs(),
+                                    opts.endpoint
+                                );
+                                if let ResponseMode::Streaming {
+                                    progress_handler, ..
+                                } = &mode
+                                {
+                                    progress_handler(&ProgressInfo {
+                                        status: StatusUpdate::RateLimited {
+                                            until: std::time::SystemTime::now() + delay,
+                                        },
+                                        elapsed_ms: start_time.elapsed().as_millis() as u64,
+                                    })?;
+                                }
+                                wait_to_retry(
+                                    &mut slot, limiter, delay, &ctrl_c_rx, &mode, start_time,
+                                )?;
+                                continue;
+                            }
+                            let error_text = resp
+                                .text()
+                                .unwrap_or_else(|_| "Unable to read response".to_string());
+                            return Err(format!(
+                                "got error code: {}: {} (still rate limited after waiting {}s, \
+                             the most rate_limit_wait allows)",
+                                status,
+                                error_text,
+                                since.elapsed().as_secs()
                             )
-                            .min(MAX_RATE_LIMIT_BACKOFF)
-                            .min(left)
-                        });
-                        if !left.is_zero() && delay <= left {
-                            // Let go before saying so: by the time anyone
-                            // hears it's waiting, others can go ahead.
-                            slot = None;
+                            .into());
+                        }
+
+                        if status.is_server_error() && attempt < max_retries {
+                            let delay_duration = Duration::from_secs(
+                                base_delay_secs * 2_u64.pow(attempt as u32 - 1),
+                            );
                             warn!(
-                                "Rate limited (try {}). Retrying after {} seconds for endpoint: {}",
-                                tries,
-                                delay.as_secs(),
+                                "Server error {} (attempt {}/{}). Retrying after {} seconds for endpoint: {}",
+                                status,
+                                attempt,
+                                max_retries,
+                                delay_duration.as_secs(),
                                 opts.endpoint
                             );
-                            if let ResponseMode::Streaming {
-                                progress_handler, ..
-                            } = &mode
-                            {
-                                progress_handler(&ProgressInfo {
-                                    status: StatusUpdate::RateLimited {
-                                        until: std::time::SystemTime::now() + delay,
-                                    },
-                                    elapsed_ms: start_time.elapsed().as_millis() as u64,
-                                })?;
-                            }
                             wait_to_retry(
-                                &mut slot, limiter, delay, &ctrl_c_rx, &mode, start_time,
+                                &mut slot,
+                                limiter,
+                                delay_duration,
+                                &ctrl_c_rx,
+                                &mode,
+                                start_time,
                             )?;
                             continue;
                         }
+
+                        // Non-retryable error or max retries reached
                         let error_text = resp
                             .text()
                             .unwrap_or_else(|_| "Unable to read response".to_string());
-                        return Err(format!(
-                            "got error code: {}: {} (still rate limited after waiting {}s, \
-                             the most rate_limit_wait allows)",
-                            status,
-                            error_text,
-                            since.elapsed().as_secs()
-                        )
-                        .into());
+                        let err: Box<dyn Error> =
+                            format!("got error code: {}: {}", status, error_text).into();
+                        return Err(if matches!(status.as_u16(), 400 | 413 | 422) {
+                            classify_context_error(err, &messages)
+                        } else {
+                            err
+                        });
                     }
-
-                    if status.is_server_error() && attempt < max_retries {
-                        let delay_duration =
-                            Duration::from_secs(base_delay_secs * 2_u64.pow(attempt as u32 - 1));
-                        warn!(
-                            "Server error {} (attempt {}/{}). Retrying after {} seconds for endpoint: {}",
-                            status,
-                            attempt,
-                            max_retries,
-                            delay_duration.as_secs(),
-                            opts.endpoint
-                        );
-                        wait_to_retry(
-                            &mut slot,
-                            limiter,
-                            delay_duration,
-                            &ctrl_c_rx,
-                            &mode,
-                            start_time,
-                        )?;
-                        continue;
+                    Err(e) => {
+                        if attempt < max_retries {
+                            let delay_duration = Duration::from_secs(
+                                base_delay_secs * 2_u64.pow(attempt as u32 - 1),
+                            );
+                            warn!(
+                                "Request failed (attempt {}/{}): {}. Retrying after {} seconds for endpoint: {}",
+                                attempt,
+                                max_retries,
+                                e,
+                                delay_duration.as_secs(),
+                                opts.endpoint
+                            );
+                            wait_to_retry(
+                                &mut slot,
+                                limiter,
+                                delay_duration,
+                                &ctrl_c_rx,
+                                &mode,
+                                start_time,
+                            )?;
+                            continue;
+                        }
+                        return Err(e.into());
                     }
-
-                    // Non-retryable error or max retries reached
-                    let error_text = resp
-                        .text()
-                        .unwrap_or_else(|_| "Unable to read response".to_string());
-                    let err: Box<dyn Error> =
-                        format!("got error code: {}: {}", status, error_text).into();
-                    return Err(if matches!(status.as_u16(), 400 | 413 | 422) {
-                        classify_context_error(err, &messages)
-                    } else {
-                        err
-                    });
                 }
-                Err(e) => {
-                    if attempt < max_retries {
-                        let delay_duration =
-                            Duration::from_secs(base_delay_secs * 2_u64.pow(attempt as u32 - 1));
-                        warn!(
-                            "Request failed (attempt {}/{}): {}. Retrying after {} seconds for endpoint: {}",
-                            attempt,
-                            max_retries,
-                            e,
-                            delay_duration.as_secs(),
-                            opts.endpoint
-                        );
-                        wait_to_retry(
-                            &mut slot,
-                            limiter,
-                            delay_duration,
-                            &ctrl_c_rx,
-                            &mode,
-                            start_time,
-                        )?;
-                        continue;
-                    }
-                    return Err(e.into());
-                }
+            };
+
+            if !use_streaming {
+                let response_text = interruptible(move || response.text(), &ctrl_c_rx)??;
+                trace!("Got response {:?}", response_text);
+                break serde_json::from_str(&response_text)?;
             }
-        };
-
-        let mut openai_response: OpenAIResponse = if use_streaming {
-            handle_streaming_response(response, &mode, ctrl_c_rx.clone())
-                .map_err(|e| classify_context_error(e, &messages))?
-        } else {
-            let response_text = interruptible(move || response.text(), &ctrl_c_rx)??;
-            trace!("Got response {:?}", response_text);
-            serde_json::from_str(&response_text)?
+            match handle_streaming_response(
+                response,
+                &mode,
+                ctrl_c_rx.clone(),
+                rules.stream_idle_timeout,
+            ) {
+                Ok(response) => break response,
+                Err(e)
+                    if e.downcast_ref::<StreamStalledError>().is_some()
+                        && attempt < max_retries =>
+                {
+                    let delay =
+                        Duration::from_secs(base_delay_secs * 2_u64.pow(attempt as u32 - 1));
+                    warn!(
+                        "{} (attempt {}/{}). Retrying after {} seconds for endpoint: {}",
+                        e,
+                        attempt,
+                        max_retries,
+                        delay.as_secs(),
+                        opts.endpoint
+                    );
+                    slot = None;
+                    if let ResponseMode::Streaming {
+                        progress_handler, ..
+                    } = &mode
+                    {
+                        progress_handler(&ProgressInfo {
+                            status: StatusUpdate::Retrying {
+                                reason: e.to_string(),
+                            },
+                            elapsed_ms: start_time.elapsed().as_millis() as u64,
+                        })?;
+                    }
+                    wait_to_retry(&mut slot, limiter, delay, &ctrl_c_rx, &mode, start_time)?;
+                }
+                Err(e) => return Err(classify_context_error(e, &messages)),
+            }
         };
         drop(slot);
         accumulate_usage(&mut turn_usage, openai_response.usage.as_ref());
@@ -1773,10 +1868,13 @@ fn post_request_with_mode_and_recursion(
 }
 
 /// Handle streaming response from the API
+/// Reads a streamed response as it comes, giving up with
+/// `StreamStalledError` once nothing has come for `idle_timeout`.
 fn handle_streaming_response(
     response: reqwest::blocking::Response,
     mode: &ResponseMode,
     ctrl_c_rx: Option<Arc<Mutex<mpsc::Receiver<()>>>>,
+    idle_timeout: Duration,
 ) -> Result<OpenAIResponse, Box<dyn Error>> {
     let (stream_handler, reasoning_handler, progress_handler) = match mode {
         ResponseMode::Streaming {
@@ -1801,6 +1899,7 @@ fn handle_streaming_response(
 
     // Create a channel for line reading
     let (line_tx, line_rx) = mpsc::channel::<Result<String, std::io::Error>>();
+    let mut last_line_at = Instant::now();
 
     let _reader_thread = std::thread::spawn(move || {
         for line in reader.lines() {
@@ -1824,6 +1923,7 @@ fn handle_streaming_response(
 
         match line_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(Ok(line)) => {
+                last_line_at = Instant::now();
                 bytes_read += line.len();
 
                 let data = if line.starts_with("data: ") {
@@ -2034,6 +2134,15 @@ fn handle_streaming_response(
                 return Err(Box::new(e));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                if last_line_at.elapsed() >= idle_timeout {
+                    // Whatever was shown of it ends here; the reading
+                    // thread is left to the client's own timeout.
+                    reasoning_handler("")?;
+                    stream_handler("")?;
+                    return Err(Box::new(StreamStalledError {
+                        idle: last_line_at.elapsed(),
+                    }));
+                }
                 // Timeout - continue checking for Ctrl-C signals
                 continue;
             }
@@ -2753,6 +2862,12 @@ mod tests {
         )
     }
 
+    /// In a response `serve_responses` serves: a pause of 200ms.
+    const PAUSE: &str = "\u{1}";
+    /// In a response `serve_responses` serves: nothing more is sent, but
+    /// the connection is left open, for a minute.
+    const STALL: &str = "\u{2}";
+
     /// Serves one raw HTTP response per request, in order, on a local port
     /// and returns the endpoint to use.
     fn serve_responses(responses: Vec<String>) -> String {
@@ -2788,8 +2903,27 @@ mod tests {
                     let n = stream.read(&mut buf).unwrap();
                     request.extend_from_slice(&buf[..n]);
                 }
-                stream.write_all(response.as_bytes()).unwrap();
-                drop(stream);
+                // PAUSE: a moment between what's before and after it;
+                // STALL: nothing more, the connection left open.
+                let (response, stalls) = match response.split_once(STALL) {
+                    Some((before, _)) => (before.to_string(), true),
+                    None => (response, false),
+                };
+                for (i, part) in response.split(PAUSE).enumerate() {
+                    if i > 0 {
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                    let _ = stream.write_all(part.as_bytes());
+                    let _ = stream.flush();
+                }
+                if stalls {
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_secs(60));
+                        drop(stream);
+                    });
+                } else {
+                    drop(stream);
+                }
                 let _ = sent_tx.send(());
             }
         });
@@ -2892,6 +3026,7 @@ mod tests {
     enum Said {
         RateLimited,
         WaitingForSlot,
+        Retrying(String),
     }
 
     /// Long enough for anything these tests wait for: a test that gets
@@ -2907,6 +3042,17 @@ mod tests {
         limiter: &'static RequestLimiter,
         ctrl_c: Option<mpsc::Receiver<()>>,
     ) -> (mpsc::Receiver<Result<String, String>>, mpsc::Receiver<Said>) {
+        request_in_background_with(opts, limiter, Duration::from_secs(180), ctrl_c)
+    }
+
+    /// Like `request_in_background`, giving up on a stream that sends
+    /// nothing for `stream_idle_timeout`.
+    fn request_in_background_with(
+        opts: Opts,
+        limiter: &'static RequestLimiter,
+        stream_idle_timeout: Duration,
+        ctrl_c: Option<mpsc::Receiver<()>>,
+    ) -> (mpsc::Receiver<Result<String, String>>, mpsc::Receiver<Said>) {
         let (said_tx, said) = mpsc::channel();
         let (done_tx, done) = mpsc::channel();
         thread::spawn(move || {
@@ -2919,9 +3065,12 @@ mod tests {
                 }),
                 reasoning_handler: Box::new(|_| Ok(())),
                 progress_handler: Box::new(move |info| {
-                    let _ = match info.status {
+                    let _ = match &info.status {
                         StatusUpdate::RateLimited { .. } => said_tx.send(Said::RateLimited),
                         StatusUpdate::WaitingForSlot => said_tx.send(Said::WaitingForSlot),
+                        StatusUpdate::Retrying { reason } => {
+                            said_tx.send(Said::Retrying(reason.clone()))
+                        }
                         _ => Ok(()),
                     };
                     Ok(())
@@ -2934,7 +3083,10 @@ mod tests {
                 mode,
                 &crate::ToolContext::new(|_: &str| {}),
                 ctrl_c.map(|rx| Arc::new(Mutex::new(rx))),
-                limiter,
+                &RequestRules {
+                    limiter,
+                    stream_idle_timeout,
+                },
             )
             .map(|_| answer.lock().unwrap().clone())
             .map_err(|e| {
@@ -3041,6 +3193,99 @@ mod tests {
         assert_eq!(outcome(&done), Err("interrupted".to_string()));
         assert_eq!(limiter.in_use(), 1, "only the slot still held elsewhere");
         drop(other);
+        assert_eq!(limiter.in_use(), 0);
+    }
+
+    /// A streamed response that starts its answer with "par", then stalls.
+    fn stalling_sse_response() -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n\
+             data: {{\"choices\":[{{\"delta\":{{\"content\":\"par\"}}}}]}}\n\n{}",
+            STALL
+        )
+    }
+
+    #[test]
+    fn a_stalled_response_is_sent_again() {
+        let limiter = own_limiter(1);
+        let endpoint = serve_responses(vec![stalling_sse_response(), ok_sse_response()]);
+        let started = Instant::now();
+        let (done, said) = request_in_background_with(
+            retry_opts(endpoint, 0),
+            limiter,
+            Duration::from_millis(300),
+            None,
+        );
+        // What came before the stall stays, the answer starts again after.
+        assert_eq!(outcome(&done), Ok("parok".to_string()));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        match said.try_recv() {
+            Ok(Said::Retrying(reason)) => assert!(reason.contains("stalled"), "{reason}"),
+            other => panic!("said {other:?}"),
+        }
+        assert_eq!(limiter.in_use(), 0);
+    }
+
+    #[test]
+    fn a_response_that_keeps_stalling_fails_in_the_end() {
+        let limiter = own_limiter(1);
+        let endpoint = serve_responses(vec![stalling_sse_response(); 3]);
+        let mut opts = retry_opts(endpoint, 0);
+        opts.max_retries = Some(3);
+        let (done, said) =
+            request_in_background_with(opts, limiter, Duration::from_millis(200), None);
+        let err = outcome(&done).unwrap_err();
+        assert!(err.contains("stalled"), "{err}");
+        // The first two tries are retried, the third is the last.
+        let retries = said
+            .try_iter()
+            .filter(|s| matches!(s, Said::Retrying(_)))
+            .count();
+        assert_eq!(retries, 2);
+        assert_eq!(limiter.in_use(), 0);
+    }
+
+    #[test]
+    fn a_slow_response_that_keeps_coming_is_not_a_stall() {
+        // A chunk every 200ms, for over a second, against 500ms of
+        // nothing allowed.
+        let mut response = String::from(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        );
+        for word in ["a", "b", "c", "d", "e", "f"] {
+            response.push_str(&format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n{}",
+                word, PAUSE
+            ));
+        }
+        response.push_str(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n",
+        );
+        let (done, said) = request_in_background_with(
+            retry_opts(serve_responses(vec![response]), 0),
+            own_limiter(1),
+            Duration::from_millis(500),
+            None,
+        );
+        assert_eq!(outcome(&done), Ok("abcdef".to_string()));
+        assert!(said.try_iter().all(|s| !matches!(s, Said::Retrying(_))));
+    }
+
+    #[test]
+    fn ctrl_c_stops_a_stalled_response_at_once() {
+        let limiter = own_limiter(1);
+        let endpoint = serve_responses(vec![stalling_sse_response()]);
+        let (ctrl_c, rx) = mpsc::channel();
+        let (done, _) =
+            request_in_background_with(retry_opts(endpoint, 0), limiter, STUCK * 6, Some(rx));
+        thread::sleep(Duration::from_millis(300));
+        ctrl_c.send(()).unwrap();
+        assert_eq!(outcome(&done), Err("interrupted".to_string()));
         assert_eq!(limiter.in_use(), 0);
     }
 

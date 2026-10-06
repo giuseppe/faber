@@ -8373,6 +8373,7 @@ impl ActivityRecorder {
                 "rate limited, retrying at {}",
                 openai::format_retry_time(*until)
             ),
+            StatusUpdate::Retrying { reason } => format!("{}, retrying", reason),
             StatusUpdate::SendingRequest { .. } => "waiting for the model".to_string(),
             _ => return,
         };
@@ -8564,6 +8565,13 @@ fn create_response_mode(
                             "Rate limited by the model's server, retrying at {}",
                             openai::format_retry_time(*until)
                         ),
+                        true,
+                    );
+                }
+                StatusUpdate::Retrying { reason } => {
+                    status_bar.set_agent_status(
+                        &agent_name,
+                        &format!("Retrying: {}", reason),
                         true,
                     );
                 }
@@ -13420,6 +13428,11 @@ struct Opts {
     /// take hours to reset. 8h unless set
     rate_limit_wait: Option<String>,
 
+    #[clap(long, value_name = "DURATION")]
+    /// How long a streamed response may send nothing before it's given up
+    /// on as stalled and the request sent again, e.g. 5m. 3m unless set
+    stream_idle_timeout: Option<String>,
+
     #[clap(long = "mcp-server")]
     #[serde(skip)]
     /// Give the session's own agent an MCP server's tools: NAME=URL (or
@@ -13468,6 +13481,7 @@ impl Default for Opts {
             profile: None,
             task_retention: None,
             rate_limit_wait: None,
+            stream_idle_timeout: None,
             max_parallel_requests: None,
             mcp_server: Vec::new(),
             mcp_granted: Vec::new(),
@@ -13570,6 +13584,10 @@ impl Opts {
 
         if self.rate_limit_wait.is_none() {
             self.rate_limit_wait = config.rate_limit_wait;
+        }
+
+        if self.stream_idle_timeout.is_none() {
+            self.stream_idle_timeout = config.stream_idle_timeout;
         }
 
         if self.max_parallel_requests.is_none() {
@@ -14354,6 +14372,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                 )
             })?;
         openai::set_rate_limit_wait(duration);
+    }
+    if let Some(timeout) = &opts.stream_idle_timeout {
+        let duration = parse_duration(timeout)
+            .and_then(|d| d.to_std().ok())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| {
+                format!(
+                    "can't read stream_idle_timeout '{}': use a duration like 90s or 5m",
+                    timeout
+                )
+            })?;
+        openai::set_stream_idle_timeout(duration);
     }
     if let Some(retention) = &opts.task_retention {
         parse_duration(retention).ok_or_else(|| {
