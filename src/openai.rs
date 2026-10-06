@@ -1398,10 +1398,37 @@ pub fn post_request_with_mode(
             ctrl_c_rx,
         );
     }
-    post_request_with_mode_and_recursion(messages, tools_collection, opts, mode, ctx, ctrl_c_rx)
+    post_request_with_mode_and_recursion(
+        messages,
+        tools_collection,
+        opts,
+        mode,
+        ctx,
+        ctrl_c_rx,
+        request_limiter(),
+    )
 }
 
-/// Internal function with iterative tool call handling.
+/// Waits `delay` before a request is retried without holding its place
+/// among the requests in flight - `slot`, given back first, then taken
+/// again (waiting for one to be free) - so a request waiting to retry,
+/// for minutes when rate limited, doesn't keep others from the model.
+fn wait_to_retry<'a>(
+    slot: &mut Option<RequestSlot<'a>>,
+    limiter: &'a RequestLimiter,
+    delay: Duration,
+    ctrl_c_rx: &Option<Arc<Mutex<mpsc::Receiver<()>>>>,
+    mode: &ResponseMode,
+    start_time: Instant,
+) -> Result<(), Box<dyn Error>> {
+    *slot = None;
+    sleep_interruptibly(delay, ctrl_c_rx)?;
+    *slot = Some(limiter.acquire(ctrl_c_rx, mode, start_time)?);
+    Ok(())
+}
+
+/// Internal function with iterative tool call handling. Its requests take
+/// their turns with `limiter`'s.
 fn post_request_with_mode_and_recursion(
     messages: Vec<Message>,
     tools_collection: &ToolsCollection,
@@ -1409,6 +1436,7 @@ fn post_request_with_mode_and_recursion(
     mode: ResponseMode,
     ctx: &crate::ToolContext,
     ctrl_c_rx: Option<Arc<Mutex<mpsc::Receiver<()>>>>,
+    limiter: &RequestLimiter,
 ) -> Result<OpenAIResponse, Box<dyn Error>> {
     let start_time = Instant::now();
     let mut messages = messages;
@@ -1476,8 +1504,9 @@ fn post_request_with_mode_and_recursion(
                 return Err(request_budget_error(limit));
             }
         }
-        // Held until this round trip's response has been read in full.
-        let _slot = request_limiter().acquire(&ctrl_c_rx, &mode, start_time)?;
+        // Held until this round trip's response has been read in full -
+        // but not while waiting to retry it (see `wait_to_retry`).
+        let mut slot = Some(limiter.acquire(&ctrl_c_rx, &mode, start_time)?);
 
         let max_retries = opts.max_retries.unwrap_or(5);
         let base_delay_secs = opts.retry_base_delay_secs.unwrap_or(1);
@@ -1517,6 +1546,9 @@ fn post_request_with_mode_and_recursion(
                             .min(left)
                         });
                         if !left.is_zero() && delay <= left {
+                            // Let go before saying so: by the time anyone
+                            // hears it's waiting, others can go ahead.
+                            slot = None;
                             warn!(
                                 "Rate limited (try {}). Retrying after {} seconds for endpoint: {}",
                                 tries,
@@ -1534,7 +1566,9 @@ fn post_request_with_mode_and_recursion(
                                     elapsed_ms: start_time.elapsed().as_millis() as u64,
                                 })?;
                             }
-                            sleep_interruptibly(delay, &ctrl_c_rx)?;
+                            wait_to_retry(
+                                &mut slot, limiter, delay, &ctrl_c_rx, &mode, start_time,
+                            )?;
                             continue;
                         }
                         let error_text = resp
@@ -1561,7 +1595,14 @@ fn post_request_with_mode_and_recursion(
                             delay_duration.as_secs(),
                             opts.endpoint
                         );
-                        sleep_interruptibly(delay_duration, &ctrl_c_rx)?;
+                        wait_to_retry(
+                            &mut slot,
+                            limiter,
+                            delay_duration,
+                            &ctrl_c_rx,
+                            &mode,
+                            start_time,
+                        )?;
                         continue;
                     }
 
@@ -1589,7 +1630,14 @@ fn post_request_with_mode_and_recursion(
                             delay_duration.as_secs(),
                             opts.endpoint
                         );
-                        sleep_interruptibly(delay_duration, &ctrl_c_rx)?;
+                        wait_to_retry(
+                            &mut slot,
+                            limiter,
+                            delay_duration,
+                            &ctrl_c_rx,
+                            &mode,
+                            start_time,
+                        )?;
                         continue;
                     }
                     return Err(e.into());
@@ -1605,7 +1653,7 @@ fn post_request_with_mode_and_recursion(
             trace!("Got response {:?}", response_text);
             serde_json::from_str(&response_text)?
         };
-        drop(_slot);
+        drop(slot);
         accumulate_usage(&mut turn_usage, openai_response.usage.as_ref());
 
         if let Some(mut err) = openai_response.error {
@@ -2708,9 +2756,16 @@ mod tests {
     /// Serves one raw HTTP response per request, in order, on a local port
     /// and returns the endpoint to use.
     fn serve_responses(responses: Vec<String>) -> String {
+        serve_responses_telling(responses).0
+    }
+
+    /// Like `serve_responses`, also telling, through the receiver, once
+    /// each response has been sent.
+    fn serve_responses_telling(responses: Vec<String>) -> (String, mpsc::Receiver<()>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let (sent_tx, sent) = mpsc::channel();
         thread::spawn(move || {
             for response in responses {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -2734,9 +2789,11 @@ mod tests {
                     request.extend_from_slice(&buf[..n]);
                 }
                 stream.write_all(response.as_bytes()).unwrap();
+                drop(stream);
+                let _ = sent_tx.send(());
             }
         });
-        format!("http://{}/chat/completions", addr)
+        (format!("http://{}/chat/completions", addr), sent)
     }
 
     /// A 429 response, with a `Retry-After` header of `retry_after`.
@@ -2800,6 +2857,271 @@ mod tests {
         assert!(err.contains("429"), "{err}");
         assert!(err.contains("Usage limit reached"), "{err}");
         assert!(err.contains("rate_limit_wait"), "{err}");
+    }
+
+    /// The streamed answer "ok".
+    fn ok_sse_response() -> String {
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+         data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n\
+         data: [DONE]\n\n"
+            .to_string()
+    }
+
+    /// A 500, which is retried after `retry_base_delay_secs`.
+    fn server_error_response() -> String {
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string()
+    }
+
+    fn retry_opts(endpoint: String, base_delay_secs: u64) -> Opts {
+        Opts {
+            max_tokens: None,
+            model: "test-model".to_string(),
+            endpoint,
+            tool_choice: None,
+            api_key: None,
+            max_retries: Some(50),
+            retry_base_delay_secs: Some(base_delay_secs),
+            parameters: HashMap::new(),
+        }
+    }
+
+    /// What a request in its own thread says while it runs: "rate limited"
+    /// and "waiting for a slot", as they happen.
+    #[derive(Debug, PartialEq)]
+    enum Said {
+        RateLimited,
+        WaitingForSlot,
+    }
+
+    /// Long enough for anything these tests wait for: a test that gets
+    /// stuck fails after it rather than hanging.
+    const STUCK: Duration = Duration::from_secs(10);
+
+    /// Sends a streamed request to `endpoint`, taking turns with
+    /// `limiter`'s, in a thread of its own: what it says comes through one
+    /// receiver, its answer (or "interrupted", or the error) through the
+    /// other.
+    fn request_in_background(
+        opts: Opts,
+        limiter: &'static RequestLimiter,
+        ctrl_c: Option<mpsc::Receiver<()>>,
+    ) -> (mpsc::Receiver<Result<String, String>>, mpsc::Receiver<Said>) {
+        let (said_tx, said) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel();
+        thread::spawn(move || {
+            let answer = Arc::new(Mutex::new(String::new()));
+            let answer_out = answer.clone();
+            let mode = ResponseMode::Streaming {
+                stream_handler: Box::new(move |chunk| {
+                    answer_out.lock().unwrap().push_str(chunk);
+                    Ok(())
+                }),
+                reasoning_handler: Box::new(|_| Ok(())),
+                progress_handler: Box::new(move |info| {
+                    let _ = match info.status {
+                        StatusUpdate::RateLimited { .. } => said_tx.send(Said::RateLimited),
+                        StatusUpdate::WaitingForSlot => said_tx.send(Said::WaitingForSlot),
+                        _ => Ok(()),
+                    };
+                    Ok(())
+                }),
+            };
+            let outcome = post_request_with_mode_and_recursion(
+                vec![make_message("user", "hi".to_string())],
+                &ToolsCollection::new(),
+                &opts,
+                mode,
+                &crate::ToolContext::new(|_: &str| {}),
+                ctrl_c.map(|rx| Arc::new(Mutex::new(rx))),
+                limiter,
+            )
+            .map(|_| answer.lock().unwrap().clone())
+            .map_err(|e| {
+                if e.downcast_ref::<InterruptedError>().is_some() {
+                    "interrupted".to_string()
+                } else {
+                    e.to_string()
+                }
+            });
+            let _ = done_tx.send(outcome);
+        });
+        (done, said)
+    }
+
+    /// The request's outcome, unless it's stuck.
+    fn outcome(done: &mpsc::Receiver<Result<String, String>>) -> Result<String, String> {
+        done.recv_timeout(STUCK).expect("the request got stuck")
+    }
+
+    /// A limiter of its own for a test: the process-wide one is shared
+    /// with every other test making requests.
+    fn own_limiter(slots: usize) -> &'static RequestLimiter {
+        Box::leak(Box::new(RequestLimiter::new(slots)))
+    }
+
+    /// A slot of `limiter`'s, unless none comes free in time.
+    fn take_slot(limiter: &'static RequestLimiter) -> RequestSlot<'static> {
+        let (give_up, rx) = mpsc::channel();
+        thread::spawn(move || {
+            thread::sleep(STUCK);
+            let _ = give_up.send(());
+        });
+        limiter
+            .acquire(
+                &Some(Arc::new(Mutex::new(rx))),
+                &ResponseMode::Complete,
+                Instant::now(),
+            )
+            .expect("no slot came free")
+    }
+
+    #[test]
+    fn a_request_waiting_to_retry_gives_its_slot_back_and_waits_for_one() {
+        let limiter = own_limiter(1);
+        let endpoint = serve_responses(vec![rate_limited_response("1"), ok_sse_response()]);
+        let (done, said) = request_in_background(retry_opts(endpoint, 1), limiter, None);
+        assert_eq!(said.recv_timeout(STUCK), Ok(Said::RateLimited));
+        // While it waits to retry, its slot is someone else's to take...
+        assert_eq!(limiter.in_use(), 0, "kept its slot");
+        let other = take_slot(limiter);
+        // ...and then its retry waits for that one to be done: never more
+        // requests at once than the limit.
+        assert_eq!(said.recv_timeout(STUCK), Ok(Said::WaitingForSlot));
+        thread::sleep(Duration::from_millis(300));
+        assert!(done.try_recv().is_err(), "retried without a slot");
+        drop(other);
+        assert_eq!(outcome(&done), Ok("ok".to_string()));
+        assert_eq!(limiter.in_use(), 0);
+    }
+
+    #[test]
+    fn a_request_waiting_to_retry_after_a_server_error_gives_its_slot_back() {
+        let limiter = own_limiter(1);
+        let (endpoint, sent) =
+            serve_responses_telling(vec![server_error_response(), ok_sse_response()]);
+        // Two seconds' wait after the 500.
+        let (done, _) = request_in_background(retry_opts(endpoint, 2), limiter, None);
+        sent.recv_timeout(STUCK).expect("no request");
+        // Let go of within moments of the 500, well within its wait.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while limiter.in_use() != 0 {
+            assert!(Instant::now() < deadline, "kept its slot");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let other = take_slot(limiter);
+        thread::sleep(Duration::from_millis(2500));
+        assert!(done.try_recv().is_err(), "retried without a slot");
+        drop(other);
+        assert_eq!(outcome(&done), Ok("ok".to_string()));
+        assert_eq!(limiter.in_use(), 0);
+    }
+
+    #[test]
+    fn ctrl_c_while_waiting_to_retry_leaves_no_slot_taken() {
+        // While waiting out the server's Retry-After...
+        let limiter = own_limiter(1);
+        let endpoint = serve_responses(vec![rate_limited_response("30")]);
+        let (ctrl_c, rx) = mpsc::channel();
+        let (done, said) = request_in_background(retry_opts(endpoint, 1), limiter, Some(rx));
+        assert_eq!(said.recv_timeout(STUCK), Ok(Said::RateLimited));
+        ctrl_c.send(()).unwrap();
+        assert_eq!(outcome(&done), Err("interrupted".to_string()));
+        assert_eq!(limiter.in_use(), 0);
+
+        // ...and while waiting for a slot to retry with.
+        let limiter = own_limiter(1);
+        let endpoint = serve_responses(vec![rate_limited_response("1")]);
+        let (ctrl_c, rx) = mpsc::channel();
+        let (done, said) = request_in_background(retry_opts(endpoint, 1), limiter, Some(rx));
+        assert_eq!(said.recv_timeout(STUCK), Ok(Said::RateLimited));
+        let other = take_slot(limiter);
+        assert_eq!(said.recv_timeout(STUCK), Ok(Said::WaitingForSlot));
+        ctrl_c.send(()).unwrap();
+        assert_eq!(outcome(&done), Err("interrupted".to_string()));
+        assert_eq!(limiter.in_use(), 1, "only the slot still held elsewhere");
+        drop(other);
+        assert_eq!(limiter.in_use(), 0);
+    }
+
+    #[test]
+    fn requests_retrying_never_exceed_the_limit_and_all_get_through() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::AtomicUsize;
+        // A server turning away most requests - rate limited or failing -
+        // that notes how many it's handling at once: a request it's
+        // answering is one whose client holds a slot.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+        let handling = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let served = Arc::new(AtomicUsize::new(0));
+        {
+            let (handling, most, served) = (handling.clone(), most.clone(), served.clone());
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let (handling, most, served) = (handling.clone(), most.clone(), served.clone());
+                    thread::spawn(move || {
+                        let mut request = Vec::new();
+                        let mut buf = [0u8; 4096];
+                        // The whole request: headers, then its body.
+                        loop {
+                            let Ok(n) = stream.read(&mut buf) else { return };
+                            if n == 0 {
+                                return;
+                            }
+                            request.extend_from_slice(&buf[..n]);
+                            let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n")
+                            else {
+                                continue;
+                            };
+                            let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                            let length = headers
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            if request.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                        let now = handling.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(now, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(10));
+                        // Stops counting before answering: once answered,
+                        // its client may let its slot go.
+                        handling.fetch_sub(1, Ordering::SeqCst);
+                        let response = match served.fetch_add(1, Ordering::SeqCst) % 3 {
+                            0 => rate_limited_response("0"),
+                            1 => server_error_response(),
+                            _ => ok_sse_response(),
+                        };
+                        let _ = stream.write_all(response.as_bytes());
+                    });
+                }
+            });
+        }
+        let limiter = own_limiter(2);
+        let requests: Vec<_> = (0..10)
+            .map(|_| {
+                let opts = retry_opts(endpoint.clone(), 0);
+                thread::spawn(move || {
+                    (0..3)
+                        .map(|_| outcome(&request_in_background(opts.clone(), limiter, None).0))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for request in requests {
+            for answer in request.join().unwrap() {
+                assert_eq!(answer, Ok("ok".to_string()));
+            }
+        }
+        let most = most.load(Ordering::SeqCst);
+        assert!(most <= 2, "{most} at once");
+        assert!(served.load(Ordering::SeqCst) > 30, "some were retried");
+        assert_eq!(limiter.in_use(), 0);
     }
 
     #[test]
