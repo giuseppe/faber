@@ -159,6 +159,11 @@ impl RequestLimiter {
         }
     }
 
+    /// How many slots are taken right now.
+    pub fn in_use(&self) -> usize {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).1
+    }
+
     pub fn set_limit(&self, limit: usize) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).0 = limit;
         self.changed.notify_all();
@@ -166,7 +171,7 @@ impl RequestLimiter {
 
     /// Waits - interruptibly, telling `mode`'s progress handler once - for
     /// a free slot.
-    fn acquire(
+    pub(crate) fn acquire(
         &self,
         ctrl_c_rx: &Option<Arc<Mutex<mpsc::Receiver<()>>>>,
         mode: &ResponseMode,
@@ -208,7 +213,7 @@ impl RequestLimiter {
 }
 
 /// The process's `RequestLimiter`.
-fn request_limiter() -> &'static RequestLimiter {
+pub(crate) fn request_limiter() -> &'static RequestLimiter {
     static LIMITER: std::sync::OnceLock<RequestLimiter> = std::sync::OnceLock::new();
     LIMITER.get_or_init(|| RequestLimiter::new(0))
 }
@@ -1386,6 +1391,7 @@ pub fn post_request_with_mode(
     if crate::dummy_llm::is_dummy_model(&opts.model) {
         return crate::dummy_llm::post_request_dummy(
             messages,
+            &opts.model,
             tools_collection,
             mode,
             ctx,

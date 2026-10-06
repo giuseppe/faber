@@ -176,6 +176,9 @@ pub fn post_request_scripted(
             .and_then(|m| m.content.clone())
             .unwrap_or_default();
         let rule = pick(path, &last)?;
+        // Held, as a real request's, until the response is in - not while
+        // its tools run.
+        let slot = crate::openai::request_limiter().acquire(&ctrl_c_rx, &mode, start)?;
         if let Some(rule) = &rule {
             let deadline = Instant::now() + Duration::from_millis(rule.delay_ms);
             while Instant::now() < deadline {
@@ -231,6 +234,7 @@ pub fn post_request_scripted(
         };
         accumulate_usage(&mut turn_usage, Some(&usage));
         messages.push(message.clone());
+        drop(slot);
 
         if let Some(calls) = &message.tool_calls {
             let results = run_tool_calls(tools_collection, calls, ctx, &mode, start)?;
