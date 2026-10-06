@@ -1917,6 +1917,9 @@ fn post_request_with_mode_and_recursion(
 }
 
 /// Handle streaming response from the API
+/// How often what arrives before a response's answer starts is reported.
+const WAITING_REPORT_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Reads a streamed response as it comes, giving up with
 /// `StreamStalledError` once nothing has come for `idle_timeout`. With
 /// `keep_reasoning`, the message it makes carries the model's reasoning.
@@ -1952,6 +1955,7 @@ fn handle_streaming_response(
     // Create a channel for line reading
     let (line_tx, line_rx) = mpsc::channel::<Result<String, std::io::Error>>();
     let mut last_line_at = Instant::now();
+    let mut waiting_reported_at: Option<Instant> = None;
 
     let _reader_thread = std::thread::spawn(move || {
         for line in reader.lines() {
@@ -1977,12 +1981,28 @@ fn handle_streaming_response(
             Ok(Ok(line)) => {
                 last_line_at = Instant::now();
                 bytes_read += line.len();
-
                 let data = if line.starts_with("data: ") {
                     &line[6..]
                 } else if line.starts_with("data:") {
                     &line[5..]
                 } else {
+                    // Before the answer starts, what arrives that isn't
+                    // data - a server's keep-alive lines while it processes
+                    // the prompt - is reported: the request isn't waiting
+                    // on nothing.
+                    if !thinking_reported
+                        && waiting_reported_at
+                            .is_none_or(|at| at.elapsed() >= WAITING_REPORT_INTERVAL)
+                    {
+                        waiting_reported_at = Some(Instant::now());
+                        let _ = progress_handler(&ProgressInfo {
+                            status: StatusUpdate::StreamProcessing {
+                                bytes_read,
+                                chunks_processed,
+                            },
+                            elapsed_ms: start_time.elapsed().as_millis() as u64,
+                        });
+                    }
                     continue;
                 };
                 chunks_processed += 1;
@@ -3751,6 +3771,44 @@ mod tests {
             .cloned()
             .unwrap();
         (response.history, assistant)
+    }
+
+    #[test]
+    fn test_what_arrives_before_the_answer_is_reported() {
+        // Keep-alive lines while the server processes the prompt, then the
+        // answer.
+        let mut response = String::from(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        );
+        for _ in 0..4 {
+            response.push_str(": processing\n\n");
+            response.push_str(PAUSE);
+        }
+        response.push_str(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n",
+        );
+        let (_, answer, _, statuses, _) =
+            stream_to_vecs_with(serve_responses(vec![response]), &ToolsCollection::new());
+        assert_eq!(answer, "ok");
+        let thinking = statuses
+            .iter()
+            .position(|s| matches!(s, StatusUpdate::Thinking))
+            .expect("the answer started");
+        let before: Vec<usize> = statuses[..thinking]
+            .iter()
+            .filter_map(|s| match s {
+                StatusUpdate::StreamProcessing { bytes_read, .. } => Some(*bytes_read),
+                _ => None,
+            })
+            .collect();
+        // At least two, at most one per half second of the 800ms of
+        // keep-alives, each with more than the one before.
+        assert!((2..=3).contains(&before.len()), "{statuses:?}");
+        assert!(
+            before[0] > 0 && before.windows(2).all(|w| w[0] < w[1]),
+            "{before:?}"
+        );
     }
 
     #[test]
