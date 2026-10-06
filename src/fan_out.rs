@@ -1075,15 +1075,30 @@ mod tests {
         mpsc::Sender<()>,
         Arc<dyn faber::db_backend::DbBackend>,
     ) {
+        let (ctx, ctrl_c, db, _) = dummy_agent_ctx_with_conn(model);
+        (ctx, ctrl_c, db)
+    }
+
+    /// Like `dummy_agent_ctx`, also handing over the database's
+    /// connection, to break it behind faber's back.
+    fn dummy_agent_ctx_with_conn(
+        model: &str,
+    ) -> (
+        ToolContext,
+        mpsc::Sender<()>,
+        Arc<dyn faber::db_backend::DbBackend>,
+        Arc<Mutex<rusqlite::Connection>>,
+    ) {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         faber::db::initialize_db(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
         let db: Arc<dyn faber::db_backend::DbBackend> =
-            Arc::new(faber::local_db::LocalDb::new(Arc::new(Mutex::new(conn))));
+            Arc::new(faber::local_db::LocalDb::new(conn.clone()));
         db.create_agent("boss", "test").unwrap();
         let (mut ctx, ctrl_c, _) = dummy_chat_ctx_for(model);
         ctx.db = Some(db.clone());
         ctx.agent_name = Some("boss".to_string());
-        (ctx, ctrl_c, db)
+        (ctx, ctrl_c, db, conn)
     }
 
     fn running_workers(ctx: &ToolContext) -> Arc<Mutex<HashMap<String, crate::RunningSubAgent>>> {
@@ -1402,6 +1417,108 @@ mod tests {
         });
         let out = fan_out_within(Arc::new(ctx), params, model, Duration::from_secs(30)).unwrap();
         assert_eq!(out.matches("Worked 2 steps").count(), 4, "{out}");
+    }
+
+    #[test]
+    fn test_fan_out_ends_with_every_item_accounted_for_when_database_writes_fail() {
+        let model = "dummy:slots=2,id=fan-out-db-fails";
+        let (ctx, _ctrl_c, _db, conn) = dummy_agent_ctx_with_conn(model);
+        let ctx = Arc::new(ctx);
+        // Partway through, every write about agents fails: making, claiming
+        // and releasing them, their data, events and conversations.
+        let breaker = thread_after(Duration::from_millis(200), move || {
+            let fail = |table: &str, op: &str| {
+                format!(
+                    "CREATE TRIGGER fail_{op}_{table} BEFORE {op} ON {table} BEGIN \
+                     SELECT RAISE(FAIL, 'disk on fire'); END;"
+                )
+            };
+            let mut sql = String::new();
+            for table in ["agents", "agent_data", "agent_events", "agent_messages"] {
+                for op in ["INSERT", "UPDATE", "DELETE"] {
+                    sql.push_str(&fail(table, op));
+                }
+            }
+            conn.lock().unwrap().execute_batch(&sql).unwrap();
+        });
+        let items: Vec<String> = (1..=12).map(|i| format!("item-{i}")).collect();
+        let params = serde_json::json!({
+            "items": items,
+            "prompt": "work 5 50 on {item}",
+            "max_parallel": 4,
+        });
+        let out = fan_out_within(ctx.clone(), params, model, Duration::from_secs(60)).unwrap();
+        assert!(
+            breaker.is_finished(),
+            "the fan-out was over before the writes failed"
+        );
+        breaker.join().unwrap();
+        // Each item has an outcome - its result, or why it failed -
+        // none left "Not run.", none lost.
+        for (i, item) in items.iter().enumerate() {
+            let heading = format!("## {}. {}\n", i + 1, item);
+            let at = out
+                .find(&heading)
+                .unwrap_or_else(|| panic!("{item} missing: {out}"));
+            let body = &out[at + heading.len()..];
+            assert!(
+                body.starts_with("Worked 5 steps") || body.starts_with("Error: "),
+                "{item}: {body}"
+            );
+        }
+        assert!(
+            out.contains("disk on fire"),
+            "some item failed for it: {out}"
+        );
+        assert_eq!(faber::dummy_llm::requests_in_flight(model), 0);
+        assert!(running_workers(&ctx).lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_fan_out_recovers_from_a_transaction_left_open_partway() {
+        // What a failed COMMIT used to leave behind: every write after it
+        // going nowhere, silently, until a restart.
+        let model = "dummy:slots=2,id=fan-out-open-tx";
+        let (ctx, _ctrl_c, db, conn) = dummy_agent_ctx_with_conn(model);
+        let ctx = Arc::new(ctx);
+        let breaker = thread_after(Duration::from_millis(200), {
+            let conn = conn.clone();
+            move || {
+                conn.lock()
+                    .unwrap()
+                    .execute_batch("BEGIN IMMEDIATE")
+                    .unwrap()
+            }
+        });
+        let items: Vec<String> = (1..=8).map(|i| format!("item-{i}")).collect();
+        let params = serde_json::json!({
+            "items": items,
+            "prompt": "work 5 50 on {item}",
+            "max_parallel": 4,
+        });
+        let out = fan_out_within(ctx.clone(), params, model, Duration::from_secs(60)).unwrap();
+        assert!(
+            breaker.is_finished(),
+            "the fan-out was over before the transaction was left open"
+        );
+        breaker.join().unwrap();
+        assert_eq!(out.matches("Worked 5 steps").count(), 8, "{out}");
+        assert!(
+            conn.lock().unwrap().is_autocommit(),
+            "still inside the transaction"
+        );
+        assert_all_let_go(&ctx, db.as_ref(), model, "after a transaction left open");
+    }
+
+    /// Runs `f` on a thread of its own after `delay`.
+    fn thread_after(
+        delay: Duration,
+        f: impl FnOnce() + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            f()
+        })
     }
 
     #[test]
