@@ -518,9 +518,12 @@ pub fn poll_notifications_for_session(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Vec<NotificationRow>, Box<dyn Error>> {
-    conn.execute("BEGIN IMMEDIATE", [])?;
-    let result = (|| -> Result<Vec<NotificationRow>, Box<dyn Error>> {
-        let mut stmt = conn.prepare(
+    // Rolled back however it fails, COMMIT included: a transaction left
+    // open would keep every later write on this connection from ever
+    // being committed.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let notifications = {
+        let mut stmt = tx.prepare(
             "SELECT n.id, n.from_agent, n.to_agent, n.message, n.created_at
              FROM notifications n
              INNER JOIN agents a ON n.to_agent = a.name
@@ -543,23 +546,15 @@ pub fn poll_notifications_for_session(
         drop(stmt);
         if !notifications.is_empty() {
             let ids: Vec<String> = notifications.iter().map(|n| n.id.to_string()).collect();
-            conn.execute(
+            tx.execute(
                 &format!("DELETE FROM notifications WHERE id IN ({})", ids.join(",")),
                 [],
             )?;
         }
-        Ok(notifications)
-    })();
-    match result {
-        Ok(notifications) => {
-            conn.execute("COMMIT", [])?;
-            Ok(notifications)
-        }
-        Err(e) => {
-            let _ = conn.execute("ROLLBACK", []);
-            Err(e)
-        }
-    }
+        notifications
+    };
+    tx.commit()?;
+    Ok(notifications)
 }
 
 // --- Agent CRUD ---
@@ -3109,6 +3104,35 @@ mod tests {
         claim_agent(&conn, "alice", "s1").unwrap();
         let notifs = poll_notifications_for_session(&conn, "s1").unwrap();
         assert!(notifs.is_empty());
+    }
+
+    #[test]
+    fn test_a_poll_whose_commit_fails_leaves_no_transaction_open() {
+        let conn = test_db();
+        create_agent(&conn, "alice", "").unwrap();
+        create_agent(&conn, "bob", "").unwrap();
+        claim_agent(&conn, "bob", "s1").unwrap();
+        send_notification(&conn, "alice", "bob", "hi").unwrap();
+        // Taking the notification records a reference to an agent that
+        // doesn't exist, a foreign key checked only at COMMIT: the
+        // poll's COMMIT fails.
+        conn.execute_batch(
+            "CREATE TABLE deferred_ref (
+                 agent TEXT REFERENCES agents(name) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TRIGGER fail_commit AFTER DELETE ON notifications BEGIN
+                 INSERT INTO deferred_ref VALUES ('ghost');
+             END;",
+        )
+        .unwrap();
+        assert!(poll_notifications_for_session(&conn, "s1").is_err());
+        // Left inside the transaction, every later write would go
+        // nowhere: never committed, never seen by anyone else.
+        assert!(conn.is_autocommit(), "left inside a transaction");
+        conn.execute_batch("DROP TRIGGER fail_commit").unwrap();
+        assert_eq!(
+            poll_notifications_for_session(&conn, "s1").unwrap().len(),
+            1
+        );
     }
 
     #[test]
