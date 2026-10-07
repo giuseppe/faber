@@ -517,7 +517,8 @@ function taskCard(task, draggable) {
       task.cron_expression ? ` · cron ${task.cron_expression}` : ""),
     st === "running" ? runningLine(latest) : null,
     (st === "failed" || st === "succeeded") && task.last_result
-      ? el("div", { class: "card-meta" }, firstLine(task.last_result, 90)) : null);
+      ? el("div", { class: "card-meta card-result", title: firstLine(task.last_result, 300) },
+        firstLine(task.last_result, 90)) : null);
   if (draggable) {
     card.addEventListener("dragstart", (e) => {
       e.dataTransfer.setData("text/plain", String(task.id));
@@ -574,7 +575,7 @@ function renderTaskList() {
   list.replaceChildren(...shown.map(([key, title]) => {
     const tasks = groups.get(key).sort((a, b) => b.id - a.id);
     return el("div", { class: "group" },
-      el("h3", {}, `${title} · ${tasks.length}`),
+      el("h3", {}, el("span", {}, title), el("span", { class: "count" }, String(tasks.length))),
       tasks.map((t) => taskCard(t, false)));
   }));
 }
@@ -611,7 +612,7 @@ function renderBoard() {
     const cut = column.finished && !state.showAllDone.has(column.key) && total > DONE_SHOWN;
     if (cut) tasks = tasks.slice(0, DONE_SHOWN);
     const node = el("div", { class: "column" },
-      el("h3", {}, el("span", {}, column.title), el("span", {}, String(total))),
+      el("h3", {}, el("span", {}, column.title), el("span", { class: "count" }, String(total))),
       column.hint ? el("p", { class: "hint" }, column.hint) : null,
       tasks.map((t) => taskCard(t, ["held", "disabled", "waiting", "blocked"].includes(taskState(t)))),
       cut ? el("button", { class: "ghost more", onclick: () => {
