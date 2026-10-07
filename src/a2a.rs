@@ -198,6 +198,12 @@ fn skills(conn: &Connection) -> Result<Vec<Skill>, Box<dyn Error>> {
         .collect())
 }
 
+/// Where this server is, as the caller reached it: what URLs it's given
+/// start with.
+fn base_url(request: &Request) -> String {
+    format!("http://{}", request.host.as_deref().unwrap_or("localhost"))
+}
+
 fn agent_card(request: &Request, db: &Arc<Mutex<Connection>>) -> Response {
     let skills = match db.lock() {
         Ok(conn) => skills(&conn),
@@ -207,7 +213,7 @@ fn agent_card(request: &Request, db: &Arc<Mutex<Connection>>) -> Response {
         Ok(skills) => skills,
         Err(e) => return Response::error(500, &e.to_string()),
     };
-    let base = format!("http://{}", request.host.as_deref().unwrap_or("localhost"));
+    let base = base_url(request);
     Response::json(
         200,
         &json!({
@@ -276,6 +282,8 @@ fn rpc_response(id: &Value, result: Result<Value, RpcError>) -> Response {
 /// A JSON-RPC request, checked: who sent it, its id, method and params.
 struct RpcCall {
     caller: String,
+    /// See `base_url`.
+    base: String,
     id: Value,
     method: String,
     params: Value,
@@ -321,6 +329,7 @@ fn parse_rpc(request: &Request, keys: &A2aKeys) -> Result<RpcCall, Response> {
     ) {
         (Some("2.0"), Some(method), Some(id @ (Value::String(_) | Value::Number(_)))) => {
             Ok(RpcCall {
+                base: base_url(request),
                 caller: caller.to_string(),
                 id: id.clone(),
                 method: method.to_string(),
@@ -337,21 +346,18 @@ fn parse_rpc(request: &Request, keys: &A2aKeys) -> Result<RpcCall, Response> {
 /// `POST /a2a`.
 fn rpc(request: &Request, db: &Arc<Mutex<Connection>>, keys: &A2aKeys) -> Response {
     match parse_rpc(request, keys) {
-        Ok(rpc) => rpc_response(&rpc.id, call(&rpc.method, &rpc.params, &rpc.caller, db)),
+        Ok(rpc) => rpc_response(&rpc.id, call(&rpc, db)),
         Err(response) => response,
     }
 }
 
-fn call(
-    method: &str,
-    params: &Value,
-    caller: &str,
-    db: &Arc<Mutex<Connection>>,
-) -> Result<Value, RpcError> {
+fn call(rpc: &RpcCall, db: &Arc<Mutex<Connection>>) -> Result<Value, RpcError> {
+    let (method, params, caller, base) =
+        (&rpc.method[..], &rpc.params, &rpc.caller[..], &rpc.base[..]);
     match method {
-        "message/send" => message_send(params, caller, db),
-        "tasks/get" => tasks_get(params, caller, db),
-        "tasks/cancel" => tasks_cancel(params, caller, db),
+        "message/send" => message_send(params, caller, base, db),
+        "tasks/get" => tasks_get(params, caller, base, db),
+        "tasks/cancel" => tasks_cancel(params, caller, base, db),
         m if m.starts_with("tasks/pushNotificationConfig/") => {
             fail(PUSH_NOT_SUPPORTED, "push notifications aren't supported")
         }
@@ -580,12 +586,75 @@ fn task_answer(conn: &Connection, task: &db::TaskRow) -> String {
         .unwrap_or_default()
 }
 
+/// The files the task saved (see `faber::artifacts`), as A2A artifacts:
+/// each one `file` part, for the caller to fetch from its `uri` with its
+/// key (see `file_download`).
+fn file_artifacts(conn: &Connection, task_id: i64, base: &str) -> Vec<Value> {
+    db::list_artifacts(conn, task_id)
+        .unwrap_or_default()
+        .iter()
+        .map(|artifact| file_artifact(artifact, base))
+        .collect()
+}
+
+fn file_artifact(artifact: &db::ArtifactRow, base: &str) -> Value {
+    json!({
+        "artifactId": format!("file-{}", artifact.id),
+        "name": artifact.name,
+        "parts": [{"kind": "file", "file": {
+            "name": artifact.name,
+            "mimeType": artifact.media_type,
+            "uri": format!("{}/a2a/files/{}", base, artifact.id),
+        }}],
+        "metadata": {"size": artifact.size, "digest": artifact.digest},
+    })
+}
+
+/// The artifact `GET /a2a/files/<id>` asks for, if the caller's key owns
+/// its task's context - one that doesn't is not found, as with tasks; or
+/// `None` for another request.
+pub(crate) fn file_download(
+    request: &Request,
+    db: &Arc<Mutex<Connection>>,
+    keys: &A2aKeys,
+) -> Option<Result<db::ArtifactRow, Response>> {
+    let segments: Vec<&str> = request.path.split('/').filter(|s| !s.is_empty()).collect();
+    let ["a2a", "files", id] = segments.as_slice() else {
+        return None;
+    };
+    if keys.is_empty() {
+        return Some(Err(Response::error(404, "not found")));
+    }
+    Some((|| {
+        let given = request.authorization.as_deref().unwrap_or("");
+        let given = given.strip_prefix("Bearer ").unwrap_or("");
+        let Some(caller) = keys.caller(given) else {
+            return Err(Response::error(401, "unauthorized"));
+        };
+        if request.method != "GET" {
+            return Err(Response::error(405, "method not allowed"));
+        }
+        let missing = || Response::error(404, "no such file");
+        let id: i64 = id.parse().map_err(|_| missing())?;
+        let conn = db
+            .lock()
+            .map_err(|e| Response::error(500, &format!("DB lock: {}", e)))?;
+        let artifact = db::get_artifact(&conn, id)
+            .ok()
+            .flatten()
+            .ok_or_else(missing)?;
+        owned_task(&conn, caller, &json!(artifact.task_id.to_string())).map_err(|_| missing())?;
+        Ok(artifact)
+    })())
+}
+
 /// A task as an A2A `Task`.
 fn task_json(
     conn: &Connection,
     task: &db::TaskRow,
     context: &db::A2aContext,
     history_length: Option<usize>,
+    base: &str,
 ) -> Value {
     let state = task_state(task);
     let mut status = json!({"state": state, "timestamp": task_timestamp(task)});
@@ -622,6 +691,7 @@ fn task_json(
             "parts": [answer_part(&answer)],
         }));
     }
+    artifacts.extend(file_artifacts(conn, task.id, base));
     if let Some(n) = history_length {
         let skip = history.len().saturating_sub(n);
         history.drain(..skip);
@@ -742,6 +812,7 @@ fn submit_message(
 fn message_send(
     params: &Value,
     caller: &str,
+    base: &str,
     db: &Arc<Mutex<Connection>>,
 ) -> Result<Value, RpcError> {
     let (task_id, context, configuration) = submit_message(params, caller, db)?;
@@ -762,6 +833,7 @@ fn message_send(
                 &task,
                 &context,
                 history_length(&configuration),
+                base,
             ));
         }
         drop(conn);
@@ -784,15 +856,27 @@ fn check_skill(skill: Option<&str>, context: &db::A2aContext) -> Result<(), RpcE
     }
 }
 
-fn tasks_get(params: &Value, caller: &str, db: &Arc<Mutex<Connection>>) -> Result<Value, RpcError> {
+fn tasks_get(
+    params: &Value,
+    caller: &str,
+    base: &str,
+    db: &Arc<Mutex<Connection>>,
+) -> Result<Value, RpcError> {
     let conn = lock(db)?;
     let (task, context) = owned_task(&conn, caller, params.get("id").unwrap_or(&Value::Null))?;
-    Ok(task_json(&conn, &task, &context, history_length(params)))
+    Ok(task_json(
+        &conn,
+        &task,
+        &context,
+        history_length(params),
+        base,
+    ))
 }
 
 fn tasks_cancel(
     params: &Value,
     caller: &str,
+    base: &str,
     db: &Arc<Mutex<Connection>>,
 ) -> Result<Value, RpcError> {
     let conn = lock(db)?;
@@ -805,7 +889,7 @@ fn tasks_cancel(
         db::cancel_waiting_task(&conn, task.id)?;
     }
     let task = db::get_task(&conn, task.id)?.unwrap_or(task);
-    Ok(task_json(&conn, &task, &context, None))
+    Ok(task_json(&conn, &task, &context, None, base))
 }
 
 /// A `message/stream` or `tasks/resubscribe` request, checked and ready
@@ -817,6 +901,8 @@ pub(crate) struct Stream {
     context: db::A2aContext,
     /// Carrying on from where the task is, not from its start.
     resume: bool,
+    /// See `base_url`.
+    base: String,
 }
 
 /// Prepares `request` as a stream if it is one - `None` if it isn't, for
@@ -856,6 +942,7 @@ pub(crate) fn streaming(
             task_id,
             context,
             resume,
+            base: rpc.base.clone(),
         }),
         Err(e) => Err(rpc_response(&rpc.id, Err(e))),
     })
@@ -904,7 +991,10 @@ impl Stream {
             let task = db::get_task(&conn, self.task_id)
                 .map_err(|e| std::io::Error::other(e.to_string()))?
                 .ok_or_else(|| std::io::Error::other("the task went away"))?;
-            self.send(out, task_json(&conn, &task, &self.context, None))?;
+            self.send(
+                out,
+                task_json(&conn, &task, &self.context, None, &self.base),
+            )?;
             // Resubscribed, from now on.
             let last = if self.resume {
                 self.events_after(&conn, None, 1)
@@ -1029,6 +1119,23 @@ impl Stream {
                     self.artifact_part_update(answer_part(&answer), false, true),
                 )?;
             }
+        }
+        let files = {
+            let conn = lock(&self.db).map_err(|e| std::io::Error::other(e.message))?;
+            file_artifacts(&conn, task.id, &self.base)
+        };
+        for artifact in files {
+            self.send(
+                out,
+                json!({
+                    "kind": "artifact-update",
+                    "taskId": self.task_id.to_string(),
+                    "contextId": self.context.id,
+                    "artifact": artifact,
+                    "append": false,
+                    "lastChunk": true,
+                }),
+            )?;
         }
         let message = (state == "failed").then(|| {
             text_message(
@@ -1591,6 +1698,61 @@ mod tests {
     }
 
     #[test]
+    fn test_a_tasks_files_are_artifacts_only_its_caller_can_fetch() {
+        let db = test_db();
+        add_profile(&db, "writer", json!({"model": "dummy"}));
+        let sent = send(&db, ALICE, user("write a report")).unwrap();
+        let task_id: i64 = sent["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(sent["artifacts"], json!([]));
+        let saved = db::add_artifact(
+            &db.lock().unwrap(),
+            &faber::artifacts::NewArtifact {
+                task_id,
+                name: "report.pdf".to_string(),
+                media_type: "application/pdf".to_string(),
+                agent: None,
+            },
+            &format!("sha256:{}", "ab".repeat(32)),
+            1234,
+        )
+        .unwrap();
+
+        let task = rpc_as(&db, ALICE, "tasks/get", json!({"id": sent["id"]})).unwrap();
+        let uri = format!("http://faber.test:9090/a2a/files/{}", saved.id);
+        assert_eq!(
+            task["artifacts"],
+            json!([{
+                "artifactId": format!("file-{}", saved.id),
+                "name": "report.pdf",
+                "parts": [{"kind": "file", "file": {
+                    "name": "report.pdf", "mimeType": "application/pdf", "uri": uri,
+                }}],
+                "metadata": {"size": 1234, "digest": saved.digest},
+            }])
+        );
+
+        let path = format!("/a2a/files/{}", saved.id);
+        let fetch = |key: Option<&str>, path: &str| {
+            file_download(&http("GET", path, key, ""), &db, &keys())
+                .unwrap()
+                .map_err(|response| response.status)
+        };
+        assert_eq!(fetch(Some(ALICE), &path), Ok(saved));
+        // Someone else's is as missing as one that isn't there.
+        assert_eq!(fetch(Some(BOB), &path), Err(404));
+        assert_eq!(fetch(Some(ALICE), "/a2a/files/999"), Err(404));
+        assert_eq!(fetch(Some(SERVER), &path), Err(401));
+        assert_eq!(fetch(None, &path), Err(401));
+        let no_keys = file_download(
+            &http("GET", &path, Some(ALICE), ""),
+            &db,
+            &A2aKeys::default(),
+        );
+        assert_eq!(no_keys.unwrap().unwrap_err().status, 404);
+        assert!(file_download(&http("GET", "/a2a", Some(ALICE), ""), &db, &keys()).is_none());
+    }
+
+    #[test]
     fn test_a_failed_task_says_why() {
         let db = test_db();
         add_profile(
@@ -1943,6 +2105,19 @@ mod tests {
         {
             let conn = db.lock().unwrap();
             db::claim_task(&conn, task, "ws").unwrap();
+            // What it saved before failing is still handed back.
+            db::add_artifact(
+                &conn,
+                &faber::artifacts::NewArtifact {
+                    task_id: task,
+                    name: "partial.log".to_string(),
+                    media_type: "text/plain".to_string(),
+                    agent: None,
+                },
+                &format!("sha256:{}", "cd".repeat(32)),
+                10,
+            )
+            .unwrap();
             db::finish_task(
                 &conn,
                 task,
@@ -1961,7 +2136,22 @@ mod tests {
         assert_eq!(end["status"]["state"], "failed");
         assert_eq!(end["final"], true);
         assert_eq!(end["status"]["message"]["parts"][0]["text"], "no model");
-        assert!(events.iter().all(|e| e["kind"] != "artifact-update"));
+        let artifacts: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["kind"] == "artifact-update")
+            .collect();
+        assert_eq!(artifacts.len(), 1, "no result, only the file: {events:?}");
+        assert_eq!(artifacts[0]["artifact"]["name"], "partial.log");
+        assert_eq!(
+            artifacts[0]["artifact"]["parts"][0]["file"]["uri"],
+            format!(
+                "http://faber.test:9090/a2a/files/{}",
+                artifacts[0]["artifact"]["artifactId"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("file-")
+            )
+        );
     }
 
     #[test]

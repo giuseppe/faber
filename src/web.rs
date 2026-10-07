@@ -316,11 +316,16 @@ pub fn handle_http(
     let mut reader = BufReader::new(std::io::Read::take(stream.try_clone()?, limit));
     let mut writer = stream;
     let response = match read_request(&mut reader) {
-        Ok(request) => match artifact_download(&request, &db, auth_key, artifacts) {
-            Some(Ok((artifact, mut file))) => {
-                writer.set_write_timeout(Some(STREAM_WRITE_TIMEOUT))?;
-                return write_artifact(&mut writer, &artifact, &mut file).map_err(Into::into);
-            }
+        Ok(request) => match artifact_download(&request, &db, auth_key)
+            .or_else(|| crate::a2a::file_download(&request, &db, a2a_keys))
+        {
+            Some(Ok(artifact)) => match artifacts.open(&artifact.digest) {
+                Ok(mut file) => {
+                    writer.set_write_timeout(Some(STREAM_WRITE_TIMEOUT))?;
+                    return write_artifact(&mut writer, &artifact, &mut file).map_err(Into::into);
+                }
+                Err(e) => Response::error(500, &e.to_string()),
+            },
             Some(Err(response)) => response,
             None => match crate::a2a::streaming(&request, &db, a2a_keys) {
                 Some(Ok(stream)) => {
@@ -411,14 +416,13 @@ fn check_api_auth(request: &Request, auth_key: Option<&str>) -> Result<(), Respo
 }
 
 /// The artifact `GET /api/tasks/<id>/artifacts/<name>` asks for (of the
-/// task's latest run that saved one by that name, or of `?run=`), and its
-/// contents; `None` for another request.
+/// task's latest run that saved one by that name, or of `?run=`); `None`
+/// for another request.
 fn artifact_download(
     request: &Request,
     db: &Arc<Mutex<Connection>>,
     auth_key: Option<&str>,
-    artifacts: &ArtifactStore,
-) -> Option<Result<(db::ArtifactRow, std::fs::File), Response>> {
+) -> Option<Result<db::ArtifactRow, Response>> {
     let segments: Vec<&str> = request.path.split('/').filter(|s| !s.is_empty()).collect();
     let ("GET", ["api", "tasks", id, "artifacts", name]) =
         (request.method.as_str(), segments.as_slice())
@@ -445,10 +449,7 @@ fn artifact_download(
                 .map_err(|e| Response::error(500, &e.to_string()))?
         }
         .ok_or_else(|| Response::error(404, "no such artifact"))?;
-        let file = artifacts
-            .open(&artifact.digest)
-            .map_err(|e| Response::error(500, &e.to_string()))?;
-        Ok((artifact, file))
+        Ok(artifact)
     })())
 }
 
@@ -2204,9 +2205,10 @@ mod tests {
         assert_eq!(call(&db, "GET", "/api/tasks/999/artifacts", "").status, 404);
 
         let target = format!("/api/tasks/{}/artifacts/my%20report.md", task);
-        let (row, mut file) = artifact_download(&request("GET", &target, ""), &db, None, &store)
+        let row = artifact_download(&request("GET", &target, ""), &db, None)
             .unwrap()
             .unwrap();
+        let mut file = store.open(&row.digest).unwrap();
         let mut out = Vec::new();
         write_artifact(&mut out, &row, &mut file).unwrap();
         let out = String::from_utf8(out).unwrap();
@@ -2215,15 +2217,15 @@ mod tests {
         assert!(out.ends_with("\r\n\r\n# Report\n"));
 
         let missing = format!("/api/tasks/{}/artifacts/other.md", task);
-        let response = artifact_download(&request("GET", &missing, ""), &db, None, &store);
+        let response = artifact_download(&request("GET", &missing, ""), &db, None);
         assert_eq!(response.unwrap().unwrap_err().status, 404);
         let wrong_run = format!("{}?run=2", target);
-        let response = artifact_download(&request("GET", &wrong_run, ""), &db, None, &store);
+        let response = artifact_download(&request("GET", &wrong_run, ""), &db, None);
         assert_eq!(response.unwrap().unwrap_err().status, 404);
         // Behind the key, like the rest of the API.
-        let response = artifact_download(&request("GET", &target, ""), &db, Some("k"), &store);
+        let response = artifact_download(&request("GET", &target, ""), &db, Some("k"));
         assert_eq!(response.unwrap().unwrap_err().status, 401);
-        assert!(artifact_download(&request("GET", "/api/tasks", ""), &db, None, &store).is_none());
+        assert!(artifact_download(&request("GET", "/api/tasks", ""), &db, None).is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
