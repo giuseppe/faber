@@ -318,6 +318,27 @@ impl std::fmt::Display for StreamStalledError {
 
 impl Error for StreamStalledError {}
 
+/// A response whose body couldn't be read to its end: the connection
+/// dropped or broke partway through it.
+#[derive(Debug)]
+pub struct ResponseBrokenError {
+    cause: String,
+}
+
+impl std::fmt::Display for ResponseBrokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the model's response broke off: {}", self.cause)
+    }
+}
+
+impl Error for ResponseBrokenError {}
+
+/// Whether reading a response failed in a way that sending the request
+/// again may get past: it stalled, or its connection broke.
+fn response_read_is_retryable(e: &(dyn Error + 'static)) -> bool {
+    e.is::<StreamStalledError>() || e.is::<ResponseBrokenError>()
+}
+
 /// When a response's `Retry-After` header says to try again: in seconds,
 /// or at an HTTP date.
 fn retry_after(headers: &HeaderMap) -> Option<Duration> {
@@ -1747,29 +1768,34 @@ fn post_request_with_mode_and_recursion(
                 }
             };
 
-            if !use_streaming {
-                let response_text = interruptible(move || response.text(), &ctrl_c_rx)??;
-                trace!("Got response {:?}", response_text);
-                let mut response: OpenAIResponse = serde_json::from_str(&response_text)?;
-                if !keep_reasoning {
-                    for choice in response.choices.iter_mut().flatten() {
-                        choice.message.reasoning_content = None;
+            let read = if use_streaming {
+                handle_streaming_response(
+                    response,
+                    &mode,
+                    ctrl_c_rx.clone(),
+                    rules.stream_idle_timeout,
+                    keep_reasoning,
+                )
+            } else {
+                match interruptible(move || response.text(), &ctrl_c_rx)? {
+                    Ok(response_text) => {
+                        trace!("Got response {:?}", response_text);
+                        let mut response: OpenAIResponse = serde_json::from_str(&response_text)?;
+                        if !keep_reasoning {
+                            for choice in response.choices.iter_mut().flatten() {
+                                choice.message.reasoning_content = None;
+                            }
+                        }
+                        Ok(response)
                     }
+                    Err(e) => Err(Box::new(ResponseBrokenError {
+                        cause: e.to_string(),
+                    }) as Box<dyn Error>),
                 }
-                break response;
-            }
-            match handle_streaming_response(
-                response,
-                &mode,
-                ctrl_c_rx.clone(),
-                rules.stream_idle_timeout,
-                keep_reasoning,
-            ) {
+            };
+            match read {
                 Ok(response) => break response,
-                Err(e)
-                    if e.downcast_ref::<StreamStalledError>().is_some()
-                        && attempt < max_retries =>
-                {
+                Err(e) if response_read_is_retryable(e.as_ref()) && attempt < max_retries => {
                     let delay =
                         Duration::from_secs(base_delay_secs * 2_u64.pow(attempt as u32 - 1));
                     warn!(
@@ -2205,8 +2231,13 @@ fn handle_streaming_response(
                 }
             }
             Ok(Err(e)) => {
-                // Line reading error
-                return Err(Box::new(e));
+                // The connection broke partway: whatever was shown of the
+                // response ends here.
+                reasoning_handler("")?;
+                stream_handler("")?;
+                return Err(Box::new(ResponseBrokenError {
+                    cause: e.to_string(),
+                }));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if last_line_at.elapsed() >= idle_timeout {
@@ -3306,6 +3337,68 @@ mod tests {
             other => panic!("said {other:?}"),
         }
         assert_eq!(limiter.in_use(), 0);
+    }
+
+    /// A chunked, streamed response that starts its answer with "par",
+    /// then breaks off in the middle of a chunk's size line.
+    fn broken_sse_response() -> String {
+        let event = "data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n\n";
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+             Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n1",
+            event.len(),
+            event
+        )
+    }
+
+    #[test]
+    fn a_response_whose_connection_breaks_is_sent_again() {
+        let limiter = own_limiter(1);
+        let endpoint = serve_responses(vec![broken_sse_response(), ok_sse_response()]);
+        let (done, said) = request_in_background_with(
+            retry_opts(endpoint, 0),
+            limiter,
+            Duration::from_secs(60),
+            None,
+        );
+        assert_eq!(outcome(&done), Ok("parok".to_string()));
+        match said.try_recv() {
+            Ok(Said::Retrying(reason)) => assert!(reason.contains("broke off"), "{reason}"),
+            other => panic!("said {other:?}"),
+        }
+        assert_eq!(limiter.in_use(), 0);
+    }
+
+    #[test]
+    fn a_complete_response_whose_connection_breaks_is_sent_again() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#;
+        let ok = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let broken = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            &body[..10]
+        );
+        let endpoint = serve_responses(vec![broken, ok]);
+        let ctx = crate::ToolContext::new(|_: &str| {});
+        let response = post_request_with_mode(
+            vec![make_message("user", "hi".to_string())],
+            &ToolsCollection::new(),
+            &retry_opts(endpoint, 0),
+            ResponseMode::Complete,
+            &ctx,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            response.choices.unwrap()[0].message.content.as_deref(),
+            Some("ok")
+        );
     }
 
     #[test]
