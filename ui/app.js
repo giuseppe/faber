@@ -39,6 +39,8 @@ const state = {
   // What an agent's panel shows: "activity" (the live feed) or
   // "conversation" (its saved messages).
   agentView: "activity",
+  // The selected task's artifacts: {task, rows}, fetched with the rest.
+  artifacts: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -670,6 +672,7 @@ function select(what) {
   renderFeed();
   pollEvents();
   if (what?.kind === "agent" && state.agentView === "conversation") loadConversation();
+  if (what?.kind === "task") refresh();
 }
 
 $("detail-back").addEventListener("click", () => select(null));
@@ -855,7 +858,53 @@ function renderDetail() {
     ...field("Runs", task.run_count ? `${task.run_count}${task.max_runs ? ` of ${task.max_runs}` : ""}` : null),
     ...field("Started", task.started_at ? relative(task.started_at) : null),
     ...field("Command", task.command),
-    ...field("Last result", task.last_result));
+    ...field("Last result", task.last_result),
+    ...field("Artifacts", artifactList(task)));
+}
+
+// The files the task produced, each a download; null with none (or
+// before they're fetched).
+function artifactList(task) {
+  const rows = state.artifacts?.task === task.id ? state.artifacts.rows : [];
+  if (!rows.length) return null;
+  const runs = new Set(rows.map((a) => a.run)).size > 1;
+  return el("ul", { class: "artifacts" }, rows.map((a) => el("li", {},
+    el("a", { href: "#", onclick: (e) => { e.preventDefault(); downloadArtifact(task.id, a); } },
+      runs ? `run ${a.run}: ${a.name}` : a.name),
+    ` ${formatSize(a.size)} · ${a.media_type}`)));
+}
+
+function formatSize(bytes) {
+  const units = ["bytes", "KiB", "MiB", "GiB", "TiB"];
+  let size = bytes;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit++; }
+  return unit ? `${size.toFixed(1)} ${units[unit]}` : `${size} bytes`;
+}
+
+// Fetched with the key, which a plain link can't send, and handed to the
+// browser to save under the artifact's name.
+async function downloadArtifact(taskId, artifact) {
+  try {
+    const headers = {};
+    const key = authKey();
+    if (key) headers["Authorization"] = `Bearer ${key}`;
+    const response = await fetch(
+      `/api/tasks/${taskId}/artifacts/${encodeURIComponent(artifact.name)}?run=${artifact.run}`,
+      { headers });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || `${response.status}`);
+    }
+    const url = URL.createObjectURL(await response.blob());
+    const link = el("a", { href: url, download: artifact.name });
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  } catch (e) {
+    toast(`Couldn't download ${artifact.name}: ${e.message}`);
+  }
 }
 
 // --- Agent settings: the user's to change, unsafe tools included --------
@@ -1662,9 +1711,12 @@ window.addEventListener("blur", pointerReleased);
 async function refresh() {
   const pill = $("connection");
   try {
-    const [agents, tasks, profiles] = await Promise.all([
+    const selected = state.selected;
+    const [agents, tasks, profiles, artifacts] = await Promise.all([
       api("GET", "agents"), api("GET", "tasks"), api("GET", "profiles"),
+      selected?.kind === "task" ? api("GET", `tasks/${selected.id}/artifacts`).catch(() => []) : [],
     ]);
+    state.artifacts = selected?.kind === "task" ? { task: selected.id, rows: artifacts } : null;
     if (state.serverCwd === null) {
       const info = await api("GET", "info");
       state.serverCwd = info.cwd || "";

@@ -239,6 +239,80 @@ fn tool_report_result(params_str: &String, ctx: &ToolContext) -> Result<String, 
     Ok("Result recorded. Finish now with a short final answer.".to_string())
 }
 
+/// entrypoint for the artifact_save tool
+fn tool_artifact_save(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        media_type: Option<String>,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let task_id = ctx.task_id.ok_or(
+        "you're not running a task, so there's nothing to attach a file to: write it with \
+         write_file instead",
+    )?;
+    let db = ctx.db()?;
+    let mut source: Box<dyn Read> = match (&params.path, &params.content) {
+        (Some(path), None) => {
+            let path = ctx.tool_path(path);
+            check_names_a_file(&path)?;
+            let file = Root::open(ctx.cwd())?.open_subpath(
+                PathBuf::from(&path),
+                OpenFlags::O_RDONLY | OpenFlags::O_NONBLOCK,
+            )?;
+            if !file.metadata()?.is_file() {
+                return Err(format!("'{}' isn't a regular file", path).into());
+            }
+            Box::new(file)
+        }
+        (None, Some(content)) => Box::new(std::io::Cursor::new(content.clone().into_bytes())),
+        _ => return Err("give either path (a file to save) or content (the text to save)".into()),
+    };
+    let name = match (params.name, &params.path) {
+        (Some(name), _) => name,
+        (None, Some(path)) => std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .ok_or("give the artifact a name")?,
+        (None, None) => return Err("give the artifact a name, e.g. report.md".into()),
+    };
+    faber::artifacts::check_name(&name)?;
+    let media_type = params
+        .media_type
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| faber::artifacts::guess_media_type(&name).to_string());
+    let artifact = faber::artifacts::upload(
+        db,
+        &mut source,
+        &faber::artifacts::NewArtifact {
+            task_id,
+            name,
+            media_type,
+            agent: ctx.agent_name.clone(),
+        },
+    )?;
+    ctx.println(&format!(
+        "\u{1f4e6} Saved artifact '{}' ({} bytes) for task #{}",
+        artifact.name, artifact.size, task_id
+    ));
+    Ok(serde_json::json!({
+        "saved": artifact.name,
+        "task": task_id,
+        "run": artifact.run,
+        "size": artifact.size,
+        "media_type": artifact.media_type,
+        "digest": artifact.digest,
+    })
+    .to_string())
+}
+
 /// Runs a piece of delegated work with `run`, and if a `schema` asks for a
 /// structured result that wasn't reported, reminds the agent once and
 /// lets it continue.
@@ -6088,6 +6162,32 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
 
     append_tool(
         &mut tools,
+        "artifact_save".to_string(),
+        tool_artifact_save,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "artifact_save",
+                "description": "When running a task: save a file as one of the task's outputs (an artifact), for whoever gave you the task to download - a report, a generated file, an archive. Give path, a file in your working directory (written with write_file or made with run_command), or content, the text itself. Saving the same name again replaces it. Only files saved this way are handed back: files you merely write stay where you work.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "The file to save, relative to your working directory"},
+                        "content": {"type": "string", "description": "The text to save, instead of a file"},
+                        "name": {"type": "string", "description": "The file name it's downloaded as, e.g. report.md; by default, path's file name"},
+                        "media_type": {"type": "string", "description": "e.g. text/markdown; guessed from the name if not given"}
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
         "fan_out".to_string(),
         fan_out::tool_fan_out,
         r#"
@@ -7114,6 +7214,10 @@ fn has_unfinished_task(db: &dyn DbBackend, agent: &str) -> bool {
         .flatten();
     db::holds_unfinished_task(marker.as_deref(), |id| db.get_task(id).ok().flatten())
 }
+
+/// Every how many 5-second heartbeats a session removes the artifacts'
+/// contents no task names any more: hourly.
+const ARTIFACTS_GC_BEATS: u64 = 720;
 
 /// Removes the agents made for one job - fan-out workers, tasks' agents -
 /// that are done and have lingered (`db::one_job_agents_done`), with
@@ -9755,6 +9859,11 @@ fn chat_command(
                         debug!("Couldn't remove finished agents: {}", e);
                     }
                 }
+                if beat % ARTIFACTS_GC_BEATS == 0 {
+                    if let Err(e) = heartbeat_db.gc_artifacts() {
+                        debug!("Couldn't remove unused artifacts: {}", e);
+                    }
+                }
             }
         });
     }
@@ -10420,7 +10529,7 @@ fn gc_command(opts: &Opts) -> Result<(), Box<dyn Error>> {
         .ok_or("No db_path configured. Set 'db_path' in your config file.")?;
     let conn = rusqlite::Connection::open(db_path)?;
     db::initialize_db(&conn)?;
-    let db = LocalDb::new(Arc::new(Mutex::new(conn)));
+    let db = LocalDb::new(Arc::new(Mutex::new(conn))).with_artifacts(artifact_store(opts, db_path));
     let removed = db.gc_agents()?;
     if removed.is_empty() {
         println!("No dormant agents to clean up.");
@@ -10430,7 +10539,20 @@ fn gc_command(opts: &Opts) -> Result<(), Box<dyn Error>> {
             println!("  {}", name);
         }
     }
+    match db.gc_artifacts()? {
+        0 => println!("No unused artifact files to clean up."),
+        n => println!("Removed {} unused artifact file(s).", n),
+    }
     Ok(())
+}
+
+/// Where the database at `db_path` keeps artifacts (see `--artifacts-dir`).
+fn artifact_store(opts: &Opts, db_path: &str) -> Arc<faber::artifacts::ArtifactStore> {
+    let dir = match &opts.artifacts_dir {
+        Some(dir) => PathBuf::from(dir),
+        None => faber::artifacts::ArtifactStore::default_dir(std::path::Path::new(db_path)),
+    };
+    Arc::new(faber::artifacts::ArtifactStore::new(dir))
 }
 
 /// A duration like `45s`, `30m`, `2h`, `3d` or `1w`.
@@ -11918,6 +12040,11 @@ fn run_worker(
                         debug!("Couldn't remove finished agents: {}", e);
                     }
                 }
+                if beat % ARTIFACTS_GC_BEATS == 0 {
+                    if let Err(e) = db.gc_artifacts() {
+                        debug!("Couldn't remove unused artifacts: {}", e);
+                    }
+                }
                 std::thread::sleep(Duration::from_secs(5));
             }
         });
@@ -13011,7 +13138,92 @@ fn show_task_command(
             "{}",
             describe_task(&task, &dependencies, chrono::Utc::now())
         );
+        let artifacts = db.list_artifacts(id)?;
+        if !artifacts.is_empty() {
+            println!("Artifacts:");
+            print!("{}", describe_artifacts(&artifacts));
+        }
     }
+    Ok(())
+}
+
+/// A task's artifacts, one per line: run, name, size, type.
+fn describe_artifacts(artifacts: &[db::ArtifactRow]) -> String {
+    let runs = artifacts.iter().any(|a| a.run != artifacts[0].run);
+    artifacts
+        .iter()
+        .map(|a| {
+            format!(
+                "  {}{}  {} bytes  {}\n",
+                if runs {
+                    format!("run {}: ", a.run)
+                } else {
+                    String::new()
+                },
+                a.name,
+                a.size,
+                a.media_type
+            )
+        })
+        .collect()
+}
+
+/// `faber tasks artifacts`: lists task `id`'s artifacts, or downloads
+/// `name`.
+fn artifacts_command(
+    db: &Option<Arc<dyn DbBackend>>,
+    id: i64,
+    name: Option<&str>,
+    output: Option<&str>,
+    run: Option<i64>,
+    force: bool,
+) -> Result<(), Box<dyn Error>> {
+    let db = db.as_ref().ok_or(
+        "No database configured: set 'db_path' in your config file, or use --db-path or --server.",
+    )?;
+    db.get_task(id)?.ok_or_else(|| format!("no task #{}", id))?;
+    let Some(name) = name else {
+        if output.is_some() || run.is_some() {
+            return Err("name the artifact to download".into());
+        }
+        let artifacts = db.list_artifacts(id)?;
+        if artifacts.is_empty() {
+            println!("Task #{} has no artifacts.", id);
+        } else {
+            print!("{}", describe_artifacts(&artifacts));
+        }
+        return Ok(());
+    };
+    let artifact = db.find_artifact(id, name, run)?.ok_or_else(|| match run {
+        Some(run) => format!("task #{}'s run {} saved no artifact '{}'", id, run, name),
+        None => format!("task #{} has no artifact '{}'", id, name),
+    })?;
+    if output == Some("-") {
+        faber::artifacts::download(db.as_ref(), artifact.id, &mut std::io::stdout().lock())?;
+        return Ok(());
+    }
+    // The name is a file name (`artifacts::check_name`): it stays here.
+    let path = output.unwrap_or(&artifact.name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .create_new(!force)
+        .truncate(true)
+        .open(path)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => {
+                format!("'{}' exists: give --force to replace it, or --output", path)
+            }
+            _ => format!("can't write '{}': {}", path, e),
+        })?;
+    let size = match faber::artifacts::download(db.as_ref(), artifact.id, &mut file) {
+        Ok(size) => size,
+        Err(e) => {
+            let _ = std::fs::remove_file(path);
+            return Err(e);
+        }
+    };
+    eprintln!("Wrote '{}' ({} bytes)", path, size);
     Ok(())
 }
 
@@ -13372,6 +13584,12 @@ struct Opts {
     #[clap(long)]
     /// Path to the SQLite database file for persistent storage (agents, tasks, memory)
     db_path: Option<String>,
+    #[clap(long)]
+    /// Where to keep the files tasks produce (artifacts), with the database:
+    /// by default next to it, in a directory named after it (faber.db's in
+    /// faber-artifacts). One per database: each removes the files its tasks
+    /// no longer name
+    artifacts_dir: Option<String>,
     #[clap(long, value_name = "NAME[:CONFIG]")]
     #[serde(skip)]
     /// Start chat session with this agent instead of 'default'. With
@@ -13496,6 +13714,7 @@ impl Default for Opts {
             api_key: None,
             parameter: Vec::new(),
             db_path: None,
+            artifacts_dir: None,
             agent: Vec::new(),
             context_window: None,
             display_graphics: None,
@@ -13582,6 +13801,10 @@ impl Opts {
 
         if self.db_path.is_none() {
             self.db_path = config.db_path;
+        }
+
+        if self.artifacts_dir.is_none() {
+            self.artifacts_dir = config.artifacts_dir;
         }
 
         if self.server.is_none() {
@@ -13701,6 +13924,24 @@ enum TasksAction {
         /// Print the task as JSON instead
         #[clap(long)]
         json: bool,
+    },
+    /// List the files a task produced (its artifacts), or download one by
+    /// name - from its latest run that saved one, unless --run says
+    /// which - to a file of that name here, or to --output
+    Artifacts {
+        /// The task's id, as `faber tasks` lists it
+        id: i64,
+        /// The artifact to download
+        name: Option<String>,
+        /// Where to write it; '-' for standard output
+        #[clap(short, long, value_name = "FILE")]
+        output: Option<String>,
+        /// Which run's artifact, for a task that ran more than once
+        #[clap(long)]
+        run: Option<i64>,
+        /// Replace the file if it exists
+        #[clap(long)]
+        force: bool,
     },
     /// Delete done tasks whose last run is older than --older-than (7d by
     /// default), or all of them with --done. Scheduled, running and
@@ -14367,9 +14608,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         opts.db_path = None;
     }
     // With the config file's db_path, when it has one.
-    if let Some(path) = &opts.db_path {
-        if let (Some(rest), Some(home)) = (path.strip_prefix("~/"), std::env::var_os("HOME")) {
-            opts.db_path = Some(PathBuf::from(home).join(rest).display().to_string());
+    for path in [&mut opts.db_path, &mut opts.artifacts_dir] {
+        if let Some(given) = path.as_deref() {
+            if let (Some(rest), Some(home)) = (given.strip_prefix("~/"), std::env::var_os("HOME")) {
+                *path = Some(PathBuf::from(home).join(rest).display().to_string());
+            }
         }
     }
     set_faber_files(config_path.as_deref(), opts.db_path.as_deref());
@@ -14446,7 +14689,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let conn = if matches!(
             opts.command,
             CliCommand::Tasks {
-                action: None | Some(TasksAction::Show { .. }),
+                action: None | Some(TasksAction::Show { .. }) | Some(TasksAction::Artifacts { .. }),
                 ..
             } | CliCommand::Kb {
                 action: None | Some(KbAction::Search { .. }) | Some(KbAction::Show { .. }),
@@ -14473,7 +14716,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         let conn = Arc::new(Mutex::new(conn));
         db_conn_for_history = Some(conn.clone());
-        Some(Arc::new(LocalDb::new(conn)))
+        Some(Arc::new(
+            LocalDb::new(conn).with_artifacts(artifact_store(&opts, db_path)),
+        ))
     } else {
         debug!("No db_path configured, database tools will be unavailable");
         None
@@ -14550,6 +14795,24 @@ fn main() -> Result<(), Box<dyn Error>> {
             action: Some(TasksAction::Show { id, json }),
             ..
         } => show_task_command(&db_connection, *id, *json),
+        CliCommand::Tasks {
+            action:
+                Some(TasksAction::Artifacts {
+                    id,
+                    name,
+                    output,
+                    run,
+                    force,
+                }),
+            ..
+        } => artifacts_command(
+            &db_connection,
+            *id,
+            name.as_deref(),
+            output.as_deref(),
+            *run,
+            *force,
+        ),
         CliCommand::Tasks {
             action: Some(TasksAction::Hold { ids }),
             ..
@@ -14701,7 +14964,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let mut mcp_servers: Vec<String> = opts.mcp_servers.keys().cloned().collect();
                 mcp_servers.sort();
                 let _ = web::MCP_SERVERS.set(mcp_servers);
-                server::serve_command(bind, conn, key.as_deref(), profiles, a2a_keys)
+                let artifacts = artifact_store(&opts, opts.db_path.as_deref().unwrap_or(""));
+                server::serve_command(bind, conn, key.as_deref(), profiles, a2a_keys, artifacts)
             })
         }
     };
@@ -19207,6 +19471,99 @@ for line in sys.stdin:
         .unwrap_err()
         .to_string();
         assert!(err.contains("nobody is waiting"), "{err}");
+    }
+
+    #[test]
+    fn test_artifact_save_attaches_a_file_to_the_task() {
+        let dir = test_dir().join("artifact-store");
+        let db: Arc<dyn DbBackend> = Arc::new(
+            LocalDb::new(test_db_conn())
+                .with_artifacts(Arc::new(faber::artifacts::ArtifactStore::new(&dir))),
+        );
+        let mut ctx = test_ctx();
+        ctx.db = Some(db.clone());
+        let save = |ctx: &ToolContext, params: serde_json::Value| {
+            tool_artifact_save(&params.to_string(), ctx).map_err(|e| e.to_string())
+        };
+        let err = save(&ctx, serde_json::json!({"name": "a.md", "content": "x"})).unwrap_err();
+        assert!(err.contains("not running a task"), "{err}");
+
+        let task = db
+            .create_task(&db::NewTask {
+                name: "t".to_string(),
+                description: String::new(),
+                kind: db::TaskKind::PROMPT.to_string(),
+                command: "write a report".to_string(),
+                agent_name: None,
+                schedule: db::TaskSchedule::Once {
+                    at: chrono::Utc::now().to_rfc3339(),
+                },
+                held: false,
+                depends_on: Vec::new(),
+                profile: None,
+                run_safe: false,
+                cwd: None,
+                continue_agent: None,
+                continue_task: None,
+            })
+            .unwrap();
+        ctx.task_id = Some(task);
+        ctx.agent_name = Some("bob".to_string());
+        save(
+            &ctx,
+            serde_json::json!({"name": "report.md", "content": "# Done\n"}),
+        )
+        .unwrap();
+        write_test_file("artifact-source.csv", "a,b\n1,2\n");
+        save(&ctx, serde_json::json!({"path": "artifact-source.csv"})).unwrap();
+        let absolute = test_dir().join("artifact-source.csv").display().to_string();
+        save(
+            &ctx,
+            serde_json::json!({"path": absolute, "name": "again.csv"}),
+        )
+        .unwrap();
+
+        let artifacts = db.list_artifacts(task).unwrap();
+        let shown: Vec<(&str, &str, u64, Option<&str>)> = artifacts
+            .iter()
+            .map(|a| {
+                (
+                    a.name.as_str(),
+                    a.media_type.as_str(),
+                    a.size,
+                    a.agent.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("again.csv", "text/csv", 8, Some("bob")),
+                ("artifact-source.csv", "text/csv", 8, Some("bob")),
+                ("report.md", "text/markdown", 7, Some("bob")),
+            ]
+        );
+        assert_eq!(artifacts[0].digest, artifacts[1].digest);
+        let mut back = Vec::new();
+        faber::artifacts::download(db.as_ref(), artifacts[2].id, &mut back).unwrap();
+        assert_eq!(back, b"# Done\n");
+
+        // Only files where the agent works.
+        for path in ["../../../../etc/passwd", "/etc/passwd"] {
+            assert!(
+                save(&ctx, serde_json::json!({"path": path})).is_err(),
+                "{path}"
+            );
+        }
+        for bad in [
+            serde_json::json!({"content": "no name"}),
+            serde_json::json!({"path": "artifact-source.csv", "content": "both"}),
+            serde_json::json!({"name": "a/b", "content": "x"}),
+        ] {
+            assert!(save(&ctx, bad.clone()).is_err(), "{bad}");
+        }
+        cleanup("artifact-source.csv");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

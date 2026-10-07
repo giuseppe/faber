@@ -284,6 +284,8 @@ button:disabled { opacity: 0.5; cursor: default; }
 .fields:empty { display: none; }
 .fields dt { color: var(--muted); }
 .fields dd { margin: 0; white-space: pre-wrap; word-break: break-word; max-height: 12em; overflow: auto; }
+.fields dd ul.artifacts { margin: 0; padding: 0; list-style: none; white-space: normal; }
+.fields dd ul.artifacts li { margin: 0 0 0.2em; color: var(--muted); }
 
 .feed-options { margin: 6px 0; }
 .toggle { font-size: 12px; color: var(--muted); font-weight: normal; margin-right: 10px; }

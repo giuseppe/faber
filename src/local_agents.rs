@@ -23,9 +23,10 @@
 //! runs them as given without changing them for anyone else.
 
 use faber::agent_io::{AgentEvent, AgentEventRow, EventFilter};
+use faber::artifacts::NewArtifact;
 use faber::db::{
-    AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow, TaskConversation,
-    TaskOutcome, TaskRow,
+    AgentConfig, AgentRow, ArtifactRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow,
+    TaskConversation, TaskOutcome, TaskRow,
 };
 use faber::db_backend::DbBackend;
 use std::collections::HashMap;
@@ -357,6 +358,43 @@ impl DbBackend for LocalAgents {
 
     fn gc_agents(&self) -> Result<Vec<String>, Box<dyn Error>> {
         self.inner.gc_agents()
+    }
+
+    fn artifact_upload_begin(&self) -> Result<String, Box<dyn Error>> {
+        self.inner.artifact_upload_begin()
+    }
+
+    fn artifact_upload_append(&self, upload: &str, data: &[u8]) -> Result<(), Box<dyn Error>> {
+        self.inner.artifact_upload_append(upload, data)
+    }
+
+    fn artifact_upload_finish(
+        &self,
+        upload: &str,
+        artifact: &NewArtifact,
+    ) -> Result<ArtifactRow, Box<dyn Error>> {
+        self.inner.artifact_upload_finish(upload, artifact)
+    }
+
+    fn list_artifacts(&self, task_id: i64) -> Result<Vec<ArtifactRow>, Box<dyn Error>> {
+        self.inner.list_artifacts(task_id)
+    }
+
+    fn find_artifact(
+        &self,
+        task_id: i64,
+        name: &str,
+        run: Option<i64>,
+    ) -> Result<Option<ArtifactRow>, Box<dyn Error>> {
+        self.inner.find_artifact(task_id, name, run)
+    }
+
+    fn read_artifact(&self, id: i64, offset: u64, len: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+        self.inner.read_artifact(id, offset, len)
+    }
+
+    fn gc_artifacts(&self) -> Result<usize, Box<dyn Error>> {
+        self.inner.gc_artifacts()
     }
 
     fn append_agent_events(

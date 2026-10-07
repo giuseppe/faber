@@ -217,7 +217,8 @@ faber --db-path state.db gc
 ```
 
 Removes agents with no active session (stale heartbeat or no session_id),
-except the `default` agent.
+except the `default` agent, and the artifacts' files no task names any
+more (see Artifacts).
 
 ## Agents
 
@@ -748,6 +749,40 @@ deletes its tasks, and the model can delete one with `task_delete`.
 `--since` also takes a date or `"YYYY-MM-DD HH:MM"` in local time, or an
 RFC 3339 timestamp. It works with `--server` too.
 
+### Artifacts
+
+A task can hand back files: an agent running it saves them with the
+`artifact_save` tool - a file in its working directory, or text given
+directly - and they're kept with the task, as its artifacts, for whoever
+made it to download. Ask for it in the task, e.g. `faber tasks add "Write
+a summary of the open issues to summary.md and save it as an artifact"`.
+
+```bash
+faber --db-path state.db tasks artifacts 7                 # list task #7's artifacts
+faber --db-path state.db tasks artifacts 7 summary.md      # download one, to ./summary.md
+faber --db-path state.db tasks artifacts 7 summary.md -o - # to standard output
+faber --db-path state.db tasks artifacts 7 out.csv --run 3 # a cron task's third run's
+```
+
+`tasks show` lists them too, and the web UI's task panel links each for
+download (`GET /api/tasks/<id>/artifacts`, and `.../artifacts/<name>` for
+the file). It all works the same with `--server`.
+
+Saving the same name again in a run replaces it; each run of a cron task
+has its own. The files are kept where the database is, not where the
+agent works: an agent connected to a `faber serve` elsewhere uploads them
+to the server, a few MiB at a time, and downloads go through the server
+too. There they're stored by content, one file per SHA-256 digest -
+identical outputs are stored once - in `--artifacts-dir` (`artifacts_dir`
+in the config file), by default a directory next to the database named
+after it (`faber.db` keeps them in `faber-artifacts/`). Give each
+database its own: it removes the files its tasks no longer name.
+
+A task's artifacts go when it's deleted (or pruned), and their files once
+no artifact names them: `faber serve` checks every 10 minutes, a session
+on a local database every hour, and `faber gc` straight away. Uploads
+abandoned for a day go too. There's no size limit.
+
 ## Knowledge base
 
 Agents keep a knowledge base of notes - project facts, decisions and why,
@@ -824,6 +859,7 @@ that agent.
 | `agent_wait` | Wait for your sub-agents (all, some, or the first to finish) and get their results together |
 | `task_wait` | Wait for tasks (run by other agents) to finish, and get how each went |
 | `report_result` | For a sub-agent, fan-out worker or task: report the outcome of its work - succeeded/failed, summary, data |
+| `artifact_save` | When running a task: save a file from the working directory (or given text) as one of the task's outputs, for its creator to download (see Artifacts) |
 | `fan_out` | Run the same task for many items (e.g. files) at once, one worker agent each, at most `max_parallel` at a time (default 32, up to 256; up to 1000 items), and return all the results together, in item order, once every worker is done. `{item}` in the prompt is replaced by each worker's item. Workers only get read-only tools (`read_file`, `glob`, `grep`, `lsp`, web/GitHub reads) unless `tools` names others - workers that write can overwrite each other's changes - and can't spawn agents. Ctrl-C stops every worker. Each result gets a share of the output cap |
 | `run_command` | Execute a command, sandboxed with [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`): no network access, no capabilities, a cleared environment, a read-only root with only the current directory writable, its own PID/IPC/UTS/cgroup namespaces (no visibility into other processes or the host's hostname), killed if faber itself dies, and detached from the controlling terminal. Requires `bwrap` to be installed; use `--unsafe-tools` for unrestricted execution instead |
 
@@ -1040,7 +1076,8 @@ When `--db-path` is provided, the following state is persisted in SQLite:
 - Agent definitions and configuration
 - Agent key-value data store
 - Conversation history per agent
-- Scheduled tasks (cron and one-shot)
+- Scheduled tasks (cron and one-shot), and the files they produce (in
+  the artifacts directory, see Artifacts)
 - Inter-agent notifications
 - Readline history (Ctrl-R search works across sessions)
 
@@ -1263,6 +1300,7 @@ python3 -m venv /tmp/a2a && /tmp/a2a/bin/pip install 'a2a-sdk<0.4' httpx
     --parameter <K=V>        Model parameter (can be repeated; a JSON object or array is taken as JSON)
     --mcp-server <N[=URL]>   Give the session's agent an MCP server, adding a remote one with =URL (can be repeated); see MCP section
     --db-path <PATH>         SQLite database for persistent storage
+    --artifacts-dir <PATH>   Where to keep the files tasks produce (default: next to the database)
     --agent <NAME>           Start chat as this agent instead of 'default'
     --profile <NAME>         Make the chat's agent from this profile (see Profiles)
     --display-graphics       Render LaTeX blocks as images on terminals that support it; see below
