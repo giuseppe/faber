@@ -37,7 +37,10 @@ use clap::{Parser, Subcommand};
 use console::Style;
 use env_logger::Env;
 use log::{debug, trace, warn};
-use pathrs::{Root, flags::OpenFlags};
+use pathrs::{
+    Root,
+    flags::{OpenFlags, RenameFlags},
+};
 use prettytable::{Cell, Row, Table, format};
 use rustyline::Editor;
 use rustyline::completion::{Completer, Pair};
@@ -237,6 +240,116 @@ fn tool_report_result(params_str: &String, ctx: &ToolContext) -> Result<String, 
         data: params.data,
     });
     Ok("Result recorded. Finish now with a short final answer.".to_string())
+}
+
+/// An artifact as the artifact tools show it.
+fn artifact_json(artifact: &db::ArtifactRow) -> serde_json::Value {
+    serde_json::json!({
+        "name": artifact.name,
+        "run": artifact.run,
+        "size": artifact.size,
+        "media_type": artifact.media_type,
+        "saved_by": artifact.agent,
+        "saved_at": artifact.created_at,
+    })
+}
+
+/// entrypoint for the artifact_list tool
+fn tool_artifact_list(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        task: i64,
+        #[serde(default)]
+        run: Option<i64>,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let db = ctx.db()?;
+    db.get_task(params.task)?
+        .ok_or_else(|| format!("no task #{}", params.task))?;
+    let artifacts: Vec<serde_json::Value> = db
+        .list_artifacts(params.task)?
+        .iter()
+        .filter(|a| params.run.is_none_or(|run| a.run == run))
+        .map(artifact_json)
+        .collect();
+    ctx.println(&format!(
+        "\u{1f4e6} Task #{} has {} artifact(s)",
+        params.task,
+        artifacts.len()
+    ));
+    Ok(serde_json::json!({"task": params.task, "artifacts": artifacts}).to_string())
+}
+
+/// entrypoint for the artifact_fetch tool
+fn tool_artifact_fetch(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        task: i64,
+        name: String,
+        #[serde(default)]
+        run: Option<i64>,
+        #[serde(default)]
+        path: Option<String>,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let db = ctx.db()?;
+    let artifact = db
+        .find_artifact(params.task, &params.name, params.run)?
+        .ok_or_else(|| match params.run {
+            Some(run) => format!(
+                "task #{}'s run {} saved no artifact '{}': artifact_list shows what it has",
+                params.task, run, params.name
+            ),
+            None => format!(
+                "task #{} has no artifact '{}': artifact_list shows what it has",
+                params.task, params.name
+            ),
+        })?;
+    let path = ctx.tool_path(params.path.as_deref().unwrap_or(&artifact.name));
+    check_names_a_file(&path)?;
+    let path_buf = PathBuf::from(&path);
+    let root = Root::open(ctx.cwd())?;
+    if let Some(parent) = path_buf.parent().filter(|p| !p.as_os_str().is_empty()) {
+        root.mkdir_all(parent, &Permissions::from_mode(0o755))?;
+    }
+    // Written next to it, then put in its place: never half a file there.
+    let file_name = path_buf
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let partial =
+        path_buf.with_file_name(format!(".{}.fetching-{}", file_name, std::process::id()));
+    let mut file = root.create_file(
+        &partial,
+        OpenFlags::O_WRONLY | OpenFlags::O_CREAT | OpenFlags::O_EXCL,
+        &Permissions::from_mode(0o644),
+    )?;
+    let fetched = faber::artifacts::download(db, artifact.id, &mut file).and_then(|size| {
+        root.rename(&partial, &path_buf, RenameFlags::empty())?;
+        Ok(size)
+    });
+    let size = match fetched {
+        Ok(size) => size,
+        Err(e) => {
+            let _ = root.remove_file(&partial);
+            return Err(e);
+        }
+    };
+    ctx.println(&format!(
+        "\u{1f4e6} Fetched artifact '{}' of task #{} to {} ({} bytes)",
+        artifact.name, params.task, path, size
+    ));
+    Ok(serde_json::json!({
+        "fetched": artifact.name,
+        "task": params.task,
+        "run": artifact.run,
+        "path": path,
+        "size": size,
+        "media_type": artifact.media_type,
+    })
+    .to_string())
 }
 
 /// entrypoint for the artifact_save tool
@@ -6188,6 +6301,58 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
 
     append_tool(
         &mut tools,
+        "artifact_list".to_string(),
+        tool_artifact_list,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "artifact_list",
+                "description": "List the files a task produced (its artifacts, saved with artifact_save): name, run, size and type. Any task's, by id - e.g. one this task runs after, or one you waited for.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task": {"type": "integer", "description": "The task's id"},
+                        "run": {"type": "integer", "description": "Only this run's, for a task that ran more than once"}
+                    },
+                    "required": ["task"],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "artifact_fetch".to_string(),
+        tool_artifact_fetch,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "artifact_fetch",
+                "description": "Copy a file another task produced (one of its artifacts) into your working directory, to read or work on - wherever that task ran. Replaces a file already at that path.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task": {"type": "integer", "description": "The task's id"},
+                        "name": {"type": "string", "description": "The artifact's name, as artifact_list shows it"},
+                        "run": {"type": "integer", "description": "Which run's, for a task that ran more than once; the latest by default"},
+                        "path": {"type": "string", "description": "Where to put it, relative to your working directory; by default, its name"}
+                    },
+                    "required": ["task", "name"],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
         "fan_out".to_string(),
         fan_out::tool_fan_out,
         r#"
@@ -11816,7 +11981,7 @@ fn task_input(task: &db::TaskRow, db: &dyn DbBackend) -> String {
         .iter()
         .filter_map(|id| db.get_task(*id).ok().flatten())
         .map(|dependency| {
-            format!(
+            let mut result = format!(
                 "## Task #{} \"{}\" ({})\n{}",
                 dependency.id,
                 dependency.name,
@@ -11827,7 +11992,22 @@ fn task_input(task: &db::TaskRow, db: &dyn DbBackend) -> String {
                     .map(str::trim)
                     .filter(|r| !r.is_empty())
                     .unwrap_or("(no result)")
-            )
+            );
+            let files: Vec<String> = db
+                .list_artifacts(dependency.id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|a| a.run == dependency.run_count.max(1))
+                .map(|a| format!("- {} ({} bytes, {})", a.name, a.size, a.media_type))
+                .collect();
+            if !files.is_empty() {
+                result.push_str(&format!(
+                    "\n\nIts files (artifact_fetch with task {} gets them):\n{}",
+                    dependency.id,
+                    files.join("\n")
+                ));
+            }
+            result
         })
         .collect();
     if !results.is_empty() {
@@ -19563,6 +19743,74 @@ for line in sys.stdin:
             assert!(save(&ctx, bad.clone()).is_err(), "{bad}");
         }
         cleanup("artifact-source.csv");
+
+        // Another job lists them, and fetches them where it works.
+        let list = |params: serde_json::Value| -> serde_json::Value {
+            serde_json::from_str(&tool_artifact_list(&params.to_string(), &ctx).unwrap()).unwrap()
+        };
+        let listed = list(serde_json::json!({"task": task}));
+        assert_eq!(listed["artifacts"].as_array().unwrap().len(), 3);
+        assert_eq!(listed["artifacts"][2]["name"], "report.md");
+        assert_eq!(listed["artifacts"][2]["saved_by"], "bob");
+        assert_eq!(
+            list(serde_json::json!({"task": task, "run": 2}))["artifacts"],
+            serde_json::json!([])
+        );
+        assert!(tool_artifact_list(&r#"{"task": 999}"#.to_string(), &ctx).is_err());
+
+        let fetch = |params: serde_json::Value| {
+            tool_artifact_fetch(&params.to_string(), &ctx).map_err(|e| e.to_string())
+        };
+        fetch(serde_json::json!({"task": task, "name": "report.md"})).unwrap();
+        assert_eq!(read_test_file("report.md"), "# Done\n");
+        fetch(serde_json::json!({"task": task, "name": "again.csv", "path": "fetched/in.csv"}))
+            .unwrap();
+        assert_eq!(read_test_file("fetched/in.csv"), "a,b\n1,2\n");
+        // Replaced, never left half written.
+        fetch(serde_json::json!({"task": task, "name": "report.md", "path": "fetched/in.csv"}))
+            .unwrap();
+        assert_eq!(read_test_file("fetched/in.csv"), "# Done\n");
+        let names: Vec<String> = std::fs::read_dir(test_dir().join("fetched"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["in.csv"]);
+        let err = fetch(serde_json::json!({"task": task, "name": "nope.md"})).unwrap_err();
+        assert!(err.contains("artifact_list"), "{err}");
+        // Only where it works: ".." stops there.
+        fetch(serde_json::json!({"task": task, "name": "report.md", "path": "../../escape.md"}))
+            .unwrap();
+        assert_eq!(read_test_file("escape.md"), "# Done\n");
+        assert!(!test_dir().parent().unwrap().join("escape.md").exists());
+        cleanup("escape.md");
+        cleanup("report.md");
+        let _ = std::fs::remove_dir_all(test_dir().join("fetched"));
+
+        // A task that runs after it is told what files it left.
+        assert!(db.claim_task(task, "s").unwrap());
+        db.finish_task(
+            task,
+            "s",
+            &db::TaskOutcome {
+                succeeded: true,
+                exit_code: None,
+                result: "wrote the report".to_string(),
+            },
+        )
+        .unwrap();
+        let mut next = db.get_task(task).unwrap().unwrap();
+        next.depends_on = vec![task];
+        let input = task_input(&next, db.as_ref());
+        assert!(
+            input.ends_with(&format!(
+                "wrote the report\n\n\
+                 Its files (artifact_fetch with task {task} gets them):\n\
+                 - again.csv (8 bytes, text/csv)\n\
+                 - artifact-source.csv (8 bytes, text/csv)\n\
+                 - report.md (7 bytes, text/markdown)"
+            )),
+            "{input}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

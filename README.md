@@ -764,6 +764,13 @@ faber --db-path state.db tasks artifacts 7 summary.md -o - # to standard output
 faber --db-path state.db tasks artifacts 7 out.csv --run 3 # a cron task's third run's
 ```
 
+Other jobs can use them: an agent lists any task's artifacts with
+`artifact_list`, and copies one into its working directory with
+`artifact_fetch` - wherever either ran. A task that runs after another
+(`--after`, or `depends_on`) is told, with that task's result, which files
+it left. To wait for a task without depending on it, an agent has
+`task_wait`.
+
 `tasks show` lists them too, and the web UI's task panel links each for
 download (`GET /api/tasks/<id>/artifacts`, and `.../artifacts/<name>` for
 the file). It all works the same with `--server`.
@@ -860,6 +867,8 @@ that agent.
 | `task_wait` | Wait for tasks (run by other agents) to finish, and get how each went |
 | `report_result` | For a sub-agent, fan-out worker or task: report the outcome of its work - succeeded/failed, summary, data |
 | `artifact_save` | When running a task: save a file from the working directory (or given text) as one of the task's outputs, for its creator to download (see Artifacts) |
+| `artifact_list` | List the files (artifacts) any task produced |
+| `artifact_fetch` | Copy one of any task's artifacts into the working directory |
 | `fan_out` | Run the same task for many items (e.g. files) at once, one worker agent each, at most `max_parallel` at a time (default 32, up to 256; up to 1000 items), and return all the results together, in item order, once every worker is done. `{item}` in the prompt is replaced by each worker's item. Workers only get read-only tools (`read_file`, `glob`, `grep`, `lsp`, web/GitHub reads) unless `tools` names others - workers that write can overwrite each other's changes - and can't spawn agents. Ctrl-C stops every worker. Each result gets a share of the output cap |
 | `run_command` | Execute a command, sandboxed with [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`): no network access, no capabilities, a cleared environment, a read-only root with only the current directory writable, its own PID/IPC/UTS/cgroup namespaces (no visibility into other processes or the host's hostname), killed if faber itself dies, and detached from the controlling terminal. Requires `bwrap` to be installed; use `--unsafe-tools` for unrestricted execution instead |
 
