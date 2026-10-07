@@ -1258,9 +1258,15 @@ message the skills below. Without the option, `/a2a` and the card answer
   answer with JSON only. An agent that needs more from the caller ends its
   turn with a question: the task is `completed`, and the answer goes in a
   new message with the same `contextId`.
+- **Files**: each file the agent saves with `artifact_save` (see
+  Artifacts) is one more artifact, `file-<id>`, with a `file` part giving
+  its name, `mimeType` and `uri`: `/a2a/files/<id>`, fetched with the
+  same key. Only the key whose context made it can, as with tasks; to
+  another it's not found.
 - **Streaming**: `message/stream` and `tasks/resubscribe` answer with
   server-sent events: the task, `working` updates (one per tool call), the
-  text as `result` artifact chunks, then a final status. The answer
+  text as `result` artifact chunks, the files saved, then a final status
+  - whether it succeeded or not. The answer
   streams as text even when it is JSON; `tasks/get` then shows it as a
   `data` part. A stream counts as a connection, and closes after 30
   minutes without an event, to be resubscribed.
@@ -1270,8 +1276,8 @@ message the skills below. Without the option, `/a2a` and the card answer
   contexts' tasks are only taken by workers that have the unsafe tools
   (`--unsafe-tools`), and wait for one otherwise. Think twice before
   giving an agent that a stranger can talk to an unsandboxed shell.
-- **Not supported**: push notifications (`-32003`), `file` parts
-  (`-32005`), `auth-required` and `input-required`, the authenticated
+- **Not supported**: push notifications (`-32003`), `file` parts in
+  messages (`-32005`), `auth-required` and `input-required`, the authenticated
   extended card, and the gRPC and REST bindings.
 
 `tests/a2a_interop.py` runs the official Python SDK against a server, for
