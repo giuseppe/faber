@@ -19,7 +19,7 @@
 
 use crate::agent_io::{AgentEvent, AgentEventRow, EventFilter};
 use cron::Schedule;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::str::FromStr;
@@ -389,6 +389,24 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
              created_at TEXT NOT NULL,
              last_used_at TEXT NOT NULL
          );",
+    )?;
+
+    // See `ArtifactRow`. A task's artifacts go with it; their contents,
+    // once no row names them, with the next garbage collection.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS artifacts (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             task_id INTEGER NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+             run INTEGER NOT NULL,
+             name TEXT NOT NULL,
+             media_type TEXT NOT NULL,
+             size INTEGER NOT NULL,
+             digest TEXT NOT NULL,
+             agent TEXT,
+             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+             UNIQUE (task_id, run, name)
+         );
+         CREATE INDEX IF NOT EXISTS idx_artifacts_digest ON artifacts(digest);",
     )?;
 
     initialize_kb(conn)?;
@@ -2251,6 +2269,127 @@ pub fn unmet_dependencies(all: &[TaskRow]) -> std::collections::HashMap<i64, Vec
             (!unmet.is_empty()).then_some((t.id, unmet))
         })
         .collect()
+}
+
+/// A file a task produced (see `artifacts`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ArtifactRow {
+    pub id: i64,
+    pub task_id: i64,
+    /// Which run of the task saved it, from 1: a cron task's runs each
+    /// have their own.
+    pub run: i64,
+    /// What it's downloaded as: a file name. Unique in a task's run:
+    /// saving the same name again replaces it.
+    pub name: String,
+    pub media_type: String,
+    pub size: u64,
+    /// `sha256:<hex>` of its contents, which is where the store keeps them.
+    pub digest: String,
+    /// The agent that saved it, if any.
+    pub agent: Option<String>,
+    pub created_at: String,
+}
+
+const ARTIFACT_COLUMNS: &str =
+    "id, task_id, run, name, media_type, size, digest, agent, created_at";
+
+fn row_to_artifact(row: &rusqlite::Row) -> rusqlite::Result<ArtifactRow> {
+    Ok(ArtifactRow {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        run: row.get(2)?,
+        name: row.get(3)?,
+        media_type: row.get(4)?,
+        size: row.get::<_, i64>(5)? as u64,
+        digest: row.get(6)?,
+        agent: row.get(7)?,
+        created_at: row.get(8)?,
+    })
+}
+
+/// Records that the task's run under way (or its last, once done) made
+/// `artifact`, with contents `digest`, replacing what the run saved under
+/// the same name.
+pub fn add_artifact(
+    conn: &Connection,
+    artifact: &crate::artifacts::NewArtifact,
+    digest: &str,
+    size: u64,
+) -> Result<ArtifactRow, Box<dyn Error>> {
+    crate::artifacts::check_name(&artifact.name)?;
+    let task =
+        get_task(conn, artifact.task_id)?.ok_or_else(|| format!("no task {}", artifact.task_id))?;
+    let run = if task.status == TaskStatus::RUNNING {
+        task.run_count + 1
+    } else {
+        task.run_count.max(1)
+    };
+    let id: i64 = conn.query_row(
+        "INSERT INTO artifacts (task_id, run, name, media_type, size, digest, agent)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT (task_id, run, name) DO UPDATE SET
+             media_type = excluded.media_type, size = excluded.size,
+             digest = excluded.digest, agent = excluded.agent,
+             created_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+         RETURNING id",
+        params![
+            artifact.task_id,
+            run,
+            artifact.name,
+            artifact.media_type,
+            size as i64,
+            digest,
+            artifact.agent
+        ],
+        |row| row.get(0),
+    )?;
+    get_artifact(conn, id)?.ok_or_else(|| "artifact vanished".into())
+}
+
+/// A task's artifacts, oldest run first, by name within a run.
+pub fn list_artifacts(conn: &Connection, task_id: i64) -> Result<Vec<ArtifactRow>, Box<dyn Error>> {
+    let sql = format!(
+        "SELECT {} FROM artifacts WHERE task_id = ?1 ORDER BY run, name",
+        ARTIFACT_COLUMNS
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![task_id], row_to_artifact)?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+pub fn get_artifact(conn: &Connection, id: i64) -> Result<Option<ArtifactRow>, Box<dyn Error>> {
+    let sql = format!("SELECT {} FROM artifacts WHERE id = ?1", ARTIFACT_COLUMNS);
+    Ok(conn
+        .query_row(&sql, params![id], row_to_artifact)
+        .optional()?)
+}
+
+/// The artifact a task's latest run that saved one under `name` saved
+/// (or run `run`'s).
+pub fn find_artifact(
+    conn: &Connection,
+    task_id: i64,
+    name: &str,
+    run: Option<i64>,
+) -> Result<Option<ArtifactRow>, Box<dyn Error>> {
+    let sql = format!(
+        "SELECT {} FROM artifacts WHERE task_id = ?1 AND name = ?2 AND (?3 IS NULL OR run = ?3)
+         ORDER BY run DESC LIMIT 1",
+        ARTIFACT_COLUMNS
+    );
+    Ok(conn
+        .query_row(&sql, params![task_id, name, run], row_to_artifact)
+        .optional()?)
+}
+
+/// Every digest an artifact names: the contents to keep.
+pub fn artifact_digests(
+    conn: &Connection,
+) -> Result<std::collections::HashSet<String>, Box<dyn Error>> {
+    let mut stmt = conn.prepare("SELECT DISTINCT digest FROM artifacts")?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 /// One A2A caller's ongoing conversation: an agent made from a profile,

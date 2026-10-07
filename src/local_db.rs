@@ -18,10 +18,11 @@
  */
 
 use crate::agent_io::{AgentEvent, AgentEventRow, EventFilter};
+use crate::artifacts::{ArtifactStore, NewArtifact};
 use crate::db;
 use crate::db::{
-    AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow, TaskConversation,
-    TaskOutcome, TaskRow,
+    AgentConfig, AgentRow, ArtifactRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow,
+    TaskConversation, TaskOutcome, TaskRow,
 };
 use crate::db_backend::DbBackend;
 use std::error::Error;
@@ -29,11 +30,28 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 pub struct LocalDb {
     conn: Arc<Mutex<rusqlite::Connection>>,
+    artifacts: Option<Arc<ArtifactStore>>,
 }
 
 impl LocalDb {
     pub fn new(conn: Arc<Mutex<rusqlite::Connection>>) -> Self {
-        Self { conn }
+        Self {
+            conn,
+            artifacts: None,
+        }
+    }
+
+    /// Keeps artifacts' contents in `store`: without one, they can't be
+    /// saved or read.
+    pub fn with_artifacts(mut self, store: Arc<ArtifactStore>) -> Self {
+        self.artifacts = Some(store);
+        self
+    }
+
+    fn artifacts(&self) -> Result<&ArtifactStore, Box<dyn Error>> {
+        self.artifacts
+            .as_deref()
+            .ok_or_else(|| "no directory for artifacts is configured".into())
     }
 
     /// The connection, to use for one call. None leaves a transaction
@@ -422,6 +440,50 @@ impl DbBackend for LocalDb {
     fn gc_agents(&self) -> Result<Vec<String>, Box<dyn Error>> {
         let conn = self.lock()?;
         db::gc_agents(&conn)
+    }
+
+    fn artifact_upload_begin(&self) -> Result<String, Box<dyn Error>> {
+        self.artifacts()?.begin()
+    }
+
+    fn artifact_upload_append(&self, upload: &str, data: &[u8]) -> Result<(), Box<dyn Error>> {
+        self.artifacts()?.append(upload, data)
+    }
+
+    fn artifact_upload_finish(
+        &self,
+        upload: &str,
+        artifact: &NewArtifact,
+    ) -> Result<ArtifactRow, Box<dyn Error>> {
+        crate::artifacts::finish_upload(self.artifacts()?, upload, artifact, || self.lock())
+    }
+
+    fn list_artifacts(&self, task_id: i64) -> Result<Vec<ArtifactRow>, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::list_artifacts(&conn, task_id)
+    }
+
+    fn find_artifact(
+        &self,
+        task_id: i64,
+        name: &str,
+        run: Option<i64>,
+    ) -> Result<Option<ArtifactRow>, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::find_artifact(&conn, task_id, name, run)
+    }
+
+    fn read_artifact(&self, id: i64, offset: u64, len: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+        let store = self.artifacts()?;
+        let conn = self.lock()?;
+        crate::artifacts::read_artifact(&conn, store, id, offset, len)
+    }
+
+    fn gc_artifacts(&self) -> Result<usize, Box<dyn Error>> {
+        let Some(store) = &self.artifacts else {
+            return Ok(0);
+        };
+        crate::artifacts::collect_garbage(store, || self.lock())
     }
 
     fn append_agent_events(

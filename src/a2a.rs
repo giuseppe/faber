@@ -1976,8 +1976,15 @@ mod tests {
             let db = db.clone();
             std::thread::spawn(move || {
                 let (stream, _) = listener.accept().unwrap();
-                crate::web::handle_http(stream, db, Some(SERVER), &crate::Profiles::new(), &keys())
-                    .unwrap();
+                crate::web::handle_http(
+                    stream,
+                    db,
+                    Some(SERVER),
+                    &crate::Profiles::new(),
+                    &keys(),
+                    &faber::artifacts::ArtifactStore::new(std::env::temp_dir().join("faber-none")),
+                )
+                .unwrap();
             })
         };
         let body = stream_request(

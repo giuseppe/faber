@@ -18,7 +18,10 @@
  */
 
 use crate::web;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use faber::agent_io::{AgentEvent, EventFilter};
+use faber::artifacts::{ArtifactStore, NewArtifact};
 use faber::db;
 use faber::protocol::{RpcRequest, RpcResponse};
 use log::{info, warn};
@@ -59,8 +62,10 @@ pub fn serve_command(
     auth_key: Option<&str>,
     profiles: crate::Profiles,
     a2a_keys: crate::a2a::A2aKeys,
+    artifacts: Arc<ArtifactStore>,
 ) -> Result<(), Box<dyn Error>> {
     let profiles = Arc::new(profiles);
+    collect_artifacts_garbage(db.clone(), artifacts.clone());
     let a2a_keys = Arc::new(a2a_keys);
 
     let listener = TcpListener::bind(bind)?;
@@ -93,12 +98,20 @@ pub fn serve_command(
         let auth_key = auth_key.map(|s| s.to_string());
         let profiles = profiles.clone();
         let a2a_keys = a2a_keys.clone();
+        let artifacts = artifacts.clone();
         std::thread::spawn(move || {
             let _ = stream.set_read_timeout(Some(GREETING_TIMEOUT));
             let result = if is_http(&stream) {
-                web::handle_http(stream, db, auth_key.as_deref(), &profiles, &a2a_keys)
+                web::handle_http(
+                    stream,
+                    db,
+                    auth_key.as_deref(),
+                    &profiles,
+                    &a2a_keys,
+                    &artifacts,
+                )
             } else {
-                handle_client(stream, db, auth_key.as_deref())
+                handle_client(stream, db, auth_key.as_deref(), &artifacts)
             };
             if let Err(e) = result {
                 warn!("Client {} error: {}", peer, e);
@@ -108,6 +121,26 @@ pub fn serve_command(
         });
     }
     Ok(())
+}
+
+/// How often the server removes artifacts' contents nothing names.
+const ARTIFACTS_GC_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Removes, every `ARTIFACTS_GC_INTERVAL`, the artifacts' contents no row
+/// names any more: the server keeps them, so it cleans up after them, with
+/// or without workers connected.
+fn collect_artifacts_garbage(db: Arc<Mutex<Connection>>, artifacts: Arc<ArtifactStore>) {
+    std::thread::spawn(move || {
+        loop {
+            let locked = || db.lock().map_err(|e| format!("DB lock: {}", e).into());
+            match faber::artifacts::collect_garbage(&artifacts, locked) {
+                Ok(0) => {}
+                Ok(n) => info!("Removed {} unused artifact file(s)", n),
+                Err(e) => warn!("Couldn't collect unused artifacts: {}", e),
+            }
+            std::thread::sleep(ARTIFACTS_GC_INTERVAL);
+        }
+    });
 }
 
 /// Whether the client speaks HTTP (the web UI and its API) rather than
@@ -122,6 +155,7 @@ fn handle_client(
     stream: TcpStream,
     db: Arc<Mutex<Connection>>,
     auth_key: Option<&str>,
+    artifacts: &ArtifactStore,
 ) -> Result<(), Box<dyn Error>> {
     // Every message is a small request/response exchange; don't let
     // Nagle's algorithm hold any of them back.
@@ -170,7 +204,7 @@ fn handle_client(
             continue;
         }
 
-        let response = dispatch(&db, &request);
+        let response = dispatch(&db, artifacts, &request);
         send_response(&mut writer, &response)?;
     }
     Ok(())
@@ -216,10 +250,77 @@ fn send_response(writer: &mut TcpStream, resp: &RpcResponse) -> Result<(), Box<d
     Ok(())
 }
 
-fn dispatch(db: &Arc<Mutex<Connection>>, req: &RpcRequest) -> RpcResponse {
-    match dispatch_inner(db, req) {
+fn dispatch(
+    db: &Arc<Mutex<Connection>>,
+    artifacts: &ArtifactStore,
+    req: &RpcRequest,
+) -> RpcResponse {
+    let result = if ARTIFACT_METHODS.contains(&req.method.as_str()) {
+        dispatch_artifacts(db, artifacts, req)
+    } else {
+        dispatch_inner(db, req)
+    };
+    match result {
         Ok(value) => RpcResponse::success(req.id, value),
         Err(e) => RpcResponse::error(Some(req.id), e.to_string()),
+    }
+}
+
+/// The methods `dispatch_artifacts` answers.
+const ARTIFACT_METHODS: &[&str] = &[
+    "artifact_upload_begin",
+    "artifact_upload_append",
+    "artifact_upload_finish",
+    "read_artifact",
+    "gc_artifacts",
+];
+
+/// One of `ARTIFACT_METHODS`. They lock the database themselves: after the
+/// artifacts' directory, as garbage collection does.
+fn dispatch_artifacts(
+    db: &Arc<Mutex<Connection>>,
+    artifacts: &ArtifactStore,
+    req: &RpcRequest,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let p = &req.params;
+    let str_param = |name: &str| -> Result<&str, Box<dyn Error>> {
+        p[name]
+            .as_str()
+            .ok_or_else(|| format!("missing param '{}'", name).into())
+    };
+    let locked = || db.lock().map_err(|e| format!("DB lock: {}", e).into());
+    match req.method.as_str() {
+        "artifact_upload_begin" => Ok(serde_json::json!(artifacts.begin()?)),
+        "artifact_upload_append" => {
+            let data = BASE64
+                .decode(str_param("data")?)
+                .map_err(|e| format!("bad param 'data': {}", e))?;
+            artifacts.append(str_param("upload")?, &data)?;
+            Ok(serde_json::json!(true))
+        }
+        "artifact_upload_finish" => {
+            let artifact: NewArtifact = serde_json::from_value(p["artifact"].clone())
+                .map_err(|e| format!("bad param 'artifact': {}", e))?;
+            let row = faber::artifacts::finish_upload(
+                artifacts,
+                str_param("upload")?,
+                &artifact,
+                locked,
+            )?;
+            Ok(serde_json::to_value(row)?)
+        }
+        "read_artifact" => {
+            let id = p["id"].as_i64().ok_or("missing param 'id'")?;
+            let offset = p["offset"].as_u64().ok_or("missing param 'offset'")?;
+            let len = p["len"].as_u64().ok_or("missing param 'len'")? as usize;
+            let conn = locked()?;
+            let data = faber::artifacts::read_artifact(&conn, artifacts, id, offset, len)?;
+            Ok(serde_json::json!(BASE64.encode(data)))
+        }
+        "gc_artifacts" => Ok(serde_json::json!(faber::artifacts::collect_garbage(
+            artifacts, locked
+        )?)),
+        _ => Err(format!("unknown method: {}", req.method).into()),
     }
 }
 
@@ -547,6 +648,19 @@ fn dispatch_inner(
             let v = db::gc_agents(&conn)?;
             Ok(serde_json::to_value(v)?)
         }
+        "list_artifacts" => {
+            let v = db::list_artifacts(&conn, i64_param!("task_id"))?;
+            Ok(serde_json::to_value(v)?)
+        }
+        "find_artifact" => {
+            let v = db::find_artifact(
+                &conn,
+                i64_param!("task_id"),
+                str_param!("name"),
+                p["run"].as_i64(),
+            )?;
+            Ok(serde_json::to_value(v)?)
+        }
         "append_agent_events" => {
             let events: Vec<AgentEvent> = serde_json::from_value(p["events"].clone())
                 .map_err(|e| format!("bad param 'events': {}", e))?;
@@ -572,6 +686,19 @@ mod tests {
     /// A `RemoteDb` talking to the real `handle_client` over a local
     /// socket, backed by an in-memory database.
     fn connected_client() -> RemoteDb {
+        connected_client_with_artifacts().0
+    }
+
+    /// `connected_client`, with where the server keeps artifacts: a
+    /// directory of its own, to remove once done.
+    fn connected_client_with_artifacts() -> (RemoteDb, std::path::PathBuf) {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "faber-server-artifacts-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        let artifacts = ArtifactStore::new(&dir);
         let conn = Connection::open_in_memory().unwrap();
         db::initialize_db(&conn).unwrap();
         let db = Arc::new(Mutex::new(conn));
@@ -579,9 +706,89 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let _ = handle_client(stream, db, None);
+            let _ = handle_client(stream, db, None, &artifacts);
         });
-        RemoteDb::connect(&addr.to_string()).unwrap()
+        (RemoteDb::connect(&addr.to_string()).unwrap(), dir)
+    }
+
+    fn new_task(name: &str) -> db::NewTask {
+        db::NewTask {
+            name: name.to_string(),
+            description: String::new(),
+            kind: db::TaskKind::PROMPT.to_string(),
+            command: "make a file".to_string(),
+            agent_name: None,
+            schedule: db::TaskSchedule::Once {
+                at: chrono::Utc::now().to_rfc3339(),
+            },
+            held: false,
+            depends_on: Vec::new(),
+            profile: None,
+            run_safe: false,
+            cwd: None,
+            continue_agent: None,
+            continue_task: None,
+        }
+    }
+
+    #[test]
+    fn test_artifacts_are_uploaded_to_and_downloaded_from_the_server() {
+        let (client, dir) = connected_client_with_artifacts();
+        let task = client.create_task(&new_task("t")).unwrap();
+        // Over several chunks, the last a short one.
+        let content: Vec<u8> = (0..faber::artifacts::CHUNK_BYTES * 2 + 1000)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let artifact = NewArtifact {
+            task_id: task,
+            name: "data.bin".to_string(),
+            media_type: "application/octet-stream".to_string(),
+            agent: Some("bob".to_string()),
+        };
+        let row = faber::artifacts::upload(&client, &mut content.as_slice(), &artifact).unwrap();
+        assert_eq!((row.size, row.run), (content.len() as u64, 1));
+        assert!(dir.join("sha256").join(&row.digest[7..]).is_file());
+
+        let found = client
+            .find_artifact(task, "data.bin", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found, row);
+        assert_eq!(client.list_artifacts(task).unwrap(), vec![row.clone()]);
+        let mut back = Vec::new();
+        faber::artifacts::download(&client, row.id, &mut back).unwrap();
+        assert!(back == content, "the same bytes come back");
+
+        // Saved again under the same name: replaced, not added.
+        let row2 = faber::artifacts::upload(&client, &mut &b"short"[..], &artifact).unwrap();
+        assert_eq!(client.list_artifacts(task).unwrap(), vec![row2]);
+        assert_eq!(client.gc_artifacts().unwrap(), 1, "the old contents go");
+
+        // With its task, the artifact goes, and its contents with the
+        // next collection.
+        assert!(client.delete_task(task).unwrap());
+        assert!(client.list_artifacts(task).unwrap().is_empty());
+        assert_eq!(client.gc_artifacts().unwrap(), 1);
+        assert_eq!(std::fs::read_dir(dir.join("sha256")).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_artifacts_need_a_task_and_a_file_name() {
+        let (client, dir) = connected_client_with_artifacts();
+        let mut artifact = NewArtifact {
+            task_id: 999,
+            name: "x.txt".to_string(),
+            media_type: "text/plain".to_string(),
+            agent: None,
+        };
+        let err = faber::artifacts::upload(&client, &mut &b"x"[..], &artifact).unwrap_err();
+        assert!(err.to_string().contains("no task 999"), "{err}");
+        artifact.task_id = client.create_task(&new_task("t")).unwrap();
+        artifact.name = "../x".to_string();
+        assert!(faber::artifacts::upload(&client, &mut &b"x"[..], &artifact).is_err());
+        assert!(client.artifact_upload_append("../../etc", b"x").is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

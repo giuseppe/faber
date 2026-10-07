@@ -53,6 +53,7 @@
 //! send without a CORS preflight - never granted here.
 
 use faber::agent_io::EventFilter;
+use faber::artifacts::ArtifactStore;
 use faber::db;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -307,6 +308,7 @@ pub fn handle_http(
     auth_key: Option<&str>,
     profiles: &crate::Profiles,
     a2a_keys: &crate::a2a::A2aKeys,
+    artifacts: &ArtifactStore,
 ) -> Result<(), Box<dyn Error>> {
     // A request is its headers and a body of at most MAX_BODY_BYTES: no
     // header line of a request without end is read into memory whole.
@@ -314,14 +316,21 @@ pub fn handle_http(
     let mut reader = BufReader::new(std::io::Read::take(stream.try_clone()?, limit));
     let mut writer = stream;
     let response = match read_request(&mut reader) {
-        Ok(request) => match crate::a2a::streaming(&request, &db, a2a_keys) {
-            Some(Ok(stream)) => {
+        Ok(request) => match artifact_download(&request, &db, auth_key, artifacts) {
+            Some(Ok((artifact, mut file))) => {
                 writer.set_write_timeout(Some(STREAM_WRITE_TIMEOUT))?;
-                let mut events = EventStream::start(&mut writer)?;
-                return stream.run(&mut events).map_err(Into::into);
+                return write_artifact(&mut writer, &artifact, &mut file).map_err(Into::into);
             }
             Some(Err(response)) => response,
-            None => route(&request, &db, auth_key, profiles, a2a_keys),
+            None => match crate::a2a::streaming(&request, &db, a2a_keys) {
+                Some(Ok(stream)) => {
+                    writer.set_write_timeout(Some(STREAM_WRITE_TIMEOUT))?;
+                    let mut events = EventStream::start(&mut writer)?;
+                    return stream.run(&mut events).map_err(Into::into);
+                }
+                Some(Err(response)) => response,
+                None => route(&request, &db, auth_key, profiles, a2a_keys),
+            },
         },
         Err(response) => response,
     };
@@ -354,21 +363,8 @@ fn route(
             Response::file("text/css; charset=utf-8", include_str!("../ui/style.css"))
         }
         (_, ["api", rest @ ..]) => {
-            match auth_key {
-                Some(key) => {
-                    let given = request.authorization.as_deref().unwrap_or("");
-                    let given = given.strip_prefix("Bearer ").unwrap_or("");
-                    if !crate::server::keys_match(given, key) {
-                        return Response::error(401, "unauthorized");
-                    }
-                }
-                None if !is_local_host(request.host.as_deref()) => {
-                    return Response::error(
-                        403,
-                        "with --no-auth, the API only answers at localhost or an IP address",
-                    );
-                }
-                None => {}
+            if let Err(response) = check_api_auth(request, auth_key) {
+                return response;
             }
             if request.method != "GET"
                 && !request
@@ -390,6 +386,99 @@ fn route(
         _ => crate::a2a::handle(request, db, a2a_keys)
             .unwrap_or_else(|| Response::error(404, "not found")),
     }
+}
+
+/// Whether `request` may use `/api/`: with the server's key, or, without
+/// one, only at an address no one else's DNS can point here.
+fn check_api_auth(request: &Request, auth_key: Option<&str>) -> Result<(), Response> {
+    match auth_key {
+        Some(key) => {
+            let given = request.authorization.as_deref().unwrap_or("");
+            let given = given.strip_prefix("Bearer ").unwrap_or("");
+            if !crate::server::keys_match(given, key) {
+                return Err(Response::error(401, "unauthorized"));
+            }
+        }
+        None if !is_local_host(request.host.as_deref()) => {
+            return Err(Response::error(
+                403,
+                "with --no-auth, the API only answers at localhost or an IP address",
+            ));
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+/// The artifact `GET /api/tasks/<id>/artifacts/<name>` asks for (of the
+/// task's latest run that saved one by that name, or of `?run=`), and its
+/// contents; `None` for another request.
+fn artifact_download(
+    request: &Request,
+    db: &Arc<Mutex<Connection>>,
+    auth_key: Option<&str>,
+    artifacts: &ArtifactStore,
+) -> Option<Result<(db::ArtifactRow, std::fs::File), Response>> {
+    let segments: Vec<&str> = request.path.split('/').filter(|s| !s.is_empty()).collect();
+    let ("GET", ["api", "tasks", id, "artifacts", name]) =
+        (request.method.as_str(), segments.as_slice())
+    else {
+        return None;
+    };
+    Some((|| {
+        check_api_auth(request, auth_key)?;
+        let task_id: i64 = id
+            .parse()
+            .map_err(|_| Response::error(400, &format!("bad task id '{}'", id)))?;
+        let run = match request.query("run") {
+            Some(run) => Some(
+                run.parse::<i64>()
+                    .map_err(|_| Response::error(400, &format!("bad run '{}'", run)))?,
+            ),
+            None => None,
+        };
+        let artifact = {
+            let conn = db
+                .lock()
+                .map_err(|e| Response::error(500, &format!("DB lock: {}", e)))?;
+            db::find_artifact(&conn, task_id, name, run)
+                .map_err(|e| Response::error(500, &e.to_string()))?
+        }
+        .ok_or_else(|| Response::error(404, "no such artifact"))?;
+        let file = artifacts
+            .open(&artifact.digest)
+            .map_err(|e| Response::error(500, &e.to_string()))?;
+        Ok((artifact, file))
+    })())
+}
+
+/// Sends `file`, the contents of `artifact`, as a download.
+fn write_artifact(
+    writer: &mut impl Write,
+    artifact: &db::ArtifactRow,
+    file: &mut std::fs::File,
+) -> std::io::Result<()> {
+    // The name as an RFC 8187 extended value: any character survives.
+    let encoded: String = artifact
+        .name
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' => (b as char).to_string(),
+            _ => format!("%{:02X}", b),
+        })
+        .collect();
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
+         Content-Disposition: attachment; filename*=UTF-8''{}\r\n\
+         X-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nConnection: close\r\n\
+         X-Frame-Options: DENY\r\nContent-Security-Policy: sandbox; frame-ancestors 'none'\r\n\r\n",
+        artifact.media_type.replace(['\r', '\n'], ""),
+        artifact.size,
+        encoded
+    );
+    writer.write_all(head.as_bytes())?;
+    std::io::copy(file, writer)?;
+    writer.flush()
 }
 
 /// An agent's plan, as plan_update keeps it - `None` without one.
@@ -1092,6 +1181,13 @@ fn api(
                 })
                 .collect();
             Response::ok(tasks)
+        }
+        ("GET", ["tasks", id, "artifacts"]) => {
+            let id = task_id(id)?;
+            if db::get_task(conn, id)?.is_none() {
+                return Ok(Response::error(404, &format!("no task #{}", id)));
+            }
+            Response::ok(db::list_artifacts(conn, id)?)
         }
         ("GET", ["tasks", id]) => match db::get_task(conn, task_id(id)?)? {
             Some(task) => {
@@ -2056,5 +2152,78 @@ mod tests {
             "fast"
         );
         assert_eq!(call(&db, "PUT", "/api/tasks", "").status, 405);
+    }
+
+    #[test]
+    fn test_artifacts_are_listed_and_downloaded() {
+        let db = test_db();
+        let dir = std::env::temp_dir().join(format!("faber-web-artifacts-{}", std::process::id()));
+        let store = ArtifactStore::new(&dir);
+        let task = db::create_task(
+            &db.lock().unwrap(),
+            &db::NewTask {
+                name: "t".to_string(),
+                description: String::new(),
+                kind: db::TaskKind::PROMPT.to_string(),
+                command: "x".to_string(),
+                agent_name: None,
+                schedule: db::TaskSchedule::Once {
+                    at: chrono::Utc::now().to_rfc3339(),
+                },
+                held: false,
+                depends_on: Vec::new(),
+                profile: None,
+                run_safe: false,
+                cwd: None,
+                continue_agent: None,
+                continue_task: None,
+            },
+        )
+        .unwrap();
+        let upload = store.begin().unwrap();
+        store.append(&upload, b"# Report\n").unwrap();
+        let artifact = faber::artifacts::NewArtifact {
+            task_id: task,
+            name: "my report.md".to_string(),
+            media_type: "text/markdown".to_string(),
+            agent: None,
+        };
+        faber::artifacts::finish_upload(&store, &upload, &artifact, || {
+            db.lock().map_err(|e| e.to_string().into())
+        })
+        .unwrap();
+
+        let listed = json(&call(
+            &db,
+            "GET",
+            &format!("/api/tasks/{}/artifacts", task),
+            "",
+        ));
+        assert_eq!(listed[0]["name"], "my report.md");
+        assert_eq!(listed[0]["size"], 9);
+        assert_eq!(call(&db, "GET", "/api/tasks/999/artifacts", "").status, 404);
+
+        let target = format!("/api/tasks/{}/artifacts/my%20report.md", task);
+        let (row, mut file) = artifact_download(&request("GET", &target, ""), &db, None, &store)
+            .unwrap()
+            .unwrap();
+        let mut out = Vec::new();
+        write_artifact(&mut out, &row, &mut file).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 200 OK\r\nContent-Type: text/markdown\r\n"));
+        assert!(out.contains("filename*=UTF-8''my%20report.md\r\n"), "{out}");
+        assert!(out.ends_with("\r\n\r\n# Report\n"));
+
+        let missing = format!("/api/tasks/{}/artifacts/other.md", task);
+        let response = artifact_download(&request("GET", &missing, ""), &db, None, &store);
+        assert_eq!(response.unwrap().unwrap_err().status, 404);
+        let wrong_run = format!("{}?run=2", target);
+        let response = artifact_download(&request("GET", &wrong_run, ""), &db, None, &store);
+        assert_eq!(response.unwrap().unwrap_err().status, 404);
+        // Behind the key, like the rest of the API.
+        let response = artifact_download(&request("GET", &target, ""), &db, Some("k"), &store);
+        assert_eq!(response.unwrap().unwrap_err().status, 401);
+        assert!(artifact_download(&request("GET", "/api/tasks", ""), &db, None, &store).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

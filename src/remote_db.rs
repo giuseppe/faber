@@ -17,10 +17,13 @@
  *
  */
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use faber::agent_io::{AgentEvent, AgentEventRow, EventFilter};
+use faber::artifacts::NewArtifact;
 use faber::db::{
-    AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow, TaskConversation,
-    TaskOutcome, TaskRow,
+    AgentConfig, AgentRow, ArtifactRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow,
+    TaskConversation, TaskOutcome, TaskRow,
 };
 use faber::db_backend::DbBackend;
 use faber::protocol::{RpcRequest, RpcResponse};
@@ -608,6 +611,63 @@ impl DbBackend for RemoteDb {
 
     fn gc_agents(&self) -> Result<Vec<String>, Box<dyn Error>> {
         let v = self.call("gc_agents", serde_json::json!({}))?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn artifact_upload_begin(&self) -> Result<String, Box<dyn Error>> {
+        let v = self.call("artifact_upload_begin", serde_json::json!({}))?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn artifact_upload_append(&self, upload: &str, data: &[u8]) -> Result<(), Box<dyn Error>> {
+        self.call(
+            "artifact_upload_append",
+            serde_json::json!({"upload": upload, "data": BASE64.encode(data)}),
+        )?;
+        Ok(())
+    }
+
+    fn artifact_upload_finish(
+        &self,
+        upload: &str,
+        artifact: &NewArtifact,
+    ) -> Result<ArtifactRow, Box<dyn Error>> {
+        let v = self.call(
+            "artifact_upload_finish",
+            serde_json::json!({"upload": upload, "artifact": artifact}),
+        )?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn list_artifacts(&self, task_id: i64) -> Result<Vec<ArtifactRow>, Box<dyn Error>> {
+        let v = self.call("list_artifacts", serde_json::json!({"task_id": task_id}))?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn find_artifact(
+        &self,
+        task_id: i64,
+        name: &str,
+        run: Option<i64>,
+    ) -> Result<Option<ArtifactRow>, Box<dyn Error>> {
+        let v = self.call(
+            "find_artifact",
+            serde_json::json!({"task_id": task_id, "name": name, "run": run}),
+        )?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn read_artifact(&self, id: i64, offset: u64, len: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+        let v = self.call(
+            "read_artifact",
+            serde_json::json!({"id": id, "offset": offset, "len": len}),
+        )?;
+        let data = v.as_str().ok_or("read_artifact: expected base64 text")?;
+        Ok(BASE64.decode(data)?)
+    }
+
+    fn gc_artifacts(&self) -> Result<usize, Box<dyn Error>> {
+        let v = self.call("gc_artifacts", serde_json::json!({}))?;
         Ok(serde_json::from_value(v)?)
     }
 

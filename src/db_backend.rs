@@ -18,9 +18,10 @@
  */
 
 use crate::agent_io::{AgentEvent, AgentEventRow, EventFilter};
+use crate::artifacts::NewArtifact;
 use crate::db::{
-    A2aContext, AgentConfig, AgentRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow,
-    TaskConversation, TaskOutcome, TaskRow,
+    A2aContext, AgentConfig, AgentRow, ArtifactRow, KbHit, KbNote, KbViewer, NewTask,
+    NotificationRow, TaskConversation, TaskOutcome, TaskRow,
 };
 use std::error::Error;
 
@@ -156,6 +157,34 @@ pub trait DbBackend: Send + Sync {
     fn a2a_delete_context(&self, id: &str) -> Result<bool, Box<dyn Error>>;
 
     fn gc_agents(&self) -> Result<Vec<String>, Box<dyn Error>>;
+
+    /// Starts uploading an artifact's contents (see `artifacts::upload`),
+    /// returning the upload's id.
+    fn artifact_upload_begin(&self) -> Result<String, Box<dyn Error>>;
+    /// Adds `data` to the end of an upload.
+    fn artifact_upload_append(&self, upload: &str, data: &[u8]) -> Result<(), Box<dyn Error>>;
+    /// Ends an upload, saving what it sent as `artifact` (see
+    /// `db::add_artifact`).
+    fn artifact_upload_finish(
+        &self,
+        upload: &str,
+        artifact: &NewArtifact,
+    ) -> Result<ArtifactRow, Box<dyn Error>>;
+    /// See `db::list_artifacts`.
+    fn list_artifacts(&self, task_id: i64) -> Result<Vec<ArtifactRow>, Box<dyn Error>>;
+    /// See `db::find_artifact`.
+    fn find_artifact(
+        &self,
+        task_id: i64,
+        name: &str,
+        run: Option<i64>,
+    ) -> Result<Option<ArtifactRow>, Box<dyn Error>>;
+    /// Up to `len` bytes of artifact `id`'s contents, from `offset`: fewer
+    /// only at the end.
+    fn read_artifact(&self, id: i64, offset: u64, len: usize) -> Result<Vec<u8>, Box<dyn Error>>;
+    /// Removes the contents no artifact names any more, and abandoned
+    /// uploads; returns how many files went.
+    fn gc_artifacts(&self) -> Result<usize, Box<dyn Error>>;
 
     /// See `db::append_agent_events`.
     fn append_agent_events(
