@@ -200,7 +200,8 @@ fn tool_report_result(params_str: &String, ctx: &ToolContext) -> Result<String, 
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Params {
-        status: String,
+        #[serde(default)]
+        status: Option<String>,
         summary: String,
         #[serde(default)]
         data: Option<serde_json::Value>,
@@ -209,7 +210,14 @@ fn tool_report_result(params_str: &String, ctx: &ToolContext) -> Result<String, 
     let slot = ctx.result_slot.as_ref().ok_or(
         "nobody is waiting for a result from you: just answer (report_result is for sub-agents, fan-out workers and tasks)",
     )?;
-    let succeeded = match report_status(&params.status) {
+    // Models put it among the data, and kept doing so when told only
+    // that the field was missing: take it from there.
+    let status = params
+        .status
+        .clone()
+        .or_else(|| params.data.as_ref()?["status"].as_str().map(String::from))
+        .ok_or("give status, succeeded or failed, next to summary - not inside data")?;
+    let succeeded = match report_status(&status) {
         ReportStatus::Final(succeeded) => succeeded,
         // Smaller models report progress with it: not a mistake worth
         // failing the call over, nor the result - note it and carry on.
@@ -224,11 +232,7 @@ fn tool_report_result(params_str: &String, ctx: &ToolContext) -> Result<String, 
             );
         }
         ReportStatus::Unknown => {
-            return Err(format!(
-                "status must be succeeded or failed, not '{}'",
-                params.status
-            )
-            .into());
+            return Err(format!("status must be succeeded or failed, not '{}'", status).into());
         }
     };
     if let Some(schema) = &ctx.result_schema {
@@ -20259,6 +20263,17 @@ for line in sys.stdin:
         assert!(
             tool_report_result(&r#"{"status":"maybe","summary":"x"}"#.to_string(), &ctx).is_err()
         );
+        // Among the data, as models put it, it's taken from there.
+        tool_report_result(
+            &r#"{"data":{"pr": 792, "status": "done"},"summary":"PR #792 opened"}"#.to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert!(slot.lock().unwrap().take().unwrap().succeeded);
+        let err = tool_report_result(&r#"{"summary":"x","data":{}}"#.to_string(), &ctx)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not inside data"), "{err}");
         assert!(matches!(
             report_status("FAILED"),
             ReportStatus::Final(false)
