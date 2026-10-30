@@ -746,7 +746,8 @@ scheduled, running and disabled tasks are never touched, nor a done one
 that a task still to finish depends on or carries on from. To do it automatically, set `"task_retention": "30d"` in the
 config file (or pass `--task-retention 30d`): while a `faber chat` runs,
 it prunes done tasks older than that every hour. Deleting an agent also
-deletes its tasks, and the model can delete one with `task_delete`.
+deletes its tasks, and the model can delete one with `task_delete`, or
+done ones with `task_prune`.
 `--since` also takes a date or `"YYYY-MM-DD HH:MM"` in local time, or an
 RFC 3339 timestamp. It works with `--server` too.
 
@@ -865,6 +866,7 @@ that agent.
 | `task_run` | Make a task due right away, or run a done one again (e.g. retry a failed one) |
 | `task_stop` | Stop a running task, whichever agent runs it |
 | `task_update` | Change a task that isn't running (name, description, command, schedule, dependencies), keeping its id and state |
+| `task_prune` | Delete done tasks, all or those older than an age, as `faber tasks prune` does |
 | `send_message` | Send a message to another agent |
 | `spawn_agent` | Spawn a sub-agent for parallel work, optionally with a `timeout_seconds` or `max_requests` budget |
 | `agent_cancel` | Stop a running sub-agent you started |

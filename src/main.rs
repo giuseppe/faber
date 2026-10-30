@@ -4429,6 +4429,60 @@ fn tool_task_update(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     .to_string())
 }
 
+/// entrypoint for the task_prune tool: deletes done tasks, as `faber tasks
+/// prune` does - only the ones it may change, for an agent without the
+/// unsafe tools.
+fn tool_task_prune(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        #[serde(default)]
+        older_than: Option<String>,
+        #[serde(default)]
+        dry_run: bool,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let age = match params.older_than.as_deref() {
+        Some(text) => parse_duration(text)
+            .ok_or_else(|| format!("'{}': give an age like 30m, 12h, 7d", text))?,
+        None => chrono::Duration::zero(),
+    };
+    // A moment in the future, with no age, so a task that finished this
+    // very second still counts.
+    let cutoff = (chrono::Utc::now() - age + chrono::Duration::seconds(1)).to_rfc3339();
+    let db = ctx.db()?;
+    let pruned = if ctx.unsafe_tools {
+        db.prune_tasks(&cutoff, params.dry_run)?
+    } else {
+        let mine: Vec<db::TaskRow> = db
+            .prune_tasks(&cutoff, true)?
+            .into_iter()
+            .filter(|t| check_may_change_task(ctx, t).is_ok())
+            .collect();
+        let mut pruned = Vec::new();
+        for task in mine {
+            if params.dry_run || db.delete_task(task.id)? {
+                pruned.push(task);
+            }
+        }
+        pruned
+    };
+    ctx.println(&format!(
+        "{} {} done task(s)",
+        if params.dry_run {
+            "Would delete"
+        } else {
+            "Deleted"
+        },
+        pruned.len()
+    ));
+    let tasks: Vec<serde_json::Value> = pruned
+        .iter()
+        .map(|t| serde_json::json!({"id": t.id, "name": t.name, "outcome": t.last_outcome}))
+        .collect();
+    Ok(serde_json::json!({"dry_run": params.dry_run, "deleted": tasks}).to_string())
+}
+
 /// entrypoint for the task_assign tool: changes where a task runs - on an
 /// agent, on a new agent made from a profile, or on any agent.
 fn tool_task_assign(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
@@ -6391,6 +6445,30 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "depends_on": {"type": "array", "items": {"type": "integer"}, "description": "The tasks it waits for, replacing the ones it did ([] for none)"}
                     },
                     "required": ["id"],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "task_prune".to_string(),
+        tool_task_prune,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "task_prune",
+                "description": "Delete done tasks - the board's Done and Failed columns - with their results and files; all of them, or the ones that finished longer ago than older_than. Tasks not done, and done ones a task still to finish depends on, stay. To delete one task, use task_delete.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "older_than": {"type": "string", "description": "Only tasks that finished at least this long ago, e.g. 30m, 12h, 7d, 2w"},
+                        "dry_run": {"type": "boolean", "description": "Only list what would be deleted"}
+                    },
                     "additionalProperties": false
                 }
             }
@@ -17692,6 +17770,59 @@ for line in sys.stdin:
             serde_json::json!({"id": 9999, "name": "y"}),
         );
         assert_eq!(missing["reason"], "no such task");
+    }
+
+    #[test]
+    fn test_task_prune_deletes_the_done_tasks_it_may() {
+        let db = local_db_with_agents(&["boss", "a"]);
+        let ctx = chat_ctx(db.clone(), "boss");
+        let done = |run_safe: bool| {
+            let id = tool_task(
+                db.as_ref(),
+                r#"{"tool":"glob","arguments":{}}"#,
+                run_safe,
+                None,
+            );
+            db.claim_task(id, "s").unwrap();
+            db.finish_task(
+                id,
+                "s",
+                &db::TaskOutcome {
+                    succeeded: true,
+                    exit_code: None,
+                    result: String::new(),
+                },
+            )
+            .unwrap();
+            id
+        };
+        let mine = done(true);
+        let users = done(false);
+        let waiting = tool_task(db.as_ref(), r#"{"tool":"glob","arguments":{}}"#, true, None);
+        let call = |params: serde_json::Value| -> Vec<i64> {
+            let out: serde_json::Value =
+                serde_json::from_str(&tool_task_prune(&params.to_string(), &ctx).unwrap()).unwrap();
+            out["deleted"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["id"].as_i64().unwrap())
+                .collect()
+        };
+        assert!(call(serde_json::json!({"older_than": "1d"})).is_empty());
+        assert_eq!(call(serde_json::json!({"dry_run": true})), [mine]);
+        assert!(db.get_task(mine).unwrap().is_some());
+        // Without the unsafe tools, not the user's.
+        assert_eq!(call(serde_json::json!({})), [mine]);
+        assert!(db.get_task(mine).unwrap().is_none());
+        assert!(db.get_task(users).unwrap().is_some());
+        assert!(db.get_task(waiting).unwrap().is_some());
+        assert!(
+            tool_task_prune(&r#"{"older_than": "soon"}"#.to_string(), &ctx)
+                .unwrap_err()
+                .to_string()
+                .contains("give an age")
+        );
     }
 
     #[test]
