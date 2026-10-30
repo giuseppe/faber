@@ -3814,6 +3814,8 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         cwd: Option<String>,
         #[serde(default)]
         continue_task: Option<i64>,
+        #[serde(default)]
+        hold: bool,
     }
     let mut params: Params = serde_json::from_str(params_str)?;
     params.profile = requested_profile(&ctx_profiles(ctx), params.profile.take());
@@ -3903,7 +3905,7 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         command: params.command,
         agent_name,
         schedule,
-        held: false,
+        held: params.hold,
         depends_on: params.depends_on,
         profile: params.profile,
         // Whoever picks it up, it can't do more than its maker could.
@@ -4185,9 +4187,48 @@ fn tool_task_set_enabled(params_str: &String, ctx: &ToolContext) -> Result<Strin
                 "the task is done; create a new one to run it again".into()
             }
             Some(db::TaskStatus::HELD) if params.enabled => {
-                "the task is on hold; the user releases it with `faber tasks release`".into()
+                "the task is on hold (in the backlog); release it with task_hold".into()
             }
             Some(other) => format!("the task is already {}", other).into(),
+        };
+    }
+    Ok(result.to_string())
+}
+
+/// entrypoint for the task_hold tool: puts a task nobody has picked up
+/// yet in the backlog (held), or releases a held one to run when due.
+fn tool_task_hold(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        id: i64,
+        held: bool,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let db = ctx.db()?;
+    if let Some(task) = db.get_task(params.id)? {
+        check_may_change_task(ctx, &task)?;
+    }
+    let updated = db.set_task_held(params.id, params.held)?;
+    let status = db.get_task(params.id)?.map(|t| t.status);
+    if updated {
+        ctx.println(&format!(
+            "Task id={} {}",
+            params.id,
+            if params.held { "held" } else { "released" }
+        ));
+    }
+    let mut result = serde_json::json!({"updated": updated, "id": params.id, "status": status});
+    if !updated {
+        result["reason"] = match status.as_deref() {
+            None => "no such task".into(),
+            Some(db::TaskStatus::DISABLED) if !params.held => {
+                "the task is disabled; enable it with task_set_enabled".into()
+            }
+            Some(db::TaskStatus::RUNNING) if params.held => {
+                "the task is running already; only one nobody has picked up can be held".into()
+            }
+            Some(other) => format!("the task is {} already", other).into(),
         };
     }
     Ok(result.to_string())
@@ -5940,7 +5981,8 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "delay_seconds": {"type": "integer", "description": "Run once, this many seconds from now"},
                         "run_at": {"type": "string", "description": "Run once at this RFC 3339 time, e.g. 2026-10-03T08:00:00Z"},
                         "depends_on": {"type": "array", "items": {"type": "integer"}, "description": "Ids of tasks that must finish successfully first; it fails if one of them fails. The instruction is given their results"},
-                        "continue_task": {"type": "integer", "description": "For an instruction: carry on where this task left off, once it's done - e.g. to address a review of its work: it runs on a new agent that starts from that task's conversation as it was when done (a fork of it), so it remembers what it did, by any worker that's free. Not with agent_name or profile"}
+                        "continue_task": {"type": "integer", "description": "For an instruction: carry on where this task left off, once it's done - e.g. to address a review of its work: it runs on a new agent that starts from that task's conversation as it was when done (a fork of it), so it remembers what it did, by any worker that's free. Not with agent_name or profile"},
+                        "hold": {"type": "boolean", "description": "Put it in the backlog (the board's Backlog column) instead: held, not picked up by anyone even when due, until released with task_hold. For work to line up now and start later"}
                     },
                     "required": ["name", "command"],
                     "additionalProperties": false
@@ -6049,6 +6091,31 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "profile": {"type": "string", "description": "Run it on a new agent made from this profile"}
                     },
                     "required": ["id"],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "task_hold".to_string(),
+        tool_task_hold,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "task_hold",
+                "description": "Put a task that nobody has picked up yet in the backlog (the board's Backlog column: held, not run even when due), or release a held one to To do, to run when due. To create it held, use task_create's hold.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer", "description": "ID of the task"},
+                        "held": {"type": "boolean", "description": "true to hold it, false to release it"}
+                    },
+                    "required": ["id", "held"],
                     "additionalProperties": false
                 }
             }
@@ -15929,6 +15996,10 @@ for line in sys.stdin:
                 tool_task_assign,
                 serde_json::json!({"id": user_task, "agent_name": "boss"}),
             ),
+            (
+                tool_task_hold,
+                serde_json::json!({"id": user_task, "held": false}),
+            ),
             (tool_task_delete, serde_json::json!({"id": user_task})),
         ] {
             let err = call(f, params).unwrap_err().to_string();
@@ -17138,6 +17209,42 @@ for line in sys.stdin:
             create(serde_json::json!({"name": "x", "command": "x", "continue_task": 12345}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_tasks_go_in_and_out_of_the_backlog() {
+        let db = local_db_with_agents(&["boss", "a", "b"]);
+        let ctx = chat_ctx(db.clone(), "boss");
+        let call = |f: ToolCallback, params: serde_json::Value| -> serde_json::Value {
+            serde_json::from_str(&f(&params.to_string(), &ctx).unwrap()).unwrap()
+        };
+        let id = call(
+            tool_task_create,
+            serde_json::json!({"name": "issue", "command": "fix #1", "hold": true}),
+        )["id"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(db.get_task(id).unwrap().unwrap().status, "held");
+        // Held, it can still be given to an agent, and isn't due for anyone.
+        let assigned = call(
+            tool_task_assign,
+            serde_json::json!({"id": id, "agent_name": "a"}),
+        );
+        assert_eq!(assigned["updated"], true, "{assigned}");
+        assert!(db.get_pending_tasks().unwrap().iter().all(|t| t.id != id));
+        let held_again = call(tool_task_hold, serde_json::json!({"id": id, "held": true}));
+        assert_eq!(held_again["updated"], false);
+        assert_eq!(held_again["reason"], "the task is held already");
+        let released = call(tool_task_hold, serde_json::json!({"id": id, "held": false}));
+        assert_eq!(released["status"], "scheduled", "{released}");
+        assert!(db.get_pending_tasks().unwrap().iter().any(|t| t.id == id));
+        let held = call(tool_task_hold, serde_json::json!({"id": id, "held": true}));
+        assert_eq!(held["status"], "held", "{held}");
+        let missing = call(
+            tool_task_hold,
+            serde_json::json!({"id": 9999, "held": false}),
+        );
+        assert_eq!(missing["reason"], "no such task");
     }
 
     #[test]

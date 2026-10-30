@@ -475,7 +475,7 @@ Each task has a status:
 | Status | Meaning |
 |---|---|
 | `scheduled` | waiting for its next run |
-| `held` | scheduled, but not picked up by anyone until released, even when due |
+| `held` | scheduled, but not picked up by anyone until released, even when due - the board's Backlog (`task_create`'s `hold`, `task_hold`) |
 | `running` | claimed by one session, which is running it |
 | `done` | a one-shot task that ran, or a cron task that reached `max_runs` |
 | `disabled` | switched off with `task_set_enabled` (switching it back on makes it `scheduled`) |
@@ -860,6 +860,7 @@ that agent.
 | `task_delete` | Delete a scheduled task |
 | `task_list` | List tasks (all, an agent's, or only the due ones), or get one by id |
 | `task_set_enabled` | Enable or disable a task |
+| `task_hold` | Put a task in the backlog (held), or release it |
 | `send_message` | Send a message to another agent |
 | `spawn_agent` | Spawn a sub-agent for parallel work, optionally with a `timeout_seconds` or `max_requests` budget |
 | `agent_cancel` | Stop a running sub-agent you started |
