@@ -1293,15 +1293,22 @@ pub fn parse_db_time(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 /// Deletes `done` tasks that last ran (or, if they never did, were
 /// created) before `older_than`, returning them. With `dry_run`, only
 /// returns what would be deleted. Scheduled, running and disabled tasks
-/// are never touched.
+/// are never touched, nor a done one a task still to finish depends on or
+/// carries on from: gone, it would fail that one.
 pub fn prune_tasks(
     conn: &Connection,
     older_than: chrono::DateTime<chrono::Utc>,
     dry_run: bool,
 ) -> Result<Vec<TaskRow>, Box<dyn Error>> {
-    let old: Vec<TaskRow> = list_tasks(conn, None)?
+    let tasks = list_tasks(conn, None)?;
+    let needed: std::collections::HashSet<i64> = tasks
+        .iter()
+        .filter(|t| t.status != TaskStatus::DONE)
+        .flat_map(|t| t.depends_on.iter().copied().chain(t.continue_task))
+        .collect();
+    let old: Vec<TaskRow> = tasks
         .into_iter()
-        .filter(|t| t.status == TaskStatus::DONE)
+        .filter(|t| t.status == TaskStatus::DONE && !needed.contains(&t.id))
         .filter(|t| {
             t.last_run_at
                 .as_deref()
@@ -3672,6 +3679,29 @@ mod tests {
             .map(|t| t.name)
             .collect();
         assert_eq!(left, ["recent done", "old disabled", "old scheduled"]);
+
+        // One a task still to finish needs stays, until that one is done.
+        make("needed", "done", Some(chrono::Duration::days(10)));
+        make("carried on", "done", Some(chrono::Duration::days(10)));
+        let ids: Vec<i64> = list_tasks(&conn, None)
+            .unwrap()
+            .iter()
+            .filter(|t| t.name == "needed" || t.name == "carried on")
+            .map(|t| t.id)
+            .collect();
+        conn.execute(
+            "UPDATE scheduled_tasks SET depends_on = ?1, continue_task = ?2
+             WHERE name = 'old scheduled'",
+            params![format!("[{}]", ids[0]), ids[1]],
+        )
+        .unwrap();
+        assert!(prune_tasks(&conn, cutoff, false).unwrap().is_empty());
+        conn.execute(
+            "UPDATE scheduled_tasks SET status = 'done' WHERE name = 'old scheduled'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(prune_tasks(&conn, cutoff, false).unwrap().len(), 3);
     }
 
     #[test]

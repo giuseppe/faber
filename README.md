@@ -742,7 +742,8 @@ faber --db-path state.db tasks prune --done                      # delete every 
 
 `prune` only deletes `done` tasks (✓ and ✗ alike) whose last run is older
 than `--older-than` - `7d` by default, or no limit with `--done` alone;
-scheduled, running and disabled tasks are never touched. To do it automatically, set `"task_retention": "30d"` in the
+scheduled, running and disabled tasks are never touched, nor a done one
+that a task still to finish depends on or carries on from. To do it automatically, set `"task_retention": "30d"` in the
 config file (or pass `--task-retention 30d`): while a `faber chat` runs,
 it prunes done tasks older than that every hour. Deleting an agent also
 deletes its tasks, and the model can delete one with `task_delete`.
