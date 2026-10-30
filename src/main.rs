@@ -3788,6 +3788,70 @@ fn tool_plan_get(_params_str: &String, ctx: &ToolContext) -> Result<String, Box<
 
 /// entrypoint for the task_create tool: one task, run on a cron schedule,
 /// once after a delay or at a time, or (with none of these) right away.
+/// The schedule task_create and task_update are given: a cron expression
+/// (with max_runs), or once after a delay or at a time - None if none.
+fn requested_schedule(
+    cron_expression: Option<&str>,
+    max_runs: Option<i64>,
+    delay_seconds: Option<u64>,
+    run_at: Option<&str>,
+) -> Result<Option<db::TaskSchedule>, Box<dyn Error>> {
+    Ok(match (cron_expression, delay_seconds, run_at) {
+        (Some(expression), None, None) => Some(db::TaskSchedule::Cron {
+            expression: expression.to_string(),
+            max_runs,
+        }),
+        (None, delay, at) => {
+            if max_runs.is_some() {
+                return Err("max_runs only applies to a cron_expression task".into());
+            }
+            match (delay, at) {
+                (Some(_), Some(_)) => return Err("give delay_seconds or run_at, not both".into()),
+                (Some(secs), None) => Some(db::TaskSchedule::Once {
+                    at: (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339(),
+                }),
+                (None, Some(at)) => Some(db::TaskSchedule::Once { at: at.to_string() }),
+                (None, None) => None,
+            }
+        }
+        (Some(_), _, _) => {
+            return Err("give cron_expression, or delay_seconds/run_at, not both".into());
+        }
+    })
+}
+
+/// The kind of task `command` makes: a tool call, or an instruction. A
+/// tool task runs a tool its maker has: an agent limited to some tools
+/// doesn't get the others by scheduling them.
+fn task_command_kind(
+    ctx: &ToolContext,
+    db: &dyn DbBackend,
+    command: &str,
+) -> Result<&'static str, Box<dyn Error>> {
+    if command.trim().is_empty() {
+        return Err("the task needs a command: an instruction, or a JSON tool call".into());
+    }
+    if !db::is_tool_call(command) {
+        return Ok(db::TaskKind::PROMPT);
+    }
+    let tool = serde_json::from_str::<serde_json::Value>(command)?["tool"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let allowed = match ctx.agent_name.as_deref() {
+        Some(agent) => db.get_agent_config(agent)?.tools,
+        None => None,
+    };
+    if allowed.is_some_and(|tools| !tools.contains(&tool)) {
+        return Err(format!(
+            "you don't have the {} tool, so a task can't run it for you",
+            tool
+        )
+        .into());
+    }
+    Ok(db::TaskKind::TOOL)
+}
+
 fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -3825,61 +3889,17 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         (Some(_), None) => None,
         (_, requested) => child_cwd(ctx, requested)?,
     };
-    if params.command.trim().is_empty() {
-        return Err("the task needs a command: an instruction, or a JSON tool call".into());
-    }
-    let schedule = match (
-        &params.cron_expression,
+    let schedule = requested_schedule(
+        params.cron_expression.as_deref(),
+        params.max_runs,
         params.delay_seconds,
-        &params.run_at,
-    ) {
-        (Some(expression), None, None) => db::TaskSchedule::Cron {
-            expression: expression.clone(),
-            max_runs: params.max_runs,
-        },
-        (None, delay, at) => {
-            if params.max_runs.is_some() {
-                return Err("max_runs only applies to a cron_expression task".into());
-            }
-            let at = match (delay, at) {
-                (Some(_), Some(_)) => return Err("give delay_seconds or run_at, not both".into()),
-                (Some(secs), None) => {
-                    (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
-                }
-                (None, Some(at)) => at.clone(),
-                (None, None) => chrono::Utc::now().to_rfc3339(),
-            };
-            db::TaskSchedule::Once { at }
-        }
-        (Some(_), _, _) => {
-            return Err("give cron_expression, or delay_seconds/run_at, not both".into());
-        }
-    };
-    let kind = if db::is_tool_call(&params.command) {
-        db::TaskKind::TOOL
-    } else {
-        db::TaskKind::PROMPT
-    };
+        params.run_at.as_deref(),
+    )?
+    .unwrap_or_else(|| db::TaskSchedule::Once {
+        at: chrono::Utc::now().to_rfc3339(),
+    });
     let db = ctx.db()?;
-    // A tool task runs a tool its maker has: an agent limited to some
-    // tools doesn't get the others by scheduling them.
-    if kind == db::TaskKind::TOOL {
-        let tool = serde_json::from_str::<serde_json::Value>(&params.command)?["tool"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        let allowed = match ctx.agent_name.as_deref() {
-            Some(agent) => db.get_agent_config(agent)?.tools,
-            None => None,
-        };
-        if allowed.is_some_and(|tools| !tools.contains(&tool)) {
-            return Err(format!(
-                "you don't have the {} tool, so a task can't run it for you",
-                tool
-            )
-            .into());
-        }
-    }
+    let kind = task_command_kind(ctx, db, &params.command)?;
     // Without a profile, it runs on the agent creating it unless told
     // otherwise - if that's an agent a session runs (a chat's, a
     // worker's): a sub-agent's or a task's agent isn't one any session
@@ -4311,6 +4331,102 @@ fn tool_task_stop(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
         };
     }
     Ok(result.to_string())
+}
+
+/// entrypoint for the task_update tool: changes what a task that isn't
+/// running is - its name, description, command, schedule, dependencies -
+/// keeping its id, state and where it runs.
+fn tool_task_update(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        id: i64,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        cron_expression: Option<String>,
+        #[serde(default)]
+        max_runs: Option<i64>,
+        #[serde(default)]
+        delay_seconds: Option<u64>,
+        #[serde(default)]
+        run_at: Option<String>,
+        #[serde(default)]
+        depends_on: Option<Vec<i64>>,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let db = ctx.db()?;
+    let Some(task) = db.get_task(params.id)? else {
+        return Ok(
+            serde_json::json!({"updated": false, "id": params.id, "reason": "no such task"})
+                .to_string(),
+        );
+    };
+    check_may_change_task(ctx, &task)?;
+    let command = params.command.unwrap_or_else(|| task.command.clone());
+    let kind = task_command_kind(ctx, db, &command)?;
+    let schedule = match requested_schedule(
+        params.cron_expression.as_deref(),
+        // Only a new limit, for the cron task it is.
+        params
+            .max_runs
+            .filter(|_| params.cron_expression.is_some() || task.cron_expression.is_none()),
+        params.delay_seconds,
+        params.run_at.as_deref(),
+    )? {
+        Some(schedule) => schedule,
+        None => match &task.cron_expression {
+            Some(expression) => db::TaskSchedule::Cron {
+                expression: expression.clone(),
+                max_runs: params.max_runs.or(task.max_runs),
+            },
+            None => db::TaskSchedule::Once {
+                at: task
+                    .run_at
+                    .clone()
+                    .or_else(|| task.next_run_at.clone())
+                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+            },
+        },
+    };
+    let changed = db::NewTask {
+        name: params.name.unwrap_or_else(|| task.name.clone()),
+        description: params
+            .description
+            .unwrap_or_else(|| task.description.clone()),
+        kind: kind.to_string(),
+        command,
+        agent_name: task.agent_name.clone(),
+        schedule,
+        held: false,
+        depends_on: params.depends_on.unwrap_or_else(|| task.depends_on.clone()),
+        profile: task.profile.clone(),
+        run_safe: task.run_safe,
+        cwd: task.cwd.clone(),
+        continue_agent: task.continue_agent.clone(),
+        continue_task: task.continue_task,
+    };
+    if !db.update_task(params.id, &changed)? {
+        return Ok(serde_json::json!({
+            "updated": false,
+            "id": params.id,
+            "reason": "the task is running: stop it (task_stop) to change it",
+        })
+        .to_string());
+    }
+    let task = db.get_task(params.id)?;
+    ctx.println(&format!("Task id={} changed", params.id));
+    Ok(serde_json::json!({
+        "updated": true,
+        "id": params.id,
+        "status": task.as_ref().map(|t| &t.status),
+        "next_run_at": task.as_ref().and_then(|t| t.next_run_at.as_ref()),
+    })
+    .to_string())
 }
 
 /// entrypoint for the task_assign tool: changes where a task runs - on an
@@ -6241,6 +6357,38 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                     "type": "object",
                     "properties": {
                         "id": {"type": "integer", "description": "ID of the task"}
+                    },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "task_update".to_string(),
+        tool_task_update,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "task_update",
+                "description": "Change a task (a card on the board) that isn't running: its name, description, command, schedule or dependencies - only what's given; the rest, its id, its state (e.g. in the backlog) and its outcomes stay. Rather than deleting and re-creating it, which breaks the tasks that depend on it. Use task_assign to change where it runs.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer", "description": "ID of the task"},
+                        "name": {"type": "string"},
+                        "description": {"type": "string"},
+                        "command": {"type": "string", "description": "An instruction, or a JSON tool call, as for task_create"},
+                        "cron_expression": {"type": "string", "description": "Run on this 7-field cron schedule instead"},
+                        "max_runs": {"type": "integer", "description": "For a cron task: stop after this many runs"},
+                        "delay_seconds": {"type": "integer", "description": "Run once, this many seconds from now, instead"},
+                        "run_at": {"type": "string", "description": "Run once at this RFC 3339 time instead"},
+                        "depends_on": {"type": "array", "items": {"type": "integer"}, "description": "The tasks it waits for, replacing the ones it did ([] for none)"}
                     },
                     "required": ["id"],
                     "additionalProperties": false
@@ -16129,6 +16277,10 @@ for line in sys.stdin:
             ),
             (tool_task_run, serde_json::json!({"id": user_task})),
             (tool_task_stop, serde_json::json!({"id": user_task})),
+            (
+                tool_task_update,
+                serde_json::json!({"id": user_task, "name": "mine"}),
+            ),
             (tool_task_delete, serde_json::json!({"id": user_task})),
         ] {
             let err = call(f, params).unwrap_err().to_string();
@@ -17465,6 +17617,81 @@ for line in sys.stdin:
             .unwrap();
         let err = call(serde_json::json!({"id": id})).unwrap_err().to_string();
         assert!(err.contains("report_result"), "{err}");
+    }
+
+    #[test]
+    fn test_task_update_changes_only_what_is_given() {
+        let db = local_db_with_agents(&["boss", "a"]);
+        let ctx = chat_ctx(db.clone(), "boss");
+        let call = |f: ToolCallback, params: serde_json::Value| -> serde_json::Value {
+            serde_json::from_str(&f(&params.to_string(), &ctx).unwrap()).unwrap()
+        };
+        let first = call(
+            tool_task_create,
+            serde_json::json!({"name": "first", "command": "x", "hold": true}),
+        )["id"]
+            .as_i64()
+            .unwrap();
+        let id = call(
+            tool_task_create,
+            serde_json::json!({
+                "name": "fix", "command": "fix #462", "description": "the bug",
+                "agent_name": "a", "hold": true, "depends_on": [first]
+            }),
+        )["id"]
+            .as_i64()
+            .unwrap();
+        let updated = call(
+            tool_task_update,
+            serde_json::json!({"id": id, "command": "fix #462 and add a test"}),
+        );
+        assert_eq!(updated["updated"], true, "{updated}");
+        let task = db.get_task(id).unwrap().unwrap();
+        assert_eq!(task.command, "fix #462 and add a test");
+        assert_eq!(
+            (task.name.as_str(), task.description.as_str()),
+            ("fix", "the bug")
+        );
+        assert_eq!(task.agent_name.as_deref(), Some("a"));
+        assert_eq!(task.status, "held", "it stays in the backlog");
+        assert_eq!(task.depends_on, vec![first]);
+
+        call(
+            tool_task_update,
+            serde_json::json!({"id": id, "depends_on": [], "cron_expression": "0 0 9 * * * *"}),
+        );
+        let task = db.get_task(id).unwrap().unwrap();
+        assert!(task.depends_on.is_empty());
+        assert_eq!(task.cron_expression.as_deref(), Some("0 0 9 * * * *"));
+        call(
+            tool_task_update,
+            serde_json::json!({"id": id, "max_runs": 2}),
+        );
+        let task = db.get_task(id).unwrap().unwrap();
+        assert_eq!(
+            (task.cron_expression.as_deref(), task.max_runs),
+            (Some("0 0 9 * * * *"), Some(2))
+        );
+
+        let err = tool_task_update(
+            &serde_json::json!({"id": id, "depends_on": [12345]}).to_string(),
+            &ctx,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no task #12345"), "{err}");
+        db.run_task_now(id).unwrap();
+        assert!(db.claim_task(id, "s").unwrap());
+        let running = call(tool_task_update, serde_json::json!({"id": id, "name": "y"}));
+        assert!(
+            running["reason"].as_str().unwrap().contains("running"),
+            "{running}"
+        );
+        let missing = call(
+            tool_task_update,
+            serde_json::json!({"id": 9999, "name": "y"}),
+        );
+        assert_eq!(missing["reason"], "no such task");
     }
 
     #[test]

@@ -863,6 +863,7 @@ that agent.
 | `task_hold` | Put a task in the backlog (held), or release it |
 | `task_run` | Make a task due right away, or run a done one again (e.g. retry a failed one) |
 | `task_stop` | Stop a running task, whichever agent runs it |
+| `task_update` | Change a task that isn't running (name, description, command, schedule, dependencies), keeping its id and state |
 | `send_message` | Send a message to another agent |
 | `spawn_agent` | Spawn a sub-agent for parallel work, optionally with a `timeout_seconds` or `max_requests` budget |
 | `agent_cancel` | Stop a running sub-agent you started |
