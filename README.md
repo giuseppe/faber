@@ -852,6 +852,7 @@ that agent.
 | `github_pull_request` | One pull request by number (or its diff, with `patch`), or the pull requests updated in the last few days |
 | `agent_create` | Create a new agent |
 | `agent_delete` | Delete an agent |
+| `agent_cleanup` | Delete the finished agents agents made, as `faber agents cleanup` does |
 | `agent_list` | List all agents |
 | `agent_get` | Get an agent's details, including its configuration |
 | `agent_configure` | Set or clear an agent's model, endpoint (unsafe agents only) or system prompt |

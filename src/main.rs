@@ -3263,6 +3263,39 @@ fn tool_agent_delete(params_str: &String, ctx: &ToolContext) -> Result<String, B
     }
 }
 
+/// entrypoint for the agent_cleanup tool: removes the finished agents
+/// agents made, as `faber agents cleanup` does - for an agent without the
+/// unsafe tools, only its own.
+fn tool_agent_cleanup(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        #[serde(default)]
+        dry_run: bool,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let db = ctx.db()?;
+    let mut removed = Vec::new();
+    for name in agents_to_clean_up(db)? {
+        if Some(&name) == ctx.agent_name.as_ref() || check_may_change(ctx, db, &name).is_err() {
+            continue;
+        }
+        if params.dry_run || db.delete_agent(&name)? {
+            removed.push(name);
+        }
+    }
+    ctx.println(&format!(
+        "{} {} finished agent(s)",
+        if params.dry_run {
+            "Would remove"
+        } else {
+            "Removed"
+        },
+        removed.len()
+    ));
+    Ok(serde_json::json!({"dry_run": params.dry_run, "removed": removed}).to_string())
+}
+
 fn tool_agent_list(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
     let _ = params_str;
     let db = ctx.db()?;
@@ -5870,6 +5903,29 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
 
     append_tool(
         &mut tools,
+        "agent_cleanup".to_string(),
+        tool_agent_cleanup,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "agent_cleanup",
+                "description": "Delete the agents agents made (sub-agents, task agents, fan-out workers) that are finished: nothing runs them or any agent below them. Agents the user made, those at work, and those a task still carries on from stay. Without the unsafe tools, only the ones you made.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "dry_run": {"type": "boolean", "description": "Only list what would be deleted"}
+                    },
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
         "agent_list".to_string(),
         tool_agent_list,
         r#"
@@ -7798,6 +7854,17 @@ fn has_unfinished_task(db: &dyn DbBackend, agent: &str) -> bool {
         .ok()
         .flatten();
     db::holds_unfinished_task(marker.as_deref(), |id| db.get_task(id).ok().flatten())
+}
+
+/// The agents `faber agents cleanup` removes: the finished ones agents
+/// made, but not one a task carries on from.
+fn agents_to_clean_up(db: &dyn DbBackend) -> Result<Vec<String>, Box<dyn Error>> {
+    Ok(
+        db::finished_made_agents(&db.list_agents()?, chrono::Utc::now())
+            .into_iter()
+            .filter(|name| !has_unfinished_task(db, name))
+            .collect(),
+    )
 }
 
 /// Every how many 5-second heartbeats a session removes the artifacts'
@@ -13127,10 +13194,7 @@ fn agents_command(
         return Ok(());
     }
     if let Some(AgentsAction::Cleanup { dry_run }) = action {
-        let names: Vec<String> = db::finished_made_agents(&db.list_agents()?, chrono::Utc::now())
-            .into_iter()
-            .filter(|name| !has_unfinished_task(db.as_ref(), name))
-            .collect();
+        let names = agents_to_clean_up(db.as_ref())?;
         if names.is_empty() {
             println!("No finished agents made by agents.");
         }
@@ -17823,6 +17887,36 @@ for line in sys.stdin:
                 .to_string()
                 .contains("give an age")
         );
+    }
+
+    #[test]
+    fn test_agent_cleanup_removes_the_finished_agents_it_may() {
+        let db = local_db_with_agents(&["boss", "other", "mine", "theirs", "busy"]);
+        for (agent, parent) in [("mine", "boss"), ("theirs", "other"), ("busy", "boss")] {
+            db.set_agent_parent(agent, Some(parent)).unwrap();
+        }
+        assert!(db.claim_agent("busy", "s").unwrap());
+        let ctx = chat_ctx(db.clone(), "boss");
+        let call = |params: serde_json::Value| -> serde_json::Value {
+            serde_json::from_str(&tool_agent_cleanup(&params.to_string(), &ctx).unwrap()).unwrap()
+        };
+        assert_eq!(
+            call(serde_json::json!({"dry_run": true}))["removed"],
+            serde_json::json!(["mine"])
+        );
+        assert!(db.get_agent("mine").unwrap().is_some());
+        assert_eq!(
+            call(serde_json::json!({}))["removed"],
+            serde_json::json!(["mine"])
+        );
+        for (agent, left) in [
+            ("mine", false),
+            ("theirs", true),
+            ("busy", true),
+            ("boss", true),
+        ] {
+            assert_eq!(db.get_agent(agent).unwrap().is_some(), left, "{agent}");
+        }
     }
 
     #[test]
