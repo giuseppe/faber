@@ -3947,7 +3947,13 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
             .flatten()
             .is_some_and(|a| a.parent.is_none())
     });
+    // "" asks for whichever agent is free first.
+    let any_agent = params.agent_name.as_deref() == Some("");
+    if any_agent {
+        params.agent_name = None;
+    }
     let agent_name = match &params.profile {
+        _ if any_agent => None,
         _ if params.continue_task.is_some() => params.agent_name.clone(),
         Some(_) => params.agent_name.clone(),
         None => params
@@ -6275,14 +6281,14 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "task_create",
-                "description": "Schedule a task: on a cron schedule (cron_expression), once after a delay (delay_seconds, preferred for relative times) or at a time (run_at), or right away if none is given. The command is either an instruction in plain language (e.g. \"tell the user a joke\", \"summarize today's commits\"), which the agent carries out as a new turn of its conversation as soon as it's idle, or a JSON tool call run directly without the AI, e.g. {\"tool\": \"run_command\", \"arguments\": {\"command\": \"echo hello\"}}. To do work now, in parallel, use fan_out or spawn_agent instead: a task waits for an agent to be free. task_wait waits for tasks run by others.",
+                "description": "Create a task: a card on the board the user follows (Backlog, To do, In progress, Done, Failed), with its own run, status and result. When the user asks for tasks or cards, for work on the board or in the backlog, or for pieces of work handed to agents to track, create one task per piece (hold: true for the backlog): spawn_agent and fan_out leave no card. For a different agent on each, give each a profile, or agent_name \"\" for whichever agent is free first. It runs on a cron schedule (cron_expression), once after a delay (delay_seconds, preferred for relative times) or at a time (run_at), or right away if none is given. The command is either an instruction in plain language (e.g. \"tell the user a joke\", \"fix issue #12\"), which the agent carries out as a new turn of its conversation as soon as it's idle, or a JSON tool call run directly without the AI, e.g. {\"tool\": \"run_command\", \"arguments\": {\"command\": \"echo hello\"}}. For help with your own work whose results you need back in this turn, use fan_out or spawn_agent instead: a task waits for an agent to be free. task_wait waits for tasks run by others.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "name": {"type": "string", "description": "Name for the task"},
                         "command": {"type": "string", "description": "What to do when it fires: an instruction, or a JSON tool call"},
                         "description": {"type": "string", "description": "What the task is for"},
-                        "agent_name": {"type": "string", "description": "The agent that runs it (default: you, unless a profile is given)"},
+                        "agent_name": {"type": "string", "description": "The agent that runs it; \"\" for whichever agent is free first (default: you, unless a profile is given)"},
                         "profile": {"type": "string", "description": "For an instruction: run it on a new agent made from this profile (one listed in your system prompt), by a worker that has it, instead of on an agent"},
                         "cwd": {"type": "string", "description": "The directory it runs in. Default: the one you work in. Only an agent with the unsafe tools can choose another"},
                         "cron_expression": {"type": "string", "description": "7 fields: 'sec min hour day_of_month month day_of_week year', e.g. '0 30 9 * * Mon-Fri *' for 9:30 every weekday"},
@@ -6620,7 +6626,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "spawn_agent",
-                "description": "Start a sub-agent on a task in the background and carry on: its result arrives later, as a message, whenever it's done - or collect it with agent_wait. Use it for long or open-ended work you don't need to wait for. To run the same task over many items and get all the results back together, use fan_out instead.",
+                "description": "Start a sub-agent in the background, as part of your own work, and carry on: its result arrives later, as a message, whenever it's done - or collect it with agent_wait. Use it for long or open-ended work you don't need to wait for. It gets no card on the board: for work the user wants as tasks or cards, use task_create. To run the same instructions over many items and get all the results back together, use fan_out instead.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -6840,7 +6846,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "fan_out",
-                "description": "Run the same task for many items at once - e.g. review each of these files, answer this question for each module - each in its own worker agent, and wait for all their results, which come back together, in item order, as this tool's result. (For one long task to run in the background while you carry on, use spawn_agent.) Workers see only their own item and the prompt, and by default can only use read-only tools (reading files, searching, lsp), so have them report findings and make any edits yourself afterwards.",
+                "description": "Run the same instructions for many items at once - e.g. review each of these files, answer this question for each module - each in its own worker agent, and wait for all their results, which come back together, in item order, as this tool's result. (For one long job to run in the background while you carry on, use spawn_agent; for work the user wants as tasks or cards on the board, task_create.) Workers see only their own item and the prompt, and by default can only use read-only tools (reading files, searching, lsp), so have them report findings and make any edits yourself afterwards.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -17672,6 +17678,16 @@ for line in sys.stdin:
             serde_json::json!({"id": 9999, "held": false}),
         );
         assert_eq!(missing["reason"], "no such task");
+        // Its own unless told otherwise; "" for any agent.
+        for (agent, runs_on) in [(None, Some("boss")), (Some(""), None)] {
+            let mut params = serde_json::json!({"name": "card", "command": "x", "hold": true});
+            if let Some(agent) = agent {
+                params["agent_name"] = agent.into();
+            }
+            let id = call(tool_task_create, params)["id"].as_i64().unwrap();
+            let task = db.get_task(id).unwrap().unwrap();
+            assert_eq!(task.agent_name.as_deref(), runs_on);
+        }
     }
 
     #[test]
