@@ -4270,6 +4270,49 @@ fn tool_task_run(params_str: &String, ctx: &ToolContext) -> Result<String, Box<d
     Ok(result.to_string())
 }
 
+/// entrypoint for the task_stop tool: asks whoever is running a task to
+/// stop it, as the user can - not the task its caller is running itself.
+fn tool_task_stop(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        id: i64,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let db = ctx.db()?;
+    if let Some(task) = db.get_task(params.id)? {
+        check_may_change_task(ctx, &task)?;
+    }
+    let own = match ctx.agent_name.as_deref() {
+        Some(agent) => db.get_agent_data(agent, db::RUNNING_TASK_KEY)?,
+        None => None,
+    };
+    if own.and_then(|id| id.parse::<i64>().ok()) == Some(params.id) {
+        return Err(format!(
+            "task #{} is the one you're running: finish it with report_result instead",
+            params.id
+        )
+        .into());
+    }
+    let updated = db.request_task_stop(params.id)?;
+    let status = db.get_task(params.id)?.map(|t| t.status);
+    if updated {
+        ctx.println(&format!("Task id={} asked to stop", params.id));
+    }
+    let mut result = serde_json::json!({"updated": updated, "id": params.id, "status": status});
+    if !updated {
+        result["reason"] = match status {
+            None => "no such task".into(),
+            Some(status) => format!(
+                "the task is {}, not running; to keep it from running, hold, disable or delete it",
+                status
+            )
+            .into(),
+        };
+    }
+    Ok(result.to_string())
+}
+
 /// entrypoint for the task_assign tool: changes where a task runs - on an
 /// agent, on a new agent made from a profile, or on any agent.
 fn tool_task_assign(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
@@ -6170,6 +6213,30 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "function": {
                 "name": "task_run",
                 "description": "Make a task that isn't running due right away, to be picked up by its agent: whatever it was waiting for (its time, being released from the backlog, being enabled), or, done, to run it again - e.g. to retry a failed card. It still waits for the tasks it depends on.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer", "description": "ID of the task"}
+                    },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "task_stop".to_string(),
+        tool_task_stop,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "task_stop",
+                "description": "Stop a task that's running (a card in progress), on whatever agent runs it: its run ends as failed - a cron task stays scheduled for its next run. To keep a task that isn't running from running, use task_hold, task_set_enabled or task_delete.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -16061,6 +16128,7 @@ for line in sys.stdin:
                 serde_json::json!({"id": user_task, "held": false}),
             ),
             (tool_task_run, serde_json::json!({"id": user_task})),
+            (tool_task_stop, serde_json::json!({"id": user_task})),
             (tool_task_delete, serde_json::json!({"id": user_task})),
         ] {
             let err = call(f, params).unwrap_err().to_string();
@@ -17361,6 +17429,42 @@ for line in sys.stdin:
         );
         let missing = call(tool_task_run, serde_json::json!({"id": 9999}));
         assert_eq!(missing["reason"], "no such task");
+    }
+
+    #[test]
+    fn test_task_stop_asks_a_running_task_to_stop() {
+        let db = local_db_with_agents(&["boss", "a"]);
+        let ctx = chat_ctx(db.clone(), "boss");
+        let call = |params: serde_json::Value| tool_task_stop(&params.to_string(), &ctx);
+        let id = tool_task(db.as_ref(), r#"{"tool":"glob","arguments":{}}"#, true, None);
+        let waiting: serde_json::Value =
+            serde_json::from_str(&call(serde_json::json!({"id": id})).unwrap()).unwrap();
+        assert_eq!(waiting["updated"], false);
+        assert!(
+            waiting["reason"].as_str().unwrap().contains("not running"),
+            "{waiting}"
+        );
+        // Run by a live session, it's asked to stop.
+        assert!(db.claim_agent("a", "s").unwrap());
+        assert!(db.claim_task(id, "s").unwrap());
+        let stopped: serde_json::Value =
+            serde_json::from_str(&call(serde_json::json!({"id": id})).unwrap()).unwrap();
+        assert_eq!(stopped["updated"], true, "{stopped}");
+        assert!(db.get_task(id).unwrap().unwrap().stop_requested);
+        // By none any more, it's ended right away.
+        db.release_all_agents("s").unwrap();
+        let ended: serde_json::Value =
+            serde_json::from_str(&call(serde_json::json!({"id": id})).unwrap()).unwrap();
+        assert_eq!(ended["status"], "done", "{ended}");
+        assert_eq!(
+            db.get_task(id).unwrap().unwrap().last_outcome.as_deref(),
+            Some("failed")
+        );
+        // Not the one it runs itself.
+        db.set_agent_data("boss", db::RUNNING_TASK_KEY, &id.to_string())
+            .unwrap();
+        let err = call(serde_json::json!({"id": id})).unwrap_err().to_string();
+        assert!(err.contains("report_result"), "{err}");
     }
 
     #[test]
