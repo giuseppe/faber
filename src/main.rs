@@ -4234,6 +4234,42 @@ fn tool_task_hold(params_str: &String, ctx: &ToolContext) -> Result<String, Box<
     Ok(result.to_string())
 }
 
+/// entrypoint for the task_run tool: makes a task due right away -
+/// whatever it was waiting for, or, done, to run it again.
+fn tool_task_run(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Params {
+        id: i64,
+    }
+    let params: Params = serde_json::from_str(params_str)?;
+    let db = ctx.db()?;
+    if let Some(task) = db.get_task(params.id)? {
+        check_may_change_task(ctx, &task)?;
+    }
+    let updated = db.run_task_now(params.id)?;
+    let task = db.get_task(params.id)?;
+    if updated {
+        ctx.println(&format!("Task id={} due now", params.id));
+    }
+    let mut result = serde_json::json!({
+        "updated": updated,
+        "id": params.id,
+        "status": task.as_ref().map(|t| &t.status),
+    });
+    match &task {
+        None => result["reason"] = "no such task".into(),
+        Some(task) if !updated => {
+            result["reason"] = format!("the task is {} already", task.status).into()
+        }
+        Some(task) if !task.depends_on.is_empty() => {
+            result["note"] = "it still waits for the tasks it depends on".into()
+        }
+        Some(_) => {}
+    }
+    Ok(result.to_string())
+}
+
 /// entrypoint for the task_assign tool: changes where a task runs - on an
 /// agent, on a new agent made from a profile, or on any agent.
 fn tool_task_assign(params_str: &String, ctx: &ToolContext) -> Result<String, Box<dyn Error>> {
@@ -6116,6 +6152,30 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
                         "held": {"type": "boolean", "description": "true to hold it, false to release it"}
                     },
                     "required": ["id", "held"],
+                    "additionalProperties": false
+                }
+            }
+        }
+"#
+        .to_string(),
+    );
+
+    append_tool(
+        &mut tools,
+        "task_run".to_string(),
+        tool_task_run,
+        r#"
+        {
+            "type": "function",
+            "function": {
+                "name": "task_run",
+                "description": "Make a task that isn't running due right away, to be picked up by its agent: whatever it was waiting for (its time, being released from the backlog, being enabled), or, done, to run it again - e.g. to retry a failed card. It still waits for the tasks it depends on.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer", "description": "ID of the task"}
+                    },
+                    "required": ["id"],
                     "additionalProperties": false
                 }
             }
@@ -16000,6 +16060,7 @@ for line in sys.stdin:
                 tool_task_hold,
                 serde_json::json!({"id": user_task, "held": false}),
             ),
+            (tool_task_run, serde_json::json!({"id": user_task})),
             (tool_task_delete, serde_json::json!({"id": user_task})),
         ] {
             let err = call(f, params).unwrap_err().to_string();
@@ -17244,6 +17305,61 @@ for line in sys.stdin:
             tool_task_hold,
             serde_json::json!({"id": 9999, "held": false}),
         );
+        assert_eq!(missing["reason"], "no such task");
+    }
+
+    #[test]
+    fn test_task_run_makes_a_task_due_now() {
+        let db = local_db_with_agents(&["boss"]);
+        let ctx = chat_ctx(db.clone(), "boss");
+        let call = |f: ToolCallback, params: serde_json::Value| -> serde_json::Value {
+            serde_json::from_str(&f(&params.to_string(), &ctx).unwrap()).unwrap()
+        };
+        let due = |id: i64| db.get_pending_tasks().unwrap().iter().any(|t| t.id == id);
+        let later = call(
+            tool_task_create,
+            serde_json::json!({"name": "later", "command": "x", "delay_seconds": 3600}),
+        )["id"]
+            .as_i64()
+            .unwrap();
+        let held = call(
+            tool_task_create,
+            serde_json::json!({"name": "held", "command": "x", "hold": true}),
+        )["id"]
+            .as_i64()
+            .unwrap();
+        for id in [later, held] {
+            assert!(!due(id));
+            let run = call(tool_task_run, serde_json::json!({"id": id}));
+            assert_eq!(run["status"], "scheduled", "{run}");
+            assert!(due(id));
+        }
+        // Done (here: failed), it runs again.
+        db.claim_task(later, "s").unwrap();
+        db.finish_task(
+            later,
+            "s",
+            &db::TaskOutcome {
+                succeeded: false,
+                exit_code: None,
+                result: "broke".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(db.get_task(later).unwrap().unwrap().status, "done");
+        assert_eq!(
+            call(tool_task_run, serde_json::json!({"id": later}))["updated"],
+            true
+        );
+        assert!(due(later));
+        // Running, it's left alone.
+        db.claim_task(held, "s").unwrap();
+        let running = call(tool_task_run, serde_json::json!({"id": held}));
+        assert_eq!(
+            running["reason"], "the task is running already",
+            "{running}"
+        );
+        let missing = call(tool_task_run, serde_json::json!({"id": 9999}));
         assert_eq!(missing["reason"], "no such task");
     }
 

@@ -861,6 +861,7 @@ that agent.
 | `task_list` | List tasks (all, an agent's, or only the due ones), or get one by id |
 | `task_set_enabled` | Enable or disable a task |
 | `task_hold` | Put a task in the backlog (held), or release it |
+| `task_run` | Make a task due right away, or run a done one again (e.g. retry a failed one) |
 | `send_message` | Send a message to another agent |
 | `spawn_agent` | Spawn a sub-agent for parallel work, optionally with a `timeout_seconds` or `max_requests` budget |
 | `agent_cancel` | Stop a running sub-agent you started |
