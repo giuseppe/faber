@@ -4009,7 +4009,10 @@ fn tool_task_create(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
         Some(agent) => match db.get_agent(agent)? {
             Some(a) if db::agent_session_is_live(&a, chrono::Utc::now()) => None,
             _ => Some(format!(
-                "No session is running '{}' now: the task waits until one does.",
+                "No session is running '{0}' now: the task waits until one does, and \
+                 nothing starts one by itself. Tell the user so, and that `faber worker \
+                 --agent {0}` runs it. If any agent may do it, delete it and create it \
+                 again with agent_name \"\" instead.",
                 agent
             )),
         },
@@ -5846,7 +5849,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "agent_create",
-                "description": "Create a new named agent in the database for organizing tasks and storing data.",
+                "description": "Create a new named agent in the database for organizing tasks and storing data. Nothing runs it by itself: tasks given to it (task_create's agent_name) wait until the user starts it, e.g. with `faber worker --agent NAME`. To have tasks run on different agents, don't create agents for them: give task_create agent_name \"\" or a profile, and a worker runs each on an agent of its own.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -6281,7 +6284,7 @@ fn initialize_tools(unsafe_tools: bool, allowed: Option<&[String]>) -> ToolsColl
             "type": "function",
             "function": {
                 "name": "task_create",
-                "description": "Create a task: a card on the board the user follows (Backlog, To do, In progress, Done, Failed), with its own run, status and result. When the user asks for tasks or cards, for work on the board or in the backlog, or for pieces of work handed to agents to track, create one task per piece (hold: true for the backlog): spawn_agent and fan_out leave no card. For a different agent on each, give each a profile, or agent_name \"\" for whichever agent is free first. It runs on a cron schedule (cron_expression), once after a delay (delay_seconds, preferred for relative times) or at a time (run_at), or right away if none is given. The command is either an instruction in plain language (e.g. \"tell the user a joke\", \"fix issue #12\"), which the agent carries out as a new turn of its conversation as soon as it's idle, or a JSON tool call run directly without the AI, e.g. {\"tool\": \"run_command\", \"arguments\": {\"command\": \"echo hello\"}}. For help with your own work whose results you need back in this turn, use fan_out or spawn_agent instead: a task waits for an agent to be free. task_wait waits for tasks run by others.",
+                "description": "Create a task: a card on the board the user follows (Backlog, To do, In progress, Done, Failed), with its own run, status and result. When the user asks for tasks or cards, for work on the board or in the backlog, or for pieces of work handed to agents to track, create one task per piece (hold: true for the backlog): spawn_agent and fan_out leave no card. For a different agent on each, give each a profile, or agent_name \"\" for whichever agent is free first: a worker runs each on an agent of its own. Don't create agents with agent_create for them: nothing runs those until the user starts them. It runs on a cron schedule (cron_expression), once after a delay (delay_seconds, preferred for relative times) or at a time (run_at), or right away if none is given. The command is either an instruction in plain language (e.g. \"tell the user a joke\", \"fix issue #12\"), which the agent carries out as a new turn of its conversation as soon as it's idle, or a JSON tool call run directly without the AI, e.g. {\"tool\": \"run_command\", \"arguments\": {\"command\": \"echo hello\"}}. For help with your own work whose results you need back in this turn, use fan_out or spawn_agent instead: a task waits for an agent to be free. task_wait waits for tasks run by others.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -20913,6 +20916,19 @@ for line in sys.stdin:
         );
         let err = tool_task_wait(&format!(r#"{{"ids": [{}]}}"#, own["id"]), &boss).unwrap_err();
         assert!(err.to_string().contains("runs on you"), "{err}");
+        // A task for an agent nobody runs says how to get it run.
+        let idle = serde_json::from_str::<serde_json::Value>(
+            &tool_task_create(
+                &r#"{"name": "t", "command": "do it", "agent_name": "helper"}"#.to_string(),
+                &boss,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let note = idle["note"].as_str().unwrap();
+        assert!(note.contains("faber worker --agent helper"), "{note}");
+        assert!(note.contains("Tell the user"), "{note}");
+        db.delete_task(idle["id"].as_i64().unwrap()).unwrap();
         // ...a sub-agent's goes to any agent, as nobody picks up its own.
         let helper = ctx_of("helper");
         let any = create(&helper);
