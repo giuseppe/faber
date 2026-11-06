@@ -332,6 +332,28 @@ button.stop-button::before { margin-right: 6px; }
   overflow: auto;
 }
 .fields dd ul.artifacts { margin: 0; padding: 0; list-style: none; white-space: normal; }
+/* A task's sub-agents: a dot each on its card, a row each in its details. */
+.card-subs {
+  font: 12px var(--mono);
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+  min-width: 0;
+}
+.sub-dots { display: flex; flex-wrap: wrap; gap: 3px; max-width: 50%; }
+.fields dd ul.subagents { margin: 0; padding: 0; list-style: none; white-space: normal; }
+.subagents li { padding-top: 2px; padding-bottom: 2px; }
+.subagents li > .dot { display: inline-block; margin-right: 6px; }
+.sub-took { color: var(--muted); font: 12px var(--mono); }
+.sub-line {
+  font: 12px var(--mono);
+  color: var(--muted);
+  margin-left: 14px;
+  overflow-wrap: anywhere;
+}
+.sub-line.failed, .sub-line.lost { color: var(--bad); }
 .fields dd ul.artifacts li { color: var(--muted); }
 
 .feed-options { margin: 6px 0; }

@@ -516,6 +516,7 @@ function taskCard(task, draggable) {
       task.blocked_by?.length ? ` · after ${task.blocked_by.map((d) => "#" + d).join(", ")}` : "",
       task.cron_expression ? ` · cron ${task.cron_expression}` : ""),
     st === "running" ? runningLine(latest) : null,
+    subagentsLine(task),
     (st === "failed" || st === "succeeded") && task.last_result
       ? el("div", { class: "card-meta card-result", title: firstLine(task.last_result, 300) },
         firstLine(task.last_result, 90)) : null);
@@ -537,6 +538,89 @@ function taskCard(task, draggable) {
 
 function errorCount(task) {
   return (state.errorsByTask.get(task.id) || []).length;
+}
+
+// A sub-agent of a task's run (see `subagents`): working, or how it
+// ended - succeeded, failed, stopped or lost.
+function subState(sub) {
+  return sub.outcome || "working";
+}
+
+const SUB_DOT = { working: "busy", succeeded: "finished", failed: "failed", lost: "failed", stopped: "queued" };
+
+// What it's doing, or what it said once done.
+function subLine(sub) {
+  return subState(sub) === "working" ? sub.activity || "working" : sub.summary || subState(sub);
+}
+
+// A dot per sub-agent and how many are where, under a card - or null
+// for a task that split up nothing.
+function subagentsLine(task) {
+  const subs = task.subagents || [];
+  if (!subs.length) return null;
+  const count = (st) => subs.filter((s) => subState(s) === st).length;
+  const parts = [
+    `${subs.length} sub-agent${subs.length === 1 ? "" : "s"}`,
+    count("succeeded") && `${count("succeeded")} done`,
+    count("working") && `${count("working")} working`,
+    count("failed") + count("lost") && `${count("failed") + count("lost")} failed`,
+    count("stopped") && `${count("stopped")} stopped`,
+  ].filter(Boolean);
+  return el("div", { class: "card-subs" },
+    el("span", { class: "sub-dots" }, subs.map((s) => el("span", {
+      class: `dot ${SUB_DOT[subState(s)]}`,
+      title: `${s.agent}: ${firstLine(subLine(s), 200)}`,
+    }))),
+    parts.join(" · "));
+}
+
+// How long it took, or has taken so far.
+function took(sub) {
+  const start = parseTime(sub.started_at);
+  if (!start) return "";
+  const secs = Math.round(((parseTime(sub.finished_at) || Date.now()) - start) / 1000);
+  return secs < 60 ? `${secs}s` : secs < 3600 ? `${Math.floor(secs / 60)}m ${secs % 60}s`
+    : `${Math.floor(secs / 3600)}h ${Math.floor(secs % 3600 / 60)}m`;
+}
+
+// The task's sub-agents, each under the one that started it; null with
+// none.
+function subagentList(task) {
+  const subs = task.subagents || [];
+  if (!subs.length) return null;
+  const names = new Set(subs.map((s) => s.agent));
+  const depth = (sub, seen = new Set()) => {
+    const parent = subs.find((s) => s.agent === sub.parent);
+    if (!parent || seen.has(parent.agent)) return 0;
+    seen.add(parent.agent);
+    return 1 + depth(parent, seen);
+  };
+  // Each one's own after the one that started it, in the order they began.
+  const ordered = [];
+  const place = (parent) => {
+    for (const sub of subs.filter((s) => s.parent === parent && !ordered.includes(s))) {
+      ordered.push(sub);
+      place(sub.agent);
+    }
+  };
+  for (const sub of subs.filter((s) => !names.has(s.parent))) {
+    if (!ordered.includes(sub)) {
+      ordered.push(sub);
+      place(sub.agent);
+    }
+  }
+  return el("ul", { class: "subagents" }, ordered.map((sub) => {
+    const st = subState(sub);
+    const exists = state.agents.some((a) => a.name === sub.agent);
+    return el("li", { style: `padding-left: ${depth(sub) * 14}px` },
+      el("span", { class: `dot ${SUB_DOT[st]}`, title: st }),
+      exists ? el("a", { href: "#", onclick: (e) => {
+        e.preventDefault();
+        select({ kind: "agent", name: sub.agent });
+      } }, sub.agent) : el("span", {}, sub.agent),
+      el("span", { class: "sub-took" }, ` ${took(sub)}`),
+      el("div", { class: `sub-line ${st}`, title: sub.summary || "" }, firstLine(subLine(sub), 160)));
+  }));
 }
 
 // What a running task's agent is up to: its latest output, or - until
@@ -859,6 +943,7 @@ function renderDetail() {
     ...field("Runs", task.run_count ? `${task.run_count}${task.max_runs ? ` of ${task.max_runs}` : ""}` : null),
     ...field("Started", task.started_at ? relative(task.started_at) : null),
     ...field("Command", task.command),
+    ...field("Sub-agents", subagentList(task)),
     ...field("Last result", task.last_result),
     ...field("Artifacts", artifactList(task)));
 }
