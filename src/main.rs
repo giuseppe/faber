@@ -11517,6 +11517,109 @@ fn task_table_row(
     ])
 }
 
+/// How a task's sub-agents are doing, e.g. "1/5 done, 3 working, 1
+/// failed"; none without any.
+fn subagents_summary(subs: &[db::TaskSubAgent]) -> Option<String> {
+    if subs.is_empty() {
+        return None;
+    }
+    let count = |outcomes: &[Option<&str>]| {
+        subs.iter()
+            .filter(|s| outcomes.contains(&s.outcome.as_deref()))
+            .count()
+    };
+    let mut parts = vec![format!(
+        "{}/{} done",
+        count(&[Some("succeeded")]),
+        subs.len()
+    )];
+    for (n, what) in [
+        (count(&[None]), "working"),
+        (count(&[Some("failed"), Some("lost")]), "failed"),
+        (count(&[Some("stopped")]), "stopped"),
+    ] {
+        if n > 0 {
+            parts.push(format!("{} {}", n, what));
+        }
+    }
+    Some(parts.join(", "))
+}
+
+/// A task's sub-agents, for `faber tasks show`: each under the one that
+/// started it, with how it's doing, how long it took and what it's doing
+/// or reported.
+fn describe_subagents(subs: &[db::TaskSubAgent], now: chrono::DateTime<chrono::Utc>) -> String {
+    let Some(summary) = subagents_summary(subs) else {
+        return String::new();
+    };
+    let mut out = format!("\nSub-agents: {}\n", summary);
+    let names: std::collections::HashSet<&str> = subs.iter().map(|s| s.agent.as_str()).collect();
+    let mut shown = vec![false; subs.len()];
+    fn place(
+        subs: &[db::TaskSubAgent],
+        index: usize,
+        depth: usize,
+        shown: &mut [bool],
+        now: chrono::DateTime<chrono::Utc>,
+        out: &mut String,
+    ) {
+        if shown[index] {
+            return;
+        }
+        shown[index] = true;
+        let sub = &subs[index];
+        let took = |t: &str| db::parse_db_time(t);
+        let secs = match (
+            took(&sub.started_at),
+            sub.finished_at.as_deref().and_then(took),
+        ) {
+            (Some(start), end) => (end.unwrap_or(now) - start).num_seconds().max(0),
+            _ => 0,
+        };
+        let (mark, line) = match sub.outcome.as_deref() {
+            None => ("…", sub.activity.as_deref().unwrap_or("working")),
+            Some(outcome) => (
+                match outcome {
+                    "succeeded" => "✓",
+                    "stopped" => "■",
+                    _ => "✗",
+                },
+                sub.summary
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(outcome),
+            ),
+        };
+        out.push_str(&format!(
+            "  {}{} {} ({}): {}\n",
+            "  ".repeat(depth),
+            mark,
+            sub.agent,
+            if secs < 60 {
+                format!("{}s", secs)
+            } else {
+                format!("{}m {}s", secs / 60, secs % 60)
+            },
+            first_line(line, 120)
+        ));
+        for child in 0..subs.len() {
+            if subs[child].parent.as_deref() == Some(sub.agent.as_str()) {
+                place(subs, child, depth + 1, shown, now, out);
+            }
+        }
+    }
+    for index in 0..subs.len() {
+        if !subs[index]
+            .parent
+            .as_deref()
+            .is_some_and(|p| names.contains(p))
+        {
+            place(subs, index, 0, &mut shown, now, &mut out);
+        }
+    }
+    out
+}
+
 /// Most cards shown in one board column; the rest are counted.
 const BOARD_MAX_CARDS: usize = 10;
 
@@ -11726,27 +11829,30 @@ fn print_tasks_table(
         println!("No tasks.");
         return Ok(());
     }
+    let mut subagents: HashMap<i64, Vec<db::TaskSubAgent>> = HashMap::new();
+    for sub in db.task_subagents(None)? {
+        subagents.entry(sub.task_id).or_default().push(sub);
+    }
+    // Their column only when some task listed split up its work.
+    let with_subagents = tasks.iter().any(|t| subagents.contains_key(&t.id));
     let mut table = Table::new();
     table.set_format(*format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
-    table.set_titles(Row::new(
-        [
-            "ID",
-            "Name",
-            "Runs on",
-            "Kind",
-            "Schedule",
-            "Status",
-            "Next run",
-            "Last run",
-            "Runs",
-            "Last result",
-        ]
-        .iter()
-        .map(|t| Cell::new(t))
-        .collect(),
-    ));
+    let mut titles = vec![
+        "ID", "Name", "Runs on", "Kind", "Schedule", "Status", "Next run", "Last run", "Runs",
+    ];
+    if with_subagents {
+        titles.push("Sub-agents");
+    }
+    titles.push("Last result");
+    table.set_titles(Row::new(titles.iter().map(|t| Cell::new(t)).collect()));
     for task in &tasks {
-        table.add_row(task_table_row(task, &blocked, now));
+        let mut row = task_table_row(task, &blocked, now);
+        if with_subagents {
+            let subs = subagents.get(&task.id).map(Vec::as_slice).unwrap_or(&[]);
+            let summary = subagents_summary(subs).unwrap_or_else(|| "-".to_string());
+            row.insert_cell(row.len() - 1, Cell::new(&summary));
+        }
+        table.add_row(row);
     }
     table.printstd();
     Ok(())
@@ -13856,7 +13962,9 @@ fn show_task_command(
     )?;
     let task = db.get_task(id)?.ok_or_else(|| format!("no task #{}", id))?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&task)?);
+        let mut value = serde_json::to_value(&task)?;
+        value["subagents"] = serde_json::to_value(db.task_subagents(Some(id))?)?;
+        println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         let dependencies: Vec<String> = task
             .depends_on
@@ -13875,10 +13983,9 @@ fn show_task_command(
                 _ => format!("#{} (gone)", id),
             })
             .collect();
-        print!(
-            "{}",
-            describe_task(&task, &dependencies, chrono::Utc::now())
-        );
+        let now = chrono::Utc::now();
+        print!("{}", describe_task(&task, &dependencies, now));
+        print!("{}", describe_subagents(&db.task_subagents(Some(id))?, now));
         let artifacts = db.list_artifacts(id)?;
         if !artifacts.is_empty() {
             println!("Artifacts:");
@@ -17036,6 +17143,41 @@ for line in sys.stdin:
         assert!(
             widths.windows(2).all(|w| w[0] == w[1]),
             "cards are ragged: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn test_describe_subagents_nests_them_under_who_started_them() {
+        let now = db::parse_db_time("2026-10-02T12:00:00Z").unwrap();
+        let sub = |agent: &str, parent: &str, outcome: Option<&str>, text: &str| db::TaskSubAgent {
+            task_id: 1,
+            agent: agent.to_string(),
+            parent: Some(parent.to_string()),
+            started_at: "2026-10-02T11:58:00Z".to_string(),
+            finished_at: outcome.map(|_| "2026-10-02T11:58:30Z".to_string()),
+            outcome: outcome.map(String::from),
+            summary: outcome.map(|_| text.to_string()),
+            activity: outcome.is_none().then(|| text.to_string()),
+        };
+        assert_eq!(subagents_summary(&[]), None);
+        assert_eq!(describe_subagents(&[], now), "");
+        let subs = [
+            sub("a", "boss", None, "running grep"),
+            sub("b", "boss", Some("succeeded"), "fixed it\nin full"),
+            sub("c", "boss", Some("lost"), ""),
+            sub("a-1", "a", Some("stopped"), "stopped"),
+        ];
+        assert_eq!(
+            subagents_summary(&subs).unwrap(),
+            "1/4 done, 1 working, 1 failed, 1 stopped"
+        );
+        assert_eq!(
+            describe_subagents(&subs, now),
+            "\nSub-agents: 1/4 done, 1 working, 1 failed, 1 stopped\n\
+             \x20 … a (2m 0s): running grep\n\
+             \x20   ■ a-1 (30s): stopped\n\
+             \x20 ✓ b (30s): fixed it\n\
+             \x20 ✗ c (30s): lost\n"
         );
     }
 

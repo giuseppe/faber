@@ -362,6 +362,16 @@ timeout - and gets their results together, as one tool result, instead of
 one message per sub-agent arriving later. With nothing to wait for (say,
 after `fan_out`, which returns its results itself) it just says so.
 
+Sub-agents started for a task - by its agent's `spawn_agent` or
+`fan_out`, or by those sub-agents in turn - are recorded with it, so the
+work it split up stays visible after their agents are cleaned up. On the
+web UI's board its card has a dot for each one and how many are done,
+working or failed, and its details list them, each under the one that
+started it, with what it's doing or what it reported. `faber tasks`
+shows the same count in a Sub-agents column (when any task listed has
+some), `faber tasks show` lists them, and `--json` includes them. Only
+the task's current, or last, run is kept.
+
 Only a chat reads messages, so a sub-agent or a task whose turn ends with
 sub-agents of its own still working doesn't end there: it waits for
 their results and carries on with them, so they're never lost.
@@ -706,7 +716,7 @@ faber --db-path state.db tasks --since 2026-10-01 --agent mybot
 faber --db-path state.db tasks --profile fast   # tasks that run on the fast profile
 faber --db-path state.db tasks --watch      # redraw every 2s until Ctrl-C (--watch=N for N seconds)
 faber --db-path state.db tasks --board --watch   # as a board, one column per state
-faber --db-path state.db tasks show 7       # everything about task #7: full command, times, last result
+faber --db-path state.db tasks show 7       # everything about task #7: full command, times, last result, sub-agents
 faber --db-path state.db tasks show 7 --json
 ```
 
