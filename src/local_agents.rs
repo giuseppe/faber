@@ -26,7 +26,7 @@ use faber::agent_io::{AgentEvent, AgentEventRow, EventFilter};
 use faber::artifacts::NewArtifact;
 use faber::db::{
     AgentConfig, AgentRow, ArtifactRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow,
-    TaskConversation, TaskOutcome, TaskRow,
+    TaskConversation, TaskOutcome, TaskRow, TaskSubAgent,
 };
 use faber::db_backend::DbBackend;
 use std::collections::HashMap;
@@ -408,6 +408,28 @@ impl DbBackend for LocalAgents {
 
     fn agent_events(&self, filter: &EventFilter) -> Result<Vec<AgentEventRow>, Box<dyn Error>> {
         self.inner.agent_events(filter)
+    }
+
+    fn start_task_subagent(
+        &self,
+        task_id: i64,
+        agent: &str,
+        parent: Option<&str>,
+    ) -> Result<i64, Box<dyn Error>> {
+        self.inner.start_task_subagent(task_id, agent, parent)
+    }
+
+    fn finish_task_subagent(
+        &self,
+        id: i64,
+        outcome: &str,
+        summary: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        self.inner.finish_task_subagent(id, outcome, summary)
+    }
+
+    fn task_subagents(&self, task_id: Option<i64>) -> Result<Vec<TaskSubAgent>, Box<dyn Error>> {
+        self.inner.task_subagents(task_id)
     }
 
     fn kb_write(

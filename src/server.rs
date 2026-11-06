@@ -667,6 +667,28 @@ fn dispatch_inner(
             db::append_agent_events(&conn, str_param!("agent"), p["task_id"].as_i64(), &events)?;
             Ok(serde_json::json!(true))
         }
+        "start_task_subagent" => {
+            let v = db::start_task_subagent(
+                &conn,
+                i64_param!("task_id"),
+                str_param!("agent"),
+                opt_str_param!("parent"),
+            )?;
+            Ok(serde_json::to_value(v)?)
+        }
+        "finish_task_subagent" => {
+            db::finish_task_subagent(
+                &conn,
+                i64_param!("id"),
+                str_param!("outcome"),
+                str_param!("summary"),
+            )?;
+            Ok(serde_json::Value::Null)
+        }
+        "task_subagents" => {
+            let v = db::task_subagents(&conn, p["task_id"].as_i64())?;
+            Ok(serde_json::to_value(v)?)
+        }
         "agent_events" => {
             let filter: EventFilter = serde_json::from_value(p["filter"].clone())
                 .map_err(|e| format!("bad param 'filter': {}", e))?;

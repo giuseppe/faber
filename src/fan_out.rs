@@ -589,6 +589,9 @@ fn run_worker(
         db.clone()
             .map(|db| (db, agent.to_string(), sa_ctx.session_id.clone())),
     );
+    let record = db.as_ref().and_then(|db| {
+        crate::SubAgentRecord::start(db, ctx.task_id, agent, ctx.agent_name.as_deref())
+    });
     let events = db
         .as_ref()
         .map(|db| EventLog::new(db.clone(), agent, ctx.task_id));
@@ -692,6 +695,9 @@ fn run_worker(
             if let Some(activity) = &activity {
                 activity.set("stopped");
             }
+            if let Some(record) = &record {
+                record.finish("stopped", "stopped");
+            }
             crate::record_turn_end(
                 &events,
                 &faber::db::TaskOutcome {
@@ -725,6 +731,9 @@ fn run_worker(
             result: text.clone(),
         },
     );
+    if let Some(record) = &record {
+        record.finish(if succeeded { "succeeded" } else { "failed" }, &text);
+    }
     if let Some(activity) = &activity {
         let first = crate::first_line(&text, 80);
         activity.set(&if succeeded {

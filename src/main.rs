@@ -4881,6 +4881,7 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
     let sub_unsafe = agent_config.unsafe_tools == Some(true);
     let sub_cwd = agent_config.cwd.clone().map(PathBuf::from);
     let task_id = ctx.task_id;
+    let record = SubAgentRecord::start(&db, task_id, &agent_name, Some(&parent_agent));
 
     let agent_opts = with_agent_config(&sa_ctx.opts, &agent_config);
     let tools = Arc::new(agent_tools(&sa_ctx.tools, sub_unsafe, &agent_config));
@@ -5090,6 +5091,21 @@ fn tool_spawn_agent(params_str: &String, ctx: &ToolContext) -> Result<String, Bo
                 Err(e) => format!("Error: {}", e),
             },
         };
+        if let Some(record) = &record {
+            record.finish(
+                if response_text.starts_with("Stopped: ") {
+                    "stopped"
+                } else if ["Error: ", "Failed: "]
+                    .iter()
+                    .any(|p| response_text.starts_with(p))
+                {
+                    "failed"
+                } else {
+                    "succeeded"
+                },
+                &response_text,
+            );
+        }
         let first_line = first_line(&response_text, 80);
         record_turn_end(
             &events,
@@ -9116,6 +9132,54 @@ fn latex_aware_line_streamer(
             plain("")?;
         }
         Ok(())
+    }
+}
+
+/// Records a sub-agent working for a task, so the board shows it with the
+/// task (see `db::TaskSubAgent`). Dropped unfinished - its run cut short
+/// by an error - it's recorded as failed.
+pub(crate) struct SubAgentRecord {
+    db: Arc<dyn DbBackend>,
+    id: i64,
+    finished: std::sync::atomic::AtomicBool,
+}
+
+impl SubAgentRecord {
+    /// Records `agent`, started by `parent`, as working for `task_id`, if
+    /// it's for a task at all.
+    pub(crate) fn start(
+        db: &Arc<dyn DbBackend>,
+        task_id: Option<i64>,
+        agent: &str,
+        parent: Option<&str>,
+    ) -> Option<Self> {
+        let id = db
+            .start_task_subagent(task_id?, agent, parent)
+            .map_err(|e| warn!("can't record sub-agent '{}': {}", agent, e))
+            .ok()?;
+        Some(Self {
+            db: db.clone(),
+            id,
+            finished: Default::default(),
+        })
+    }
+
+    /// Records how it ended: `succeeded`, `failed` or `stopped`.
+    pub(crate) fn finish(&self, outcome: &str, text: &str) {
+        if !self
+            .finished
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            let _ = self
+                .db
+                .finish_task_subagent(self.id, outcome, &first_line(text, 200));
+        }
+    }
+}
+
+impl Drop for SubAgentRecord {
+    fn drop(&mut self) {
+        self.finish("failed", "ended without a result");
     }
 }
 
@@ -18687,6 +18751,92 @@ for line in sys.stdin:
         )
         .unwrap();
         assert_eq!(sub_agent_result(&db, "boss", "middle"), "the leaf says 42");
+    }
+
+    #[test]
+    fn test_a_task_records_the_sub_agents_working_for_it() {
+        let (db, mut ctx) = spawning_setup(
+            "task_subagents",
+            serde_json::json!([
+                {"if": "\"agent\":\"leaf\"", "tool": "agent_wait", "arguments": {"names": ["leaf"]}},
+                {"if": "## leaf", "reply": "the leaf says 42"},
+                {"if": "middle job", "tool": "spawn_agent", "arguments": {"name": "leaf", "prompt": "leaf job"}},
+                {"if": "leaf job", "reply": "42"},
+                {"if": "check", "reply": "ok"},
+            ]),
+        );
+        let task = db
+            .create_task(&db::NewTask {
+                name: "t".to_string(),
+                description: String::new(),
+                kind: db::TaskKind::PROMPT.to_string(),
+                command: "split it up".to_string(),
+                agent_name: Some("boss".to_string()),
+                schedule: db::TaskSchedule::Once {
+                    at: chrono::Utc::now().to_rfc3339(),
+                },
+                held: false,
+                depends_on: Vec::new(),
+                profile: None,
+                run_safe: false,
+                cwd: None,
+                continue_agent: None,
+                continue_task: None,
+            })
+            .unwrap();
+        assert!(db.claim_task(task, "test-session").unwrap());
+        ctx.task_id = Some(task);
+        tool_spawn_agent(
+            &serde_json::json!({"name": "middle", "prompt": "middle job"}).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(sub_agent_result(&db, "boss", "middle"), "the leaf says 42");
+        fan_out::tool_fan_out(
+            &serde_json::json!({"items": ["a", "b"], "prompt": "check {item}"}).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        let mut subs: Vec<_> = db
+            .task_subagents(Some(task))
+            .unwrap()
+            .into_iter()
+            .map(|s| {
+                (
+                    s.agent,
+                    s.parent.unwrap_or_default(),
+                    s.outcome.unwrap_or_default(),
+                    s.summary.unwrap_or_default(),
+                )
+            })
+            .collect();
+        subs.sort();
+        let sub = |agent: &str, parent: &str, summary: &str| {
+            (
+                agent.to_string(),
+                parent.to_string(),
+                "succeeded".to_string(),
+                summary.to_string(),
+            )
+        };
+        assert_eq!(
+            subs,
+            [
+                sub("boss-item-1", "boss", "ok"),
+                sub("boss-item-2", "boss", "ok"),
+                // At any depth.
+                sub("leaf", "middle", "42"),
+                sub("middle", "boss", "the leaf says 42"),
+            ]
+        );
+        // Without a task, there's nothing to record them for.
+        ctx.task_id = None;
+        fan_out::tool_fan_out(
+            &serde_json::json!({"items": ["c"], "prompt": "check {item}"}).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(db.task_subagents(None).unwrap().len(), 4);
     }
 
     #[test]

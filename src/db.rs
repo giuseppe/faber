@@ -106,6 +106,25 @@ pub struct TaskRow {
     pub continue_task: Option<i64>,
 }
 
+/// A sub-agent working for a task: one that `spawn_agent` or `fan_out`
+/// started while it ran, at any depth. The board shows them with it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TaskSubAgent {
+    pub task_id: i64,
+    pub agent: String,
+    /// The agent that started it: the task's own, or another sub-agent.
+    pub parent: Option<String>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    /// `succeeded`, `failed` or `stopped` once it's finished, `lost` if
+    /// its session went away first; none while it works.
+    pub outcome: Option<String>,
+    /// What it reported, or why it failed - the start of it.
+    pub summary: Option<String>,
+    /// While it works, what it's doing (see `AgentRow::activity`).
+    pub activity: Option<String>,
+}
+
 /// What a task's `command` is:
 ///
 /// - `tool`: a `{"tool": ..., "arguments": ...}` call, run directly by the
@@ -366,6 +385,21 @@ pub fn initialize_db(conn: &Connection) -> Result<(), rusqlite::Error> {
              settings TEXT NOT NULL,
              updated_at TEXT NOT NULL DEFAULT (datetime('now'))
          );",
+    )?;
+    // See `TaskSubAgent`. Kept apart from the agents, which are deleted
+    // once done, so a task still shows its sub-agents after.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS task_subagents (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             task_id INTEGER NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+             agent TEXT NOT NULL,
+             parent TEXT,
+             started_at TEXT NOT NULL,
+             finished_at TEXT,
+             outcome TEXT,
+             summary TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_task_subagents_task ON task_subagents(task_id, id);",
     )?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS agent_events (
@@ -2583,6 +2617,84 @@ pub fn a2a_message_task(
     }
 }
 
+/// Records that `agent`, started by `parent`, works for task `task_id`'s
+/// run, forgetting those of its earlier runs; returns the record's id, for
+/// `finish_task_subagent`.
+pub fn start_task_subagent(
+    conn: &Connection,
+    task_id: i64,
+    agent: &str,
+    parent: Option<&str>,
+) -> Result<i64, Box<dyn Error>> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM task_subagents WHERE task_id = ?1 AND started_at < (
+             SELECT COALESCE(started_at, '') FROM scheduled_tasks WHERE id = ?1)",
+        params![task_id],
+    )?;
+    tx.execute(
+        "INSERT INTO task_subagents (task_id, agent, parent, started_at) VALUES (?1, ?2, ?3, ?4)",
+        params![task_id, agent, parent, chrono::Utc::now().to_rfc3339()],
+    )?;
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Records how sub-agent record `id` (see `start_task_subagent`) ended:
+/// `outcome` is `succeeded`, `failed` or `stopped`.
+pub fn finish_task_subagent(
+    conn: &Connection,
+    id: i64,
+    outcome: &str,
+    summary: &str,
+) -> Result<(), Box<dyn Error>> {
+    conn.execute(
+        "UPDATE task_subagents SET finished_at = ?2, outcome = ?3, summary = ?4
+         WHERE id = ?1 AND finished_at IS NULL",
+        params![id, chrono::Utc::now().to_rfc3339(), outcome, summary],
+    )?;
+    Ok(())
+}
+
+/// The sub-agents of task `task_id`'s current (or last) run - of every
+/// task's, without one - in the order they started.
+pub fn task_subagents(
+    conn: &Connection,
+    task_id: Option<i64>,
+) -> Result<Vec<TaskSubAgent>, Box<dyn Error>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.task_id, s.agent, s.parent, s.started_at, s.finished_at, s.outcome,
+                s.summary, a.activity,
+                a.session_id IS NOT NULL AND a.heartbeat_at >= datetime('now', '-30 seconds')
+         FROM task_subagents s
+         JOIN scheduled_tasks t ON t.id = s.task_id
+         LEFT JOIN agents a ON a.name = s.agent
+         WHERE (?1 IS NULL OR s.task_id = ?1) AND s.started_at >= COALESCE(t.started_at, '')
+         ORDER BY s.task_id, s.id",
+    )?;
+    let rows = stmt.query_map(params![task_id], |row| {
+        let finished = row.get::<_, Option<String>>(4)?.is_some();
+        let live: Option<bool> = row.get(8)?;
+        Ok(TaskSubAgent {
+            task_id: row.get(0)?,
+            agent: row.get(1)?,
+            parent: row.get(2)?,
+            started_at: row.get(3)?,
+            finished_at: row.get(4)?,
+            // Its session went away without saying how it ended.
+            outcome: if finished || live == Some(true) {
+                row.get(5)?
+            } else {
+                Some("lost".to_string())
+            },
+            summary: row.get(6)?,
+            activity: if finished { None } else { row.get(7)? },
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
 /// Records `events` of `agent` (for `task_id`'s run, if any), dropping
 /// its oldest beyond `agent_io::MAX_EVENTS_PER_AGENT`.
 pub fn append_agent_events(
@@ -2690,6 +2802,78 @@ pub fn gc_agents(conn: &Connection) -> Result<Vec<String>, Box<dyn Error>> {
     }
     tx.commit()?;
     Ok(names)
+}
+
+#[cfg(test)]
+mod subagent_tests {
+    use super::*;
+
+    #[test]
+    fn test_a_task_lists_the_sub_agents_of_its_run() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO scheduled_tasks (name, description, task_type, next_run_at, command, kind)
+             VALUES ('t', '', 'oneshot', '2000-01-01T00:00:00+00:00', 'do it', 'prompt')",
+            [],
+        )
+        .unwrap();
+        let task = conn.last_insert_rowid();
+        assert!(claim_task(&conn, task, "s").unwrap());
+        for agent in ["boss", "helper", "gone"] {
+            create_agent(&conn, agent, "").unwrap();
+        }
+        assert!(claim_agent(&conn, "helper", "s").unwrap());
+        set_agent_activity(&conn, "helper", "running grep").unwrap();
+        let helper = start_task_subagent(&conn, task, "helper", Some("boss")).unwrap();
+        let gone = start_task_subagent(&conn, task, "gone", Some("boss")).unwrap();
+        let subs = task_subagents(&conn, Some(task)).unwrap();
+        assert_eq!(subs.len(), 2);
+        // A working one says what it's doing...
+        assert_eq!(subs[0].agent, "helper");
+        assert_eq!(subs[0].parent.as_deref(), Some("boss"));
+        assert_eq!(subs[0].outcome, None);
+        assert_eq!(subs[0].activity.as_deref(), Some("running grep"));
+        // ...one nobody runs any more is lost.
+        assert_eq!(subs[1].outcome.as_deref(), Some("lost"));
+        finish_task_subagent(&conn, helper, "succeeded", "found it").unwrap();
+        finish_task_subagent(&conn, gone, "failed", "no luck").unwrap();
+        let subs = task_subagents(&conn, None).unwrap();
+        assert_eq!(subs[0].outcome.as_deref(), Some("succeeded"));
+        assert_eq!(subs[0].summary.as_deref(), Some("found it"));
+        assert_eq!(subs[0].activity, None);
+        assert!(subs[0].finished_at.is_some());
+        assert_eq!(subs[1].outcome.as_deref(), Some("failed"));
+        // Once finished, it stays so.
+        finish_task_subagent(&conn, helper, "failed", "again").unwrap();
+        assert_eq!(
+            task_subagents(&conn, Some(task)).unwrap()[0]
+                .summary
+                .as_deref(),
+            Some("found it")
+        );
+
+        // The next run starts with none, and forgets those of the last.
+        let outcome = TaskOutcome {
+            succeeded: true,
+            exit_code: None,
+            result: "ok".to_string(),
+        };
+        assert!(finish_task(&conn, task, "s", &outcome).unwrap());
+        assert_eq!(task_subagents(&conn, Some(task)).unwrap().len(), 2);
+        assert!(run_task_now(&conn, task).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(claim_task(&conn, task, "s").unwrap());
+        assert!(task_subagents(&conn, Some(task)).unwrap().is_empty());
+        start_task_subagent(&conn, task, "helper", Some("boss")).unwrap();
+        let count = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM task_subagents", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(&conn), 1);
+        assert!(delete_task(&conn, task).unwrap());
+        assert_eq!(count(&conn), 0);
+    }
 }
 
 #[cfg(test)]

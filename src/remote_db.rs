@@ -23,7 +23,7 @@ use faber::agent_io::{AgentEvent, AgentEventRow, EventFilter};
 use faber::artifacts::NewArtifact;
 use faber::db::{
     AgentConfig, AgentRow, ArtifactRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow,
-    TaskConversation, TaskOutcome, TaskRow,
+    TaskConversation, TaskOutcome, TaskRow, TaskSubAgent,
 };
 use faber::db_backend::DbBackend;
 use faber::protocol::{RpcRequest, RpcResponse};
@@ -686,6 +686,37 @@ impl DbBackend for RemoteDb {
 
     fn agent_events(&self, filter: &EventFilter) -> Result<Vec<AgentEventRow>, Box<dyn Error>> {
         let v = self.call("agent_events", serde_json::json!({"filter": filter}))?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn start_task_subagent(
+        &self,
+        task_id: i64,
+        agent: &str,
+        parent: Option<&str>,
+    ) -> Result<i64, Box<dyn Error>> {
+        let v = self.call(
+            "start_task_subagent",
+            serde_json::json!({"task_id": task_id, "agent": agent, "parent": parent}),
+        )?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    fn finish_task_subagent(
+        &self,
+        id: i64,
+        outcome: &str,
+        summary: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        self.call(
+            "finish_task_subagent",
+            serde_json::json!({"id": id, "outcome": outcome, "summary": summary}),
+        )?;
+        Ok(())
+    }
+
+    fn task_subagents(&self, task_id: Option<i64>) -> Result<Vec<TaskSubAgent>, Box<dyn Error>> {
+        let v = self.call("task_subagents", serde_json::json!({"task_id": task_id}))?;
         Ok(serde_json::from_value(v)?)
     }
 }

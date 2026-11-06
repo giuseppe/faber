@@ -22,7 +22,7 @@ use crate::artifacts::{ArtifactStore, NewArtifact};
 use crate::db;
 use crate::db::{
     AgentConfig, AgentRow, ArtifactRow, KbHit, KbNote, KbViewer, NewTask, NotificationRow,
-    TaskConversation, TaskOutcome, TaskRow,
+    TaskConversation, TaskOutcome, TaskRow, TaskSubAgent,
 };
 use crate::db_backend::DbBackend;
 use std::error::Error;
@@ -499,6 +499,31 @@ impl DbBackend for LocalDb {
     fn agent_events(&self, filter: &EventFilter) -> Result<Vec<AgentEventRow>, Box<dyn Error>> {
         let conn = self.lock()?;
         db::agent_events(&conn, filter)
+    }
+
+    fn start_task_subagent(
+        &self,
+        task_id: i64,
+        agent: &str,
+        parent: Option<&str>,
+    ) -> Result<i64, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::start_task_subagent(&conn, task_id, agent, parent)
+    }
+
+    fn finish_task_subagent(
+        &self,
+        id: i64,
+        outcome: &str,
+        summary: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::finish_task_subagent(&conn, id, outcome, summary)
+    }
+
+    fn task_subagents(&self, task_id: Option<i64>) -> Result<Vec<TaskSubAgent>, Box<dyn Error>> {
+        let conn = self.lock()?;
+        db::task_subagents(&conn, task_id)
     }
 }
 

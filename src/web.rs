@@ -666,12 +666,13 @@ struct ApiAgent {
 }
 
 /// A task as `/api/tasks` lists it: with the dependencies it's still
-/// waiting on.
+/// waiting on, and the sub-agents working for its current (or last) run.
 #[derive(Serialize)]
 struct ApiTask {
     #[serde(flatten)]
     task: db::TaskRow,
     blocked_by: Vec<i64>,
+    subagents: Vec<db::TaskSubAgent>,
 }
 
 /// A task to create, as `POST /api/tasks` takes it.
@@ -1174,10 +1175,16 @@ fn api(
         ("GET", ["tasks"]) => {
             let tasks = db::list_tasks(conn, None)?;
             let mut blocked = db::unmet_dependencies(&tasks);
+            let mut subagents: std::collections::HashMap<i64, Vec<db::TaskSubAgent>> =
+                std::collections::HashMap::new();
+            for sub in db::task_subagents(conn, None)? {
+                subagents.entry(sub.task_id).or_default().push(sub);
+            }
             let tasks: Vec<ApiTask> = tasks
                 .into_iter()
                 .map(|task| ApiTask {
                     blocked_by: blocked.remove(&task.id).unwrap_or_default(),
+                    subagents: subagents.remove(&task.id).unwrap_or_default(),
                     task,
                 })
                 .collect();
@@ -1196,7 +1203,12 @@ fn api(
                 let blocked_by = db::unmet_dependencies(&all)
                     .remove(&task.id)
                     .unwrap_or_default();
-                Response::ok(ApiTask { task, blocked_by })
+                let subagents = db::task_subagents(conn, Some(task.id))?;
+                Response::ok(ApiTask {
+                    task,
+                    blocked_by,
+                    subagents,
+                })
             }
             None => Response::error(404, &format!("no task #{}", id)),
         },
@@ -1542,6 +1554,27 @@ mod tests {
             .status,
             200
         );
+    }
+
+    #[test]
+    fn test_tasks_come_with_their_sub_agents() {
+        let db = test_db();
+        let r = call(&db, "POST", "/api/tasks", r#"{"command": "split it up"}"#);
+        let id = json(&r)["id"].as_i64().unwrap();
+        {
+            let conn = db.lock().unwrap();
+            assert!(db::claim_task(&conn, id, "s").unwrap());
+            db::create_agent(&conn, "helper", "").unwrap();
+            assert!(db::claim_agent(&conn, "helper", "s").unwrap());
+            db::start_task_subagent(&conn, id, "helper", Some("boss")).unwrap();
+        }
+        let tasks = json(&call(&db, "GET", "/api/tasks", ""));
+        let subs = &tasks.as_array().unwrap()[0]["subagents"];
+        assert_eq!(subs[0]["agent"], "helper");
+        assert_eq!(subs[0]["parent"], "boss");
+        assert!(subs[0]["outcome"].is_null(), "working: {subs}");
+        let task = json(&call(&db, "GET", &format!("/api/tasks/{}", id), ""));
+        assert_eq!(task["subagents"], *subs);
     }
 
     #[test]

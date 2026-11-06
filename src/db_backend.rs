@@ -21,7 +21,7 @@ use crate::agent_io::{AgentEvent, AgentEventRow, EventFilter};
 use crate::artifacts::NewArtifact;
 use crate::db::{
     A2aContext, AgentConfig, AgentRow, ArtifactRow, KbHit, KbNote, KbViewer, NewTask,
-    NotificationRow, TaskConversation, TaskOutcome, TaskRow,
+    NotificationRow, TaskConversation, TaskOutcome, TaskRow, TaskSubAgent,
 };
 use std::error::Error;
 
@@ -185,6 +185,23 @@ pub trait DbBackend: Send + Sync {
     /// Removes the contents no artifact names any more, and abandoned
     /// uploads; returns how many files went.
     fn gc_artifacts(&self) -> Result<usize, Box<dyn Error>>;
+
+    /// See `db::start_task_subagent`.
+    fn start_task_subagent(
+        &self,
+        task_id: i64,
+        agent: &str,
+        parent: Option<&str>,
+    ) -> Result<i64, Box<dyn Error>>;
+    /// See `db::finish_task_subagent`.
+    fn finish_task_subagent(
+        &self,
+        id: i64,
+        outcome: &str,
+        summary: &str,
+    ) -> Result<(), Box<dyn Error>>;
+    /// See `db::task_subagents`.
+    fn task_subagents(&self, task_id: Option<i64>) -> Result<Vec<TaskSubAgent>, Box<dyn Error>>;
 
     /// See `db::append_agent_events`.
     fn append_agent_events(
